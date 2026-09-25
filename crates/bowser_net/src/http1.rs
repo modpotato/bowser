@@ -99,6 +99,10 @@ pub enum HttpError {
     ChunkedNotFinal,
     /// A chunk-size line has no valid hexadecimal size.
     InvalidChunkSize,
+    /// A chunk-size exceeds [`MAX_CHUNK_SIZE`]. Chunk sizes parse into a
+    /// u64, so without a cap a hostile size line could overflow the
+    /// `usize` arithmetic used while slicing chunk data.
+    ChunkTooLarge,
     /// A chunk extension is malformed.
     InvalidChunkExtension,
     /// Chunk data is not followed by CRLF.
@@ -132,6 +136,7 @@ impl fmt::Display for HttpError {
             Self::UnsupportedTransferEncoding => "unsupported transfer coding",
             Self::ChunkedNotFinal => "chunked is not the final transfer coding",
             Self::InvalidChunkSize => "invalid chunk-size",
+            Self::ChunkTooLarge => "chunk size exceeds limit",
             Self::InvalidChunkExtension => "invalid chunk extension",
             Self::InvalidChunkTerminator => "chunk data not followed by CRLF",
             Self::ForbiddenTrailer => "forbidden field in chunked trailer",
@@ -767,6 +772,13 @@ fn push_hex(out: &mut Vec<u8>, mut n: u64) {
     out.extend_from_slice(&buf[i..]);
 }
 
+/// Largest single chunk the chunked decoders accept. Chunk sizes parse into
+/// a u64 (up to 16 hex digits), but chunk payloads are sliced with `usize`
+/// arithmetic in [`decode_chunked`], so an uncapped size like
+/// `FFFFFFFFFFFFFFFF` would overflow. 16 MiB is far above any sane single
+/// chunk and fits comfortably in `usize` on 32- and 64-bit targets.
+pub const MAX_CHUNK_SIZE: u64 = 16 * 1024 * 1024;
+
 /// Parse a chunk-size line: `1*HEXDIG [ chunk-ext ]`.
 /// Returns the size and whether this is the terminating zero-size chunk.
 fn parse_chunk_size(line: &[u8]) -> Result<(u64, bool), HttpError> {
@@ -785,6 +797,9 @@ fn parse_chunk_size(line: &[u8]) -> Result<(u64, bool), HttpError> {
             _ => return Err(HttpError::InvalidChunkSize),
         };
         size = size * 16 + d;
+    }
+    if size > MAX_CHUNK_SIZE {
+        return Err(HttpError::ChunkTooLarge);
     }
     validate_chunk_ext(&line[semi..])?;
     Ok((size, size == 0))
@@ -889,7 +904,10 @@ pub fn decode_chunked<'a>(
                 rest: &input[pos..],
             });
         }
-        let size = size as usize;
+        // Checked conversion: `parse_chunk_size` already caps at
+        // MAX_CHUNK_SIZE, but the explicit check keeps this sound even if
+        // the cap ever changes.
+        let size = usize::try_from(size).map_err(|_| HttpError::ChunkTooLarge)?;
         if input.len() - pos < size + 2 {
             return Err(HttpError::Incomplete);
         }
@@ -1871,6 +1889,44 @@ mod tests {
     }
 
     #[test]
+    fn decode_chunked_huge_size_rejected_not_panicking() {
+        // B1: 16 hex F's (u64::MAX) must be a clean error, never a panic.
+        // This exact 18-byte message used to kill the process.
+        assert_eq!(
+            decode_chunked(b"FFFFFFFFFFFFFFFF\r\n", &limits()),
+            Err(HttpError::ChunkTooLarge)
+        );
+        // Lowercase and near-max variants.
+        assert_eq!(
+            decode_chunked(b"ffffffffffffffff\r\n", &limits()),
+            Err(HttpError::ChunkTooLarge)
+        );
+        assert_eq!(
+            decode_chunked(b"FFFFFFFFFFFFFFFE\r\n", &limits()),
+            Err(HttpError::ChunkTooLarge)
+        );
+        // Just over the 16 MiB cap (0x1000001).
+        assert_eq!(
+            decode_chunked(b"1000001\r\n", &limits()),
+            Err(HttpError::ChunkTooLarge)
+        );
+        // A chunk of exactly MAX_CHUNK_SIZE (0x1000000) is accepted
+        // size-wise: with a short buffer the decoder reports Incomplete.
+        assert_eq!(
+            decode_chunked(b"1000000\r\n", &limits()),
+            Err(HttpError::Incomplete)
+        );
+        // And a full 16 MiB chunk decodes.
+        let mut body = Vec::from(b"1000000\r\n".as_slice());
+        body.extend_from_slice(&vec![b'x'; MAX_CHUNK_SIZE as usize]);
+        body.extend_from_slice(b"\r\n0\r\n\r\n");
+        let msg = decode_chunked(&body, &limits()).unwrap();
+        assert_eq!(msg.chunks.len(), 1);
+        assert_eq!(msg.chunks[0].len(), MAX_CHUNK_SIZE as usize);
+        assert_eq!(msg.rest, b"");
+    }
+
+    #[test]
     fn decode_chunked_incomplete() {
         assert_eq!(decode_chunked(b"", &limits()), Err(HttpError::Incomplete));
         assert_eq!(
@@ -1974,6 +2030,19 @@ mod tests {
             dec.feed(b"0\r\nContent-Length: 1\r\n\r\n"),
             Err(HttpError::ForbiddenTrailer)
         );
+    }
+
+    #[test]
+    fn streaming_huge_chunk_size_rejected() {
+        // Same B1 fix as the one-shot path: an absurd chunk-size line is a
+        // clean error through the streaming decoder too.
+        let mut dec = ChunkedDecoder::new(Limits::default());
+        assert_eq!(
+            dec.feed(b"FFFFFFFFFFFFFFFF\r\n"),
+            Err(HttpError::ChunkTooLarge)
+        );
+        let mut dec = ChunkedDecoder::new(Limits::default());
+        assert_eq!(dec.feed(b"1000001\r\n"), Err(HttpError::ChunkTooLarge));
     }
 
     #[test]
