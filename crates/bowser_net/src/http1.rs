@@ -221,7 +221,9 @@ fn trim_ows(bytes: &[u8]) -> &[u8] {
         .iter()
         .rposition(|&b| b != b' ' && b != b'\t')
         .map_or(0, |i| i + 1);
-    &bytes[start..end]
+    // On all-whitespace input `start == len` and `end == 0`; clamp so the
+    // slice is empty instead of `start > end` (which would panic).
+    &bytes[start..end.max(start)]
 }
 
 /// A field-value may hold HTAB, VCHAR, and obs-text — nothing else.
@@ -1348,6 +1350,88 @@ mod tests {
             req(b"GET / HTTP/1.1\r\nHost: \t example.com \t\r\nX-Empty:\r\n\r\n").unwrap();
         assert_eq!(head.headers.get("host"), Some(b"example.com".as_slice()));
         assert_eq!(head.headers.get("x-empty"), Some(b"".as_slice()));
+    }
+
+    // Regression tests: `trim_ows` used to panic on all-whitespace input
+    // (`&bytes[len..0]`). Every shape below is reachable from the network
+    // and must parse (or fail cleanly) instead of panicking.
+
+    #[test]
+    fn trim_ows_all_whitespace_is_empty() {
+        assert_eq!(trim_ows(b" "), b"");
+        assert_eq!(trim_ows(b"   "), b"");
+        assert_eq!(trim_ows(b"\t \t"), b"");
+        assert_eq!(trim_ows(b""), b"");
+        assert_eq!(trim_ows(b"  x  "), b"x");
+        assert_eq!(trim_ows(b"x"), b"x");
+    }
+
+    #[test]
+    fn header_single_space_value_parses_as_empty() {
+        // `X: \r\n`: OWS-only value is the empty value (RFC 9110 §5.5).
+        let (head, _) = req(b"GET / HTTP/1.1\r\nX: \r\n\r\n").unwrap();
+        assert_eq!(head.headers.get("x"), Some(b"".as_slice()));
+    }
+
+    #[test]
+    fn content_length_ows_only_value_does_not_panic() {
+        let (head, _) = req(b"POST / HTTP/1.1\r\nContent-Length:    \r\n\r\n").unwrap();
+        assert_eq!(head.headers.get("content-length"), Some(b"".as_slice()));
+        // Empty is not a valid decimal; that is an error, not a panic.
+        assert_eq!(
+            content_length(&head.headers),
+            Err(HttpError::InvalidContentLength)
+        );
+    }
+
+    #[test]
+    fn content_length_ows_only_list_element_does_not_panic() {
+        // `Content-Length: 5,   ,6`: the empty element rejects cleanly.
+        let (head, _) = req(b"POST / HTTP/1.1\r\nContent-Length: 5,   ,6\r\n\r\n").unwrap();
+        assert_eq!(
+            content_length(&head.headers),
+            Err(HttpError::InvalidContentLength)
+        );
+    }
+
+    #[test]
+    fn transfer_encoding_ows_only_value_rejected_without_panic() {
+        // An empty coding is invalid; that is an error, not a panic.
+        let (head, _) = req(b"POST / HTTP/1.1\r\nTransfer-Encoding:   \r\n\r\n").unwrap();
+        assert_eq!(head.headers.get("transfer-encoding"), Some(b"".as_slice()));
+        assert_eq!(
+            request_body_spec(&head),
+            Err(HttpError::InvalidTransferEncoding)
+        );
+    }
+
+    #[test]
+    fn transfer_encoding_ows_only_list_element_rejected_without_panic() {
+        // `Transfer-Encoding: chunked,   ,identity`: empty coding rejects.
+        let (head, _) =
+            req(b"POST / HTTP/1.1\r\nTransfer-Encoding: chunked,   ,identity\r\n\r\n").unwrap();
+        assert_eq!(
+            request_body_spec(&head),
+            Err(HttpError::InvalidTransferEncoding)
+        );
+    }
+
+    #[test]
+    fn te_header_with_ows_only_element_parses() {
+        // `TE: chunked,   ,identity`: header value survives intact, no panic.
+        let (head, _) = req(b"GET / HTTP/1.1\r\nTE: chunked,   ,identity\r\n\r\n").unwrap();
+        assert_eq!(
+            head.headers.get("te"),
+            Some(b"chunked,   ,identity".as_slice())
+        );
+    }
+
+    #[test]
+    fn decode_chunked_ows_only_trailer_value_parses() {
+        // `0\r\nX:  \r\n\r\n`: trailer with OWS-only value is empty.
+        let msg = decode_chunked(b"0\r\nX:  \r\n\r\n", &limits()).unwrap();
+        assert_eq!(msg.trailers.len(), 1);
+        assert_eq!(msg.trailers.get("x"), Some(b"".as_slice()));
     }
 
     #[test]
