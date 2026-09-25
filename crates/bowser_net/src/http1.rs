@@ -646,12 +646,14 @@ pub fn response_body_spec(
     head: &ResponseHead,
     request_method: &[u8],
 ) -> Result<BodySpec, HttpError> {
-    if request_method == b"HEAD" {
+    // 1xx / 204 / 304 responses, and responses to HEAD, never carry a body,
+    // but their framing headers must still be well-formed: garbage
+    // Transfer-Encoding / Content-Length is rejected rather than silently
+    // swallowed.
+    if request_method == b"HEAD" || matches!(head.status, 100..=199 | 204 | 304) {
+        transfer_encoding(&head.headers)?;
+        content_length(&head.headers)?;
         return Ok(BodySpec::Empty);
-    }
-    match head.status {
-        100..=199 | 204 | 304 => return Ok(BodySpec::Empty),
-        _ => {}
     }
     match transfer_encoding(&head.headers)? {
         TransferOutcome::Chunked => Ok(BodySpec::Chunked),
@@ -1667,6 +1669,32 @@ mod tests {
         );
         assert_eq!(
             res_spec(b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked", b"HEAD"),
+            Ok(BodySpec::Empty)
+        );
+    }
+
+    #[test]
+    fn bodiless_response_framing_still_validated() {
+        // Malformed framing headers are rejected even though the body is empty.
+        assert_eq!(
+            res_spec(b"HTTP/1.1 204 X\r\nTransfer-Encoding: bogus", b"GET"),
+            Err(HttpError::UnsupportedTransferEncoding)
+        );
+        assert_eq!(
+            res_spec(b"HTTP/1.1 304 X\r\nContent-Length: abc", b"GET"),
+            Err(HttpError::InvalidContentLength)
+        );
+        assert_eq!(
+            res_spec(b"HTTP/1.1 200 OK\r\nTransfer-Encoding: bogus", b"HEAD"),
+            Err(HttpError::UnsupportedTransferEncoding)
+        );
+        // Well-formed framing headers on bodiless responses are fine.
+        assert_eq!(
+            res_spec(b"HTTP/1.1 204 X\r\nContent-Length: 0", b"GET"),
+            Ok(BodySpec::Empty)
+        );
+        assert_eq!(
+            res_spec(b"HTTP/1.1 204 X\r\nTransfer-Encoding: identity", b"GET"),
             Ok(BodySpec::Empty)
         );
     }
