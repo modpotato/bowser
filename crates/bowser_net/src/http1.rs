@@ -13,8 +13,10 @@
 //! (they are small and rare).
 //!
 //! Strictness notes (deliberate, RFC 9112 §5):
-//! * Header lines must end with CRLF; a lone LF is tolerated, a bare CR
-//!   is rejected.
+//! * Line endings: CRLF is the wire format; a lone LF is tolerated
+//!   everywhere a line ending is expected (start-line, header lines,
+//!   chunk-size lines, chunk-data terminators, trailers). A bare CR
+//!   (a CR not followed by LF) is always rejected.
 //! * `obs-fold` (a header line starting with SP/HTAB) is rejected, not
 //!   unfolded.
 //! * Whitespace between a field name and the colon is rejected.
@@ -133,7 +135,7 @@ impl fmt::Display for HttpError {
             Self::ChunkedNotFinal => "chunked is not the final transfer coding",
             Self::InvalidChunkSize => "invalid chunk-size",
             Self::InvalidChunkExtension => "invalid chunk extension",
-            Self::InvalidChunkTerminator => "chunk data not followed by CRLF",
+            Self::InvalidChunkTerminator => "chunk data not followed by CRLF or LF",
             Self::ForbiddenTrailer => "forbidden field in chunked trailer",
         };
         f.write_str(msg)
@@ -870,6 +872,10 @@ pub struct ChunkedMessage<'a> {
 /// Decode a complete chunked body in one shot. Chunk payloads are slices of
 /// `input` — no copying. Returns [`HttpError::Incomplete`] if the buffer
 /// does not yet hold the whole body.
+///
+/// Line endings follow the same lenient policy as [`next_line`]: chunk-size
+/// lines and the CRLF after each chunk's data accept a lone LF, and a bare
+/// CR is rejected.
 pub fn decode_chunked<'a>(
     input: &'a [u8],
     limits: &Limits,
@@ -890,15 +896,25 @@ pub fn decode_chunked<'a>(
             });
         }
         let size = size as usize;
-        if input.len() - pos < size + 2 {
+        if input.len() - pos < size {
             return Err(HttpError::Incomplete);
         }
         chunks.push(&input[pos..pos + size]);
-        pos += size;
-        if &input[pos..pos + 2] != b"\r\n" {
+        let term = &input[pos + size..];
+        // The terminator accepts CRLF or a lone LF. A lone trailing CR may be
+        // the first half of a split CRLF, so that stays Incomplete.
+        let term_len = if term.starts_with(b"\r\n") {
+            2
+        } else if term.starts_with(b"\n") {
+            1
+        } else if term.is_empty() || term == b"\r" {
+            // No terminator bytes yet, or a lone CR that may be the first
+            // half of a split CRLF.
+            return Err(HttpError::Incomplete);
+        } else {
             return Err(HttpError::InvalidChunkTerminator);
-        }
-        pos += 2;
+        };
+        pos += size + term_len;
     }
 }
 
@@ -984,11 +1000,18 @@ impl ChunkedDecoder {
                     };
                 }
                 DecoderState::ChunkDataCr => {
-                    if input[0] != b'\r' {
+                    // The chunk-data terminator follows the same lenient line-ending
+                    // policy as `next_line`: CRLF, or a lone LF. A CR followed by
+                    // anything else is still an error.
+                    if input[0] == b'\n' {
+                        input = &input[1..];
+                        self.state = DecoderState::ChunkSize;
+                    } else if input[0] == b'\r' {
+                        input = &input[1..];
+                        self.state = DecoderState::ChunkDataLf;
+                    } else {
                         return Err(HttpError::InvalidChunkTerminator);
                     }
-                    input = &input[1..];
-                    self.state = DecoderState::ChunkDataLf;
                 }
                 DecoderState::ChunkDataLf => {
                     if input[0] != b'\n' {
@@ -1009,13 +1032,15 @@ impl ChunkedDecoder {
                             self.handle_line(&mut events, is_trailer)?;
                         }
                         None => {
+                            // Length first, matching `next_line`: an over-limit line
+                            // reports LineTooLong even if it also holds a bare CR.
+                            if self.line.len() + input.len() > self.limits.max_line_bytes {
+                                return Err(HttpError::LineTooLong);
+                            }
                             for (i, &b) in input.iter().enumerate() {
                                 if b == b'\r' && i + 1 < input.len() {
                                     return Err(HttpError::BareCr);
                                 }
-                            }
-                            if self.line.len() + input.len() > self.limits.max_line_bytes {
-                                return Err(HttpError::LineTooLong);
                             }
                             self.line.extend_from_slice(input);
                             input = &[];
@@ -1815,6 +1840,28 @@ mod tests {
     }
 
     #[test]
+    fn decode_chunked_lone_lf_terminator() {
+        // Chunk-data terminators accept a lone LF: the same lenient line-ending
+        // policy as `next_line` (m4).
+        let msg = decode_chunked(b"5\nhello\n0\r\n\r\n", &limits()).unwrap();
+        assert_eq!(msg.chunks, vec![b"hello".as_slice()]);
+        // Lone LF everywhere: size lines, terminators, trailers.
+        let msg = decode_chunked(b"5\nhello\n0\nX-A: 1\n\n", &limits()).unwrap();
+        assert_eq!(msg.chunks, vec![b"hello".as_slice()]);
+        assert_eq!(msg.trailers.get("x-a"), Some(b"1".as_slice()));
+        // A trailing lone CR may be the first half of a split CRLF: incomplete.
+        assert_eq!(
+            decode_chunked(b"5\r\nhello\r", &limits()),
+            Err(HttpError::Incomplete)
+        );
+        // A byte that can never start a line ending is a terminator error.
+        assert_eq!(
+            decode_chunked(b"5\r\nhelloX", &limits()),
+            Err(HttpError::InvalidChunkTerminator)
+        );
+    }
+
+    #[test]
     fn decode_chunked_malformed_rejected() {
         // Bad hex.
         assert_eq!(
@@ -1984,6 +2031,51 @@ mod tests {
         };
         let mut dec = ChunkedDecoder::new(tiny);
         assert_eq!(dec.feed(b"12345\r\n"), Err(HttpError::LineTooLong));
+    }
+
+    #[test]
+    fn streaming_lone_lf_terminator() {
+        // The streaming decoder tolerates a lone LF after chunk data, matching
+        // `decode_chunked` and `next_line` (m4).
+        let mut dec = ChunkedDecoder::new(Limits::default());
+        let events = dec.feed(b"5\r\nhello\n0\r\n\r\n").unwrap();
+        assert!(
+            events
+                .iter()
+                .any(|e| matches!(e, ChunkEvent::Data(b"hello")))
+        );
+        assert!(events.iter().any(|e| matches!(e, ChunkEvent::End)));
+        assert!(dec.is_done());
+        // Lone LF arriving in its own feed.
+        let mut dec = ChunkedDecoder::new(Limits::default());
+        assert!(
+            dec.feed(b"5\r\nhello")
+                .unwrap()
+                .iter()
+                .any(|e| matches!(e, ChunkEvent::Data(_)))
+        );
+        let events = dec.feed(b"\n0\r\n\r\n").unwrap();
+        assert!(events.iter().any(|e| matches!(e, ChunkEvent::End)));
+        assert!(dec.is_done());
+        // A CR followed by a non-LF byte is still rejected, not tolerated.
+        let mut dec = ChunkedDecoder::new(Limits::default());
+        dec.feed(b"5\r\nhello").unwrap();
+        assert_eq!(dec.feed(b"\rX"), Err(HttpError::BareCr));
+    }
+
+    #[test]
+    fn over_limit_line_with_bare_cr_reports_line_too_long_in_both_paths() {
+        // Error precedence is length-first in both the one-shot line parser
+        // and the streaming decoder: an over-limit line holding an interior
+        // CR (and no LF yet) is LineTooLong in both (m5).
+        let tiny = Limits {
+            max_line_bytes: 8,
+            ..Default::default()
+        };
+        let input = b"AAAAAAAAA\rBB"; // 12 bytes, interior CR, no LF.
+        assert_eq!(decode_chunked(input, &tiny), Err(HttpError::LineTooLong));
+        let mut dec = ChunkedDecoder::new(tiny);
+        assert_eq!(dec.feed(input), Err(HttpError::LineTooLong));
     }
 
     // -- serialization --------------------------------------------------------
