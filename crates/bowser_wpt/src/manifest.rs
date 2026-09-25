@@ -91,6 +91,12 @@ pub struct Manifest {
     items: Vec<TestItem>,
     /// Entries in `MANIFEST.json` whose shape we did not understand.
     pub skipped: usize,
+    /// Directory entries dropped during [`Manifest::walk`] because reading
+    /// the entry itself failed. Non-fatal by design: a single unreadable
+    /// entry (transient filesystem error, vanishing file) must not abort a
+    /// scan of an entire checkout. A caller that wants a strict scan should
+    /// treat a non-zero value as failure.
+    pub walk_errors: usize,
 }
 
 impl Manifest {
@@ -140,7 +146,25 @@ impl Manifest {
     /// - contains a `<link rel=match|mismatch>` → [`TestKind::Reftest`]
     /// - references `testharness.js` → [`TestKind::Testharness`]
     /// - otherwise → [`TestKind::Other`]("unknown-html")
+    ///
+    /// Robustness notes:
+    /// - A symlinked `root` is refused with [`ManifestError::Invalid`]:
+    ///   `read_dir` follows the root symlink, so it could point anywhere
+    ///   (even `/`) and we would traverse it. Symlinks *inside* the tree
+    ///   are never followed (see `walk_dir`).
+    /// - Per-entry I/O errors while listing a directory are non-fatal and
+    ///   counted in [`Manifest::walk_errors`]; any other I/O error aborts
+    ///   the walk.
     pub fn walk(root: &Path) -> Result<Manifest, ManifestError> {
+        // Guard the root itself: read_dir follows symlinks, and inner
+        // symlink protection (symlink_metadata in walk_dir) does not apply
+        // to the starting directory.
+        if std::fs::symlink_metadata(root)?.file_type().is_symlink() {
+            return Err(ManifestError::Invalid(format!(
+                "refusing to walk symlinked root: {}",
+                root.display()
+            )));
+        }
         let mut manifest = Manifest::default();
         walk_dir(root, root, &mut manifest)?;
         manifest.items.sort_by(|a, b| a.id.cmp(&b.id));
@@ -205,16 +229,16 @@ const SKIP_DIRS: &[&str] = &[".git", "tools", "resources", "infrastructure", ".g
 const TEST_EXTENSIONS: &[&str] = &["html", "htm", "xhtml"];
 
 fn walk_dir(root: &Path, dir: &Path, manifest: &mut Manifest) -> Result<(), ManifestError> {
-    let mut entries: Vec<PathBuf> = std::fs::read_dir(dir)?
-        .filter_map(|e| e.ok().map(|e| e.path()))
-        .collect();
+    let mut entries = collect_entries(std::fs::read_dir(dir)?, manifest);
     entries.sort();
     for path in entries {
+        // Lossy on purpose, matching the id construction below: a non-UTF8
+        // file name must still get its extension checked instead of being
+        // silently dropped via `to_str().unwrap_or_default() == ""`.
         let name = path
             .file_name()
-            .and_then(|n| n.to_str())
-            .unwrap_or_default()
-            .to_owned();
+            .map(|n| n.to_string_lossy().into_owned())
+            .unwrap_or_default();
         // Never follow symlinks: WPT has none that matter, and loops are fatal.
         let meta = std::fs::symlink_metadata(&path)?;
         if meta.is_dir() {
@@ -237,6 +261,23 @@ fn walk_dir(root: &Path, dir: &Path, manifest: &mut Manifest) -> Result<(), Mani
         }
     }
     Ok(())
+}
+
+/// Collect one directory's entries. Per-entry I/O errors are counted on
+/// [`Manifest::walk_errors`] and skipped rather than silently dropped or
+/// aborting the whole walk; see the [`Manifest::walk`] docs for the policy.
+fn collect_entries(
+    iter: impl Iterator<Item = io::Result<std::fs::DirEntry>>,
+    manifest: &mut Manifest,
+) -> Vec<PathBuf> {
+    let mut entries = Vec::new();
+    for entry in iter {
+        match entry {
+            Ok(e) => entries.push(e.path()),
+            Err(_) => manifest.walk_errors += 1,
+        }
+    }
+    entries
 }
 
 fn has_test_extension(name: &str) -> bool {
@@ -438,6 +479,7 @@ mod tests {
         let m = Manifest::walk(&tree.root).unwrap();
         // 5 html files: .txt/.js/.json skipped, tools/ and resources/ skipped.
         assert_eq!(m.len(), 5);
+        assert_eq!(m.walk_errors, 0);
         assert_eq!(m.by_kind(&TestKind::Testharness).len(), 2);
         assert_eq!(m.by_kind(&TestKind::Reftest).len(), 2);
         assert_eq!(m.by_kind(&TestKind::Other("unknown-html".into())).len(), 1);
@@ -459,6 +501,53 @@ mod tests {
     fn walk_missing_root_is_io_error() {
         let err = Manifest::walk(Path::new("/nonexistent-bowser-wpt-root")).unwrap_err();
         assert!(matches!(err, ManifestError::Io(_)));
+    }
+
+    #[test]
+    fn collect_entries_counts_per_entry_io_errors() {
+        // Deterministic coverage of the error-counting policy without
+        // needing a real failing filesystem entry.
+        let boom: io::Result<std::fs::DirEntry> = Err(io::Error::other("boom"));
+        let mut manifest = Manifest::default();
+        let entries = collect_entries(vec![boom].into_iter(), &mut manifest);
+        assert!(entries.is_empty());
+        assert_eq!(manifest.walk_errors, 1);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn walk_keeps_non_utf8_file_names() {
+        use std::os::unix::ffi::OsStringExt;
+
+        let tree = FixtureTree::new(&[("ok.html", TESTHARNESS_HTML)]);
+        let raw_name = std::ffi::OsString::from_vec(b"weird_\xff.html".to_vec());
+        std::fs::write(tree.root.join(&raw_name), TESTHARNESS_HTML).unwrap();
+
+        let m = Manifest::walk(&tree.root).unwrap();
+        assert_eq!(m.len(), 2);
+        assert_eq!(m.walk_errors, 0);
+        // The id is lossy, consistent with the ids of UTF-8 names.
+        let id = "weird_\u{fffd}.html";
+        let item = m.items().iter().find(|t| t.id == id).unwrap();
+        assert_eq!(item.kind, TestKind::Testharness);
+        assert_eq!(item.url, format!("/{id}"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn walk_refuses_symlinked_root() {
+        use std::os::unix::fs::symlink;
+
+        let tree = FixtureTree::new(&[("a.html", TESTHARNESS_HTML)]);
+        let link = tree.root.with_extension("link");
+        let _ = std::fs::remove_file(&link);
+        symlink(&tree.root, &link).unwrap();
+        let err = Manifest::walk(&link).unwrap_err();
+        assert!(
+            matches!(err, ManifestError::Invalid(_)),
+            "expected Invalid, got {err:?}"
+        );
+        let _ = std::fs::remove_file(&link);
     }
 
     #[test]
