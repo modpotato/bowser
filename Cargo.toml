@@ -1,0 +1,14 @@
+[workspace]
+members = ["crates/*"]
+resolver = "2"
+
+[profile.release]
+lto = true
+codegen-units = 1
+opt-level = 3
+strip = true
+
+[profile.bench]
+lto = true
+codegen-units = 1
+opt-level = 3
