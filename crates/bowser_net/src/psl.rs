@@ -5,15 +5,15 @@
 //! `psl_data.bin` by `psl/gen_psl.py`: a reversed-label (TLD-first) trie
 //! where each node records whether an exact, wildcard (`*.`), or exception
 //! (`!`) rule ends there. Lookup implements the prevailing-rule algorithm:
-//! candidates are examined longest-first, and at each candidate an exception
-//! rule beats a wildcard rule beats an exact rule; with no match the `*`
-//! rule makes the last label the public suffix.
+//! first any exception rule among the candidates prevails (longest wins),
+//! otherwise candidates are examined longest-first with wildcard beating
+//! exact; with no match the `*` rule makes the last label the public suffix.
 //!
 //! All functions take plain host strings. Hosts are matched ASCII
-//! case-insensitively and a single trailing dot is ignored. Unicode (IDN)
-//! labels never match: the trie stores rules IDNA-encoded to ASCII, so
-//! callers must pass the ASCII (punycode) form — UTS-46 processing belongs
-//! to `bowser_url`, not here.
+//! case-insensitively and trailing dots (FQDN root markers) are ignored.
+//! Unicode (IDN) labels never match: the trie stores rules IDNA-encoded to
+//! ASCII, so callers must pass the ASCII (punycode) form — UTS-46
+//! processing belongs to `bowser_url`, not here.
 
 use std::borrow::Cow;
 
@@ -30,11 +30,19 @@ const FLAG_EXCEPTION: u8 = 0b100;
 /// inputs fall back to the `*` rule.
 const MAX_LABELS: usize = 128;
 
-/// Strip one trailing dot and ASCII-lowercase a host for canonical use
-/// (cookie domains, comparisons). Returns a borrowed slice when the
-/// input is already canonical.
+/// Strip all trailing dots (FQDN root markers) from a host. `""` stays `""`.
+fn strip_trailing_dots(host: &str) -> &str {
+    host.trim_end_matches('.')
+}
+
+/// Strip ASCII whitespace and all trailing dots, then ASCII-lowercase a
+/// host for canonical use (cookie domains, comparisons). Returns a
+/// borrowed slice when the input is already canonical.
+///
+/// Callers should pre-trim their input; the trimming here is defensive so
+/// a stray space or an extra root dot cannot poison label splitting.
 pub fn normalize_host(host: &str) -> Cow<'_, str> {
-    let h = host.strip_suffix('.').unwrap_or(host);
+    let h = strip_trailing_dots(host.trim_matches(|c: char| c.is_ascii_whitespace()));
     if h.bytes().any(|b| b.is_ascii_uppercase()) {
         Cow::Owned(h.to_ascii_lowercase())
     } else {
@@ -44,50 +52,58 @@ pub fn normalize_host(host: &str) -> Cow<'_, str> {
 
 /// The `(version, commit)` of the vendored list, e.g.
 /// `("2026-09-24_13-26-36_UTC", "a179a48...")`.
+// Introspection API: no in-tree callers yet, but the vendored-data contract
+// includes version reporting (psl's own tests cover it), so it is kept
+// rather than deleted now that the module is `pub(crate)`.
+#[allow(dead_code)]
 pub fn list_version() -> (&'static str, &'static str) {
     let mut pos = 0;
     if DATA.get(0..8) != Some(MAGIC.as_slice()) {
         return ("", "");
     }
     pos += 8;
-    let version = read_len_prefixed(pos);
+    let version = read_len_prefixed(DATA, pos);
     pos += 1 + version.len();
-    let commit = read_len_prefixed(pos);
+    let commit = read_len_prefixed(DATA, pos);
     (version, commit)
 }
 
-fn read_len_prefixed(pos: usize) -> &'static str {
-    let len = DATA.get(pos).copied().unwrap_or(0) as usize;
-    let bytes = DATA.get(pos + 1..pos + 1 + len).unwrap_or(&[]);
+#[allow(dead_code)] // only used by `list_version` (kept: see above)
+fn read_len_prefixed(data: &[u8], pos: usize) -> &str {
+    let len = data.get(pos).copied().unwrap_or(0) as usize;
+    let bytes = data.get(pos + 1..pos + 1 + len).unwrap_or(&[]);
     std::str::from_utf8(bytes).unwrap_or("")
 }
 
-/// Byte offset of the trie root node, or `None` if the header is corrupt.
-fn trie_root() -> Option<usize> {
-    if DATA.get(0..8) != Some(MAGIC.as_slice()) {
+/// Byte slice starting at the trie root node, or `None` if the header is
+/// corrupt. Taking the data as a parameter (rather than using `DATA`
+/// directly) lets tests walk synthetic tries.
+fn trie(data: &[u8]) -> Option<&[u8]> {
+    if data.get(0..8) != Some(MAGIC.as_slice()) {
         return None;
     }
     let mut pos = 8;
     for _ in 0..2 {
-        let len = DATA.get(pos).copied().unwrap_or(0) as usize;
+        let len = data.get(pos).copied().unwrap_or(0) as usize;
         pos = pos.checked_add(1 + len)?;
     }
     pos = pos.checked_add(4)?; // rule count
-    DATA.get(pos..).is_some().then_some(pos)
+    data.get(pos..)
 }
 
 /// Find the child of the node at `node_off` whose label equals `label`
-/// (ASCII case-insensitive). Returns the child node's offset.
-fn find_child(node_off: usize, label: &str) -> Option<usize> {
-    let count = u16::from_le_bytes([*DATA.get(node_off + 1)?, *DATA.get(node_off + 2)?]);
+/// (ASCII case-insensitive). Returns the child node's offset, relative to
+/// the start of `trie`.
+fn find_child(trie: &[u8], node_off: usize, label: &str) -> Option<usize> {
+    let count = u16::from_le_bytes([*trie.get(node_off + 1)?, *trie.get(node_off + 2)?]);
     let mut pos = node_off + 3;
     let want = label.as_bytes();
     for _ in 0..count {
-        let label_len = *DATA.get(pos)? as usize;
+        let label_len = *trie.get(pos)? as usize;
         pos += 1;
-        let child_label = DATA.get(pos..pos + label_len)?;
+        let child_label = trie.get(pos..pos + label_len)?;
         pos += label_len;
-        let subtree_len = u32::from_le_bytes(DATA.get(pos..pos + 4)?.try_into().ok()?) as usize;
+        let subtree_len = u32::from_le_bytes(trie.get(pos..pos + 4)?.try_into().ok()?) as usize;
         pos += 4;
         if child_label.eq_ignore_ascii_case(want) {
             return Some(pos);
@@ -98,16 +114,17 @@ fn find_child(node_off: usize, label: &str) -> Option<usize> {
 }
 
 /// The public suffix of `host`, returned as a slice of `host` (case
-/// preserved). Never returns an empty slice for non-empty input; for `""`
-/// it returns `""`.
+/// preserved). Never returns an empty slice for non-empty input, except
+/// degenerate all-dots input (`"..."`), which is treated as empty; for
+/// `""` it returns `""`.
 pub fn public_suffix(host: &str) -> &str {
-    walk(host).unwrap_or_else(|| last_label(host))
+    walk(DATA, host).unwrap_or_else(|| last_label(host))
 }
 
 /// The registrable domain (eTLD+1): one label above the public suffix, or
 /// `None` when `host` is itself a public suffix (or empty).
 pub fn registrable_domain(host: &str) -> Option<&str> {
-    let h = host.strip_suffix('.').unwrap_or(host);
+    let h = strip_trailing_dots(host);
     let ps = public_suffix(host);
     if ps.len() >= h.len() {
         return None;
@@ -121,19 +138,33 @@ pub fn registrable_domain(host: &str) -> Option<&str> {
 
 /// True when `host` is itself a public suffix.
 pub fn is_public_suffix(host: &str) -> bool {
-    let h = host.strip_suffix('.').unwrap_or(host);
+    let h = strip_trailing_dots(host);
     public_suffix(host).len() == h.len()
 }
 
-/// Core walk: longest candidate first; at each candidate, exception >
-/// wildcard > exact. Returns the byte range of the public suffix within
-/// the dot-stripped host, or `None` on corrupt data / absurd input.
-fn walk(host: &str) -> Option<&str> {
-    let root = trie_root()?;
-    let h = host.strip_suffix('.').unwrap_or(host);
+/// Core walk over the embedded data. Returns the public suffix as a slice
+/// of the dot-stripped host, or `None` on corrupt data / absurd input.
+fn walk<'a>(data: &[u8], host: &'a str) -> Option<&'a str> {
+    walk_trie(trie(data)?, host)
+}
+
+/// Core walk over a trie slice (the bytes starting at the root node).
+/// Two passes over the candidates (the host and its parent domains,
+/// TLD-first):
+///
+/// 1. exception pass: per the PSL spec an exception rule at *any* candidate
+///    depth prevails over longer wildcard/exact matches, so scan all
+///    depths first (longest wins); the public suffix is one label beyond
+///    the exception rule.
+/// 2. longest-first pass: wildcard beats exact at each candidate.
+///
+/// Returns the byte range of the public suffix within the dot-stripped
+/// host, or `None` on corrupt data / absurd input.
+fn walk_trie<'a>(trie: &[u8], host: &'a str) -> Option<&'a str> {
+    let h = strip_trailing_dots(host);
 
     // Label byte ranges, left to right.
-    let mut ranges = [(0usize, 0usize); MAX_LABELS];
+    let mut ranges_buf = [(0usize, 0usize); MAX_LABELS];
     let mut n = 0usize;
     let mut start = 0usize;
     for (i, b) in h.bytes().enumerate() {
@@ -141,7 +172,7 @@ fn walk(host: &str) -> Option<&str> {
             if n >= MAX_LABELS {
                 return None;
             }
-            ranges[n] = (start, i);
+            ranges_buf[n] = (start, i);
             n += 1;
             start = i + 1;
         }
@@ -149,17 +180,20 @@ fn walk(host: &str) -> Option<&str> {
     if n >= MAX_LABELS {
         return None;
     }
-    ranges[n] = (start, h.len());
+    ranges_buf[n] = (start, h.len());
     n += 1;
+    // Only the first `n` entries hold valid ranges; slice so that a
+    // `.get()` past the end fails instead of reading a stale entry.
+    let ranges = &ranges_buf[..n];
 
     // Walk from the TLD down, recording the node at each depth.
     // depths[k] = (node offset, d) with d = number of labels consumed.
     let mut depths = [(0usize, 0usize); MAX_LABELS];
     let mut ndepth = 0usize;
-    let mut node_off = root;
+    let mut node_off = 0; // the root node is at offset 0 of the trie slice
     for d in 1..=n {
         let (s, e) = ranges[n - d];
-        let Some(child) = find_child(node_off, &h[s..e]) else {
+        let Some(child) = find_child(trie, node_off, &h[s..e]) else {
             break;
         };
         depths[ndepth] = (child, d);
@@ -167,13 +201,20 @@ fn walk(host: &str) -> Option<&str> {
         node_off = child;
     }
 
-    // Longest candidate first.
+    // Pass 1: an exception rule at any candidate depth prevails (longest
+    // wins); the public suffix starts one label beyond the exception rule.
     for &(off, d) in depths[..ndepth].iter().rev() {
-        let flags = *DATA.get(off)?;
+        let flags = *trie.get(off)?;
         if flags & FLAG_EXCEPTION != 0 {
-            let (s, _) = ranges[n - d + 1];
+            // `n - d + 1` can exceed the valid label range on corrupt
+            // input (e.g. an exception flag at depth 1); fail closed.
+            let (s, _) = *ranges.get(n - d + 1)?;
             return Some(&h[s..]);
         }
+    }
+    // Pass 2: longest candidate first, wildcard beats exact.
+    for &(off, d) in depths[..ndepth].iter().rev() {
+        let flags = *trie.get(off)?;
         if flags & FLAG_WILDCARD != 0 && d < n {
             let (s, _) = ranges[n - d - 1];
             return Some(&h[s..]);
@@ -190,7 +231,7 @@ fn walk(host: &str) -> Option<&str> {
 
 /// Last label of the dot-stripped host (the `*` rule fallback).
 fn last_label(host: &str) -> &str {
-    let h = host.strip_suffix('.').unwrap_or(host);
+    let h = strip_trailing_dots(host);
     match h.rfind('.') {
         Some(i) => &h[i + 1..],
         None => h,
@@ -320,5 +361,118 @@ mod tests {
         // Absurd label counts fall back to the "*" rule, never panic.
         let deep: String = (0..300).map(|_| "a.").collect::<String>() + "com";
         assert_eq!(public_suffix(&deep), "com");
+    }
+
+    #[test]
+    fn trailing_dots() {
+        assert_eq!(public_suffix("example.com.."), "com");
+        assert_eq!(public_suffix("example.com..."), "com");
+        assert_eq!(public_suffix("WWW.CK.."), "CK");
+        assert_eq!(normalize_host("example.com..."), "example.com");
+        assert_eq!(registrable_domain("example.com.."), Some("example.com"));
+        assert!(is_public_suffix("co.uk.."));
+        // All-dots input is treated as empty.
+        assert_eq!(public_suffix("..."), "");
+        assert_eq!(normalize_host("..."), "");
+        assert_eq!(registrable_domain("..."), None);
+    }
+
+    #[test]
+    fn normalize_trims_whitespace() {
+        // Callers should pre-trim, but stray whitespace must not poison labels.
+        assert_eq!(normalize_host(" example.com "), "example.com");
+        assert_eq!(normalize_host("\tExample.COM.\n"), "example.com");
+        assert_eq!(normalize_host("  ...  "), "");
+    }
+
+    /// Build a minimal trie (root node at offset 0) from
+    /// `(flags, labels left-to-right)` rules, in the `psl_data.bin` format.
+    #[cfg(test)]
+    fn build_trie(rules: &[(u8, &[&str])]) -> Vec<u8> {
+        #[derive(Clone)]
+        struct Node {
+            kids: Vec<(Vec<u8>, usize)>,
+            flags: u8,
+        }
+        let mut nodes = vec![Node {
+            kids: Vec::new(),
+            flags: 0,
+        }];
+        for &(flags, labels) in rules {
+            let mut idx = 0;
+            for lab in labels.iter().rev() {
+                let labb = lab.as_bytes();
+                let next = match nodes[idx].kids.iter().find(|(l, _)| l == labb) {
+                    Some(&(_, c)) => c,
+                    None => {
+                        nodes.push(Node {
+                            kids: Vec::new(),
+                            flags: 0,
+                        });
+                        let c = nodes.len() - 1;
+                        nodes[idx].kids.push((labb.to_vec(), c));
+                        c
+                    }
+                };
+                idx = next;
+            }
+            nodes[idx].flags |= flags;
+        }
+        fn serialize(nodes: &[Node], idx: usize, out: &mut Vec<u8>) {
+            let mut kids = nodes[idx].kids.clone();
+            kids.sort_by(|a, b| a.0.cmp(&b.0));
+            out.push(nodes[idx].flags);
+            out.extend_from_slice(&(kids.len() as u16).to_le_bytes());
+            for (lab, c) in &kids {
+                let mut child = Vec::new();
+                serialize(nodes, *c, &mut child);
+                out.push(lab.len() as u8);
+                out.extend_from_slice(lab);
+                out.extend_from_slice(&(child.len() as u32).to_le_bytes());
+                out.extend_from_slice(&child);
+            }
+        }
+        let mut out = Vec::new();
+        serialize(&nodes, 0, &mut out);
+        out
+    }
+
+    #[test]
+    fn exception_flag_at_depth1_fails_closed() {
+        // Corrupt trie: EXCEPTION on the TLD node itself. `n - d + 1` is out
+        // of range here, so the walk must fail closed (None) instead of
+        // panicking or reading a stale label range.
+        let t = build_trie(&[(FLAG_EXCEPTION, &["ck"])]);
+        assert_eq!(walk_trie(&t, "a.ck"), None);
+        // ... including at the maximum label count, where the old direct
+        // indexing would panic outright.
+        let deep: String = (0..127).map(|_| "a.").collect::<String>() + "a";
+        let t2 = build_trie(&[(FLAG_EXCEPTION, &["a"])]);
+        assert_eq!(walk_trie(&t2, &deep), None);
+        // A well-formed exception still resolves one label beyond the rule.
+        let t3 = build_trie(&[(FLAG_EXCEPTION, &["www", "ck"]), (FLAG_WILDCARD, &["ck"])]);
+        assert_eq!(walk_trie(&t3, "a.www.ck"), Some("ck"));
+        assert_eq!(walk_trie(&t3, "www.ck"), Some("ck"));
+    }
+
+    #[test]
+    fn exception_priority_is_global() {
+        // An exception at a *shorter* candidate must prevail over an exact
+        // rule at a longer one: the old longest-first single pass returned
+        // "x.y.b" here, but the spec gives the exception global priority.
+        let t = build_trie(&[
+            (FLAG_EXACT, &["x", "y", "b"]),
+            (FLAG_EXCEPTION, &["y", "b"]),
+        ]);
+        assert_eq!(walk_trie(&t, "x.y.b"), Some("b"));
+        // Sanity: without the exception, longest-first still applies.
+        let t2 = build_trie(&[(FLAG_EXACT, &["x", "y", "b"])]);
+        assert_eq!(walk_trie(&t2, "x.y.b"), Some("x.y.b"));
+        // And the longest exception wins when several match.
+        let t3 = build_trie(&[
+            (FLAG_EXCEPTION, &["y", "b"]),
+            (FLAG_EXCEPTION, &["z", "y", "b"]),
+        ]);
+        assert_eq!(walk_trie(&t3, "z.y.b"), Some("y.b"));
     }
 }

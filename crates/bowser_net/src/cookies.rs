@@ -40,7 +40,15 @@ pub enum SameSite {
 /// (`Set-Cookie`) and retrieving (`Cookie`) cookies.
 #[derive(Debug, Clone, Copy)]
 pub struct RequestContext<'a> {
-    /// Request host, e.g. `"www.example.com"`. Plain string; normalized internally.
+    /// Request host, e.g. `"www.example.com"`. Plain string; normalized
+    /// internally (lowercased, one trailing dot stripped, any `:port`
+    /// suffix dropped). Callers should pass bare hosts without a port.
+    ///
+    /// Hosts must be IDNA-ToASCII encoded (punycode) by the caller.
+    /// `set_cookie` rejects non-ASCII hosts fail-closed — nothing is
+    /// stored — because the public-suffix list only understands ASCII
+    /// labels. UTS-46 encoding will move into `bowser_url` later; until
+    /// then the caller owns it.
     pub host: &'a str,
     /// Request path, e.g. `"/a/b"`. Empty is treated as `"/"`.
     pub path: &'a str,
@@ -48,10 +56,16 @@ pub struct RequestContext<'a> {
     pub secure: bool,
     /// True when the call comes from the network stack rather than
     /// `document.cookie`. `HttpOnly` cookies are invisible to non-HTTP APIs,
-    /// and non-HTTP APIs cannot overwrite them.
+    /// and non-HTTP APIs cannot create, overwrite, or delete them.
     pub http_api: bool,
     /// Host of the top-level document, for `SameSite` decisions.
-    /// `None` (unknown) is treated as cross-site.
+    /// `None` (unknown) is treated as cross-site. Like `host`, prefer a
+    /// bare host without a port.
+    ///
+    /// Known phase-1 limitation: [`is_same_site`] compares only registrable
+    /// domains, ignoring scheme — an `http` frame embedding an `https`
+    /// resource (or vice versa) counts as same-site. Schemeful same-site
+    /// is future work.
     pub top_host: Option<&'a str>,
     /// True for a top-level navigation with a "safe" method (GET/HEAD/...).
     /// Lets `Lax` cookies ride cross-site top-level navigations.
@@ -72,7 +86,6 @@ struct Cookie {
     same_site: SameSite,
     /// Expiry as epoch seconds; `u64::MAX` for session cookies.
     expires_at: u64,
-    persistent: bool,
     /// Monotonic insertion order: earlier sorts first in `Cookie` headers.
     creation_seq: u64,
     /// Monotonic access order for LRU eviction.
@@ -108,14 +121,23 @@ impl CookieJar {
     }
 
     /// Process one `Set-Cookie` header value received in a response from
-    /// `ctx.host` for path `ctx.path`, at time `now` (epoch seconds).
-    /// Invalid or rejected cookies are silently ignored, per spec.
+    /// `ctx.host` for path `ctx.path`, at time `now` (epoch seconds), or one
+    /// `document.cookie` assignment from script (`ctx.http_api == false`).
+    /// Attribute parsing is the same for both; only `HttpOnly` is treated
+    /// specially for non-HTTP APIs (RFC 6265bis §5.3). Invalid or rejected
+    /// cookies are silently ignored, per spec.
+    ///
+    /// `ctx.host` and any `Domain` attribute must be IDNA-ToASCII encoded
+    /// (punycode) by the caller; non-ASCII hosts or domains are rejected
+    /// fail-closed (nothing is stored), because the public-suffix list
+    /// only understands ASCII labels. See the IDN gate below.
     pub fn set_cookie(&mut self, header: &str, ctx: &RequestContext<'_>, now: u64) {
-        let host = psl::normalize_host(ctx.host);
+        let normalized = psl::normalize_host(ctx.host);
+        let host = strip_port(&normalized);
         if host.is_empty() {
             return;
         }
-        let host_is_ip = is_ip_literal(&host);
+        let host_is_ip = is_ip_literal(host);
 
         // --- name=value pair (RFC 6265 §5.2 steps 1-4) ---
         let pair_end = header.find(';').unwrap_or(header.len());
@@ -130,40 +152,43 @@ impl CookieJar {
         let mut secure = false;
         let mut http_only = false;
         let mut same_site = SameSite::Lax;
+        let mut samesite_seen = false;
         let mut max_age: Option<i64> = None;
         let mut expires: Option<u64> = None;
 
-        if ctx.http_api {
-            for av in header[pair_end..].split(';').skip(1) {
-                let (attr_name, attr_value) = split_attribute(av);
-                match attr_name.as_str() {
-                    "expires" => {
-                        if expires.is_none() {
-                            expires = parse_cookie_date(attr_value);
-                        }
+        // --- attributes (RFC 6265 §5.2 steps 5+, RFC 6265bis §5.3) ---
+        // Attributes parse identically for HTTP and non-HTTP APIs; only
+        // HttpOnly is special-cased below.
+        for av in header[pair_end..].split(';').skip(1) {
+            let (attr_name, attr_value) = split_attribute(av);
+            match attr_name.as_str() {
+                "expires" => {
+                    if expires.is_none() {
+                        expires = parse_cookie_date(attr_value);
                     }
-                    "max-age" => {
-                        if max_age.is_none() {
-                            max_age = parse_max_age(attr_value);
-                        }
-                    }
-                    "domain" => {
-                        if domain_attr.is_none() {
-                            domain_attr = parse_domain_attribute(attr_value);
-                        }
-                    }
-                    "path" => {
-                        if path_attr.is_none() {
-                            path_attr = Some(attr_value.to_string());
-                        }
-                    }
-                    "secure" => secure = true,
-                    "httponly" => http_only = true,
-                    "samesite" => {
-                        same_site = parse_samesite(attr_value);
-                    }
-                    _ => {} // unknown attributes are ignored
                 }
+                "max-age" => {
+                    if max_age.is_none() {
+                        max_age = parse_max_age(attr_value);
+                    }
+                }
+                "domain" => {
+                    if domain_attr.is_none() {
+                        domain_attr = parse_domain_attribute(attr_value);
+                    }
+                }
+                "path" => {
+                    if path_attr.is_none() {
+                        path_attr = Some(attr_value.to_string());
+                    }
+                }
+                "secure" => secure = true,
+                "httponly" => http_only = true,
+                "samesite" if !samesite_seen => {
+                    samesite_seen = true;
+                    same_site = parse_samesite(attr_value);
+                }
+                _ => {} // unknown attributes are ignored
             }
         }
 
@@ -171,12 +196,39 @@ impl CookieJar {
         if same_site == SameSite::None && !secure {
             return;
         }
-        // RFC 6265bis §4.1.3: name prefixes (case-sensitive).
-        if name.starts_with("__Secure-") && !secure {
+        // RFC 6265 §5.3 step 4 / 6265bis §4.1.3: a cookie with the
+        // secure-only flag (the Secure attribute) cannot be stored when the
+        // request arrived over an insecure scheme. Without this, an
+        // attacker on the network path of an http:// response could plant
+        // a Secure-marked cookie that is later sent over https://.
+        if secure && !ctx.secure {
+            return;
+        }
+        // RFC 6265bis §4.1.3: name prefixes (case-sensitive). The prefixes
+        // also require a secure request scheme, not just the attribute.
+        if name.starts_with("__Secure-") && !(secure && ctx.secure) {
             return;
         }
         if name.starts_with("__Host-")
-            && !(secure && path_attr.as_deref() == Some("/") && domain_attr.is_none())
+            && !(secure && ctx.secure && path_attr.as_deref() == Some("/") && domain_attr.is_none())
+        {
+            return;
+        }
+
+        // --- IDN stopgap: fail closed on non-ASCII hosts and domains ---
+        // The PSL trie stores ASCII (punycode) labels only, so a non-ASCII
+        // label can never match; `psl::walk` then falls back to the `*`
+        // rule and an IDN public suffix such as 公司.cn would be judged a
+        // registrable domain — silently bypassing the public-suffix gate
+        // (fail open) on both the Domain-attribute and host-only paths.
+        // Until callers pass IDNA-ToASCII (punycode) hosts (planned for
+        // `bowser_url`, UTS-46), reject non-ASCII request hosts and Domain
+        // attributes outright, before either PSL gate below.
+        if !host.is_ascii() {
+            return;
+        }
+        if let Some(d) = &domain_attr
+            && !d.is_ascii()
         {
             return;
         }
@@ -187,7 +239,7 @@ impl CookieJar {
                 if host_is_ip {
                     return; // no Domain cookies on IP literals
                 }
-                if !domain_match(&host, &d) {
+                if !domain_match(host, &d) {
                     return;
                 }
                 if psl::is_public_suffix(&d) && !is_localhost(&d) {
@@ -196,25 +248,26 @@ impl CookieJar {
                 (d, false)
             }
             None => {
-                if psl::is_public_suffix(&host) && !host_is_ip && !is_localhost(&host) {
+                if psl::is_public_suffix(host) && !host_is_ip && !is_localhost(host) {
                     return; // e.g. a bare public suffix cannot set cookies
                 }
-                (host.into_owned(), true)
+                (host.to_owned(), true)
             }
         };
 
         // --- expiry: Max-Age wins over Expires (RFC 6265 §5.3) ---
-        let (expires_at, persistent) = match (max_age, expires) {
+        // Note: a cookie whose expiry equals `now` is already expired —
+        // expiry comparisons are strict (`expires_at > now`) everywhere.
+        let expires_at = match (max_age, expires) {
             (Some(delta), _) => {
-                let at = if delta <= 0 {
+                if delta <= 0 {
                     0
                 } else {
                     now.saturating_add(delta as u64)
-                };
-                (at, true)
+                }
             }
-            (None, Some(t)) => (t, true),
-            (None, None) => (u64::MAX, false),
+            (None, Some(t)) => t,
+            (None, None) => u64::MAX,
         };
 
         // --- path (RFC 6265 §5.3 step 10) ---
@@ -227,22 +280,25 @@ impl CookieJar {
             return;
         }
 
+        // RFC 6265bis §5.3 step 10: a non-HTTP API must not create a cookie
+        // with the http-only flag set, nor overwrite or delete a pre-existing
+        // HttpOnly cookie.
+        if !ctx.http_api
+            && (http_only
+                || self
+                    .cookies
+                    .iter()
+                    .find(|c| c.name == name && c.domain == domain && c.path == path)
+                    .is_some_and(|c| c.http_only))
+        {
+            return;
+        }
+
         // An already-expired cookie deletes any existing cookie with the
         // same (name, domain, path) and is not stored.
         if expires_at <= now {
             self.cookies
                 .retain(|c| !(c.name == name && c.domain == domain && c.path == path));
-            return;
-        }
-
-        // Non-HTTP APIs cannot clobber HttpOnly cookies (RFC 6265 §5.3).
-        if !ctx.http_api
-            && let Some(old) = self
-                .cookies
-                .iter()
-                .find(|c| c.name == name && c.domain == domain && c.path == path)
-            && old.http_only
-        {
             return;
         }
 
@@ -260,7 +316,6 @@ impl CookieJar {
             old.http_only = http_only;
             old.same_site = same_site;
             old.expires_at = expires_at;
-            old.persistent = persistent;
             old.host_only = host_only;
             old.last_access = seq;
             return;
@@ -277,7 +332,6 @@ impl CookieJar {
             http_only,
             same_site,
             expires_at,
-            persistent,
             creation_seq: seq,
             last_access: seq,
         });
@@ -288,11 +342,13 @@ impl CookieJar {
     /// are purged. Matches are sorted by longest path first, then earliest
     /// creation time (RFC 6265 §5.4).
     pub fn cookie_header(&mut self, ctx: &RequestContext<'_>, now: u64) -> Option<String> {
-        let host = psl::normalize_host(ctx.host);
+        let normalized = psl::normalize_host(ctx.host);
+        let host = strip_port(&normalized);
         if host.is_empty() {
             return None;
         }
-        let top: Option<Cow<'_, str>> = ctx.top_host.map(psl::normalize_host);
+        let top_normalized: Option<Cow<'_, str>> = ctx.top_host.map(psl::normalize_host);
+        let top = top_normalized.as_deref().map(strip_port);
         let req_path = if ctx.path.is_empty() { "/" } else { ctx.path };
 
         self.cookies.retain(|c| c.expires_at > now);
@@ -303,7 +359,7 @@ impl CookieJar {
                 if c.domain != host {
                     continue;
                 }
-            } else if !domain_match(&host, &c.domain) {
+            } else if !domain_match(host, &c.domain) {
                 continue;
             }
             if !path_match(req_path, &c.path) {
@@ -315,7 +371,7 @@ impl CookieJar {
             if c.http_only && !ctx.http_api {
                 continue;
             }
-            if !samesite_allows(c, &host, top.as_deref(), ctx) {
+            if !samesite_allows(c, host, top, ctx) {
                 continue;
             }
             hits.push(i);
@@ -399,6 +455,11 @@ fn split_name_value(pair: &str) -> Option<(String, String)> {
     let name = name.trim_matches(|c| c == ' ' || c == '\t');
     let value = value.trim_matches(|c| c == ' ' || c == '\t');
     if name.is_empty() || name.bytes().any(|b| b < 0x20 || b == 0x7f) {
+        return None;
+    }
+    // RFC 6265 cookie-octet excludes CTLs; a value carrying them would be
+    // emitted verbatim into the Cookie header, enabling header injection.
+    if value.bytes().any(|b| b < 0x20 || b == 0x7f) {
         return None;
     }
     // Real-world quirk: strip one pair of surrounding DQUOTEs.
@@ -497,8 +558,10 @@ fn default_path(request_path: &str) -> String {
     }
 }
 
-/// Lenient IP-literal check: dotted-decimal IPv4 or anything with a colon
-/// (IPv6, optionally bracketed).
+/// Lenient IP-literal check: IPv4 in any of the WHATWG URL Standard's
+/// notations (decimal/octal/hex dotted parts, or a single integer), or
+/// anything with a colon (IPv6, optionally bracketed). A `host:port`
+/// string is NOT an IP literal — strip the port with [`strip_port`] first.
 fn is_ip_literal(host: &str) -> bool {
     let h = host
         .strip_prefix('[')
@@ -507,14 +570,69 @@ fn is_ip_literal(host: &str) -> bool {
     if h.contains(':') {
         return true;
     }
-    let mut parts = h.split('.');
-    for _ in 0..4 {
-        match parts.next() {
-            Some(p) if !p.is_empty() && p.len() <= 3 && p.bytes().all(|b| b.is_ascii_digit()) => {}
-            _ => return false,
-        }
+    parse_ipv4(h).is_some()
+}
+
+/// Parse an IPv4 address per the WHATWG URL Standard's IPv4 parser: 1–4
+/// dot-separated parts, each decimal, octal (`0…`), or hex (`0x…`); all but
+/// the last part must fit in a byte, and the last must fit in the remaining
+/// bytes (`256^(5 - parts)`). Returns the 32-bit value on success.
+fn parse_ipv4(input: &str) -> Option<u32> {
+    let parts: Vec<&str> = input.split('.').collect();
+    if parts.is_empty() || parts.len() > 4 || parts.iter().any(|p| p.is_empty()) {
+        return None;
     }
-    parts.next().is_none()
+    let mut value: u64 = 0;
+    let n = parts.len();
+    for (i, part) in parts.iter().enumerate() {
+        let num = parse_ipv4_part(part)?;
+        let max = if i == n - 1 {
+            256u64.pow(5 - n as u32)
+        } else {
+            256
+        };
+        if num >= max {
+            return None;
+        }
+        value += num << (8 * (n - 1 - i));
+    }
+    u32::try_from(value).ok()
+}
+
+/// Parse one IPv4 part: hex with a `0x`/`0X` prefix, octal with a leading
+/// `0`, decimal otherwise. Overflow or invalid digits are an error.
+fn parse_ipv4_part(s: &str) -> Option<u64> {
+    let (digits, radix): (&str, u32) = match s.strip_prefix("0x").or_else(|| s.strip_prefix("0X")) {
+        Some(hex) => (hex, 16),
+        None if s.len() > 1 && s.starts_with('0') => (s, 8),
+        None => (s, 10),
+    };
+    if digits.is_empty() || !digits.bytes().all(|b| (b as char).is_digit(radix)) {
+        return None;
+    }
+    let mut v: u64 = 0;
+    for b in digits.bytes() {
+        v = v
+            .checked_mul(radix as u64)?
+            .checked_add((b as char).to_digit(radix)? as u64)?;
+    }
+    Some(v)
+}
+
+/// Strip a `:port` suffix from a normalized host. Bracketed IPv6 keeps its
+/// brackets: `[::1]:80` becomes `[::1]`. An unbracketed host with more than
+/// one colon (a bare IPv6 literal) is left alone.
+fn strip_port(host: &str) -> &str {
+    if let Some(inner) = host.strip_prefix('[') {
+        return match inner.find(']') {
+            Some(i) => &host[..i + 2],
+            None => host,
+        };
+    }
+    match host.rfind(':') {
+        Some(i) if !host[..i].contains(':') => &host[..i],
+        _ => host,
+    }
 }
 
 fn is_localhost(host: &str) -> bool {
@@ -523,6 +641,10 @@ fn is_localhost(host: &str) -> bool {
 
 /// Same-site per registrable domains; unknown or IP top contexts are
 /// conservative. Hosts must be normalized.
+///
+/// Known phase-1 limitation: scheme is ignored, so an `http` page embedding
+/// an `https` resource (or vice versa) counts as same-site. Schemeful
+/// same-site is future work.
 fn is_same_site(host: &str, top: &str) -> bool {
     if host == top {
         return true;
@@ -546,7 +668,9 @@ fn samesite_allows(
     match cookie.same_site {
         SameSite::None => true,
         SameSite::Strict => same_site,
-        SameSite::Lax => same_site || (ctx.top_level_safe_navigation && ctx.http_api),
+        // A top-level safe navigation lets Lax cookies ride along whether
+        // the read comes from the network stack or `document.cookie`.
+        SameSite::Lax => same_site || ctx.top_level_safe_navigation,
     }
 }
 
@@ -772,6 +896,52 @@ mod tests {
     }
 
     #[test]
+    fn idn_hosts_and_domains_rejected_fail_closed() {
+        let mut jar = CookieJar::new();
+        // 公司.cn is a public suffix, but the PSL trie stores ASCII
+        // (punycode) labels only: without the fail-closed gate the
+        // non-ASCII spelling would never match, `psl::walk` would fall back
+        // to the `*` rule, and the Domain cookie below would be stored as
+        // readable by every other registrant under 公司.cn.
+        jar.set_cookie("s=1; Domain=公司.cn", &ctx("a.公司.cn", "/"), NOW);
+        assert!(jar.is_empty());
+        // Same for the host-only path: a bare Set-Cookie from the public
+        // suffix itself must not be accepted either.
+        jar.set_cookie("s=1", &ctx("公司.cn", "/"), NOW);
+        assert!(jar.is_empty());
+        // Non-ASCII in the Domain attribute is rejected even when the
+        // request host is plain ASCII.
+        jar.set_cookie("s=1; Domain=公司.cn", &ctx("a.example.com", "/"), NOW);
+        assert!(jar.is_empty());
+        // Nothing stored means nothing readable by sibling hosts.
+        assert_eq!(get(&mut jar, "b.公司.cn", "/"), None);
+    }
+
+    #[test]
+    fn punycode_spellings_behave_as_before() {
+        let mut jar = CookieJar::new();
+        // Pure-ASCII (punycode) inputs are untouched by the fail-closed
+        // gate: they are judged by the PSL exactly as before. So the
+        // punycode spelling of 公司.cn is rejected or accepted precisely
+        // when `psl::is_public_suffix` says so — never by the ASCII gate.
+        jar.set_cookie(
+            "s=1; Domain=xn--55qx5d.cn",
+            &ctx("a.xn--55qx5d.cn", "/"),
+            NOW,
+        );
+        assert_eq!(jar.is_empty(), psl::is_public_suffix("xn--55qx5d.cn"));
+        // A normal ASCII public suffix is still rejected by the PSL gate.
+        // (Bin-independent: "com" is a PSL rule, and even the "*" fallback
+        // reports a single label as a public suffix.)
+        jar.clear();
+        jar.set_cookie("s=1; Domain=com", &ctx("www.example.com", "/"), NOW);
+        assert!(jar.is_empty());
+        // A host-only cookie from a normal punycode host is accepted.
+        jar.set_cookie("p=2", &ctx("www.xn--55qx5d.cn", "/"), NOW);
+        assert_eq!(get(&mut jar, "www.xn--55qx5d.cn", "/"), Some("p=2".into()));
+    }
+
+    #[test]
     fn domain_attribute_normalization() {
         let mut jar = CookieJar::new();
         jar.set_cookie(
@@ -902,20 +1072,110 @@ mod tests {
     }
 
     #[test]
-    fn document_cookie_ignores_attributes() {
+    fn document_cookie_parses_attributes() {
         let mut jar = CookieJar::new();
         let script = RequestContext {
             http_api: false,
             ..ctx("www.example.com", "/")
         };
-        jar.set_cookie("d=1; Domain=evil.com; Secure; HttpOnly", &script, NOW);
-        // Stored as a plain host-only cookie for the document host.
-        assert_eq!(jar.cookie_header(&script, NOW), Some("d=1".into()));
+        // Domain attribute: a script set creates a real domain cookie,
+        // visible to subdomains (RFC 6265bis §5.3, non-HTTP APIs).
+        jar.set_cookie("x=1; Domain=example.com", &script, NOW);
         let script_sub = RequestContext {
             http_api: false,
             ..ctx("sub.example.com", "/")
         };
+        assert_eq!(jar.cookie_header(&script_sub, NOW), Some("x=1".into()));
+        // A mismatched Domain is still rejected for script sets.
+        jar.set_cookie("bad=1; Domain=evil.com", &script, NOW);
+        assert_eq!(jar.cookie_header(&script_sub, NOW), Some("x=1".into()));
+
+        // Path attribute honored.
+        jar.set_cookie("p=1; Path=/sub", &script, NOW);
+        let script_deep = RequestContext {
+            http_api: false,
+            ..ctx("www.example.com", "/sub/deep")
+        };
+        assert_eq!(
+            jar.cookie_header(&script_deep, NOW),
+            Some("p=1; x=1".into())
+        );
+        let script_root = RequestContext {
+            http_api: false,
+            ..ctx("www.example.com", "/")
+        };
+        assert_eq!(jar.cookie_header(&script_root, NOW), Some("x=1".into()));
+
+        // Max-Age honored.
+        jar.set_cookie("m=1; Max-Age=60", &script, NOW);
+        assert!(
+            jar.cookie_header(&script_root, NOW + 59)
+                .unwrap()
+                .contains("m=1")
+        );
+        assert!(
+            !jar.cookie_header(&script_root, NOW + 60)
+                .unwrap()
+                .contains("m=1")
+        );
+
+        // HttpOnly: a non-HTTP API must reject the cookie entirely
+        // (RFC 6265bis §5.3 step 10).
+        jar.set_cookie("ho=1; HttpOnly", &script, NOW);
+        assert!(!jar.cookies.iter().any(|c| c.name == "ho"));
+
+        // Scripts can still overwrite and delete non-HttpOnly cookies.
+        jar.set_cookie("x=2; Domain=example.com", &script, NOW);
+        assert_eq!(jar.cookie_header(&script_sub, NOW), Some("x=2".into()));
+        jar.set_cookie("x=gone; Domain=example.com; Max-Age=0", &script, NOW);
         assert_eq!(jar.cookie_header(&script_sub, NOW), None);
+    }
+
+    #[test]
+    fn document_cookie_cannot_touch_httponly() {
+        let mut jar = CookieJar::new();
+        let https = ctx("www.example.com", "/");
+        let script = RequestContext {
+            http_api: false,
+            ..https
+        };
+        jar.set_cookie("k=1; HttpOnly", &https, NOW);
+        // Scripts cannot overwrite an HttpOnly cookie...
+        jar.set_cookie("k=evil", &script, NOW);
+        assert_eq!(jar.cookie_header(&https, NOW), Some("k=1".into()));
+        // ...nor delete one via an expired set.
+        jar.set_cookie("k=gone; Max-Age=0", &script, NOW);
+        assert_eq!(jar.cookie_header(&https, NOW), Some("k=1".into()));
+        // The network stack still can.
+        jar.set_cookie("k=2; HttpOnly", &https, NOW);
+        assert_eq!(jar.cookie_header(&https, NOW), Some("k=2".into()));
+    }
+
+    #[test]
+    fn document_cookie_parses_secure_and_samesite() {
+        let mut jar = CookieJar::new();
+        let script = RequestContext {
+            http_api: false,
+            ..ctx("www.example.com", "/")
+        };
+        // Secure attribute parsed: not sent over an insecure transport.
+        jar.set_cookie("s=1; Secure", &script, NOW);
+        let script_http = RequestContext {
+            secure: false,
+            ..script
+        };
+        assert_eq!(jar.cookie_header(&script, NOW), Some("s=1".into()));
+        assert_eq!(jar.cookie_header(&script_http, NOW), None);
+
+        // SameSite attribute parsed: Strict stays same-site-only.
+        let mut jar = CookieJar::new();
+        jar.set_cookie("t=1; SameSite=Strict", &script, NOW);
+        let script_cross = RequestContext {
+            top_host: Some("other.com"),
+            ..script
+        };
+        assert_eq!(jar.cookie_header(&script_cross, NOW), None);
+        assert_eq!(jar.cookie_header(&script, NOW), Some("t=1".into()));
     }
 
     #[test]
@@ -1086,6 +1346,68 @@ mod tests {
     }
 
     #[test]
+    fn secure_prefix_requires_secure_scheme() {
+        let mut jar = CookieJar::new();
+        let https = ctx("www.example.com", "/");
+        let http = RequestContext {
+            secure: false,
+            ..https
+        };
+        // __Secure- over an insecure scheme is rejected, even with Secure.
+        jar.set_cookie("__Secure-s=1; Secure", &http, NOW);
+        assert!(jar.is_empty());
+        // Control: same cookie over https:// is accepted.
+        jar.set_cookie("__Secure-s=1; Secure", &https, NOW);
+        assert_eq!(jar.len(), 1);
+        // Without the Secure attribute it is rejected on both schemes.
+        jar.clear();
+        jar.set_cookie("__Secure-s=1", &https, NOW);
+        assert!(jar.is_empty());
+        jar.set_cookie("__Secure-s=1", &http, NOW);
+        assert!(jar.is_empty());
+    }
+
+    #[test]
+    fn host_prefix_requires_secure_scheme() {
+        let mut jar = CookieJar::new();
+        let https = ctx("www.example.com", "/");
+        let http = RequestContext {
+            secure: false,
+            ..https
+        };
+        // __Host- over an insecure scheme is rejected, even with Secure + Path=/.
+        jar.set_cookie("__Host-h=1; Secure; Path=/", &http, NOW);
+        assert!(jar.is_empty());
+        // Control: same cookie over https:// is accepted.
+        jar.set_cookie("__Host-h=1; Secure; Path=/", &https, NOW);
+        assert_eq!(jar.len(), 1);
+    }
+
+    #[test]
+    fn secure_cookies_require_secure_scheme() {
+        let mut jar = CookieJar::new();
+        let https = ctx("www.example.com", "/");
+        let http = RequestContext {
+            secure: false,
+            ..https
+        };
+        // A plain Secure cookie set over http:// is rejected: the jar stays
+        // empty, so nothing planted over the network rides later https://
+        // requests.
+        jar.set_cookie("s=1; Secure", &http, NOW);
+        assert!(jar.is_empty());
+        // Control: same cookie over https:// is accepted and stays https-only.
+        jar.set_cookie("s=1; Secure", &https, NOW);
+        assert_eq!(jar.len(), 1);
+        assert_eq!(jar.cookie_header(&http, NOW), None);
+        assert_eq!(jar.cookie_header(&https, NOW), Some("s=1".into()));
+        // Non-Secure cookies are still storable over http://.
+        jar.set_cookie("p=2", &http, NOW);
+        assert_eq!(jar.len(), 2);
+        assert_eq!(jar.cookie_header(&http, NOW), Some("p=2".into()));
+    }
+
+    #[test]
     fn replacement_keeps_creation_order() {
         let mut jar = CookieJar::new();
         jar.set_cookie("a=1; Path=/", &ctx("h.test", "/"), NOW);
@@ -1165,6 +1487,40 @@ mod tests {
         assert!(h.contains("c=quoted value"), "{h}");
         assert!(h.contains("d=1"), "{h}");
         assert!(h.contains("e=2"), "{h}");
+    }
+
+    #[test]
+    fn control_bytes_in_value_rejected() {
+        let mut jar = CookieJar::new();
+        // CRLF header-injection attempt.
+        jar.set_cookie("a=b\r\nX-Injected: 1", &ctx("h.test", "/"), NOW);
+        assert!(jar.is_empty());
+        // C0 control bytes.
+        jar.set_cookie("a=\u{1}\u{2}", &ctx("h.test", "/"), NOW);
+        assert!(jar.is_empty());
+        // DEL (0x7F).
+        jar.set_cookie("a=\u{7f}", &ctx("h.test", "/"), NOW);
+        assert!(jar.is_empty());
+        // Interior TAB is a CTL too (RFC 6265 cookie-octet excludes CTLs).
+        jar.set_cookie("a=b\tc", &ctx("h.test", "/"), NOW);
+        assert!(jar.is_empty());
+    }
+
+    #[test]
+    fn printable_value_chars_still_accepted() {
+        let mut jar = CookieJar::new();
+        // SP inside a value is fine (0x20 is not a CTL).
+        jar.set_cookie("a=b c", &ctx("h.test", "/"), NOW);
+        // Leading/trailing SP/TAB are trimmed, not rejected.
+        jar.set_cookie("b=\tquoted\t", &ctx("h.test", "/"), NOW);
+        // DQUOTE-strip quirk keeps working: surrounding DQUOTEs are removed.
+        jar.set_cookie("c=\"quoted value\"", &ctx("h.test", "/"), NOW);
+        jar.set_cookie("d=\"bare\"", &ctx("h.test", "/"), NOW);
+        let h = get(&mut jar, "h.test", "/").unwrap();
+        assert!(h.contains("a=b c"), "{h}");
+        assert!(h.contains("b=quoted"), "{h}");
+        assert!(h.contains("c=quoted value"), "{h}");
+        assert!(h.contains("d=bare"), "{h}");
     }
 
     #[test]
@@ -1268,9 +1624,122 @@ mod tests {
         assert!(is_ip_literal("::1"));
         assert!(is_ip_literal("[::1]"));
         assert!(is_ip_literal("2001:db8::1"));
+        // WHATWG URL Standard IPv4 notations: hex/octal parts, 1–3 part
+        // forms, and single integers.
+        assert!(is_ip_literal("0x7f.0.0.1"));
+        assert!(is_ip_literal("0177.0.0.1"));
+        assert!(is_ip_literal("2130706433"));
+        assert!(is_ip_literal("1.2.3"));
+        // Octets must fit in a byte.
+        assert!(!is_ip_literal("999.999.999.999"));
+        assert!(!is_ip_literal("0x100.0.0.1"));
+        assert!(!is_ip_literal("1.2.3.4.5"));
         assert!(!is_ip_literal("example.com"));
         assert!(!is_ip_literal("localhost"));
-        assert!(!is_ip_literal("1.2.3"));
-        assert!(!is_ip_literal("1.2.3.4.5"));
+        // A port suffix is not part of the host: strip it before checking.
+        assert!(!is_ip_literal(strip_port("example.com:80")));
+        assert!(is_ip_literal(strip_port("1.2.3.4:8080")));
+        assert!(is_ip_literal(strip_port("[::1]:80")));
+    }
+
+    #[test]
+    fn strip_port_cases() {
+        assert_eq!(strip_port("example.com:80"), "example.com");
+        assert_eq!(strip_port("example.com"), "example.com");
+        assert_eq!(strip_port("[::1]:80"), "[::1]");
+        assert_eq!(strip_port("[::1]"), "[::1]");
+        // A bare (unbracketed) IPv6 literal has no port to strip.
+        assert_eq!(strip_port("::1"), "::1");
+        assert_eq!(strip_port("1.2.3.4:8080"), "1.2.3.4");
+    }
+
+    #[test]
+    fn samesite_first_wins() {
+        let mut jar = CookieJar::new();
+        // The first SameSite attribute wins; the later `None` is ignored.
+        jar.set_cookie(
+            "a=1; SameSite=Strict; SameSite=None; Secure",
+            &ctx("h.test", "/"),
+            NOW,
+        );
+        assert_eq!(jar.len(), 1);
+        // Stored as Strict: not sent on a cross-site top-level navigation,
+        // even though a last-wins parse would have made it `None`.
+        let nav = RequestContext {
+            host: "h.test",
+            path: "/",
+            secure: true,
+            http_api: true,
+            top_host: Some("other.com"),
+            top_level_safe_navigation: true,
+        };
+        assert_eq!(jar.cookie_header(&nav, NOW), None);
+        // Same-site is fine.
+        let same = RequestContext {
+            top_host: Some("h.test"),
+            ..nav
+        };
+        assert_eq!(jar.cookie_header(&same, NOW), Some("a=1".into()));
+    }
+
+    #[test]
+    fn lax_navigation_not_coupled_to_http_api() {
+        let mut jar = CookieJar::new();
+        jar.set_cookie("l=1; SameSite=Lax", &ctx("id.example.com", "/"), NOW);
+        // A `document.cookie` (non-HTTP API) read during a cross-site
+        // top-level safe navigation: Lax rides along regardless of
+        // `http_api`.
+        let nav = RequestContext {
+            host: "id.example.com",
+            path: "/",
+            secure: true,
+            http_api: false,
+            top_host: Some("other.com"),
+            top_level_safe_navigation: true,
+        };
+        assert_eq!(jar.cookie_header(&nav, NOW), Some("l=1".into()));
+    }
+
+    #[test]
+    fn host_normalization() {
+        let mut jar = CookieJar::new();
+        jar.set_cookie("a=1", &ctx("WWW.Example.COM.", "/"), NOW);
+        // Stored under the normalized host; retrievable via the bare form.
+        assert_eq!(get(&mut jar, "www.example.com", "/"), Some("a=1".into()));
+        assert_eq!(get(&mut jar, "WWW.EXAMPLE.COM.", "/"), Some("a=1".into()));
+        // A `:port` suffix is stripped before matching, in both directions.
+        jar.set_cookie("b=2", &ctx("www.other.com:8443", "/"), NOW);
+        assert_eq!(get(&mut jar, "www.other.com", "/"), Some("b=2".into()));
+        assert_eq!(get(&mut jar, "www.other.com:8443", "/"), Some("b=2".into()));
+    }
+
+    #[test]
+    fn global_eviction_is_lru() {
+        let mut jar = CookieJar::new();
+        for i in 0..=MAX_COOKIES {
+            let host = format!("h{i}.test");
+            jar.set_cookie(&format!("c{i}=v"), &ctx(&host, "/"), NOW);
+        }
+        assert_eq!(jar.len(), MAX_COOKIES);
+        assert!(
+            !jar.cookies.iter().any(|c| c.name == "c0"),
+            "the oldest cookie is evicted first"
+        );
+        assert!(
+            jar.cookies
+                .iter()
+                .any(|c| c.name == format!("c{MAX_COOKIES}"))
+        );
+    }
+
+    #[test]
+    fn expiry_boundary_is_strict() {
+        let mut jar = CookieJar::new();
+        jar.set_cookie("a=1; Max-Age=10", &ctx("h.test", "/"), NOW);
+        assert!(jar.cookie_header(&ctx("h.test", "/"), NOW + 9).is_some());
+        // `expires_at == now` counts as expired (strict `>`), and the read
+        // purges the cookie.
+        assert!(jar.cookie_header(&ctx("h.test", "/"), NOW + 10).is_none());
+        assert!(jar.is_empty());
     }
 }
