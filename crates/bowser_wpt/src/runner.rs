@@ -72,6 +72,10 @@ pub enum TestOutcome {
     Skipped { reason: String },
     /// The driver itself failed (timeout, crashed browser, unimplemented).
     DriverFailed(DriverError),
+    /// Reading a test or reference file from disk failed (missing file,
+    /// permissions, ...). This is harness-side I/O, not a driver failure:
+    /// the browser was never involved.
+    FilesystemFailure(String),
 }
 
 impl TestOutcome {
@@ -80,7 +84,9 @@ impl TestOutcome {
         match self {
             TestOutcome::Harness(r) => r.is_green(),
             TestOutcome::Reftest { passed, .. } => *passed,
-            TestOutcome::Skipped { .. } | TestOutcome::DriverFailed(_) => false,
+            TestOutcome::Skipped { .. }
+            | TestOutcome::DriverFailed(_)
+            | TestOutcome::FilesystemFailure(_) => false,
         }
     }
 }
@@ -113,6 +119,9 @@ pub struct RunSummary {
     pub reftest_fail: usize,
     pub skipped: usize,
     pub driver_failed: usize,
+    /// Tests that failed before the driver was involved because a test or
+    /// reference file could not be read.
+    pub filesystem_failures: usize,
 }
 
 impl RunSummary {
@@ -139,7 +148,8 @@ impl RunReport {
              testharness: {} passed, {} failed\n\
              reftest: {} passed, {} failed\n\
              skipped: {}\n\
-             driver failures: {}",
+             driver failures: {}\n\
+             filesystem failures: {}",
             self.driver_name,
             s.total,
             s.harness_pass,
@@ -148,11 +158,20 @@ impl RunReport {
             s.reftest_fail,
             s.skipped,
             s.driver_failed,
+            s.filesystem_failures,
         )
     }
 }
 
 /// Runs a manifest against a driver.
+///
+/// ## Known limitations (future work)
+///
+/// - Tests run strictly sequentially, one at a time; there is no parallel
+///   execution yet. Parallelism is a later phase.
+/// - Reftest rendering has no timeout: [`BrowserDriver::render`] calls run
+///   to completion. [`RunConfig::timeout`] applies only to testharness
+///   tests.
 pub struct Runner<D> {
     driver: D,
     config: RunConfig,
@@ -171,7 +190,10 @@ impl<D: BrowserDriver> Runner<D> {
         &mut self.driver
     }
 
-    /// Run every selected test in manifest order.
+    /// Run every selected test in manifest order, strictly sequentially.
+    ///
+    /// See [`Runner`]'s known limitations: no parallel execution, and no
+    /// timeout on reftest rendering.
     pub fn run(&mut self, manifest: &Manifest) -> RunReport {
         let mut reports = Vec::new();
         for item in manifest.items() {
@@ -187,15 +209,7 @@ impl<D: BrowserDriver> Runner<D> {
         }
         let mut summary = RunSummary::default();
         for r in &reports {
-            summary.total += 1;
-            match &r.outcome {
-                TestOutcome::Harness(h) if h.is_green() => summary.harness_pass += 1,
-                TestOutcome::Harness(_) => summary.harness_fail += 1,
-                TestOutcome::Reftest { passed: true, .. } => summary.reftest_pass += 1,
-                TestOutcome::Reftest { passed: false, .. } => summary.reftest_fail += 1,
-                TestOutcome::Skipped { .. } => summary.skipped += 1,
-                TestOutcome::DriverFailed(_) => summary.driver_failed += 1,
-            }
+            tally(&mut summary, &r.outcome);
         }
         RunReport {
             reports,
@@ -235,6 +249,9 @@ impl<D: BrowserDriver> Runner<D> {
         };
         let refs = match reftest::extract_references(&path) {
             Ok(r) => r,
+            Err(reftest::ReftestError::Io(e)) => {
+                return TestOutcome::FilesystemFailure(e.to_string());
+            }
             Err(e) => return TestOutcome::DriverFailed(DriverError::BadReport(e.to_string())),
         };
         if refs.is_empty() {
@@ -270,6 +287,20 @@ impl<D: BrowserDriver> Runner<D> {
         }
         let passed = checks.iter().all(|c| c.ok);
         TestOutcome::Reftest { passed, checks }
+    }
+}
+
+/// Fold one test's outcome into a run's aggregate counts.
+fn tally(summary: &mut RunSummary, outcome: &TestOutcome) {
+    summary.total += 1;
+    match outcome {
+        TestOutcome::Harness(h) if h.is_green() => summary.harness_pass += 1,
+        TestOutcome::Harness(_) => summary.harness_fail += 1,
+        TestOutcome::Reftest { passed: true, .. } => summary.reftest_pass += 1,
+        TestOutcome::Reftest { passed: false, .. } => summary.reftest_fail += 1,
+        TestOutcome::Skipped { .. } => summary.skipped += 1,
+        TestOutcome::DriverFailed(_) => summary.driver_failed += 1,
+        TestOutcome::FilesystemFailure(_) => summary.filesystem_failures += 1,
     }
 }
 
@@ -437,6 +468,46 @@ mod tests {
         let text = report.summary_text();
         assert!(text.contains("driver: stub"));
         assert!(text.contains("driver failures: 1"));
+    }
+
+    #[test]
+    fn unreadable_reftest_file_is_filesystem_failure() {
+        // A missing reftest file is harness-side I/O: it must be reported
+        // as a filesystem failure, never as a driver report failure.
+        let dir =
+            std::env::temp_dir().join(format!("bowser_wpt_run_missing_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let test = TestItem {
+            id: "t.html".into(),
+            url: "/t.html".into(),
+            kind: TestKind::Reftest,
+            path: Some(dir.join("t.html")),
+        };
+        let mut r = Runner::new(
+            FakeDriver {
+                report: green_report(),
+                shot: Screenshot::solid(1, 1, 0, 0, 0, 255),
+            },
+            RunConfig::default(),
+        );
+        let outcome = r.run_one(&test);
+        assert!(
+            matches!(outcome, TestOutcome::FilesystemFailure(_)),
+            "unreadable reftest file must be FilesystemFailure, got: {outcome:?}"
+        );
+        assert!(!outcome.passed());
+    }
+
+    #[test]
+    fn filesystem_failures_are_tallied() {
+        let mut summary = RunSummary::default();
+        tally(
+            &mut summary,
+            &TestOutcome::FilesystemFailure("no such file".into()),
+        );
+        assert_eq!(summary.total, 1);
+        assert_eq!(summary.filesystem_failures, 1);
+        assert_eq!(summary.driver_failed, 0);
     }
 
     #[test]

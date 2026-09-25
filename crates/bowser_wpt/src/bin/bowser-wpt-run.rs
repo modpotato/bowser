@@ -129,6 +129,7 @@ fn main() {
             }
             bowser_wpt::runner::TestOutcome::Skipped { reason } => format!("SKIP ({reason})"),
             bowser_wpt::runner::TestOutcome::DriverFailed(e) => format!("DRIVER-FAIL ({e})"),
+            bowser_wpt::runner::TestOutcome::FilesystemFailure(e) => format!("FS-FAIL ({e})"),
         };
         println!("{} [{}] {status}", r.id, r.kind);
     }
