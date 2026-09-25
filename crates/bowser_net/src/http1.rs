@@ -38,6 +38,14 @@ pub struct Limits {
     pub max_head_bytes: usize,
     /// Maximum bytes of a single line (start-line, header, chunk-size...).
     pub max_line_bytes: usize,
+    /// Maximum bytes of a message body: either the `Content-Length` value,
+    /// or the total decoded payload of a chunked body.
+    ///
+    /// The default is 256 MiB. A larger `Content-Length` is rejected before
+    /// any downstream reader can size an allocation by it; a chunked body
+    /// is rejected once its cumulative payload exceeds the cap. The fetch
+    /// layer may tighten this per request or response.
+    pub max_body_bytes: usize,
 }
 
 impl Default for Limits {
@@ -46,6 +54,7 @@ impl Default for Limits {
             max_headers: 100,
             max_head_bytes: 32 * 1024,
             max_line_bytes: 8 * 1024,
+            max_body_bytes: 256 * 1024 * 1024,
         }
     }
 }
@@ -89,6 +98,9 @@ pub enum HttpError {
     BareCr,
     /// A `Content-Length` value is not a valid non-negative integer.
     InvalidContentLength,
+    /// A `Content-Length` value exceeds [`Limits::max_body_bytes`], or a
+    /// chunked body's cumulative payload exceeded it.
+    BodyTooLarge,
     /// Multiple `Content-Length` values disagree with each other.
     ConflictingContentLength,
     /// A `Transfer-Encoding` list is syntactically invalid.
@@ -127,6 +139,7 @@ impl fmt::Display for HttpError {
             Self::ObsFoldRejected => "obsolete line folding (obs-fold) is not accepted",
             Self::BareCr => "bare CR in HTTP message",
             Self::InvalidContentLength => "invalid Content-Length value",
+            Self::BodyTooLarge => "HTTP message body exceeds size limit",
             Self::ConflictingContentLength => "conflicting Content-Length values",
             Self::InvalidTransferEncoding => "invalid Transfer-Encoding value",
             Self::UnsupportedTransferEncoding => "unsupported transfer coding",
@@ -551,7 +564,11 @@ fn parse_decimal(digits: &[u8]) -> Option<u64> {
 /// The effective `Content-Length`: every value, across every field, must be
 /// a valid decimal integer and they must all agree (RFC 9110 §8.6).
 /// Returns `None` when no `Content-Length` is present.
-pub fn content_length(headers: &Headers) -> Result<Option<u64>, HttpError> {
+///
+/// A value larger than [`Limits::max_body_bytes`] is rejected with
+/// [`HttpError::BodyTooLarge`] before any downstream reader can size an
+/// allocation by it.
+pub fn content_length(headers: &Headers, limits: &Limits) -> Result<Option<u64>, HttpError> {
     let mut result: Option<u64> = None;
     for value in headers.get_all("content-length") {
         for part in value.split(|&b| b == b',') {
@@ -560,6 +577,9 @@ pub fn content_length(headers: &Headers) -> Result<Option<u64>, HttpError> {
                 return Err(HttpError::InvalidContentLength);
             }
             let n = parse_decimal(part).ok_or(HttpError::InvalidContentLength)?;
+            if n > limits.max_body_bytes as u64 {
+                return Err(HttpError::BodyTooLarge);
+            }
             match result {
                 Some(prev) if prev != n => {
                     return Err(HttpError::ConflictingContentLength);
@@ -628,10 +648,11 @@ fn transfer_encoding(headers: &Headers) -> Result<TransferOutcome, HttpError> {
 
 /// How a request's body is framed. With neither `Transfer-Encoding` nor
 /// `Content-Length` the body length is zero (RFC 9112 §6.3).
-pub fn request_body_spec(head: &RequestHead) -> Result<BodySpec, HttpError> {
+/// A `Content-Length` above [`Limits::max_body_bytes`] is rejected.
+pub fn request_body_spec(head: &RequestHead, limits: &Limits) -> Result<BodySpec, HttpError> {
     match transfer_encoding(&head.headers)? {
         TransferOutcome::Chunked => Ok(BodySpec::Chunked),
-        TransferOutcome::None => Ok(match content_length(&head.headers)? {
+        TransferOutcome::None => Ok(match content_length(&head.headers, limits)? {
             Some(n) => BodySpec::ContentLength(n),
             None => BodySpec::Empty,
         }),
@@ -642,9 +663,11 @@ pub fn request_body_spec(head: &RequestHead) -> Result<BodySpec, HttpError> {
 ///
 /// `request_method` is the method of the request this responds to: responses
 /// to `HEAD`, and responses with status 1xx/204/304, never carry a body.
+/// A `Content-Length` above [`Limits::max_body_bytes`] is rejected.
 pub fn response_body_spec(
     head: &ResponseHead,
     request_method: &[u8],
+    limits: &Limits,
 ) -> Result<BodySpec, HttpError> {
     if request_method == b"HEAD" {
         return Ok(BodySpec::Empty);
@@ -655,7 +678,7 @@ pub fn response_body_spec(
     }
     match transfer_encoding(&head.headers)? {
         TransferOutcome::Chunked => Ok(BodySpec::Chunked),
-        TransferOutcome::None => Ok(match content_length(&head.headers)? {
+        TransferOutcome::None => Ok(match content_length(&head.headers, limits)? {
             Some(n) => BodySpec::ContentLength(n),
             None => BodySpec::UntilClose,
         }),
@@ -869,13 +892,15 @@ pub struct ChunkedMessage<'a> {
 
 /// Decode a complete chunked body in one shot. Chunk payloads are slices of
 /// `input` — no copying. Returns [`HttpError::Incomplete`] if the buffer
-/// does not yet hold the whole body.
+/// does not yet hold the whole body, and [`HttpError::BodyTooLarge`] if the
+/// cumulative chunk payload exceeds [`Limits::max_body_bytes`].
 pub fn decode_chunked<'a>(
     input: &'a [u8],
     limits: &Limits,
 ) -> Result<ChunkedMessage<'a>, HttpError> {
     let mut chunks = Vec::new();
     let mut pos = 0usize;
+    let mut total: u64 = 0;
     loop {
         let line = next_line(&input[pos..], limits.max_line_bytes)?;
         pos += line.consumed;
@@ -888,6 +913,11 @@ pub fn decode_chunked<'a>(
                 trailers,
                 rest: &input[pos..],
             });
+        }
+        // Cumulative payload cap: check before borrowing the slice.
+        total = total.saturating_add(size);
+        if total > limits.max_body_bytes as u64 {
+            return Err(HttpError::BodyTooLarge);
         }
         let size = size as usize;
         if input.len() - pos < size + 2 {
@@ -940,11 +970,16 @@ enum DecoderState {
 /// Feed it arbitrary slices; it emits [`ChunkEvent::Data`] slices that
 /// borrow the fed input, so the data path never copies. Only trailer
 /// fields are copied into owned values.
+///
+/// Payload bytes are counted cumulatively across feeds: once they exceed
+/// [`Limits::max_body_bytes`], [`feed`](Self::feed) fails with
+/// [`HttpError::BodyTooLarge`].
 pub struct ChunkedDecoder {
     state: DecoderState,
     line: Vec<u8>,
     limits: Limits,
     trailer_count: usize,
+    body_bytes: u64,
 }
 
 impl ChunkedDecoder {
@@ -954,6 +989,7 @@ impl ChunkedDecoder {
             line: Vec::new(),
             limits,
             trailer_count: 0,
+            body_bytes: 0,
         }
     }
 
@@ -973,6 +1009,10 @@ impl ChunkedDecoder {
                     let take = (remaining.min(input.len() as u64)) as usize;
                     let (data, rest) = input.split_at(take);
                     if !data.is_empty() {
+                        self.body_bytes = self.body_bytes.saturating_add(take as u64);
+                        if self.body_bytes > self.limits.max_body_bytes as u64 {
+                            return Err(HttpError::BodyTooLarge);
+                        }
                         events.push(ChunkEvent::Data(data));
                     }
                     input = rest;
@@ -1493,7 +1533,7 @@ mod tests {
     fn cl(raw: &[u8]) -> Result<Option<u64>, HttpError> {
         let input = [b"GET / HTTP/1.1\r\n", raw, b"\r\n\r\n"].concat();
         let (head, _) = req(&input).unwrap();
-        content_length(&head.headers)
+        content_length(&head.headers, &limits())
     }
 
     #[test]
@@ -1501,15 +1541,47 @@ mod tests {
         assert_eq!(cl(b"Content-Length: 5"), Ok(Some(5)));
         assert_eq!(cl(b"Content-Length: 0"), Ok(Some(0)));
         assert_eq!(cl(b"Content-Length: 007"), Ok(Some(7)));
+        // Exactly at the body-size cap passes...
+        assert_eq!(
+            cl(b"Content-Length: 268435456"),
+            Ok(Some(256 * 1024 * 1024))
+        );
+        // ...but anything above it is rejected before a downstream reader
+        // can size an allocation by it.
+        assert_eq!(
+            cl(b"Content-Length: 268435457"),
+            Err(HttpError::BodyTooLarge)
+        );
         assert_eq!(
             cl(b"Content-Length: 18446744073709551615"),
-            Ok(Some(u64::MAX))
+            Err(HttpError::BodyTooLarge)
         );
         // Equal values agree: comma list and separate fields.
         assert_eq!(cl(b"Content-Length: 5, 5"), Ok(Some(5)));
         assert_eq!(cl(b"Content-Length: 5\r\nContent-Length: 5"), Ok(Some(5)));
         // Absent entirely.
         assert_eq!(cl(b"Host: x"), Ok(None));
+    }
+
+    #[test]
+    fn content_length_respects_tightened_limit() {
+        // The fetch layer may tighten the cap per request/response.
+        let tight = Limits {
+            max_body_bytes: 100,
+            ..Default::default()
+        };
+        let input = b"POST / HTTP/1.1\r\nContent-Length: 101\r\n\r\n";
+        let (head, _) = parse_request_head(input, &tight).unwrap();
+        assert_eq!(
+            request_body_spec(&head, &tight),
+            Err(HttpError::BodyTooLarge)
+        );
+        let input = b"POST / HTTP/1.1\r\nContent-Length: 100\r\n\r\n";
+        let (head, _) = parse_request_head(input, &tight).unwrap();
+        assert_eq!(
+            request_body_spec(&head, &tight),
+            Ok(BodySpec::ContentLength(100))
+        );
     }
 
     #[test]
@@ -1549,7 +1621,7 @@ mod tests {
     fn te_spec(raw: &[u8]) -> Result<BodySpec, HttpError> {
         let input = [b"POST / HTTP/1.1\r\n", raw, b"\r\n\r\n"].concat();
         let (head, _) = req(&input).unwrap();
-        request_body_spec(&head)
+        request_body_spec(&head, &limits())
     }
 
     #[test]
@@ -1615,7 +1687,7 @@ mod tests {
         let (head, _) =
             req(b"POST / HTTP/1.1\r\nTransfer-Encoding: chunked\r\nContent-Length: 5\r\n\r\n")
                 .unwrap();
-        assert_eq!(request_body_spec(&head), Ok(BodySpec::Chunked));
+        assert_eq!(request_body_spec(&head, &limits()), Ok(BodySpec::Chunked));
     }
 
     // -- body framing -------------------------------------------------------
@@ -1623,17 +1695,20 @@ mod tests {
     #[test]
     fn request_body_spec_cases() {
         let (head, _) = req(b"GET / HTTP/1.1\r\n\r\n").unwrap();
-        assert_eq!(request_body_spec(&head), Ok(BodySpec::Empty));
+        assert_eq!(request_body_spec(&head, &limits()), Ok(BodySpec::Empty));
         let (head, _) = req(b"POST / HTTP/1.1\r\nContent-Length: 5\r\n\r\n").unwrap();
-        assert_eq!(request_body_spec(&head), Ok(BodySpec::ContentLength(5)));
+        assert_eq!(
+            request_body_spec(&head, &limits()),
+            Ok(BodySpec::ContentLength(5))
+        );
         let (head, _) = req(b"POST / HTTP/1.1\r\nTransfer-Encoding: chunked\r\n\r\n").unwrap();
-        assert_eq!(request_body_spec(&head), Ok(BodySpec::Chunked));
+        assert_eq!(request_body_spec(&head, &limits()), Ok(BodySpec::Chunked));
     }
 
     fn res_spec(status_line: &[u8], method: &[u8]) -> Result<BodySpec, HttpError> {
         let input = [status_line, b"\r\n\r\n"].concat();
         let (head, _) = parse_response_head(&input, &limits()).unwrap();
-        response_body_spec(&head, method)
+        response_body_spec(&head, method, &limits())
     }
 
     #[test]
@@ -1901,6 +1976,24 @@ mod tests {
         assert_eq!(msg.rest, b"");
     }
 
+    #[test]
+    fn decode_chunked_enforces_body_limit_cumulatively() {
+        let capped = Limits {
+            max_body_bytes: 10,
+            ..Default::default()
+        };
+        // Each chunk fits alone, but the cumulative payload exceeds the cap.
+        let body = b"6\r\nhello!\r\n6\r\n world\r\n0\r\n\r\n";
+        assert_eq!(decode_chunked(body, &capped), Err(HttpError::BodyTooLarge));
+        // A single oversized chunk is caught too.
+        let body = b"B\r\n0123456789A\r\n0\r\n\r\n";
+        assert_eq!(decode_chunked(body, &capped), Err(HttpError::BodyTooLarge));
+        // Exactly at the cap passes.
+        let body = b"5\r\nhello\r\n5\r\nworld\r\n0\r\n\r\n";
+        let msg = decode_chunked(body, &capped).unwrap();
+        assert_eq!(msg.chunks, vec![b"hello".as_slice(), b"world".as_slice()]);
+    }
+
     // -- streaming decoder -----------------------------------------------------
 
     fn collect_stream(feeds: &[&[u8]]) -> (Vec<u8>, Vec<TrailerField>, bool) {
@@ -1984,6 +2077,40 @@ mod tests {
         };
         let mut dec = ChunkedDecoder::new(tiny);
         assert_eq!(dec.feed(b"12345\r\n"), Err(HttpError::LineTooLong));
+    }
+
+    #[test]
+    fn streaming_enforces_body_limit_cumulatively() {
+        let capped = Limits {
+            max_body_bytes: 10,
+            ..Default::default()
+        };
+        // Each chunk fits alone, but the cumulative payload across feeds
+        // exceeds the cap.
+        let mut dec = ChunkedDecoder::new(capped);
+        assert!(
+            dec.feed(b"6\r\nhello!\r\n")
+                .unwrap()
+                .iter()
+                .any(|e| matches!(
+                    e,
+                    ChunkEvent::Data(d) if *d == b"hello!"
+                ))
+        );
+        assert_eq!(dec.feed(b"6\r\n world\r\n"), Err(HttpError::BodyTooLarge));
+        // Exactly at the cap passes, even split across feeds.
+        let mut dec = ChunkedDecoder::new(capped);
+        let feeds: &[&[u8]] = &[b"5\r\nhel", b"lo\r\n5\r\nwo", b"rld\r\n0\r\n\r\n"];
+        let mut data = Vec::new();
+        for feed in feeds {
+            for ev in dec.feed(feed).unwrap() {
+                if let ChunkEvent::Data(d) = ev {
+                    data.extend_from_slice(d);
+                }
+            }
+        }
+        assert_eq!(data, b"helloworld");
+        assert!(dec.is_done());
     }
 
     // -- serialization --------------------------------------------------------
@@ -2087,5 +2214,6 @@ mod tests {
         assert_eq!(l.max_headers, 100);
         assert_eq!(l.max_head_bytes, 32 * 1024);
         assert_eq!(l.max_line_bytes, 8 * 1024);
+        assert_eq!(l.max_body_bytes, 256 * 1024 * 1024);
     }
 }
