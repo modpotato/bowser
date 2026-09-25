@@ -1,0 +1,14 @@
+[package]
+name = "bowser_wpt"
+version = "0.1.0"
+edition = "2024"
+
+[lib]
+name = "bowser_wpt"
+path = "src/lib.rs"
+
+[[bin]]
+name = "bowser-wpt-run"
+path = "src/bin/bowser-wpt-run.rs"
+
+[dependencies]
