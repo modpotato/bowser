@@ -47,6 +47,16 @@ fn extract_references_from_str(text: &str) -> Vec<Reference> {
     // tracking byte offsets.
     let mut offset = 0;
     while let Some(i) = rest.find("<link") {
+        // The tag name must end here: `<linkfoo` is not a link tag.
+        let is_tag = rest[i + "<link".len()..]
+            .chars()
+            .next()
+            .is_some_and(|c| c.is_whitespace() || c == '/' || c == '>');
+        if !is_tag {
+            offset += i + "<link".len();
+            rest = &lower[offset..];
+            continue;
+        }
         let tag_start = offset + i;
         let tag_end = match lower[tag_start..].find('>') {
             Some(j) => tag_start + j,
@@ -93,8 +103,15 @@ fn attr(tag_lower: &str, tag_orig: &str, name: &str) -> Option<String> {
         }
         let after = rest[i + name.len()..].trim_start();
         let after_orig = orig_rest[i + name.len()..].trim_start();
-        let value_start = after.strip_prefix('=')?;
-        let value_start_orig = after_orig.strip_prefix('=')?;
+        // A same-prefix lookalike (`relx="..."`) leaves junk instead of `=`;
+        // skip past it and keep searching rather than aborting the scan.
+        let (Some(value_start), Some(value_start_orig)) =
+            (after.strip_prefix('='), after_orig.strip_prefix('='))
+        else {
+            rest = &rest[i + name.len()..];
+            orig_rest = &orig_rest[i + name.len()..];
+            continue;
+        };
         let value = value_start.trim_start();
         let value_orig = value_start_orig.trim_start();
         let raw: &str = if let Some(stripped) = value.strip_prefix('"') {
@@ -104,8 +121,9 @@ fn attr(tag_lower: &str, tag_orig: &str, name: &str) -> Option<String> {
             let end = stripped.find('\'')?;
             &value_orig[1..1 + end]
         } else {
+            // Unquoted values run to whitespace or `>`; `/` is legal inside.
             let end = value
-                .find(|c: char| c.is_whitespace() || c == '>' || c == '/')
+                .find(|c: char| c.is_whitespace() || c == '>')
                 .unwrap_or(value.len());
             &value_orig[..end]
         };
@@ -263,6 +281,31 @@ mod tests {
     fn extracts_nothing_without_ref_links() {
         assert!(extract_references_from_str("<link rel=stylesheet href=x>").is_empty());
         assert!(extract_references_from_str("no tags here").is_empty());
+    }
+
+    #[test]
+    fn unquoted_href_keeps_slashes() {
+        let refs = extract_references_from_str("<link rel=match href=other/ref2.html>");
+        assert_eq!(refs.len(), 1);
+        assert_eq!(refs[0].href, "other/ref2.html");
+    }
+
+    #[test]
+    fn same_prefix_lookalike_does_not_abort_scan() {
+        let refs = extract_references_from_str(r#"<link relx="y" rel="match" href="z.html">"#);
+        assert_eq!(refs.len(), 1);
+        assert_eq!(refs[0].rel, RefRel::Match);
+        assert_eq!(refs[0].href, "z.html");
+    }
+
+    #[test]
+    fn linkfoo_is_not_a_link_tag() {
+        assert!(extract_references_from_str(r#"<linkfoo rel=match href="x.html">"#).is_empty());
+        let refs = extract_references_from_str(
+            r#"<linkfoo rel=match href="x.html"><link rel=match href="y.html">"#,
+        );
+        assert_eq!(refs.len(), 1);
+        assert_eq!(refs[0].href, "y.html");
     }
 
     #[test]
