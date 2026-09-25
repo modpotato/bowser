@@ -576,13 +576,29 @@ enum TransferOutcome {
     /// No transfer coding applies (absent, or only `identity`).
     None,
     Chunked,
+    /// `chunked` is present but not the final coding. On responses this means
+    /// the body runs until the connection closes (RFC 9112 §6.3 rule 4).
+    UntilClose,
 }
 
-/// The effective transfer coding. `chunked` must appear exactly once and be
-/// the final coding; any other non-`identity` coding is unsupported.
+/// Which side sent the message; RFC 9112 §6.3 frames Transfer-Encoding
+/// differently for requests (rule 2) and responses (rule 4).
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum MessageDirection {
+    Request,
+    Response,
+}
+
+/// The effective transfer coding. `chunked` must appear exactly once; any
+/// other non-`identity` coding is unsupported. When `chunked` is not the
+/// final coding, requests are rejected (RFC 9112 §6.3 rule 2) while
+/// responses read until the connection closes (rule 4).
 /// When `Transfer-Encoding` is present it overrides `Content-Length`
 /// (RFC 9112 §6.3); callers implement that by checking this first.
-fn transfer_encoding(headers: &Headers) -> Result<TransferOutcome, HttpError> {
+fn transfer_encoding(
+    headers: &Headers,
+    direction: MessageDirection,
+) -> Result<TransferOutcome, HttpError> {
     let mut codings: Vec<&[u8]> = Vec::new();
     for value in headers.get_all("transfer-encoding") {
         for part in value.split(|&b| b == b',') {
@@ -611,7 +627,13 @@ fn transfer_encoding(headers: &Headers) -> Result<TransferOutcome, HttpError> {
             .last()
             .is_some_and(|c| c.eq_ignore_ascii_case(b"chunked"))
     {
-        return Err(HttpError::ChunkedNotFinal);
+        // Framing differs by direction: requests with chunked not final are
+        // rejected (RFC 9112 §6.3 rule 2); responses are read until the
+        // connection closes (RFC 9112 §6.3 rule 4).
+        return match direction {
+            MessageDirection::Request => Err(HttpError::ChunkedNotFinal),
+            MessageDirection::Response => Ok(TransferOutcome::UntilClose),
+        };
     }
     if chunked_count == 0
         || meaningful
@@ -629,8 +651,9 @@ fn transfer_encoding(headers: &Headers) -> Result<TransferOutcome, HttpError> {
 /// How a request's body is framed. With neither `Transfer-Encoding` nor
 /// `Content-Length` the body length is zero (RFC 9112 §6.3).
 pub fn request_body_spec(head: &RequestHead) -> Result<BodySpec, HttpError> {
-    match transfer_encoding(&head.headers)? {
+    match transfer_encoding(&head.headers, MessageDirection::Request)? {
         TransferOutcome::Chunked => Ok(BodySpec::Chunked),
+        TransferOutcome::UntilClose => Ok(BodySpec::UntilClose),
         TransferOutcome::None => Ok(match content_length(&head.headers)? {
             Some(n) => BodySpec::ContentLength(n),
             None => BodySpec::Empty,
@@ -653,8 +676,9 @@ pub fn response_body_spec(
         100..=199 | 204 | 304 => return Ok(BodySpec::Empty),
         _ => {}
     }
-    match transfer_encoding(&head.headers)? {
+    match transfer_encoding(&head.headers, MessageDirection::Response)? {
         TransferOutcome::Chunked => Ok(BodySpec::Chunked),
+        TransferOutcome::UntilClose => Ok(BodySpec::UntilClose),
         TransferOutcome::None => Ok(match content_length(&head.headers)? {
             Some(n) => BodySpec::ContentLength(n),
             None => BodySpec::UntilClose,
@@ -1607,6 +1631,54 @@ mod tests {
         assert_eq!(
             te_spec(b"Transfer-Encoding:"),
             Err(HttpError::InvalidTransferEncoding)
+        );
+    }
+
+    #[test]
+    fn request_chunked_not_final_still_rejected() {
+        // RFC 9112 §6.3 rule 2: a request with chunked not final is an error.
+        assert_eq!(
+            te_spec(b"Transfer-Encoding: chunked, gzip"),
+            Err(HttpError::ChunkedNotFinal)
+        );
+        // Plain `TE: chunked` framing is unchanged on requests.
+        assert_eq!(
+            te_spec(b"Transfer-Encoding: chunked"),
+            Ok(BodySpec::Chunked)
+        );
+    }
+
+    #[test]
+    fn response_chunked_not_final_is_until_close() {
+        // RFC 9112 §6.3 rule 4: a response with Transfer-Encoding present but
+        // chunked not final is read until the connection closes.
+        assert_eq!(
+            res_spec(
+                b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked, gzip",
+                b"GET"
+            ),
+            Ok(BodySpec::UntilClose)
+        );
+        // Case-insensitivity of the codings.
+        assert_eq!(
+            res_spec(
+                b"HTTP/1.1 200 OK\r\nTransfer-Encoding: Chunked, GZIP",
+                b"GET"
+            ),
+            Ok(BodySpec::UntilClose)
+        );
+        // Transfer-Encoding still overrides Content-Length.
+        assert_eq!(
+            res_spec(
+                b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked, gzip\r\nContent-Length: 5",
+                b"GET"
+            ),
+            Ok(BodySpec::UntilClose)
+        );
+        // Plain `TE: chunked` framing is unchanged on responses.
+        assert_eq!(
+            res_spec(b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked", b"GET"),
+            Ok(BodySpec::Chunked)
         );
     }
 
