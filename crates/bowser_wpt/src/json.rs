@@ -74,6 +74,7 @@ impl std::error::Error for ParseError {}
 pub(crate) fn parse(text: &str) -> Result<Json, ParseError> {
     let mut p = Parser {
         bytes: text.as_bytes(),
+        text,
         pos: 0,
     };
     let v = p.parse_value()?;
@@ -86,6 +87,7 @@ pub(crate) fn parse(text: &str) -> Result<Json, ParseError> {
 
 struct Parser<'a> {
     bytes: &'a [u8],
+    text: &'a str,
     pos: usize,
 }
 
@@ -161,10 +163,12 @@ impl<'a> Parser<'a> {
                 }
                 0x00..=0x1F => return Err(self.err("unescaped control character")),
                 _ => {
-                    // Consume one full UTF-8 code point.
-                    let s = std::str::from_utf8(&self.bytes[self.pos..])
-                        .map_err(|_| self.err("invalid UTF-8"))?;
-                    let ch = s
+                    // Consume one full UTF-8 code point. The input is a &str,
+                    // so it is already valid UTF-8: decode the next char
+                    // directly instead of revalidating the rest of the input
+                    // for every character (that was quadratic in practice).
+                    let rest = &self.text[self.pos..];
+                    let ch = rest
                         .chars()
                         .next()
                         .ok_or_else(|| self.err("unterminated string"))?;
@@ -363,5 +367,20 @@ mod tests {
         assert!(parse("1 2").is_err());
         assert!(parse("\"\\x\"").is_err());
         assert!(parse("\"bad\ttab\"").is_err());
+    }
+
+    #[test]
+    fn long_string_parses_in_linear_time() {
+        // Regression test: string scanning must not revalidate the rest of
+        // the input for every character; that was quadratic (a 200k-char
+        // string took ~1s). The assertion is on completion well inside a
+        // generous bound, not exact timing, so the test is not flaky.
+        let mut body = "x".repeat(200_000);
+        body.push_str("café😀");
+        let doc = format!("\"{body}\"");
+        let start = std::time::Instant::now();
+        let v = parse(&doc).unwrap();
+        assert!(start.elapsed() < std::time::Duration::from_secs(1));
+        assert_eq!(v, Json::Str(body));
     }
 }
