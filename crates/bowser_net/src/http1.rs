@@ -341,10 +341,17 @@ impl<'a> Headers<'a> {
     }
 
     /// All field-values for `name` (case-insensitive), in order.
-    pub fn get_all<'s>(&'s self, name: &'s str) -> impl Iterator<Item = &'a [u8]> + 's {
+    ///
+    /// The returned iterator borrows only from `self`; the `name` borrow
+    /// ends when this function returns, so the iterator may be held past
+    /// `name`'s lifetime.
+    pub fn get_all<'s, 'n>(&'s self, name: &'n str) -> impl Iterator<Item = &'a [u8]> + 's {
+        // Own a normalized copy of `name` so the iterator does not capture
+        // the `&'n str` borrow; items borrow from `self` alone.
+        let name_lower = name.to_ascii_lowercase();
         self.headers
             .iter()
-            .filter(move |h| h.name.eq_ignore_ascii_case(name))
+            .filter(move |h| h.name.eq_ignore_ascii_case(&name_lower))
             .map(|h| h.value)
     }
 
@@ -1427,6 +1434,22 @@ mod tests {
             vec![b"1".as_slice(), b"2".as_slice()]
         );
         assert_eq!(head.headers.len(), 3);
+    }
+
+    /// Compile-test: the `get_all` iterator must not borrow `name`.
+    /// `name` is dropped at the end of the inner block; the iterator
+    /// remains usable afterwards. This fails to compile with the old
+    /// unified `<'s>` signature.
+    #[test]
+    fn get_all_iterator_outlives_name_borrow() {
+        let (head, _) = req(b"GET / HTTP/1.1\r\nX-Dup: 1\r\nx-dup: 2\r\n\r\n").unwrap();
+        let values: Vec<&[u8]> = {
+            let name = String::from("X-DUP");
+            let iter = head.headers.get_all(&name);
+            drop(name);
+            iter.collect()
+        };
+        assert_eq!(values, vec![b"1".as_slice(), b"2".as_slice()]);
     }
 
     #[test]
