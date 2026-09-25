@@ -135,9 +135,11 @@ impl Manifest {
     ///
     /// Only `.html`/`.htm`/`.xhtml` files are considered. Infrastructure
     /// directories (`tools/`, `resources/`, `infrastructure/`, `.git/`) are
-    /// skipped. Classification:
+    /// skipped. Classification (see [`classify_file`] for the scan-window
+    /// policy):
     ///
-    /// - contains a `<link rel=match|mismatch>` → [`TestKind::Reftest`]
+    /// - a `<link>` tag with `rel` exactly `match`/`mismatch` (any quoting,
+    ///   optional whitespace around `=`) → [`TestKind::Reftest`]
     /// - references `testharness.js` → [`TestKind::Testharness`]
     /// - otherwise → [`TestKind::Other`]("unknown-html")
     pub fn walk(root: &Path) -> Result<Manifest, ManifestError> {
@@ -247,19 +249,30 @@ fn has_test_extension(name: &str) -> bool {
 }
 
 /// Classify one HTML file by looking for reftest/testharness markers.
-/// Only the first 128 KiB are read; markers live in `<head>`.
+///
+/// Only the first [`CLASSIFY_WINDOW`] bytes are read. This is a deliberate
+/// heuristic, not a correctness guarantee: markers for real WPT tests live
+/// in `<head>`, within the first few KiB, but reading whole files is
+/// unbounded (some WPT fixtures are tens of MB) and `Manifest::walk` must
+/// stay cheap per file. A file whose markers sit past the window classifies
+/// as `Other("unknown-html")`.
+const CLASSIFY_WINDOW: usize = 1024 * 1024;
+
 fn classify_file(path: &Path) -> Result<TestKind, ManifestError> {
     use std::io::Read as _;
     let mut f = std::fs::File::open(path)?;
     let mut buf = Vec::new();
-    f.by_ref().take(128 * 1024).read_to_end(&mut buf)?;
+    f.by_ref()
+        .take(CLASSIFY_WINDOW as u64)
+        .read_to_end(&mut buf)?;
     Ok(classify_html(&String::from_utf8_lossy(&buf)))
 }
 
 fn classify_html(content: &str) -> TestKind {
     let lower = content.to_ascii_lowercase();
-    // Check mismatch before match: "rel=mismatch" contains "rel=match".
-    if has_rel(&lower, "mismatch") || has_rel(&lower, "match") {
+    // Reftest links are checked before testharness.js: a reftest page may
+    // mention testharness helpers in prose without being a testharness test.
+    if has_reftest_link(&lower) {
         TestKind::Reftest
     } else if lower.contains("testharness.js") {
         TestKind::Testharness
@@ -268,18 +281,93 @@ fn classify_html(content: &str) -> TestKind {
     }
 }
 
-/// True if the document contains a `rel=<value>` attribute (any quoting).
-fn has_rel(lower: &str, value: &str) -> bool {
-    for pat in [
-        format!("rel={value}"),
-        format!("rel=\"{value}\""),
-        format!("rel='{value}'"),
-    ] {
-        if lower.contains(&pat) {
+/// True if the document contains a `<link>` tag whose `rel` attribute is
+/// exactly `match` or `mismatch`.
+///
+/// This is a small attribute tokenizer, not a substring search:
+/// - `rel=match` inside a JS comment or prose is ignored (W10a); only a
+///   real `<link ...>` tag counts,
+/// - optional whitespace around `=` is accepted: `<link rel = "match">`
+///   counts (W10b),
+/// - the value must be exactly `match`/`mismatch`: `rel=matching` does not
+///   count (W10c), and `data-rel` is a different attribute.
+fn has_reftest_link(lower: &str) -> bool {
+    let bytes = lower.as_bytes();
+    let mut pos = 0;
+    while let Some(found) = lower[pos..].find("<link") {
+        let tag_start = pos + found;
+        // `<link` must open a tag, not a longer tag name like `<linkfoo`.
+        let boundary_ok = match bytes.get(tag_start + "<link".len()) {
+            None => true, // truncated input; let the tokenizer decide
+            Some(&b) => b.is_ascii_whitespace() || b == b'/' || b == b'>',
+        };
+        pos = tag_start + "<link".len();
+        if boundary_ok && link_rel_is_reftest(bytes, pos) {
             return true;
         }
     }
     false
+}
+
+/// Scan one `<link ...>` tag's attributes, starting just after `<link`.
+/// True if the tag's `rel` attribute value is exactly `match` or `mismatch`.
+/// Stops at the tag's closing `>` (quote-aware) or at end of input.
+fn link_rel_is_reftest(bytes: &[u8], mut i: usize) -> bool {
+    loop {
+        // Skip whitespace and stray self-closing slashes between attributes.
+        while i < bytes.len() && (bytes[i].is_ascii_whitespace() || bytes[i] == b'/') {
+            i += 1;
+        }
+        if i >= bytes.len() || bytes[i] == b'>' {
+            return false;
+        }
+        // Attribute name: up to `=`, whitespace, `/` or `>`.
+        let name_start = i;
+        while i < bytes.len()
+            && !bytes[i].is_ascii_whitespace()
+            && !matches!(bytes[i], b'=' | b'/' | b'>')
+        {
+            i += 1;
+        }
+        let name = &bytes[name_start..i];
+        // Optional whitespace, then `=` and the value.
+        let mut j = i;
+        while j < bytes.len() && bytes[j].is_ascii_whitespace() {
+            j += 1;
+        }
+        let mut value: Option<&[u8]> = None;
+        if j < bytes.len() && bytes[j] == b'=' {
+            j += 1;
+            while j < bytes.len() && bytes[j].is_ascii_whitespace() {
+                j += 1;
+            }
+            if j < bytes.len() && (bytes[j] == b'"' || bytes[j] == b'\'') {
+                let quote = bytes[j];
+                j += 1;
+                let vstart = j;
+                while j < bytes.len() && bytes[j] != quote {
+                    j += 1;
+                }
+                value = Some(&bytes[vstart..j]);
+                j += 1; // consume the closing quote, if present
+            } else {
+                // Unquoted value: runs to whitespace, `/` or `>`.
+                let vstart = j;
+                while j < bytes.len()
+                    && !bytes[j].is_ascii_whitespace()
+                    && !matches!(bytes[j], b'/' | b'>')
+                {
+                    j += 1;
+                }
+                value = Some(&bytes[vstart..j]);
+            }
+        }
+        i = j;
+        if name == b"rel" {
+            // First `rel` attribute wins, per HTML parsing rules.
+            return matches!(value, Some(v) if v == b"match" || v == b"mismatch");
+        }
+    }
 }
 
 /// Manifest reading can fail on I/O or on a malformed `MANIFEST.json`.
@@ -470,5 +558,97 @@ mod tests {
         );
         assert!(TestKind::Reftest.is_automated());
         assert!(!TestKind::Manual.is_automated());
+    }
+
+    // W10a: `rel=match` in a JS comment or prose is not a reftest marker.
+    #[test]
+    fn classify_rel_match_in_comment_or_prose_is_not_reftest() {
+        let js_comment = r#"<!doctype html>
+<script src="/resources/testharness.js"></script>
+<script>
+// reftests use rel=match; this test does not
+test(function() {}, "x");</script>"#;
+        assert_eq!(classify_html(js_comment), TestKind::Testharness);
+
+        let prose = "<!doctype html><p>to compare, add rel=match to a link tag</p>";
+        assert_eq!(classify_html(prose), TestKind::Other("unknown-html".into()));
+
+        // Only a real <link> tag counts; escaped markup and other elements
+        // carrying the substring must not.
+        let escaped = "<!doctype html><pre>&lt;link rel=match&gt;</pre>";
+        assert_eq!(
+            classify_html(escaped),
+            TestKind::Other("unknown-html".into())
+        );
+        let div_rel = r#"<!doctype html><div data-rel="match">x</div>"#;
+        assert_eq!(
+            classify_html(div_rel),
+            TestKind::Other("unknown-html".into())
+        );
+    }
+
+    // W10b: optional whitespace around `=` is accepted.
+    #[test]
+    fn classify_rel_with_whitespace_around_equals() {
+        for html in [
+            r#"<!doctype html><link rel = "match" href="r.html">"#,
+            "<!doctype html><link rel\t=\n'mismatch' href=r.html>",
+            "<!doctype html><LINK REL =MATCH HREF=r.html>",
+            "<!doctype html><link  rel=match  />",
+        ] {
+            assert_eq!(classify_html(html), TestKind::Reftest, "{html}");
+        }
+    }
+
+    // W10c: the rel value must be exactly `match`/`mismatch`.
+    #[test]
+    fn classify_rel_value_prefix_is_not_reftest() {
+        // `rel=matching` must not shadow the testharness marker.
+        let prefix_unquoted = r#"<!doctype html>
+<link rel=matching href="r.html">
+<script src="/resources/testharness.js"></script>"#;
+        assert_eq!(classify_html(prefix_unquoted), TestKind::Testharness);
+
+        let prefix_quoted = r#"<!doctype html><link rel="matching" href="r.html"><p>x</p>"#;
+        assert_eq!(
+            classify_html(prefix_quoted),
+            TestKind::Other("unknown-html".into())
+        );
+
+        // A longer tag name is not <link>; data-rel is not rel.
+        for html in [
+            r#"<!doctype html><linkfoo rel=match href="r.html">"#,
+            r#"<!doctype html><link data-rel="match" href="r.html">"#,
+            r#"<!doctype html><link rel href="r.html">"#,
+        ] {
+            assert_eq!(
+                classify_html(html),
+                TestKind::Other("unknown-html".into()),
+                "{html}"
+            );
+        }
+    }
+
+    // W10d: markers past the old 128 KiB window but inside the 1 MiB window
+    // classify correctly.
+    #[test]
+    fn walk_finds_marker_past_old_128kib_window() {
+        let padding = " ".repeat(200 * 1024);
+        let html = format!("<!doctype html><title>t</title>{padding}<link rel=match href=r.html>");
+        let tree = FixtureTree::new(&[("css/late.html", &html)]);
+        let m = Manifest::walk(&tree.root).unwrap();
+        assert_eq!(m.len(), 1);
+        assert_eq!(m.items()[0].kind, TestKind::Reftest);
+    }
+
+    // W10d: the 1 MiB window is a heuristic; a marker beyond it is missed.
+    #[test]
+    fn walk_marker_past_1mib_window_is_unknown() {
+        let padding = " ".repeat(1024 * 1024 + 16);
+        let html = format!("<!doctype html><title>t</title>{padding}<link rel=match href=r.html>");
+        let tree = FixtureTree::new(&[("css/too-late.html", &html)]);
+        let m = Manifest::walk(&tree.root).unwrap();
+        assert_eq!(m.len(), 1);
+        assert_eq!(m.items()[0].kind, TestKind::Other("unknown-html".into()));
     }
 }
