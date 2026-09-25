@@ -148,10 +148,13 @@ fn parse_report(doc: &Json) -> Result<HarnessResult, ResultsError> {
         .and_then(Json::as_str)
         .map(HarnessStatus::parse)
         .unwrap_or(HarnessStatus::Unknown("missing".into()));
-    let duration_ms = doc.get("duration_ms").and_then(|v| match v {
-        Json::Num(n) if *n >= 0.0 => Some(*n as u64),
-        _ => None,
-    });
+    // Fractional durations round to the nearest millisecond instead of
+    // silently truncating; negative durations are invalid and dropped.
+    let duration_ms = doc
+        .get("duration_ms")
+        .and_then(Json::as_f64)
+        .filter(|n| n.is_finite() && *n >= 0.0)
+        .map(|n| n.round() as u64);
     let mut subtests = Vec::new();
     if let Some(tests) = doc
         .get("tests")
@@ -328,5 +331,27 @@ mod tests {
     #[test]
     fn wptreport_requires_results_array() {
         assert!(parse_wptreport(r#"{"run_info": {}}"#).is_err());
+    }
+
+    #[test]
+    fn duration_ms_rounds_and_rejects_negative() {
+        let r = HarnessResult::from_json(
+            r#"{"test": "x", "harness_status": "OK", "duration_ms": 12.7,
+                "tests": [{"name": "a", "status": "PASS"}]}"#,
+        )
+        .unwrap();
+        assert_eq!(r.duration_ms, Some(13));
+        let r = HarnessResult::from_json(
+            r#"{"test": "x", "harness_status": "OK", "duration_ms": -5,
+                "tests": [{"name": "a", "status": "PASS"}]}"#,
+        )
+        .unwrap();
+        assert_eq!(r.duration_ms, None);
+        let r = HarnessResult::from_json(
+            r#"{"test": "x", "harness_status": "OK", "duration_ms": "12",
+                "tests": [{"name": "a", "status": "PASS"}]}"#,
+        )
+        .unwrap();
+        assert_eq!(r.duration_ms, None);
     }
 }

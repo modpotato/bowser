@@ -13,19 +13,65 @@ use std::fmt;
 pub(crate) enum Json {
     Null,
     Bool(bool),
-    Num(f64),
+    /// An integer literal that fits in an `i64`, stored losslessly.
+    Int(i64),
+    /// A number with a fraction or exponent part, or an integer literal
+    /// too large for `i64`. Literals that overflow `f64` are a parse
+    /// error rather than silently becoming infinity.
+    Float(f64),
     Str(String),
     Arr(Vec<Json>),
     Obj(Vec<(String, Json)>),
 }
 
 impl Json {
-    /// Look up a key in an object value.
+    /// Look up a key in an object value. When a key repeats, the last
+    /// value wins, matching serde_json and the WPT tooling.
     pub(crate) fn get(&self, key: &str) -> Option<&Json> {
         if let Json::Obj(pairs) = self {
-            pairs.iter().find(|(k, _)| k == key).map(|(_, v)| v)
+            pairs.iter().rev().find(|(k, _)| k == key).map(|(_, v)| v)
         } else {
             None
+        }
+    }
+
+    // Not yet used by a consumer; kept as accessor API so callers do
+    // not hand-roll matches on `Json`.
+    #[allow(dead_code)]
+    pub(crate) fn as_bool(&self) -> Option<bool> {
+        if let Json::Bool(b) = self {
+            Some(*b)
+        } else {
+            None
+        }
+    }
+
+    /// The number as an `i64`. Floats convert only when they are integral
+    /// and in range, mirroring serde_json's `as_i64`.
+    // Not yet used by a consumer; kept as accessor API so callers do
+    // not hand-roll matches on `Json`.
+    #[allow(dead_code)]
+    pub(crate) fn as_i64(&self) -> Option<i64> {
+        match self {
+            Json::Int(i) => Some(*i),
+            Json::Float(f)
+                if f.is_finite()
+                    && f.fract() == 0.0
+                    && (-9_223_372_036_854_775_808.0..9_223_372_036_854_775_808.0).contains(f) =>
+            {
+                Some(*f as i64)
+            }
+            _ => None,
+        }
+    }
+
+    /// The number as an `f64`. Integers convert exactly below 2^53;
+    /// larger ones round, as with any `i64 as f64` cast.
+    pub(crate) fn as_f64(&self) -> Option<f64> {
+        match self {
+            Json::Int(i) => Some(*i as f64),
+            Json::Float(f) => Some(*f),
+            _ => None,
         }
     }
 
@@ -255,9 +301,29 @@ impl<'a> Parser<'a> {
         }
         let text = std::str::from_utf8(&self.bytes[start..self.pos])
             .map_err(|_| self.err("bad number"))?;
-        text.parse::<f64>()
-            .map(Json::Num)
-            .map_err(|_| self.err("bad number"))
+        let is_float = text.bytes().any(|b| matches!(b, b'.' | b'e' | b'E'));
+        if !is_float {
+            // Plain integer literal: keep it lossless as i64. One that is
+            // too large for i64 falls through to f64, which still errors
+            // on overflow below.
+            if let Ok(i) = text.parse::<i64>() {
+                return Ok(Json::Int(i));
+            }
+        }
+        self.parse_float(text).map(Json::Float)
+    }
+
+    /// Parse a float literal, rejecting overflow to infinity and the
+    /// underflow of a nonzero literal to zero instead of going silent.
+    fn parse_float(&self, text: &str) -> Result<f64, ParseError> {
+        let f: f64 = text.parse().map_err(|_| self.err("bad number"))?;
+        if !f.is_finite() {
+            return Err(self.err("number out of range"));
+        }
+        if f == 0.0 && text.bytes().any(|b| matches!(b, b'1'..=b'9')) {
+            return Err(self.err("number out of range"));
+        }
+        Ok(f)
     }
 
     fn parse_array(&mut self) -> Result<Json, ParseError> {
@@ -331,8 +397,8 @@ mod tests {
         assert_eq!(parse("null").unwrap(), Json::Null);
         assert_eq!(parse("true").unwrap(), Json::Bool(true));
         assert_eq!(parse("false").unwrap(), Json::Bool(false));
-        assert_eq!(parse("42").unwrap(), Json::Num(42.0));
-        assert_eq!(parse("-1.5e3").unwrap(), Json::Num(-1500.0));
+        assert_eq!(parse("42").unwrap(), Json::Int(42));
+        assert_eq!(parse("-1.5e3").unwrap(), Json::Float(-1500.0));
         assert_eq!(parse("\"hi\"").unwrap(), Json::Str("hi".into()));
     }
 
@@ -352,7 +418,7 @@ mod tests {
         assert_eq!(v.get("c").and_then(Json::as_str), Some("x"));
         let a = v.get("a").and_then(Json::as_arr).unwrap();
         assert_eq!(a.len(), 2);
-        assert_eq!(a[0], Json::Num(1.0));
+        assert_eq!(a[0], Json::Int(1));
     }
 
     #[test]
@@ -363,5 +429,64 @@ mod tests {
         assert!(parse("1 2").is_err());
         assert!(parse("\"\\x\"").is_err());
         assert!(parse("\"bad\ttab\"").is_err());
+    }
+
+    #[test]
+    fn duplicate_keys_last_wins() {
+        let v = parse(r#"{"a":1,"a":2}"#).unwrap();
+        assert_eq!(v.get("a"), Some(&Json::Int(2)));
+        // First occurrence is still visible in iteration order.
+        assert_eq!(
+            v.as_obj().unwrap(),
+            &[
+                ("a".to_owned(), Json::Int(1)),
+                ("a".to_owned(), Json::Int(2))
+            ]
+        );
+    }
+
+    #[test]
+    fn integers_are_lossless() {
+        // 2^53 + 1 is not representable as f64; it must survive as i64.
+        assert_eq!(
+            parse("9007199254740993").unwrap(),
+            Json::Int(9007199254740993)
+        );
+        assert_eq!(
+            parse("-9007199254740993").unwrap(),
+            Json::Int(-9007199254740993)
+        );
+        assert_eq!(parse("1.5").unwrap(), Json::Float(1.5));
+        // Integer literal too large for i64 falls back to f64, still
+        // finite, instead of erroring.
+        assert!(parse("99999999999999999999999").unwrap().as_f64().is_some());
+    }
+
+    #[test]
+    fn out_of_range_numbers_error() {
+        assert!(parse("1e999999").is_err());
+        assert!(parse("-1e999999").is_err());
+        assert!(parse("1e-999999").is_err());
+        // The largest finite f64 parses fine.
+        assert!(parse("1.7976931348623157e308").unwrap().as_f64().is_some());
+        assert!(parse("0.0").unwrap().as_f64().is_some());
+    }
+
+    #[test]
+    fn accessors() {
+        assert_eq!(parse("42").unwrap().as_i64(), Some(42));
+        assert_eq!(parse("42").unwrap().as_f64(), Some(42.0));
+        assert_eq!(parse("1.5").unwrap().as_i64(), None);
+        assert_eq!(parse("1.5").unwrap().as_f64(), Some(1.5));
+        assert_eq!(parse("true").unwrap().as_bool(), Some(true));
+        assert_eq!(parse("false").unwrap().as_bool(), Some(false));
+        assert_eq!(parse("null").unwrap().as_bool(), None);
+        assert_eq!(parse("1").unwrap().as_bool(), None);
+        assert_eq!(parse("\"x\"").unwrap().as_str(), Some("x"));
+        // Integral floats convert when in i64 range.
+        assert_eq!(parse("12.0").unwrap().as_i64(), Some(12));
+        assert_eq!(parse("1e3").unwrap().as_i64(), Some(1000));
+        assert_eq!(parse("1e30").unwrap().as_i64(), None);
+        assert_eq!(parse("-0.5").unwrap().as_i64(), None);
     }
 }
