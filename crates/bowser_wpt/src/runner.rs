@@ -10,7 +10,7 @@ use std::time::Duration;
 
 use crate::driver::{BrowserDriver, DriverError, Screenshot, Viewport};
 use crate::manifest::{Manifest, TestItem, TestKind};
-use crate::reftest::{self, Comparison, RefRel, ReftestTolerance};
+use crate::reftest::{self, Comparison, RefRel, Reference, ReftestTolerance};
 use crate::results::HarnessResult;
 
 /// What to run and how.
@@ -225,31 +225,46 @@ impl<D: BrowserDriver> Runner<D> {
     }
 
     fn run_reftest(&mut self, item: &TestItem) -> TestOutcome {
-        let path = match &item.path {
-            Some(p) => p.clone(),
-            None => {
-                return TestOutcome::Skipped {
-                    reason: "no local file; cannot extract reftest references".into(),
-                };
+        // Prefer the reference list parsed at manifest time. Items that
+        // carry a local file but no parsed references (walk output,
+        // hand-built items) fall back to scraping the file for
+        // <link rel=match|mismatch> tags.
+        let scraped;
+        let refs: &[Reference] = if item.references.is_empty() {
+            match &item.path {
+                Some(path) => match reftest::extract_references(path) {
+                    Ok(r) => {
+                        scraped = r;
+                        &scraped
+                    }
+                    Err(e) => {
+                        return TestOutcome::DriverFailed(DriverError::BadReport(e.to_string()));
+                    }
+                },
+                None => {
+                    return TestOutcome::Skipped {
+                        reason: "no references: manifest entry has no reference list \
+                                 and no local file"
+                            .into(),
+                    };
+                }
             }
-        };
-        let refs = match reftest::extract_references(&path) {
-            Ok(r) => r,
-            Err(e) => return TestOutcome::DriverFailed(DriverError::BadReport(e.to_string())),
+        } else {
+            &item.references
         };
         if refs.is_empty() {
             return TestOutcome::Skipped {
                 reason: "no <link rel=match|mismatch> references found".into(),
             };
         }
-        let test_shot = match self.driver.render(item, self.config.viewport) {
+        let test_shot = match self.driver.render(&item.url, self.config.viewport) {
             Ok(s) => s,
             Err(e) => return TestOutcome::DriverFailed(e),
         };
         let mut checks = Vec::with_capacity(refs.len());
         for r in refs {
-            let ref_item = reference_item(item, &path, &r.href);
-            let ref_shot: Screenshot = match self.driver.render(&ref_item, self.config.viewport) {
+            let ref_url = resolve_reference_url(&item.url, &r.href);
+            let ref_shot: Screenshot = match self.driver.render(&ref_url, self.config.viewport) {
                 Ok(s) => s,
                 Err(e) => return TestOutcome::DriverFailed(e),
             };
@@ -262,7 +277,7 @@ impl<D: BrowserDriver> Runner<D> {
                 RefRel::Mismatch => !comparison.equal,
             };
             checks.push(RefCheck {
-                reference: r.href,
+                reference: ref_url,
                 rel: r.rel,
                 comparison,
                 ok,
@@ -273,19 +288,34 @@ impl<D: BrowserDriver> Runner<D> {
     }
 }
 
-/// Build a [`TestItem`] for a reftest reference: `href` resolved against the
-/// test file's directory.
-fn reference_item(test: &TestItem, test_path: &std::path::Path, href: &str) -> TestItem {
-    let dir = test_path
-        .parent()
-        .unwrap_or_else(|| std::path::Path::new(""));
-    let path = dir.join(href);
-    TestItem {
-        id: format!("{} -> {href}", test.id),
-        url: href.to_owned(),
-        kind: TestKind::Reftest,
-        path: Some(path),
+/// Resolve a reftest reference `href` against the test's served URL.
+///
+/// `item.url` already includes the manifest's `url_base`, so resolving
+/// against it covers both. Absolute URLs and absolute paths pass through
+/// untouched; relative hrefs resolve against the test URL's directory,
+/// with `.`/`..` segments normalized.
+fn resolve_reference_url(test_url: &str, href: &str) -> String {
+    // Absolute path, or an absolute URL (a scheme is present).
+    if href.starts_with('/') || href.contains("://") {
+        return href.to_owned();
     }
+    if let Some(scheme_end) = href.find(':')
+        && !href[..scheme_end].contains('/')
+    {
+        return href.to_owned();
+    }
+    let dir = test_url.rsplit_once('/').map(|(d, _)| d).unwrap_or("");
+    let mut segments: Vec<&str> = dir.split('/').filter(|s| !s.is_empty()).collect();
+    for seg in href.split('/') {
+        match seg {
+            "" | "." => {}
+            ".." => {
+                segments.pop();
+            }
+            s => segments.push(s),
+        }
+    }
+    format!("/{}", segments.join("/"))
 }
 
 #[cfg(test)]
@@ -301,14 +331,16 @@ mod tests {
             url: format!("/{id}"),
             kind,
             path: None,
+            references: Vec::new(),
         }
     }
 
     /// A driver with canned answers, so the runner logic is testable without
-    /// a browser.
+    /// a browser. Records every URL it was asked to render.
     struct FakeDriver {
         report: HarnessResult,
         shot: Screenshot,
+        rendered_urls: Vec<String>,
     }
 
     impl BrowserDriver for FakeDriver {
@@ -320,16 +352,21 @@ mod tests {
             Ok(self.report.clone())
         }
 
-        fn render(
-            &mut self,
-            _test: &TestItem,
-            _viewport: Viewport,
-        ) -> Result<Screenshot, DriverError> {
+        fn render(&mut self, url: &str, _viewport: Viewport) -> Result<Screenshot, DriverError> {
+            self.rendered_urls.push(url.to_owned());
             Ok(self.shot.clone())
         }
 
         fn name(&self) -> &str {
             "fake"
+        }
+    }
+
+    fn fake_driver() -> FakeDriver {
+        FakeDriver {
+            report: green_report(),
+            shot: Screenshot::solid(2, 2, 0, 0, 0, 255),
+            rendered_urls: Vec::new(),
         }
     }
 
@@ -376,6 +413,7 @@ mod tests {
         let driver = FakeDriver {
             report: green_report(),
             shot: Screenshot::solid(2, 2, 0, 0, 0, 255),
+            rendered_urls: Vec::new(),
         };
         // Reftest without a local path is skipped, not failed.
         let mut r = Runner::new(
@@ -392,6 +430,7 @@ mod tests {
         let driver = FakeDriver {
             report: green_report(),
             shot: Screenshot::solid(2, 2, 0, 0, 0, 255),
+            rendered_urls: Vec::new(),
         };
         let mut r = Runner::new(
             driver,
@@ -413,6 +452,7 @@ mod tests {
             FakeDriver {
                 report: green_report(),
                 shot: Screenshot::solid(1, 1, 0, 0, 0, 255),
+                rendered_urls: Vec::new(),
             },
             RunConfig::default(),
         );
@@ -456,6 +496,7 @@ mod tests {
             url: "/t.html".into(),
             kind: TestKind::Reftest,
             path: Some(dir.join("t.html")),
+            references: Vec::new(),
         };
         // The path does not survive a manifest round-trip, so drive this
         // single test directly instead of going through Runner::run.
@@ -463,6 +504,7 @@ mod tests {
             FakeDriver {
                 report: green_report(),
                 shot: Screenshot::solid(2, 2, 7, 7, 7, 255),
+                rendered_urls: Vec::new(),
             },
             RunConfig::default(),
         );
@@ -477,5 +519,96 @@ mod tests {
             o => panic!("unexpected outcome: {o:?}"),
         }
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn reftest_runs_from_manifest_references_without_local_files() {
+        // A manifest-sourced item: no local file, references parsed from
+        // MANIFEST.json at manifest time.
+        let test = TestItem {
+            id: "css/t.html".into(),
+            url: "/css/t.html".into(),
+            kind: TestKind::Reftest,
+            path: None,
+            references: vec![
+                Reference {
+                    rel: RefRel::Match,
+                    href: "same.html".into(),
+                },
+                Reference {
+                    rel: RefRel::Mismatch,
+                    href: "sub/diff.html".into(),
+                },
+            ],
+        };
+        let mut r = Runner::new(fake_driver(), RunConfig::default());
+        let outcome = r.run_one(&test);
+        match &outcome {
+            TestOutcome::Reftest { passed, checks } => {
+                assert_eq!(checks.len(), 2);
+                assert!(checks[0].ok); // match, identical
+                assert!(!checks[1].ok); // mismatch, identical -> bad
+                assert!(!passed);
+                // Reports carry the resolved reference URLs.
+                assert_eq!(checks[0].reference, "/css/same.html");
+                assert_eq!(checks[1].reference, "/css/sub/diff.html");
+            }
+            o => panic!("reftest from manifest references must run, got: {o:?}"),
+        }
+        // The driver saw the test URL plus both resolved reference URLs.
+        assert_eq!(
+            r.driver().rendered_urls,
+            vec!["/css/t.html", "/css/same.html", "/css/sub/diff.html"]
+        );
+    }
+
+    #[test]
+    fn reftest_without_references_or_file_is_skipped() {
+        let test = TestItem {
+            id: "css/u.html".into(),
+            url: "/css/u.html".into(),
+            kind: TestKind::Reftest,
+            path: None,
+            references: Vec::new(),
+        };
+        let mut r = Runner::new(fake_driver(), RunConfig::default());
+        let outcome = r.run_one(&test);
+        assert!(matches!(outcome, TestOutcome::Skipped { .. }));
+    }
+
+    #[test]
+    fn reference_url_resolution() {
+        // Relative hrefs resolve against the test's directory.
+        assert_eq!(
+            resolve_reference_url("/dir/test.html", "ref.html"),
+            "/dir/ref.html"
+        );
+        assert_eq!(
+            resolve_reference_url("/dir/test.html", "sub/ref.html"),
+            "/dir/sub/ref.html"
+        );
+        // Dot segments normalize.
+        assert_eq!(
+            resolve_reference_url("/dir/sub/test.html", "../ref.html"),
+            "/dir/ref.html"
+        );
+        assert_eq!(
+            resolve_reference_url("/dir/test.html", "./ref.html"),
+            "/dir/ref.html"
+        );
+        // The test URL already carries url_base; it is preserved.
+        assert_eq!(
+            resolve_reference_url("/_wpt_/dir/test.html", "ref.html"),
+            "/_wpt_/dir/ref.html"
+        );
+        // Absolute paths and full URLs pass through untouched.
+        assert_eq!(
+            resolve_reference_url("/dir/test.html", "/abs/ref.html"),
+            "/abs/ref.html"
+        );
+        assert_eq!(
+            resolve_reference_url("/dir/test.html", "https://example.com/ref.html"),
+            "https://example.com/ref.html"
+        );
     }
 }

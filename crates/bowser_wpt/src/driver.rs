@@ -78,8 +78,8 @@ pub trait BrowserDriver {
         timeout: Duration,
     ) -> Result<HarnessResult, DriverError>;
 
-    /// Render `test.url` in `viewport` and return the screenshot.
-    fn render(&mut self, test: &TestItem, viewport: Viewport) -> Result<Screenshot, DriverError>;
+    /// Render `url` in `viewport` and return the screenshot.
+    fn render(&mut self, url: &str, viewport: Viewport) -> Result<Screenshot, DriverError>;
 
     /// Human-readable name for logs (e.g. "bowser-headless/0.1.0").
     fn name(&self) -> &str {
@@ -107,10 +107,9 @@ impl BrowserDriver for StubDriver {
         )))
     }
 
-    fn render(&mut self, test: &TestItem, _viewport: Viewport) -> Result<Screenshot, DriverError> {
+    fn render(&mut self, url: &str, _viewport: Viewport) -> Result<Screenshot, DriverError> {
         Err(DriverError::Unimplemented(format!(
-            "no browser behind the driver yet; cannot render {}",
-            test.id
+            "no browser behind the driver yet; cannot render {url}"
         )))
     }
 
@@ -163,6 +162,7 @@ mod tests {
             url: "/dom/a.html".into(),
             kind: TestKind::Testharness,
             path: None,
+            references: Vec::new(),
         }
     }
 
@@ -175,7 +175,7 @@ mod tests {
             .unwrap_err();
         assert!(matches!(err, DriverError::Unimplemented(_)));
         assert!(err.to_string().contains("dom/a.html"));
-        let err = d.render(&item(), Viewport::DEFAULT).unwrap_err();
+        let err = d.render("/dom/a.html", Viewport::DEFAULT).unwrap_err();
         assert!(matches!(err, DriverError::Unimplemented(_)));
     }
 

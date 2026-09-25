@@ -13,7 +13,7 @@
 //! ```json
 //! {"version": 9, "url_base": "/", "items": {
 //!   "testharness": {"dom/x.html": ["item", ["/dom/x.html", {}]]},
-//!   "reftest":     {"css/y.html": ["item", ["/css/y.html", {}]]}
+//!   "reftest":     {"css/y.html": ["item", ["/css/y.html", [["ref.html", "=="]], {}]]}
 //! }}
 //! ```
 
@@ -22,6 +22,7 @@ use std::io;
 use std::path::{Path, PathBuf};
 
 use crate::json::{self, Json};
+use crate::reftest::{self, RefRel, Reference};
 
 /// The kind of a WPT test.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
@@ -83,6 +84,10 @@ pub struct TestItem {
     pub kind: TestKind,
     /// Absolute filesystem path, present when the manifest came from [`Manifest::walk`].
     pub path: Option<PathBuf>,
+    /// Reftest references, parsed at manifest time from the
+    /// `[[ref_url, "=="|"!="], ...]` list in `MANIFEST.json` (or scraped
+    /// from the file by [`Manifest::walk`]). Empty for non-reftest items.
+    pub references: Vec<Reference>,
 }
 
 /// A set of tests enumerated from a WPT checkout.
@@ -115,6 +120,7 @@ impl Manifest {
                         url: join_url(url_base, &url),
                         kind: kind.clone(),
                         path: None,
+                        references: manifest_references(item),
                     }),
                     None => manifest.skipped += 1,
                 }
@@ -189,6 +195,42 @@ fn manifest_url(item: &Json) -> Option<String> {
     inner.first()?.as_str().map(str::to_owned)
 }
 
+/// Extract the reftest reference list from a manifest item entry:
+/// `["item", [url, [[ref_url, "=="|"!="], ...], extras]]`.
+///
+/// Returns an empty list for non-reftest entries and for malformed
+/// reference lists. The runner treats "no references" as a skip, so
+/// leniency here is safe.
+fn manifest_references(item: &Json) -> Vec<Reference> {
+    let refs: &[Json] = item
+        .as_arr()
+        .and_then(|pair| pair.get(1))
+        .and_then(Json::as_arr)
+        .and_then(|inner| inner.get(1))
+        .and_then(Json::as_arr)
+        .unwrap_or(&[]);
+    let mut out = Vec::new();
+    for r in refs {
+        let entry = r.as_arr().unwrap_or(&[]);
+        let (Some(url), Some(rel)) = (
+            entry.first().and_then(Json::as_str),
+            entry.get(1).and_then(Json::as_str),
+        ) else {
+            continue;
+        };
+        let rel = match rel {
+            "==" => RefRel::Match,
+            "!=" => RefRel::Mismatch,
+            _ => continue,
+        };
+        out.push(Reference {
+            rel,
+            href: url.to_owned(),
+        });
+    }
+    out
+}
+
 fn join_url(base: &str, url: &str) -> String {
     let base = base.strip_suffix('/').unwrap_or(base);
     if url.starts_with('/') {
@@ -228,11 +270,20 @@ fn walk_dir(root: &Path, dir: &Path, manifest: &mut Manifest) -> Result<(), Mani
                 .to_string_lossy()
                 .replace('\\', "/");
             let kind = classify_file(&path)?;
+            let references = if kind == TestKind::Reftest {
+                // classify_file just read this file successfully, so a
+                // scrape failure here is unexpected; degrade to no
+                // references rather than failing the whole walk.
+                reftest::extract_references(&path).unwrap_or_default()
+            } else {
+                Vec::new()
+            };
             manifest.items.push(TestItem {
                 id: id.clone(),
                 url: format!("/{id}"),
                 kind,
                 path: Some(path),
+                references,
             });
         }
     }
@@ -407,6 +458,47 @@ mod tests {
     }
 
     #[test]
+    fn from_json_reads_reftest_references() {
+        let json = r#"{"version": 9, "url_base": "/", "items": {
+            "reftest": {
+                "css/c.html": ["item", ["/css/c.html",
+                    [[ "ref.html", "==" ], ["/other.html", "!=" ], ["bogus.html", "??"]],
+                    {}]],
+                "css/d.html": ["item", ["/css/d.html", {}]]
+            },
+            "testharness": {
+                "dom/a.html": ["item", ["/dom/a.html", {}]]
+            }
+        }}"#;
+        let m = Manifest::from_json(json).unwrap();
+        let by_id: std::collections::HashMap<&str, &TestItem> =
+            m.items().iter().map(|t| (t.id.as_str(), t)).collect();
+        assert_eq!(
+            by_id["css/c.html"].references,
+            vec![
+                Reference {
+                    rel: RefRel::Match,
+                    href: "ref.html".into()
+                },
+                Reference {
+                    rel: RefRel::Mismatch,
+                    href: "/other.html".into()
+                },
+            ]
+        );
+        // Unknown relations are dropped, not fatal.
+        assert!(
+            by_id["css/c.html"]
+                .references
+                .iter()
+                .all(|r| r.href != "bogus.html")
+        );
+        // No reference list present: empty, not an error.
+        assert!(by_id["css/d.html"].references.is_empty());
+        assert!(by_id["dom/a.html"].references.is_empty());
+    }
+
+    #[test]
     fn from_json_rejects_garbage() {
         assert!(Manifest::from_json("not json").is_err());
         assert!(Manifest::from_json(r#"{"version": 9}"#).is_err());
@@ -453,6 +545,23 @@ mod tests {
             ]
         );
         assert!(m.items().iter().all(|t| t.path.is_some()));
+        // Walk also parses reftest references at manifest time.
+        let b = m.items().iter().find(|t| t.id == "css/b.html").unwrap();
+        assert_eq!(
+            b.references,
+            vec![Reference {
+                rel: RefRel::Match,
+                href: "ref.html".into()
+            }]
+        );
+        let c = m.items().iter().find(|t| t.id == "css/c.html").unwrap();
+        assert_eq!(
+            c.references,
+            vec![Reference {
+                rel: RefRel::Mismatch,
+                href: "not-ref.html".into()
+            }]
+        );
     }
 
     #[test]
