@@ -962,9 +962,21 @@ impl ChunkedDecoder {
         self.state == DecoderState::Done
     }
 
-    /// Feed input bytes; returns the events they complete. After
-    /// [`is_done`](Self::is_done) further input is ignored.
-    pub fn feed<'a>(&mut self, mut input: &'a [u8]) -> Result<Vec<ChunkEvent<'a>>, HttpError> {
+    /// Feed input bytes; returns the events they complete plus the number
+    /// of input bytes consumed.
+    ///
+    /// After [`is_done`](Self::is_done) further input is ignored, reported
+    /// as zero consumed bytes.
+    ///
+    /// Pipelined messages: when [`ChunkEvent::End`] is emitted, any bytes
+    /// after the terminator belong to the next message on the connection.
+    /// They are deliberately not consumed: `&input[consumed..]` is the
+    /// start of the next message, and the caller must retain it.
+    pub fn feed<'a>(
+        &mut self,
+        mut input: &'a [u8],
+    ) -> Result<(Vec<ChunkEvent<'a>>, usize), HttpError> {
+        let total = input.len();
         let mut events = Vec::new();
         while !input.is_empty() {
             match self.state {
@@ -1024,7 +1036,7 @@ impl ChunkedDecoder {
                 }
             }
         }
-        Ok(events)
+        Ok((events, total - input.len()))
     }
 
     fn handle_line(
@@ -1903,12 +1915,15 @@ mod tests {
 
     // -- streaming decoder -----------------------------------------------------
 
-    fn collect_stream(feeds: &[&[u8]]) -> (Vec<u8>, Vec<TrailerField>, bool) {
+    fn collect_stream(feeds: &[&[u8]]) -> (Vec<u8>, Vec<TrailerField>, bool, usize) {
         let mut dec = ChunkedDecoder::new(Limits::default());
         let mut data = Vec::new();
         let mut trailers = Vec::new();
+        let mut consumed = 0usize;
         for feed in feeds {
-            for ev in dec.feed(feed).unwrap() {
+            let (events, n) = dec.feed(feed).unwrap();
+            consumed += n;
+            for ev in events {
                 match ev {
                     ChunkEvent::Data(d) => data.extend_from_slice(d),
                     ChunkEvent::Trailer(t) => trailers.push(t),
@@ -1916,19 +1931,20 @@ mod tests {
                 }
             }
         }
-        (data, trailers, dec.is_done())
+        (data, trailers, dec.is_done(), consumed)
     }
 
     #[test]
     fn streaming_byte_by_byte() {
         let input = b"5\r\nhello\r\n6\r\n world\r\n0\r\nX-T: 1\r\n\r\n";
         let feeds: Vec<&[u8]> = input.chunks(1).map(|c| c as &[u8]).collect();
-        let (data, trailers, done) = collect_stream(&feeds);
+        let (data, trailers, done, consumed) = collect_stream(&feeds);
         assert_eq!(data, b"hello world");
         assert_eq!(trailers.len(), 1);
         assert_eq!(trailers[0].name, "X-T");
         assert_eq!(trailers[0].value, b"1");
         assert!(done);
+        assert_eq!(consumed, input.len());
     }
 
     #[test]
@@ -1937,22 +1953,60 @@ mod tests {
         let feeds: &[&[u8]] = &[
             b"5", b"\r", b"\nhel", b"lo\r", b"\n0\r", b"\n", b"\r", b"\n",
         ];
-        let (data, trailers, done) = collect_stream(feeds);
+        let (data, trailers, done, consumed) = collect_stream(feeds);
         assert_eq!(data, b"hello");
         assert!(trailers.is_empty());
         assert!(done);
+        assert_eq!(consumed, feeds.iter().map(|f| f.len()).sum::<usize>());
     }
 
     #[test]
     fn streaming_one_shot_matches_incremental() {
         let input = b"3\r\nfoo\r\n0\r\n\r\n";
         let mut dec = ChunkedDecoder::new(Limits::default());
-        let events = dec.feed(input).unwrap();
+        let (events, consumed) = dec.feed(input).unwrap();
         assert!(matches!(events[0], ChunkEvent::Data(b"foo")));
         assert!(matches!(events[1], ChunkEvent::End));
+        assert_eq!(consumed, input.len());
         assert!(dec.is_done());
-        // Input after End is ignored.
-        assert!(dec.feed(b"junk").unwrap().is_empty());
+        // Input after End is ignored: no events, nothing consumed.
+        let (events, consumed) = dec.feed(b"junk").unwrap();
+        assert!(events.is_empty());
+        assert_eq!(consumed, 0);
+    }
+
+    #[test]
+    fn streaming_consumed_stops_at_pipelined_next_message() {
+        // The terminator is 5 bytes; the pipelined next request must be
+        // recoverable via &input[consumed..], not swallowed.
+        let input = b"0\r\n\r\nGET /next HTTP/1.1\r\n";
+        let mut dec = ChunkedDecoder::new(Limits::default());
+        let (events, consumed) = dec.feed(input).unwrap();
+        assert!(matches!(events.as_slice(), [ChunkEvent::End]));
+        assert_eq!(consumed, 5);
+        assert_eq!(&input[consumed..], b"GET /next HTTP/1.1\r\n");
+        assert!(dec.is_done());
+    }
+
+    #[test]
+    fn streaming_consumed_sums_across_byte_at_a_time_feeds() {
+        let input = b"3\r\nfoo\r\n0\r\n\r\n";
+        let mut dec = ChunkedDecoder::new(Limits::default());
+        let mut total = 0usize;
+        let mut data = Vec::new();
+        for byte in input.chunks(1) {
+            let (events, consumed) = dec.feed(byte).unwrap();
+            assert_eq!(consumed, byte.len());
+            total += consumed;
+            for ev in events {
+                if let ChunkEvent::Data(d) = ev {
+                    data.extend_from_slice(d);
+                }
+            }
+        }
+        assert_eq!(data, b"foo");
+        assert_eq!(total, input.len());
+        assert!(dec.is_done());
     }
 
     #[test]
@@ -1964,6 +2018,7 @@ mod tests {
         assert!(
             dec.feed(b"5\r\nhello")
                 .unwrap()
+                .0
                 .iter()
                 .any(|e| matches!(e, ChunkEvent::Data(_)))
         );
