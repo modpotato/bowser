@@ -937,8 +937,9 @@ enum DecoderState {
 
 /// Incremental chunked-body decoder.
 ///
-/// Feed it arbitrary slices; it emits [`ChunkEvent::Data`] slices that
-/// borrow the fed input, so the data path never copies. Only trailer
+/// Feed it arbitrary slices, passing a reusable events buffer; it pushes
+/// [`ChunkEvent::Data`] slices that borrow the fed input, so the data path
+/// never copies or allocates a fresh event list. Only trailer
 /// fields are copied into owned values.
 pub struct ChunkedDecoder {
     state: DecoderState,
@@ -962,10 +963,16 @@ impl ChunkedDecoder {
         self.state == DecoderState::Done
     }
 
-    /// Feed input bytes; returns the events they complete. After
+    /// Feed input bytes, pushing the completed events into the caller-provided
+    /// `events` buffer. Reusing the buffer across calls avoids allocating a
+    /// `Vec` per call. Returns the number of input bytes consumed. After
     /// [`is_done`](Self::is_done) further input is ignored.
-    pub fn feed<'a>(&mut self, mut input: &'a [u8]) -> Result<Vec<ChunkEvent<'a>>, HttpError> {
-        let mut events = Vec::new();
+    pub fn feed<'a>(
+        &mut self,
+        mut input: &'a [u8],
+        events: &mut Vec<ChunkEvent<'a>>,
+    ) -> Result<usize, HttpError> {
+        let start_len = input.len();
         while !input.is_empty() {
             match self.state {
                 DecoderState::Done => break,
@@ -1006,7 +1013,7 @@ impl ChunkedDecoder {
                             self.line.extend_from_slice(&input[..lf]);
                             input = &input[lf + 1..];
                             let is_trailer = self.state == DecoderState::TrailerLine;
-                            self.handle_line(&mut events, is_trailer)?;
+                            self.handle_line(events, is_trailer)?;
                         }
                         None => {
                             for (i, &b) in input.iter().enumerate() {
@@ -1024,7 +1031,7 @@ impl ChunkedDecoder {
                 }
             }
         }
-        Ok(events)
+        Ok(start_len - input.len())
     }
 
     fn handle_line(
@@ -1907,8 +1914,11 @@ mod tests {
         let mut dec = ChunkedDecoder::new(Limits::default());
         let mut data = Vec::new();
         let mut trailers = Vec::new();
+        let mut events = Vec::new();
         for feed in feeds {
-            for ev in dec.feed(feed).unwrap() {
+            events.clear();
+            dec.feed(feed, &mut events).unwrap();
+            for ev in events.drain(..) {
                 match ev {
                     ChunkEvent::Data(d) => data.extend_from_slice(d),
                     ChunkEvent::Trailer(t) => trailers.push(t),
@@ -1947,31 +1957,39 @@ mod tests {
     fn streaming_one_shot_matches_incremental() {
         let input = b"3\r\nfoo\r\n0\r\n\r\n";
         let mut dec = ChunkedDecoder::new(Limits::default());
-        let events = dec.feed(input).unwrap();
+        let mut events = Vec::new();
+        let consumed = dec.feed(input, &mut events).unwrap();
+        assert_eq!(consumed, input.len());
         assert!(matches!(events[0], ChunkEvent::Data(b"foo")));
         assert!(matches!(events[1], ChunkEvent::End));
         assert!(dec.is_done());
         // Input after End is ignored.
-        assert!(dec.feed(b"junk").unwrap().is_empty());
+        events.clear();
+        assert_eq!(dec.feed(b"junk", &mut events).unwrap(), 0);
+        assert!(events.is_empty());
     }
 
     #[test]
     fn streaming_errors() {
         let mut dec = ChunkedDecoder::new(Limits::default());
-        assert_eq!(dec.feed(b"zz\r\n"), Err(HttpError::InvalidChunkSize));
+        let mut events = Vec::new();
+        assert_eq!(
+            dec.feed(b"zz\r\n", &mut events),
+            Err(HttpError::InvalidChunkSize)
+        );
 
         let mut dec = ChunkedDecoder::new(Limits::default());
-        assert!(
-            dec.feed(b"5\r\nhello")
-                .unwrap()
-                .iter()
-                .any(|e| matches!(e, ChunkEvent::Data(_)))
+        events.clear();
+        dec.feed(b"5\r\nhello", &mut events).unwrap();
+        assert!(events.iter().any(|e| matches!(e, ChunkEvent::Data(_))));
+        assert_eq!(
+            dec.feed(b"XX", &mut events),
+            Err(HttpError::InvalidChunkTerminator)
         );
-        assert_eq!(dec.feed(b"XX"), Err(HttpError::InvalidChunkTerminator));
 
         let mut dec = ChunkedDecoder::new(Limits::default());
         assert_eq!(
-            dec.feed(b"0\r\nContent-Length: 1\r\n\r\n"),
+            dec.feed(b"0\r\nContent-Length: 1\r\n\r\n", &mut events),
             Err(HttpError::ForbiddenTrailer)
         );
     }
@@ -1983,7 +2001,11 @@ mod tests {
             ..Default::default()
         };
         let mut dec = ChunkedDecoder::new(tiny);
-        assert_eq!(dec.feed(b"12345\r\n"), Err(HttpError::LineTooLong));
+        let mut events = Vec::new();
+        assert_eq!(
+            dec.feed(b"12345\r\n", &mut events),
+            Err(HttpError::LineTooLong)
+        );
     }
 
     // -- serialization --------------------------------------------------------
