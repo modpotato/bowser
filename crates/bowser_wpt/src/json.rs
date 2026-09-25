@@ -8,6 +8,14 @@
 
 use std::fmt;
 
+/// Maximum nesting depth for arrays and objects. Mirrors serde_json's
+/// recursion limit (128). Without it, deeply nested but valid JSON
+/// (e.g. tens of thousands of nested `[`) overflows the call stack,
+/// which aborts the process (SIGABRT) and cannot be caught or recovered
+/// from. `Manifest::from_json` feeds untrusted MANIFEST.json through this
+/// parser, so the bound is load-bearing.
+const MAX_DEPTH: usize = 128;
+
 /// A parsed JSON value.
 #[derive(Debug, Clone, PartialEq)]
 pub(crate) enum Json {
@@ -75,6 +83,7 @@ pub(crate) fn parse(text: &str) -> Result<Json, ParseError> {
     let mut p = Parser {
         bytes: text.as_bytes(),
         pos: 0,
+        depth: 0,
     };
     let v = p.parse_value()?;
     p.skip_ws();
@@ -87,6 +96,8 @@ pub(crate) fn parse(text: &str) -> Result<Json, ParseError> {
 struct Parser<'a> {
     bytes: &'a [u8],
     pos: usize,
+    /// Current array/object nesting depth. Bounded by [`MAX_DEPTH`].
+    depth: usize,
 }
 
 impl<'a> Parser<'a> {
@@ -115,11 +126,22 @@ impl<'a> Parser<'a> {
             Some(b't') => self.parse_lit("true", Json::Bool(true)),
             Some(b'f') => self.parse_lit("false", Json::Bool(false)),
             Some(b'"') => Ok(Json::Str(self.parse_string()?)),
-            Some(b'[') => self.parse_array(),
-            Some(b'{') => self.parse_object(),
+            Some(b'[') => self.nested(Self::parse_array),
+            Some(b'{') => self.nested(Self::parse_object),
             Some(c) if c == b'-' || c.is_ascii_digit() => self.parse_number(),
             _ => Err(self.err("expected a JSON value")),
         }
+    }
+
+    /// Parse one nested array/object level, enforcing [`MAX_DEPTH`].
+    fn nested(&mut self, f: fn(&mut Self) -> Result<Json, ParseError>) -> Result<Json, ParseError> {
+        if self.depth >= MAX_DEPTH {
+            return Err(self.err("maximum nesting depth exceeded"));
+        }
+        self.depth += 1;
+        let v = f(self);
+        self.depth -= 1;
+        v
     }
 
     fn parse_lit(&mut self, lit: &str, val: Json) -> Result<Json, ParseError> {
@@ -363,5 +385,28 @@ mod tests {
         assert!(parse("1 2").is_err());
         assert!(parse("\"\\x\"").is_err());
         assert!(parse("\"bad\ttab\"").is_err());
+    }
+
+    #[test]
+    fn nesting_within_limit_parses() {
+        // Well under MAX_DEPTH (128): parses fine.
+        let shallow = "[".repeat(100) + &"]".repeat(100);
+        assert!(parse(&shallow).is_ok());
+        let shallow_obj = r#"{"a":"#.repeat(60) + "1" + &"}".repeat(60);
+        assert!(parse(&shallow_obj).is_ok());
+    }
+
+    #[test]
+    fn nesting_beyond_limit_is_a_clean_error() {
+        // 10_000 nested arrays: must return Err, never abort the process.
+        let deep = "[".repeat(10_000) + &"]".repeat(10_000);
+        let err = parse(&deep).expect_err("excessively nested JSON must fail");
+        assert!(
+            err.to_string().contains("maximum nesting depth exceeded"),
+            "unexpected error: {err}"
+        );
+        // Mixed object/array nesting is bounded too.
+        let deep_obj = r#"{"a":"#.repeat(10_000) + "1" + &"}".repeat(10_000);
+        assert!(parse(&deep_obj).is_err());
     }
 }
