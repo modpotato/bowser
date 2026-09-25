@@ -11,13 +11,17 @@
 //!
 //! [`parse_wptreport`] additionally reads the `wpt run --log-wptreport`
 //! format (`{"results": [{"test": ..., "status": ..., "subtests": [...]}]}`)
-//! so runs recorded by other harnesses can be imported.
+//! so runs recorded by other harnesses can be imported. Note that wpt's
+//! top-level `status` vocabulary depends on the test type: testharness
+//! tests report `OK`/`ERROR`/`TIMEOUT`/`PRECONDITION_FAILED`, while reftest
+//! and crashtest tests report `PASS`/`FAIL` directly (they have no
+//! subtests).
 
 use std::fmt;
 
 use crate::json::{self, Json};
 
-/// How the harness itself finished a testharness test.
+/// How the harness itself finished a test.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum HarnessStatus {
     /// The harness ran to completion (`done()` was called).
@@ -28,6 +32,10 @@ pub enum HarnessStatus {
     Error,
     /// The browser process died.
     Crash,
+    /// Reftest/crashtest outcome from `wptreport`: the test passed.
+    Pass,
+    /// Reftest/crashtest outcome from `wptreport`: the test failed.
+    Fail,
     /// Forward-compatible: a status string we do not know yet.
     Unknown(String),
 }
@@ -39,6 +47,8 @@ impl HarnessStatus {
             "TIMEOUT" => HarnessStatus::Timeout,
             "ERROR" => HarnessStatus::Error,
             "CRASH" => HarnessStatus::Crash,
+            "PASS" => HarnessStatus::Pass,
+            "FAIL" => HarnessStatus::Fail,
             other => HarnessStatus::Unknown(other.to_owned()),
         }
     }
@@ -49,6 +59,8 @@ impl HarnessStatus {
             HarnessStatus::Timeout => "TIMEOUT",
             HarnessStatus::Error => "ERROR",
             HarnessStatus::Crash => "CRASH",
+            HarnessStatus::Pass => "PASS",
+            HarnessStatus::Fail => "FAIL",
             HarnessStatus::Unknown(s) => s,
         }
     }
@@ -94,7 +106,7 @@ pub struct SubtestResult {
     pub message: Option<String>,
 }
 
-/// The full result of running one testharness test.
+/// The full result of running one test (testharness, reftest, or crashtest).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct HarnessResult {
     /// Test id, as in the manifest.
@@ -111,14 +123,28 @@ impl HarnessResult {
         parse_report(&doc)
     }
 
-    /// True when the harness finished and every subtest passed.
+    /// True when the harness ran cleanly and nothing failed.
+    ///
+    /// A testharness run is green when the harness itself finished (`OK`)
+    /// and every subtest passed. Reftest and crashtest entries from
+    /// `wptreport` carry the outcome in the top-level status (`PASS`/`FAIL`)
+    /// and usually have no subtests; those are green when the status is
+    /// `PASS` and all of their (possibly zero) subtests passed.
     pub fn is_green(&self) -> bool {
-        self.status == HarnessStatus::Ok
-            && !self.subtests.is_empty()
-            && self
+        match self.status {
+            HarnessStatus::Ok => {
+                !self.subtests.is_empty()
+                    && self
+                        .subtests
+                        .iter()
+                        .all(|t| t.status == SubtestStatus::Pass)
+            }
+            HarnessStatus::Pass => self
                 .subtests
                 .iter()
-                .all(|t| t.status == SubtestStatus::Pass)
+                .all(|t| t.status == SubtestStatus::Pass),
+            _ => false,
+        }
     }
 
     pub fn passed(&self) -> usize {
@@ -323,6 +349,60 @@ mod tests {
         assert_eq!(results[0].status, HarnessStatus::Ok);
         assert!(results[0].is_green());
         assert_eq!(results[1].status, HarnessStatus::Timeout);
+    }
+
+    #[test]
+    fn wptreport_maps_reftest_and_crashtest_statuses() {
+        // Realistic mixed `--log-wptreport` output: testharness entries use
+        // OK/ERROR at the top level with PASS/FAIL subtests, while reftest
+        // and crashtest entries report PASS/FAIL at the top level with no
+        // subtests.
+        let doc = r#"{
+            "run_info": {"os": "linux", "product": "bowser"},
+            "results": [
+                {"test": "/dom/a.html", "status": "OK", "message": null,
+                 "expected": "OK", "known_intermittent": [],
+                 "subtests": [{"name": "smoke", "status": "PASS",
+                               "message": null, "expected": "PASS",
+                               "known_intermittent": []}]},
+                {"test": "/css/css-transforms/2d-rotate-001.html", "status": "PASS",
+                 "message": null, "expected": "PASS", "known_intermittent": [],
+                 "subtests": []},
+                {"test": "/css/css-transforms/2d-rotate-002.html", "status": "FAIL",
+                 "message": "REFTEST IMAGE 1 (TEST): image comparison failed",
+                 "expected": "PASS", "known_intermittent": [],
+                 "subtests": []},
+                {"test": "/crash/crash-001.html", "status": "PASS",
+                 "message": null, "expected": "PASS", "known_intermittent": [],
+                 "subtests": []},
+                {"test": "/dom/b.html", "status": "ERROR",
+                 "message": "uncaught exception", "expected": "OK",
+                 "known_intermittent": [], "subtests": []}
+            ]
+        }"#;
+        let (results, skipped) = parse_wptreport(doc).unwrap();
+        assert_eq!(skipped, 0);
+        assert_eq!(results.len(), 5);
+
+        assert_eq!(results[0].status, HarnessStatus::Ok);
+        assert!(results[0].is_green());
+
+        assert_eq!(results[1].status, HarnessStatus::Pass);
+        assert!(results[1].is_green());
+        assert_eq!(results[1].passed(), 0);
+        assert_eq!(results[1].failed(), 0);
+
+        assert_eq!(results[2].status, HarnessStatus::Fail);
+        assert!(!results[2].is_green());
+
+        assert_eq!(results[3].status, HarnessStatus::Pass);
+        assert!(results[3].is_green());
+
+        assert_eq!(results[4].status, HarnessStatus::Error);
+        assert!(!results[4].is_green());
+
+        assert_eq!(HarnessStatus::Pass.as_str(), "PASS");
+        assert_eq!(HarnessStatus::Fail.as_str(), "FAIL");
     }
 
     #[test]
