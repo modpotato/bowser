@@ -13,13 +13,17 @@
 //! (they are small and rare).
 //!
 //! Strictness notes (deliberate, RFC 9112 §5):
-//! * Header lines must end with CRLF; a lone LF is tolerated, a bare CR
-//!   is rejected.
+//! * Line endings: CRLF is the wire format; a lone LF is tolerated
+//!   everywhere a line ending is expected (start-line, header lines,
+//!   chunk-size lines, chunk-data terminators, trailers). A bare CR
+//!   (a CR not followed by LF) is always rejected.
 //! * `obs-fold` (a header line starting with SP/HTAB) is rejected, not
 //!   unfolded.
 //! * Whitespace between a field name and the colon is rejected.
-//! * `Transfer-Encoding: chunked` must be the final coding; anything else
-//!   is an error.
+//! * `Transfer-Encoding: chunked` must be the final coding for framing to
+//!   apply. On requests, anything else is an error; on responses, any
+//!   `Transfer-Encoding` without `chunked` final means the body runs until
+//!   the connection closes (RFC 9112 §6.3 rules 2, 4).
 
 use std::error::Error;
 use std::fmt;
@@ -38,6 +42,14 @@ pub struct Limits {
     pub max_head_bytes: usize,
     /// Maximum bytes of a single line (start-line, header, chunk-size...).
     pub max_line_bytes: usize,
+    /// Maximum bytes of a message body: either the `Content-Length` value,
+    /// or the total decoded payload of a chunked body.
+    ///
+    /// The default is 256 MiB. A larger `Content-Length` is rejected before
+    /// any downstream reader can size an allocation by it; a chunked body
+    /// is rejected once its cumulative payload exceeds the cap. The fetch
+    /// layer may tighten this per request or response.
+    pub max_body_bytes: usize,
 }
 
 impl Default for Limits {
@@ -46,6 +58,7 @@ impl Default for Limits {
             max_headers: 100,
             max_head_bytes: 32 * 1024,
             max_line_bytes: 8 * 1024,
+            max_body_bytes: 256 * 1024 * 1024,
         }
     }
 }
@@ -89,6 +102,9 @@ pub enum HttpError {
     BareCr,
     /// A `Content-Length` value is not a valid non-negative integer.
     InvalidContentLength,
+    /// A `Content-Length` value exceeds [`Limits::max_body_bytes`], or a
+    /// chunked body's cumulative payload exceeded it.
+    BodyTooLarge,
     /// Multiple `Content-Length` values disagree with each other.
     ConflictingContentLength,
     /// A `Transfer-Encoding` list is syntactically invalid.
@@ -97,8 +113,15 @@ pub enum HttpError {
     UnsupportedTransferEncoding,
     /// `chunked` appears but is not the final transfer coding.
     ChunkedNotFinal,
+    /// A `Transfer-Encoding` field was present on an HTTP/1.0 (or earlier)
+    /// message; the framing must be treated as faulty (RFC 9112 §6.1).
+    TransferEncodingOnHttp10,
     /// A chunk-size line has no valid hexadecimal size.
     InvalidChunkSize,
+    /// A chunk-size exceeds [`MAX_CHUNK_SIZE`]. Chunk sizes parse into a
+    /// u64, so without a cap a hostile size line could overflow the
+    /// `usize` arithmetic used while slicing chunk data.
+    ChunkTooLarge,
     /// A chunk extension is malformed.
     InvalidChunkExtension,
     /// Chunk data is not followed by CRLF.
@@ -127,13 +150,18 @@ impl fmt::Display for HttpError {
             Self::ObsFoldRejected => "obsolete line folding (obs-fold) is not accepted",
             Self::BareCr => "bare CR in HTTP message",
             Self::InvalidContentLength => "invalid Content-Length value",
+            Self::BodyTooLarge => "HTTP message body exceeds size limit",
             Self::ConflictingContentLength => "conflicting Content-Length values",
             Self::InvalidTransferEncoding => "invalid Transfer-Encoding value",
             Self::UnsupportedTransferEncoding => "unsupported transfer coding",
             Self::ChunkedNotFinal => "chunked is not the final transfer coding",
+            Self::TransferEncodingOnHttp10 => {
+                "Transfer-Encoding is not allowed in HTTP/1.0 messages"
+            }
             Self::InvalidChunkSize => "invalid chunk-size",
+            Self::ChunkTooLarge => "chunk size exceeds limit",
             Self::InvalidChunkExtension => "invalid chunk extension",
-            Self::InvalidChunkTerminator => "chunk data not followed by CRLF",
+            Self::InvalidChunkTerminator => "chunk data not followed by CRLF or LF",
             Self::ForbiddenTrailer => "forbidden field in chunked trailer",
         };
         f.write_str(msg)
@@ -221,7 +249,9 @@ fn trim_ows(bytes: &[u8]) -> &[u8] {
         .iter()
         .rposition(|&b| b != b' ' && b != b'\t')
         .map_or(0, |i| i + 1);
-    &bytes[start..end]
+    // On all-whitespace input `start == len` and `end == 0`; clamp so the
+    // slice is empty instead of `start > end` (which would panic).
+    &bytes[start..end.max(start)]
 }
 
 /// A field-value may hold HTAB, VCHAR, and obs-text — nothing else.
@@ -243,6 +273,12 @@ fn validate_field_name(name: &[u8]) -> Result<(), HttpError> {
 }
 
 /// Request-target: visible ASCII or obs-text, never whitespace or CTLs.
+///
+/// Leniency (deliberate): raw non-ASCII bytes (≥ 0x80) are accepted even
+/// though RFC 3986 forbids them in a request-target — clients in the wild
+/// send raw UTF-8 without percent-encoding it. Callers using this parser
+/// on the server side should pre-validate the target if strict RFC 3986
+/// conformance matters to them.
 fn valid_target(target: &[u8]) -> bool {
     !target.is_empty()
         && target
@@ -341,10 +377,17 @@ impl<'a> Headers<'a> {
     }
 
     /// All field-values for `name` (case-insensitive), in order.
-    pub fn get_all<'s>(&'s self, name: &'s str) -> impl Iterator<Item = &'a [u8]> + 's {
+    ///
+    /// The returned iterator borrows only from `self`; the `name` borrow
+    /// ends when this function returns, so the iterator may be held past
+    /// `name`'s lifetime.
+    pub fn get_all<'s, 'n>(&'s self, name: &'n str) -> impl Iterator<Item = &'a [u8]> + 's {
+        // Own a normalized copy of `name` so the iterator does not capture
+        // the `&'n str` borrow; items borrow from `self` alone.
+        let name_lower = name.to_ascii_lowercase();
         self.headers
             .iter()
-            .filter(move |h| h.name.eq_ignore_ascii_case(name))
+            .filter(move |h| h.name.eq_ignore_ascii_case(&name_lower))
             .map(|h| h.value)
     }
 
@@ -479,6 +522,9 @@ fn parse_status_line(line: &[u8]) -> Result<(HttpVersion, u16, &str), HttpError>
 /// Parse a request head. Returns the head and the number of bytes consumed
 /// (the body, if any, starts there). [`HttpError::Incomplete`] means: feed
 /// more bytes and retry.
+///
+/// The request-target accepts raw non-ASCII bytes; see [`valid_target`]
+/// for the deliberate leniency rationale.
 pub fn parse_request_head<'a>(
     input: &'a [u8],
     limits: &Limits,
@@ -538,6 +584,11 @@ pub enum BodySpec {
     Chunked,
     /// The body runs until the connection closes.
     UntilClose,
+    /// The connection becomes an opaque tunnel after the head
+    /// (2xx response to CONNECT, RFC 9112 §6.3 rule 2).
+    /// Framing headers are ignored; the bytes after the head are
+    /// not an HTTP/1.x body.
+    Tunnel,
 }
 
 fn parse_decimal(digits: &[u8]) -> Option<u64> {
@@ -551,7 +602,11 @@ fn parse_decimal(digits: &[u8]) -> Option<u64> {
 /// The effective `Content-Length`: every value, across every field, must be
 /// a valid decimal integer and they must all agree (RFC 9110 §8.6).
 /// Returns `None` when no `Content-Length` is present.
-pub fn content_length(headers: &Headers) -> Result<Option<u64>, HttpError> {
+///
+/// A value larger than [`Limits::max_body_bytes`] is rejected with
+/// [`HttpError::BodyTooLarge`] before any downstream reader can size an
+/// allocation by it.
+pub fn content_length(headers: &Headers, limits: &Limits) -> Result<Option<u64>, HttpError> {
     let mut result: Option<u64> = None;
     for value in headers.get_all("content-length") {
         for part in value.split(|&b| b == b',') {
@@ -560,6 +615,9 @@ pub fn content_length(headers: &Headers) -> Result<Option<u64>, HttpError> {
                 return Err(HttpError::InvalidContentLength);
             }
             let n = parse_decimal(part).ok_or(HttpError::InvalidContentLength)?;
+            if n > limits.max_body_bytes as u64 {
+                return Err(HttpError::BodyTooLarge);
+            }
             match result {
                 Some(prev) if prev != n => {
                     return Err(HttpError::ConflictingContentLength);
@@ -576,13 +634,45 @@ enum TransferOutcome {
     /// No transfer coding applies (absent, or only `identity`).
     None,
     Chunked,
+    /// `Transfer-Encoding` is present but `chunked` is not the final coding
+    /// (possibly absent entirely). On responses this means the body runs
+    /// until the connection closes (RFC 9112 §6.3 rule 4).
+    UntilClose,
 }
 
-/// The effective transfer coding. `chunked` must appear exactly once and be
-/// the final coding; any other non-`identity` coding is unsupported.
+/// Which side sent the message; RFC 9112 §6.3 frames Transfer-Encoding
+/// differently for requests (rule 2) and responses (rule 4).
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum MessageDirection {
+    Request,
+    Response,
+}
+
+/// The effective transfer coding. `chunked` must appear exactly once and,
+/// when present, be the final coding; it is the only framing this layer
+/// applies (any other content coding is a decoding concern above it).
+/// When `chunked` is not the final coding (possibly absent entirely),
+/// requests are rejected (RFC 9112 §6.3 rule 2) while responses read until
+/// the connection closes (rule 4).
 /// When `Transfer-Encoding` is present it overrides `Content-Length`
 /// (RFC 9112 §6.3); callers implement that by checking this first.
-fn transfer_encoding(headers: &Headers) -> Result<TransferOutcome, HttpError> {
+///
+/// Leniency (deliberate): transfer parameters after a `;` (e.g. the
+/// `q=0.8` in `gzip; q=0.8`) are accepted and ignored — only the coding
+/// token itself is validated. Real-world senders attach malformed or
+/// unknown parameters often enough that rejecting them breaks real
+/// traffic while buying little security.
+///
+/// A `Transfer-Encoding` field on an HTTP/1.0 (or earlier) message is faulty
+/// framing (RFC 9112 §6.1).
+fn transfer_encoding(
+    version: HttpVersion,
+    headers: &Headers,
+    direction: MessageDirection,
+) -> Result<TransferOutcome, HttpError> {
+    if version == HttpVersion::HTTP_10 && headers.get_all("transfer-encoding").next().is_some() {
+        return Err(HttpError::TransferEncodingOnHttp10);
+    }
     let mut codings: Vec<&[u8]> = Vec::new();
     for value in headers.get_all("transfer-encoding") {
         for part in value.split(|&b| b == b',') {
@@ -601,24 +691,31 @@ fn transfer_encoding(headers: &Headers) -> Result<TransferOutcome, HttpError> {
     if meaningful.is_empty() {
         return Ok(TransferOutcome::None);
     }
-    // Framing validity first: chunked must be the final coding.
+    // Framing validity: chunked must be the final coding (RFC 9112 §6.3).
     let chunked_count = meaningful
         .iter()
         .filter(|c| c.eq_ignore_ascii_case(b"chunked"))
         .count();
-    if chunked_count > 0
-        && !meaningful
-            .last()
-            .is_some_and(|c| c.eq_ignore_ascii_case(b"chunked"))
-    {
-        return Err(HttpError::ChunkedNotFinal);
-    }
-    if chunked_count == 0
-        || meaningful
-            .iter()
-            .any(|c| !c.eq_ignore_ascii_case(b"chunked"))
-    {
-        return Err(HttpError::UnsupportedTransferEncoding);
+    let chunked_is_final = meaningful
+        .last()
+        .is_some_and(|c| c.eq_ignore_ascii_case(b"chunked"));
+    if !chunked_is_final {
+        // Chunked is not the final coding, or is absent entirely. Requests
+        // cannot be reliably framed: `TE: chunked, <other>` is
+        // ChunkedNotFinal, and any other unsupported coding is
+        // UnsupportedTransferEncoding (rule 2). Responses are read until
+        // the connection closes whenever Transfer-Encoding is present
+        // without chunked as the final coding (rule 4).
+        return match direction {
+            MessageDirection::Request => {
+                if chunked_count > 0 {
+                    Err(HttpError::ChunkedNotFinal)
+                } else {
+                    Err(HttpError::UnsupportedTransferEncoding)
+                }
+            }
+            MessageDirection::Response => Ok(TransferOutcome::UntilClose),
+        };
     }
     if chunked_count > 1 {
         return Err(HttpError::InvalidTransferEncoding);
@@ -628,10 +725,12 @@ fn transfer_encoding(headers: &Headers) -> Result<TransferOutcome, HttpError> {
 
 /// How a request's body is framed. With neither `Transfer-Encoding` nor
 /// `Content-Length` the body length is zero (RFC 9112 §6.3).
-pub fn request_body_spec(head: &RequestHead) -> Result<BodySpec, HttpError> {
-    match transfer_encoding(&head.headers)? {
+/// A `Content-Length` above [`Limits::max_body_bytes`] is rejected.
+pub fn request_body_spec(head: &RequestHead, limits: &Limits) -> Result<BodySpec, HttpError> {
+    match transfer_encoding(head.version, &head.headers, MessageDirection::Request)? {
         TransferOutcome::Chunked => Ok(BodySpec::Chunked),
-        TransferOutcome::None => Ok(match content_length(&head.headers)? {
+        TransferOutcome::UntilClose => Ok(BodySpec::UntilClose),
+        TransferOutcome::None => Ok(match content_length(&head.headers, limits)? {
             Some(n) => BodySpec::ContentLength(n),
             None => BodySpec::Empty,
         }),
@@ -642,20 +741,30 @@ pub fn request_body_spec(head: &RequestHead) -> Result<BodySpec, HttpError> {
 ///
 /// `request_method` is the method of the request this responds to: responses
 /// to `HEAD`, and responses with status 1xx/204/304, never carry a body.
+/// A 2xx response to `CONNECT` turns the connection into a tunnel: the client
+/// must ignore `Content-Length`/`Transfer-Encoding` (`BodySpec::Tunnel`).
+/// A `Content-Length` above [`Limits::max_body_bytes`] is rejected.
 pub fn response_body_spec(
     head: &ResponseHead,
     request_method: &[u8],
+    limits: &Limits,
 ) -> Result<BodySpec, HttpError> {
-    if request_method == b"HEAD" {
+    // 1xx / 204 / 304 responses, and responses to HEAD, never carry a body,
+    // but their framing headers must still be well-formed: garbage
+    // Transfer-Encoding / Content-Length is rejected rather than silently
+    // swallowed.
+    if request_method == b"HEAD" || matches!(head.status, 100..=199 | 204 | 304) {
+        transfer_encoding(head.version, &head.headers, MessageDirection::Response)?;
+        content_length(&head.headers, limits)?;
         return Ok(BodySpec::Empty);
     }
-    match head.status {
-        100..=199 | 204 | 304 => return Ok(BodySpec::Empty),
-        _ => {}
+    if request_method == b"CONNECT" && (200..=299).contains(&head.status) {
+        return Ok(BodySpec::Tunnel);
     }
-    match transfer_encoding(&head.headers)? {
+    match transfer_encoding(head.version, &head.headers, MessageDirection::Response)? {
         TransferOutcome::Chunked => Ok(BodySpec::Chunked),
-        TransferOutcome::None => Ok(match content_length(&head.headers)? {
+        TransferOutcome::UntilClose => Ok(BodySpec::UntilClose),
+        TransferOutcome::None => Ok(match content_length(&head.headers, limits)? {
             Some(n) => BodySpec::ContentLength(n),
             None => BodySpec::UntilClose,
         }),
@@ -667,7 +776,11 @@ pub fn response_body_spec(
 // ---------------------------------------------------------------------------
 
 /// The tokens of every `Connection` header field, in order, OWS-trimmed.
-/// Non-UTF-8 tokens are skipped.
+///
+/// Non-UTF-8 tokens are skipped rather than failing the whole parse: a
+/// garbage byte sequence can never equal an ASCII token such as `close`
+/// or `keep-alive`, so dropping it cannot change the persistence decision —
+/// it only keeps one malformed field from tearing down the connection.
 pub fn connection_tokens<'a>(headers: &'a Headers<'a>) -> impl Iterator<Item = &'a str> + 'a {
     headers
         .iter()
@@ -709,11 +822,59 @@ pub fn is_persistent(version: HttpVersion, headers: &Headers) -> bool {
 
 /// Trailer fields that must never appear in a trailer section
 /// (RFC 9112 §7.1.2).
+///
+/// Trailers arrive after the body, so a sender MUST NOT generate a trailer
+/// section containing fields that are needed *before* the content is fully
+/// received. The RFC forbids fields for message framing, routing, request
+/// modifiers, authentication, response control data, and payload processing;
+/// the list below covers those categories explicitly. Comparison is
+/// case-insensitive (field names are case-insensitive per RFC 9110 §5.1).
+const FORBIDDEN_TRAILERS: &[&str] = &[
+    // Framing: must be known before the body is read.
+    "content-length",
+    "transfer-encoding",
+    "trailer",
+    "te",
+    // Routing.
+    "host",
+    // Request modifiers: controls and conditionals (affect how the
+    // request is dispatched or evaluated, before the body completes).
+    "expect",
+    "max-forwards",
+    "range",
+    "if-match",
+    "if-none-match",
+    "if-modified-since",
+    "if-unmodified-since",
+    "if-range",
+    // Authentication (RFC 9112 §7.1.2 cites RFC 7616 and RFC 8174).
+    "authorization",
+    "proxy-authenticate",
+    "proxy-authorization",
+    "www-authenticate",
+    // Response control data (RFC 9110 §7.1): caching and freshness
+    // metadata that a recipient must see before consuming the content.
+    "age",
+    "cache-control",
+    "expires",
+    "date",
+    "location",
+    "retry-after",
+    "vary",
+    "warning",
+    // Payload processing: how to interpret the content itself.
+    "content-encoding",
+    "content-type",
+    "content-range",
+    "content-language",
+    "content-location",
+    "digest",
+];
+
 fn is_forbidden_trailer(name: &str) -> bool {
-    name.eq_ignore_ascii_case("content-length")
-        || name.eq_ignore_ascii_case("transfer-encoding")
-        || name.eq_ignore_ascii_case("trailer")
-        || name.eq_ignore_ascii_case("te")
+    FORBIDDEN_TRAILERS
+        .iter()
+        .any(|f| name.eq_ignore_ascii_case(f))
 }
 
 /// Encode a body with chunked transfer-coding, optionally with trailers.
@@ -767,6 +928,13 @@ fn push_hex(out: &mut Vec<u8>, mut n: u64) {
     out.extend_from_slice(&buf[i..]);
 }
 
+/// Largest single chunk the chunked decoders accept. Chunk sizes parse into
+/// a u64 (up to 16 hex digits), but chunk payloads are sliced with `usize`
+/// arithmetic in [`decode_chunked`], so an uncapped size like
+/// `FFFFFFFFFFFFFFFF` would overflow. 16 MiB is far above any sane single
+/// chunk and fits comfortably in `usize` on 32- and 64-bit targets.
+pub const MAX_CHUNK_SIZE: u64 = 16 * 1024 * 1024;
+
 /// Parse a chunk-size line: `1*HEXDIG [ chunk-ext ]`.
 /// Returns the size and whether this is the terminating zero-size chunk.
 fn parse_chunk_size(line: &[u8]) -> Result<(u64, bool), HttpError> {
@@ -785,6 +953,9 @@ fn parse_chunk_size(line: &[u8]) -> Result<(u64, bool), HttpError> {
             _ => return Err(HttpError::InvalidChunkSize),
         };
         size = size * 16 + d;
+    }
+    if size > MAX_CHUNK_SIZE {
+        return Err(HttpError::ChunkTooLarge);
     }
     validate_chunk_ext(&line[semi..])?;
     Ok((size, size == 0))
@@ -847,9 +1018,19 @@ fn skip_quoted_string(s: &[u8]) -> Result<&[u8], HttpError> {
 }
 
 /// Parse the trailer section after the zero-size chunk. Rejects forbidden
-/// trailer fields.
-fn parse_trailers<'a>(input: &'a [u8], limits: &Limits) -> Result<(Headers<'a>, usize), HttpError> {
-    let (headers, len) = parse_headers(input, limits, 0)?;
+/// trailer fields. `headers_seen` is the number of header fields already
+/// parsed in the message head; trailers share the remaining
+/// [`Limits::max_headers`] budget with them.
+fn parse_trailers<'a>(
+    input: &'a [u8],
+    limits: &Limits,
+    headers_seen: usize,
+) -> Result<(Headers<'a>, usize), HttpError> {
+    let trailer_limits = Limits {
+        max_headers: limits.max_headers.saturating_sub(headers_seen),
+        ..*limits
+    };
+    let (headers, len) = parse_headers(input, &trailer_limits, 0)?;
     for h in headers.iter() {
         if is_forbidden_trailer(h.name) {
             return Err(HttpError::ForbiddenTrailer);
@@ -868,20 +1049,30 @@ pub struct ChunkedMessage<'a> {
 }
 
 /// Decode a complete chunked body in one shot. Chunk payloads are slices of
-/// `input` — no copying. Returns [`HttpError::Incomplete`] if the buffer
-/// does not yet hold the whole body.
+/// `input` — no copying. `headers_seen` is the number of header fields
+/// already parsed in the message head; trailer fields share the remaining
+/// [`Limits::max_headers`] budget with them (headers + trailers). Returns
+/// [`HttpError::Incomplete`] if the buffer does not yet hold the whole body,
+/// and [`HttpError::BodyTooLarge`] if the cumulative chunk payload exceeds
+/// [`Limits::max_body_bytes`].
+///
+/// Line endings follow the same lenient policy as [`next_line`]: chunk-size
+/// lines and the CRLF after each chunk's data accept a lone LF, and a bare
+/// CR is rejected.
 pub fn decode_chunked<'a>(
     input: &'a [u8],
     limits: &Limits,
+    headers_seen: usize,
 ) -> Result<ChunkedMessage<'a>, HttpError> {
     let mut chunks = Vec::new();
     let mut pos = 0usize;
+    let mut total: u64 = 0;
     loop {
         let line = next_line(&input[pos..], limits.max_line_bytes)?;
         pos += line.consumed;
         let (size, is_last) = parse_chunk_size(line.bytes)?;
         if is_last {
-            let (trailers, tlen) = parse_trailers(&input[pos..], limits)?;
+            let (trailers, tlen) = parse_trailers(&input[pos..], limits, headers_seen)?;
             pos += tlen;
             return Ok(ChunkedMessage {
                 chunks,
@@ -889,16 +1080,34 @@ pub fn decode_chunked<'a>(
                 rest: &input[pos..],
             });
         }
-        let size = size as usize;
-        if input.len() - pos < size + 2 {
+        // Cumulative payload cap: check before borrowing the slice.
+        total = total.saturating_add(size);
+        if total > limits.max_body_bytes as u64 {
+            return Err(HttpError::BodyTooLarge);
+        }
+        // Checked conversion: `parse_chunk_size` already caps at
+        // MAX_CHUNK_SIZE, but the explicit check keeps this sound even if
+        // the cap ever changes.
+        let size = usize::try_from(size).map_err(|_| HttpError::ChunkTooLarge)?;
+        if input.len() - pos < size {
             return Err(HttpError::Incomplete);
         }
         chunks.push(&input[pos..pos + size]);
-        pos += size;
-        if &input[pos..pos + 2] != b"\r\n" {
+        let term = &input[pos + size..];
+        // The terminator accepts CRLF or a lone LF. A lone trailing CR may be
+        // the first half of a split CRLF, so that stays Incomplete.
+        let term_len = if term.starts_with(b"\r\n") {
+            2
+        } else if term.starts_with(b"\n") {
+            1
+        } else if term.is_empty() || term == b"\r" {
+            // No terminator bytes yet, or a lone CR that may be the first
+            // half of a split CRLF.
+            return Err(HttpError::Incomplete);
+        } else {
             return Err(HttpError::InvalidChunkTerminator);
-        }
-        pos += 2;
+        };
+        pos += size + term_len;
     }
 }
 
@@ -937,23 +1146,49 @@ enum DecoderState {
 
 /// Incremental chunked-body decoder.
 ///
-/// Feed it arbitrary slices; it emits [`ChunkEvent::Data`] slices that
-/// borrow the fed input, so the data path never copies. Only trailer
+/// Feed it arbitrary slices, passing a reusable events buffer; it pushes
+/// [`ChunkEvent::Data`] slices that borrow the fed input, so the data path
+/// never copies or allocates a fresh event list. Only trailer
 /// fields are copied into owned values.
+///
+/// Trailer fields share the [`Limits::max_headers`] budget with the header
+/// fields already parsed in the message head; tell the decoder about them
+/// with [`ChunkedDecoder::new_with_headers_seen`].
+///
+/// Poison-on-error contract: after [`feed`](Self::feed) returns an
+/// error the decoder is in an indeterminate state and must not be fed
+/// further input. Call [`reset`](Self::reset) to restore the initial
+/// state before decoding another message; dropping the decoder and
+/// creating a new one works too.
+///
+/// Payload bytes are counted cumulatively across feeds: once they exceed
+/// [`Limits::max_body_bytes`], [`feed`](Self::feed) fails with
+/// [`HttpError::BodyTooLarge`].
 pub struct ChunkedDecoder {
     state: DecoderState,
     line: Vec<u8>,
     limits: Limits,
+    headers_seen: usize,
     trailer_count: usize,
+    body_bytes: u64,
 }
 
 impl ChunkedDecoder {
     pub fn new(limits: Limits) -> Self {
+        Self::new_with_headers_seen(limits, 0)
+    }
+
+    /// Create a decoder for a body whose message head already yielded
+    /// `headers_seen` header fields. Trailer fields share the remaining
+    /// [`Limits::max_headers`] budget with them (headers + trailers).
+    pub fn new_with_headers_seen(limits: Limits, headers_seen: usize) -> Self {
         Self {
             state: DecoderState::ChunkSize,
             line: Vec::new(),
             limits,
+            headers_seen,
             trailer_count: 0,
+            body_bytes: 0,
         }
     }
 
@@ -962,10 +1197,37 @@ impl ChunkedDecoder {
         self.state == DecoderState::Done
     }
 
-    /// Feed input bytes; returns the events they complete. After
-    /// [`is_done`](Self::is_done) further input is ignored.
-    pub fn feed<'a>(&mut self, mut input: &'a [u8]) -> Result<Vec<ChunkEvent<'a>>, HttpError> {
-        let mut events = Vec::new();
+    /// Restore the decoder to its initial state, as after
+    /// [`new`](Self::new). Buffered partial line data and any decoded
+    /// state are discarded; the configured [`Limits`] are kept.
+    ///
+    /// This is the way to recover after [`feed`](Self::feed) returned an
+    /// error: an errored decoder is poisoned, and this resets it so it can
+    /// decode a fresh message.
+    pub fn reset(&mut self) {
+        self.state = DecoderState::ChunkSize;
+        self.line.clear();
+        self.trailer_count = 0;
+        self.body_bytes = 0;
+    }
+
+    /// Feed input bytes, pushing the completed events into the caller-provided
+    /// `events` buffer. Reusing the buffer across calls avoids allocating a
+    /// `Vec` per call. Returns the number of input bytes consumed. After
+    /// [`is_done`](Self::is_done) further input is ignored, reported as zero
+    /// consumed bytes. If an error is returned the decoder is poisoned (see
+    /// the struct docs) — call [`reset`](Self::reset) before feeding more.
+    ///
+    /// Pipelined messages: when [`ChunkEvent::End`] is emitted, any bytes
+    /// after the terminator belong to the next message on the connection.
+    /// They are deliberately not consumed: `&input[consumed..]` is the
+    /// start of the next message, and the caller must retain it.
+    pub fn feed<'a>(
+        &mut self,
+        mut input: &'a [u8],
+        events: &mut Vec<ChunkEvent<'a>>,
+    ) -> Result<usize, HttpError> {
+        let start_len = input.len();
         while !input.is_empty() {
             match self.state {
                 DecoderState::Done => break,
@@ -973,6 +1235,10 @@ impl ChunkedDecoder {
                     let take = (remaining.min(input.len() as u64)) as usize;
                     let (data, rest) = input.split_at(take);
                     if !data.is_empty() {
+                        self.body_bytes = self.body_bytes.saturating_add(take as u64);
+                        if self.body_bytes > self.limits.max_body_bytes as u64 {
+                            return Err(HttpError::BodyTooLarge);
+                        }
                         events.push(ChunkEvent::Data(data));
                     }
                     input = rest;
@@ -984,11 +1250,18 @@ impl ChunkedDecoder {
                     };
                 }
                 DecoderState::ChunkDataCr => {
-                    if input[0] != b'\r' {
+                    // The chunk-data terminator follows the same lenient line-ending
+                    // policy as `next_line`: CRLF, or a lone LF. A CR followed by
+                    // anything else is still an error.
+                    if input[0] == b'\n' {
+                        input = &input[1..];
+                        self.state = DecoderState::ChunkSize;
+                    } else if input[0] == b'\r' {
+                        input = &input[1..];
+                        self.state = DecoderState::ChunkDataLf;
+                    } else {
                         return Err(HttpError::InvalidChunkTerminator);
                     }
-                    input = &input[1..];
-                    self.state = DecoderState::ChunkDataLf;
                 }
                 DecoderState::ChunkDataLf => {
                     if input[0] != b'\n' {
@@ -1006,16 +1279,18 @@ impl ChunkedDecoder {
                             self.line.extend_from_slice(&input[..lf]);
                             input = &input[lf + 1..];
                             let is_trailer = self.state == DecoderState::TrailerLine;
-                            self.handle_line(&mut events, is_trailer)?;
+                            self.handle_line(events, is_trailer)?;
                         }
                         None => {
+                            // Length first, matching `next_line`: an over-limit line
+                            // reports LineTooLong even if it also holds a bare CR.
+                            if self.line.len() + input.len() > self.limits.max_line_bytes {
+                                return Err(HttpError::LineTooLong);
+                            }
                             for (i, &b) in input.iter().enumerate() {
                                 if b == b'\r' && i + 1 < input.len() {
                                     return Err(HttpError::BareCr);
                                 }
-                            }
-                            if self.line.len() + input.len() > self.limits.max_line_bytes {
-                                return Err(HttpError::LineTooLong);
                             }
                             self.line.extend_from_slice(input);
                             input = &[];
@@ -1024,7 +1299,7 @@ impl ChunkedDecoder {
                 }
             }
         }
-        Ok(events)
+        Ok(start_len - input.len())
     }
 
     fn handle_line(
@@ -1048,7 +1323,7 @@ impl ChunkedDecoder {
                 events.push(ChunkEvent::End);
                 return Ok(());
             }
-            if self.trailer_count >= self.limits.max_headers {
+            if self.headers_seen.saturating_add(self.trailer_count) >= self.limits.max_headers {
                 return Err(HttpError::TooManyHeaders);
             }
             let field = parse_header_line(&line)?;
@@ -1350,6 +1625,88 @@ mod tests {
         assert_eq!(head.headers.get("x-empty"), Some(b"".as_slice()));
     }
 
+    // Regression tests: `trim_ows` used to panic on all-whitespace input
+    // (`&bytes[len..0]`). Every shape below is reachable from the network
+    // and must parse (or fail cleanly) instead of panicking.
+
+    #[test]
+    fn trim_ows_all_whitespace_is_empty() {
+        assert_eq!(trim_ows(b" "), b"");
+        assert_eq!(trim_ows(b"   "), b"");
+        assert_eq!(trim_ows(b"\t \t"), b"");
+        assert_eq!(trim_ows(b""), b"");
+        assert_eq!(trim_ows(b"  x  "), b"x");
+        assert_eq!(trim_ows(b"x"), b"x");
+    }
+
+    #[test]
+    fn header_single_space_value_parses_as_empty() {
+        // `X: \r\n`: OWS-only value is the empty value (RFC 9110 §5.5).
+        let (head, _) = req(b"GET / HTTP/1.1\r\nX: \r\n\r\n").unwrap();
+        assert_eq!(head.headers.get("x"), Some(b"".as_slice()));
+    }
+
+    #[test]
+    fn content_length_ows_only_value_does_not_panic() {
+        let (head, _) = req(b"POST / HTTP/1.1\r\nContent-Length:    \r\n\r\n").unwrap();
+        assert_eq!(head.headers.get("content-length"), Some(b"".as_slice()));
+        // Empty is not a valid decimal; that is an error, not a panic.
+        assert_eq!(
+            content_length(&head.headers, &limits()),
+            Err(HttpError::InvalidContentLength)
+        );
+    }
+
+    #[test]
+    fn content_length_ows_only_list_element_does_not_panic() {
+        // `Content-Length: 5,   ,6`: the empty element rejects cleanly.
+        let (head, _) = req(b"POST / HTTP/1.1\r\nContent-Length: 5,   ,6\r\n\r\n").unwrap();
+        assert_eq!(
+            content_length(&head.headers, &limits()),
+            Err(HttpError::InvalidContentLength)
+        );
+    }
+
+    #[test]
+    fn transfer_encoding_ows_only_value_rejected_without_panic() {
+        // An empty coding is invalid; that is an error, not a panic.
+        let (head, _) = req(b"POST / HTTP/1.1\r\nTransfer-Encoding:   \r\n\r\n").unwrap();
+        assert_eq!(head.headers.get("transfer-encoding"), Some(b"".as_slice()));
+        assert_eq!(
+            request_body_spec(&head, &limits()),
+            Err(HttpError::InvalidTransferEncoding)
+        );
+    }
+
+    #[test]
+    fn transfer_encoding_ows_only_list_element_rejected_without_panic() {
+        // `Transfer-Encoding: chunked,   ,identity`: empty coding rejects.
+        let (head, _) =
+            req(b"POST / HTTP/1.1\r\nTransfer-Encoding: chunked,   ,identity\r\n\r\n").unwrap();
+        assert_eq!(
+            request_body_spec(&head, &limits()),
+            Err(HttpError::InvalidTransferEncoding)
+        );
+    }
+
+    #[test]
+    fn te_header_with_ows_only_element_parses() {
+        // `TE: chunked,   ,identity`: header value survives intact, no panic.
+        let (head, _) = req(b"GET / HTTP/1.1\r\nTE: chunked,   ,identity\r\n\r\n").unwrap();
+        assert_eq!(
+            head.headers.get("te"),
+            Some(b"chunked,   ,identity".as_slice())
+        );
+    }
+
+    #[test]
+    fn decode_chunked_ows_only_trailer_value_parses() {
+        // `0\r\nX:  \r\n\r\n`: trailer with OWS-only value is empty.
+        let msg = decode_chunked(b"0\r\nX:  \r\n\r\n", &limits(), 0).unwrap();
+        assert_eq!(msg.trailers.len(), 1);
+        assert_eq!(msg.trailers.get("x"), Some(b"".as_slice()));
+    }
+
     #[test]
     fn header_value_allows_htab_and_obs_text() {
         let (head, _) = req("GET / HTTP/1.1\r\nX: a\tb caf\u{e9}\r\n\r\n".as_bytes()).unwrap();
@@ -1429,6 +1786,22 @@ mod tests {
         assert_eq!(head.headers.len(), 3);
     }
 
+    /// Compile-test: the `get_all` iterator must not borrow `name`.
+    /// `name` is dropped at the end of the inner block; the iterator
+    /// remains usable afterwards. This fails to compile with the old
+    /// unified `<'s>` signature.
+    #[test]
+    fn get_all_iterator_outlives_name_borrow() {
+        let (head, _) = req(b"GET / HTTP/1.1\r\nX-Dup: 1\r\nx-dup: 2\r\n\r\n").unwrap();
+        let values: Vec<&[u8]> = {
+            let name = String::from("X-DUP");
+            let iter = head.headers.get_all(&name);
+            drop(name);
+            iter.collect()
+        };
+        assert_eq!(values, vec![b"1".as_slice(), b"2".as_slice()]);
+    }
+
     #[test]
     fn headers_push_validates() {
         let mut h = Headers::new();
@@ -1493,7 +1866,7 @@ mod tests {
     fn cl(raw: &[u8]) -> Result<Option<u64>, HttpError> {
         let input = [b"GET / HTTP/1.1\r\n", raw, b"\r\n\r\n"].concat();
         let (head, _) = req(&input).unwrap();
-        content_length(&head.headers)
+        content_length(&head.headers, &limits())
     }
 
     #[test]
@@ -1501,15 +1874,47 @@ mod tests {
         assert_eq!(cl(b"Content-Length: 5"), Ok(Some(5)));
         assert_eq!(cl(b"Content-Length: 0"), Ok(Some(0)));
         assert_eq!(cl(b"Content-Length: 007"), Ok(Some(7)));
+        // Exactly at the body-size cap passes...
+        assert_eq!(
+            cl(b"Content-Length: 268435456"),
+            Ok(Some(256 * 1024 * 1024))
+        );
+        // ...but anything above it is rejected before a downstream reader
+        // can size an allocation by it.
+        assert_eq!(
+            cl(b"Content-Length: 268435457"),
+            Err(HttpError::BodyTooLarge)
+        );
         assert_eq!(
             cl(b"Content-Length: 18446744073709551615"),
-            Ok(Some(u64::MAX))
+            Err(HttpError::BodyTooLarge)
         );
         // Equal values agree: comma list and separate fields.
         assert_eq!(cl(b"Content-Length: 5, 5"), Ok(Some(5)));
         assert_eq!(cl(b"Content-Length: 5\r\nContent-Length: 5"), Ok(Some(5)));
         // Absent entirely.
         assert_eq!(cl(b"Host: x"), Ok(None));
+    }
+
+    #[test]
+    fn content_length_respects_tightened_limit() {
+        // The fetch layer may tighten the cap per request/response.
+        let tight = Limits {
+            max_body_bytes: 100,
+            ..Default::default()
+        };
+        let input = b"POST / HTTP/1.1\r\nContent-Length: 101\r\n\r\n";
+        let (head, _) = parse_request_head(input, &tight).unwrap();
+        assert_eq!(
+            request_body_spec(&head, &tight),
+            Err(HttpError::BodyTooLarge)
+        );
+        let input = b"POST / HTTP/1.1\r\nContent-Length: 100\r\n\r\n";
+        let (head, _) = parse_request_head(input, &tight).unwrap();
+        assert_eq!(
+            request_body_spec(&head, &tight),
+            Ok(BodySpec::ContentLength(100))
+        );
     }
 
     #[test]
@@ -1549,7 +1954,7 @@ mod tests {
     fn te_spec(raw: &[u8]) -> Result<BodySpec, HttpError> {
         let input = [b"POST / HTTP/1.1\r\n", raw, b"\r\n\r\n"].concat();
         let (head, _) = req(&input).unwrap();
-        request_body_spec(&head)
+        request_body_spec(&head, &limits())
     }
 
     #[test]
@@ -1573,6 +1978,32 @@ mod tests {
         );
     }
 
+    // Transfer parameters are accepted and ignored (deliberate leniency:
+    // only the coding token is validated). Pinned so the behavior cannot
+    // change silently.
+    #[test]
+    fn transfer_encoding_parameters_accepted_and_ignored() {
+        assert_eq!(
+            te_spec(b"Transfer-Encoding: chunked;"),
+            Ok(BodySpec::Chunked)
+        );
+        assert_eq!(
+            te_spec(b"Transfer-Encoding: chunked; garbage"),
+            Ok(BodySpec::Chunked)
+        );
+        assert_eq!(
+            te_spec(b"Transfer-Encoding: chunked; q=0.8; foo"),
+            Ok(BodySpec::Chunked)
+        );
+        // Parameters do not make the token matching any less strict, but a
+        // final `chunked` still frames: content codings are a decoding
+        // concern above this layer (m1b / RFC 9112 §6.3 rule 2).
+        assert_eq!(
+            te_spec(b"Transfer-Encoding: gzip; q=0.8, chunked"),
+            Ok(BodySpec::Chunked)
+        );
+    }
+
     #[test]
     fn transfer_encoding_identity_is_no_coding() {
         assert_eq!(te_spec(b"Transfer-Encoding: identity"), Ok(BodySpec::Empty));
@@ -1584,10 +2015,13 @@ mod tests {
 
     #[test]
     fn transfer_encoding_bad_codings_rejected() {
-        // Unknown coding alongside chunked.
+        // Unknown coding alongside chunked: chunked is the final coding, so
+        // framing is valid chunked; the content coding is a decoding concern
+        // above this layer (RFC 9112 §6.3 rule 2 only rejects chunked when
+        // it is not final).
         assert_eq!(
             te_spec(b"Transfer-Encoding: gzip, chunked"),
-            Err(HttpError::UnsupportedTransferEncoding)
+            Ok(BodySpec::Chunked)
         );
         // Chunked but not final.
         assert_eq!(
@@ -1611,11 +2045,96 @@ mod tests {
     }
 
     #[test]
+    fn request_chunked_not_final_still_rejected() {
+        // RFC 9112 §6.3 rule 2: a request with chunked not final is an error.
+        assert_eq!(
+            te_spec(b"Transfer-Encoding: chunked, gzip"),
+            Err(HttpError::ChunkedNotFinal)
+        );
+        // A request with a non-chunked coding alone cannot be framed.
+        assert_eq!(
+            te_spec(b"Transfer-Encoding: gzip"),
+            Err(HttpError::UnsupportedTransferEncoding)
+        );
+        // Plain `TE: chunked` framing is unchanged on requests.
+        assert_eq!(
+            te_spec(b"Transfer-Encoding: chunked"),
+            Ok(BodySpec::Chunked)
+        );
+    }
+
+    #[test]
+    fn response_chunked_not_final_is_until_close() {
+        // RFC 9112 §6.3 rule 4: a response with Transfer-Encoding present but
+        // chunked not final is read until the connection closes.
+        assert_eq!(
+            res_spec(
+                b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked, gzip",
+                b"GET"
+            ),
+            Ok(BodySpec::UntilClose)
+        );
+        // Case-insensitivity of the codings.
+        assert_eq!(
+            res_spec(
+                b"HTTP/1.1 200 OK\r\nTransfer-Encoding: Chunked, GZIP",
+                b"GET"
+            ),
+            Ok(BodySpec::UntilClose)
+        );
+        // Transfer-Encoding still overrides Content-Length.
+        assert_eq!(
+            res_spec(
+                b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked, gzip\r\nContent-Length: 5",
+                b"GET"
+            ),
+            Ok(BodySpec::UntilClose)
+        );
+        // Plain `TE: chunked` framing is unchanged on responses.
+        assert_eq!(
+            res_spec(b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked", b"GET"),
+            Ok(BodySpec::Chunked)
+        );
+    }
+
+    #[test]
+    fn response_te_without_final_chunked_is_until_close() {
+        // RFC 9112 §6.3 rule 4: a response with Transfer-Encoding present
+        // but chunked not the final coding is read until the connection
+        // closes, even when chunked is absent entirely.
+        assert_eq!(
+            res_spec(b"HTTP/1.1 200 OK\r\nTransfer-Encoding: gzip", b"GET"),
+            Ok(BodySpec::UntilClose)
+        );
+        // Transfer-Encoding still overrides Content-Length.
+        assert_eq!(
+            res_spec(
+                b"HTTP/1.1 200 OK\r\nTransfer-Encoding: gzip\r\nContent-Length: 5",
+                b"GET"
+            ),
+            Ok(BodySpec::UntilClose)
+        );
+        // Chunked as the final coding still frames as chunked.
+        assert_eq!(
+            res_spec(
+                b"HTTP/1.1 200 OK\r\nTransfer-Encoding: gzip, chunked",
+                b"GET"
+            ),
+            Ok(BodySpec::Chunked)
+        );
+        // Plain `TE: chunked` framing is unchanged on responses.
+        assert_eq!(
+            res_spec(b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked", b"GET"),
+            Ok(BodySpec::Chunked)
+        );
+    }
+
+    #[test]
     fn transfer_encoding_overrides_content_length() {
         let (head, _) =
             req(b"POST / HTTP/1.1\r\nTransfer-Encoding: chunked\r\nContent-Length: 5\r\n\r\n")
                 .unwrap();
-        assert_eq!(request_body_spec(&head), Ok(BodySpec::Chunked));
+        assert_eq!(request_body_spec(&head, &limits()), Ok(BodySpec::Chunked));
     }
 
     // -- body framing -------------------------------------------------------
@@ -1623,17 +2142,20 @@ mod tests {
     #[test]
     fn request_body_spec_cases() {
         let (head, _) = req(b"GET / HTTP/1.1\r\n\r\n").unwrap();
-        assert_eq!(request_body_spec(&head), Ok(BodySpec::Empty));
+        assert_eq!(request_body_spec(&head, &limits()), Ok(BodySpec::Empty));
         let (head, _) = req(b"POST / HTTP/1.1\r\nContent-Length: 5\r\n\r\n").unwrap();
-        assert_eq!(request_body_spec(&head), Ok(BodySpec::ContentLength(5)));
+        assert_eq!(
+            request_body_spec(&head, &limits()),
+            Ok(BodySpec::ContentLength(5))
+        );
         let (head, _) = req(b"POST / HTTP/1.1\r\nTransfer-Encoding: chunked\r\n\r\n").unwrap();
-        assert_eq!(request_body_spec(&head), Ok(BodySpec::Chunked));
+        assert_eq!(request_body_spec(&head, &limits()), Ok(BodySpec::Chunked));
     }
 
     fn res_spec(status_line: &[u8], method: &[u8]) -> Result<BodySpec, HttpError> {
         let input = [status_line, b"\r\n\r\n"].concat();
         let (head, _) = parse_response_head(&input, &limits()).unwrap();
-        response_body_spec(&head, method)
+        response_body_spec(&head, method, &limits())
     }
 
     #[test]
@@ -1668,6 +2190,131 @@ mod tests {
         assert_eq!(
             res_spec(b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked", b"HEAD"),
             Ok(BodySpec::Empty)
+        );
+    }
+
+    #[test]
+    fn bodiless_response_framing_still_validated() {
+        // Malformed framing headers are rejected even though the body is empty.
+        // (m1b: on responses a non-chunked-final Transfer-Encoding is valid
+        // until-close framing per RFC 9112 §6.3 rule 4, so `bogus` alone no
+        // longer errors on a bodiless response — but syntactically invalid
+        // TE still does.)
+        assert_eq!(
+            res_spec(b"HTTP/1.1 204 X\r\nTransfer-Encoding: bogus", b"GET"),
+            Ok(BodySpec::Empty)
+        );
+        assert_eq!(
+            res_spec(
+                b"HTTP/1.1 204 X\r\nTransfer-Encoding: chunked, chunked",
+                b"GET"
+            ),
+            Err(HttpError::InvalidTransferEncoding)
+        );
+        assert_eq!(
+            res_spec(b"HTTP/1.1 304 X\r\nContent-Length: abc", b"GET"),
+            Err(HttpError::InvalidContentLength)
+        );
+        assert_eq!(
+            res_spec(b"HTTP/1.1 200 OK\r\nTransfer-Encoding: bogus", b"HEAD"),
+            Ok(BodySpec::Empty)
+        );
+        // Well-formed framing headers on bodiless responses are fine.
+        assert_eq!(
+            res_spec(b"HTTP/1.1 204 X\r\nContent-Length: 0", b"GET"),
+            Ok(BodySpec::Empty)
+        );
+        assert_eq!(
+            res_spec(b"HTTP/1.1 204 X\r\nTransfer-Encoding: identity", b"GET"),
+            Ok(BodySpec::Empty)
+        );
+    }
+
+    #[test]
+    fn connect_2xx_becomes_tunnel() {
+        // RFC 9112 §6.3 rule 2: any 2xx response to CONNECT turns the
+        // connection into a tunnel; framing headers must be ignored.
+        assert_eq!(
+            res_spec(b"HTTP/1.1 200 OK\r\nContent-Length: 5", b"CONNECT"),
+            Ok(BodySpec::Tunnel)
+        );
+        assert_eq!(
+            res_spec(b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked", b"CONNECT"),
+            Ok(BodySpec::Tunnel)
+        );
+        assert_eq!(
+            res_spec(b"HTTP/1.1 200 Connection Established", b"CONNECT"),
+            Ok(BodySpec::Tunnel)
+        );
+        // Other 2xx codes tunnel as well.
+        assert_eq!(
+            res_spec(b"HTTP/1.1 299 X\r\nContent-Length: 5", b"CONNECT"),
+            Ok(BodySpec::Tunnel)
+        );
+        // Non-2xx responses to CONNECT use normal framing.
+        assert_eq!(
+            res_spec(
+                b"HTTP/1.1 407 Proxy Auth Required\r\nContent-Length: 5",
+                b"CONNECT"
+            ),
+            Ok(BodySpec::ContentLength(5))
+        );
+        assert_eq!(
+            res_spec(b"HTTP/1.1 502 Bad Gateway", b"CONNECT"),
+            Ok(BodySpec::UntilClose)
+        );
+        // 204 to CONNECT stays bodiless (rule 1 wins over rule 2).
+        assert_eq!(
+            res_spec(b"HTTP/1.1 204 No Content\r\nContent-Length: 5", b"CONNECT"),
+            Ok(BodySpec::Empty)
+        );
+    }
+
+    #[test]
+    fn transfer_encoding_rejected_on_http10_request() {
+        // RFC 9112 §6.1: TE on an HTTP/1.0 message is faulty framing,
+        // even `identity`.
+        let (head, _) = req(b"POST / HTTP/1.0\r\nTransfer-Encoding: chunked\r\n\r\n").unwrap();
+        assert_eq!(
+            request_body_spec(&head, &limits()),
+            Err(HttpError::TransferEncodingOnHttp10)
+        );
+        let (head, _) = req(b"POST / HTTP/1.0\r\nTransfer-Encoding: identity\r\n\r\n").unwrap();
+        assert_eq!(
+            request_body_spec(&head, &limits()),
+            Err(HttpError::TransferEncodingOnHttp10)
+        );
+        // Content-Length framing on HTTP/1.0 is unaffected.
+        let (head, _) = req(b"POST / HTTP/1.0\r\nContent-Length: 5\r\n\r\n").unwrap();
+        assert_eq!(
+            request_body_spec(&head, &limits()),
+            Ok(BodySpec::ContentLength(5))
+        );
+        // HTTP/1.1 with TE: chunked still works.
+        let (head, _) = req(b"POST / HTTP/1.1\r\nTransfer-Encoding: chunked\r\n\r\n").unwrap();
+        assert_eq!(request_body_spec(&head, &limits()), Ok(BodySpec::Chunked));
+    }
+
+    #[test]
+    fn transfer_encoding_rejected_on_http10_response() {
+        // RFC 9112 §6.1: TE on an HTTP/1.0 message is faulty framing.
+        assert_eq!(
+            res_spec(b"HTTP/1.0 200 OK\r\nTransfer-Encoding: chunked", b"GET"),
+            Err(HttpError::TransferEncodingOnHttp10)
+        );
+        assert_eq!(
+            res_spec(b"HTTP/1.0 200 OK\r\nTransfer-Encoding: identity", b"GET"),
+            Err(HttpError::TransferEncodingOnHttp10)
+        );
+        // Content-Length framing on HTTP/1.0 is unaffected.
+        assert_eq!(
+            res_spec(b"HTTP/1.0 200 OK\r\nContent-Length: 5", b"GET"),
+            Ok(BodySpec::ContentLength(5))
+        );
+        // HTTP/1.1 with TE: chunked still works.
+        assert_eq!(
+            res_spec(b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked", b"GET"),
+            Ok(BodySpec::Chunked)
         );
     }
 
@@ -1757,6 +2404,98 @@ mod tests {
     }
 
     #[test]
+    fn forbidden_trailers_cover_rfc9112_categories() {
+        // Every field newly forbidden by the RFC 9112 §7.1.2 categories
+        // (routing, request modifiers, authentication, response control
+        // data, payload processing) must be rejected on every path that
+        // accepts trailers.
+        let forbidden = [
+            // Routing.
+            "Host",
+            // Request modifiers: controls and conditionals.
+            "Expect",
+            "Max-Forwards",
+            "Range",
+            "If-Match",
+            "If-None-Match",
+            "If-Modified-Since",
+            "If-Unmodified-Since",
+            "If-Range",
+            // Authentication.
+            "Authorization",
+            "Proxy-Authenticate",
+            "Proxy-Authorization",
+            "WWW-Authenticate",
+            // Response control data (RFC 9110 §7.1).
+            "Age",
+            "Cache-Control",
+            "Expires",
+            "Date",
+            "Location",
+            "Retry-After",
+            "Vary",
+            "Warning",
+            // Payload processing.
+            "Content-Encoding",
+            "Content-Type",
+            "Content-Range",
+            "Content-Language",
+            "Content-Location",
+            "Digest",
+        ];
+        for name in forbidden {
+            // Encoder.
+            assert_eq!(
+                encode_chunked(&[b"hi".as_slice()], &[(name, b"v".as_slice())]),
+                Err(HttpError::ForbiddenTrailer),
+                "encode: {name} must be a forbidden trailer"
+            );
+            // One-shot decoder, both canonical and lowercase spellings
+            // (field names are case-insensitive).
+            let raw = format!("0\r\n{name}: v\r\n\r\n");
+            assert_eq!(
+                decode_chunked(raw.as_bytes(), &limits(), 0),
+                Err(HttpError::ForbiddenTrailer),
+                "decode: {name} must be a forbidden trailer"
+            );
+            let lower = format!("0\r\n{}: v\r\n\r\n", name.to_ascii_lowercase());
+            assert_eq!(
+                decode_chunked(lower.as_bytes(), &limits(), 0),
+                Err(HttpError::ForbiddenTrailer),
+                "decode (lowercase): {name} must be a forbidden trailer"
+            );
+            // Streaming decoder.
+            let mut dec = ChunkedDecoder::new(Limits::default());
+            let mut events = Vec::new();
+            assert_eq!(
+                dec.feed(raw.as_bytes(), &mut events),
+                Err(HttpError::ForbiddenTrailer),
+                "streaming decode: {name} must be a forbidden trailer"
+            );
+        }
+    }
+
+    #[test]
+    fn legitimate_trailers_still_accepted() {
+        // X-Checksum is an ordinary integrity trailer: it fits none of the
+        // RFC 9112 §7.1.2 forbidden categories and must keep working.
+        let out =
+            encode_chunked(&[b"hi".as_slice()], &[("X-Checksum", b"abc".as_slice())]).unwrap();
+        assert_eq!(out, b"2\r\nhi\r\n0\r\nX-Checksum: abc\r\n\r\n");
+        let msg = decode_chunked(b"0\r\nX-Checksum: abc\r\n\r\n", &limits(), 0).unwrap();
+        assert_eq!(msg.trailers.get("x-checksum"), Some(b"abc".as_slice()));
+        let mut dec = ChunkedDecoder::new(Limits::default());
+        let mut events = Vec::new();
+        dec.feed(b"0\r\nX-Checksum: abc\r\n\r\n", &mut events)
+            .unwrap();
+        assert!(events.iter().any(|e| matches!(
+            e,
+            ChunkEvent::Trailer(t) if t.name == "X-Checksum" && t.value == b"abc"
+        )));
+        assert!(dec.is_done());
+    }
+
+    #[test]
     fn encode_chunked_hex_is_uppercase() {
         let data = vec![0u8; 255];
         let out = encode_chunked(&[data.as_slice()], &[]).unwrap();
@@ -1767,7 +2506,7 @@ mod tests {
 
     #[test]
     fn decode_chunked_basic() {
-        let msg = decode_chunked(b"5\r\nhello\r\n6\r\n world\r\n0\r\n\r\n", &limits()).unwrap();
+        let msg = decode_chunked(b"5\r\nhello\r\n6\r\n world\r\n0\r\n\r\n", &limits(), 0).unwrap();
         assert_eq!(msg.chunks, vec![b"hello".as_slice(), b" world".as_slice()]);
         assert!(msg.trailers.is_empty());
         assert_eq!(msg.rest, b"");
@@ -1775,7 +2514,8 @@ mod tests {
 
     #[test]
     fn decode_chunked_keeps_rest() {
-        let msg = decode_chunked(b"2\r\nhi\r\n0\r\n\r\nGET /next HTTP/1.1\r\n", &limits()).unwrap();
+        let msg =
+            decode_chunked(b"2\r\nhi\r\n0\r\n\r\nGET /next HTTP/1.1\r\n", &limits(), 0).unwrap();
         assert_eq!(msg.chunks, vec![b"hi".as_slice()]);
         assert_eq!(msg.rest, b"GET /next HTTP/1.1\r\n");
     }
@@ -1783,10 +2523,31 @@ mod tests {
     #[test]
     fn decode_chunked_trailers() {
         let msg =
-            decode_chunked(b"3\r\nfoo\r\n0\r\nX-A: 1\r\nX-B: two\r\n\r\n", &limits()).unwrap();
+            decode_chunked(b"3\r\nfoo\r\n0\r\nX-A: 1\r\nX-B: two\r\n\r\n", &limits(), 0).unwrap();
         assert_eq!(msg.trailers.len(), 2);
         assert_eq!(msg.trailers.get("x-a"), Some(b"1".as_slice()));
         assert_eq!(msg.trailers.get("x-b"), Some(b"two".as_slice()));
+    }
+
+    #[test]
+    fn decode_chunked_trailers_share_max_headers_with_head() {
+        // Limits::max_headers covers headers + trailers: one head header
+        // leaves room for exactly one trailer field.
+        let limits = Limits {
+            max_headers: 2,
+            ..Default::default()
+        };
+        assert_eq!(
+            decode_chunked(b"0\r\nX-A: 1\r\nX-B: 2\r\n\r\n", &limits, 1),
+            Err(HttpError::TooManyHeaders)
+        );
+        let msg = decode_chunked(b"0\r\nX-A: 1\r\n\r\n", &limits, 1).unwrap();
+        assert_eq!(msg.trailers.len(), 1);
+        // A head that already exhausted the budget rejects any trailer.
+        assert_eq!(
+            decode_chunked(b"0\r\nX-A: 1\r\n\r\n", &limits, 2),
+            Err(HttpError::TooManyHeaders)
+        );
     }
 
     #[test]
@@ -1794,6 +2555,7 @@ mod tests {
         let msg = decode_chunked(
             b"5;ext=1;foo=\"bar\\\"baz\";flag\r\nhello\r\n0\r\n\r\n",
             &limits(),
+            0,
         )
         .unwrap();
         assert_eq!(msg.chunks, vec![b"hello".as_slice()]);
@@ -1801,92 +2563,155 @@ mod tests {
 
     #[test]
     fn decode_chunked_hex_variants() {
-        let msg = decode_chunked(b"A\r\n0123456789\r\n0\r\n\r\n", &limits()).unwrap();
+        let msg = decode_chunked(b"A\r\n0123456789\r\n0\r\n\r\n", &limits(), 0).unwrap();
         assert_eq!(msg.chunks, vec![b"0123456789".as_slice()]);
-        let msg = decode_chunked(b"005\r\nhello\r\n0\r\n\r\n", &limits()).unwrap();
+        let msg = decode_chunked(b"005\r\nhello\r\n0\r\n\r\n", &limits(), 0).unwrap();
         assert_eq!(msg.chunks, vec![b"hello".as_slice()]);
     }
 
     #[test]
     fn decode_chunked_empty_body() {
-        let msg = decode_chunked(b"0\r\n\r\n", &limits()).unwrap();
+        let msg = decode_chunked(b"0\r\n\r\n", &limits(), 0).unwrap();
         assert!(msg.chunks.is_empty());
         assert!(msg.trailers.is_empty());
+    }
+
+    #[test]
+    fn decode_chunked_lone_lf_terminator() {
+        // Chunk-data terminators accept a lone LF: the same lenient line-ending
+        // policy as `next_line` (m4).
+        let msg = decode_chunked(b"5\nhello\n0\r\n\r\n", &limits(), 0).unwrap();
+        assert_eq!(msg.chunks, vec![b"hello".as_slice()]);
+        // Lone LF everywhere: size lines, terminators, trailers.
+        let msg = decode_chunked(b"5\nhello\n0\nX-A: 1\n\n", &limits(), 0).unwrap();
+        assert_eq!(msg.chunks, vec![b"hello".as_slice()]);
+        assert_eq!(msg.trailers.get("x-a"), Some(b"1".as_slice()));
+        // A trailing lone CR may be the first half of a split CRLF: incomplete.
+        assert_eq!(
+            decode_chunked(b"5\r\nhello\r", &limits(), 0),
+            Err(HttpError::Incomplete)
+        );
+        // A byte that can never start a line ending is a terminator error.
+        assert_eq!(
+            decode_chunked(b"5\r\nhelloX", &limits(), 0),
+            Err(HttpError::InvalidChunkTerminator)
+        );
     }
 
     #[test]
     fn decode_chunked_malformed_rejected() {
         // Bad hex.
         assert_eq!(
-            decode_chunked(b"zz\r\nhello\r\n0\r\n\r\n", &limits()),
+            decode_chunked(b"zz\r\nhello\r\n0\r\n\r\n", &limits(), 0),
             Err(HttpError::InvalidChunkSize)
         );
         // Empty size line.
         assert_eq!(
-            decode_chunked(b"\r\n0\r\n\r\n", &limits()),
+            decode_chunked(b"\r\n0\r\n\r\n", &limits(), 0),
             Err(HttpError::InvalidChunkSize)
         );
         // 17 hex digits: cannot fit in u64.
         assert_eq!(
-            decode_chunked(b"10000000000000000\r\n0\r\n\r\n", &limits()),
+            decode_chunked(b"10000000000000000\r\n0\r\n\r\n", &limits(), 0),
             Err(HttpError::InvalidChunkSize)
         );
         // Space inside the size.
         assert_eq!(
-            decode_chunked(b"5 \r\nhello\r\n0\r\n\r\n", &limits()),
+            decode_chunked(b"5 \r\nhello\r\n0\r\n\r\n", &limits(), 0),
             Err(HttpError::InvalidChunkSize)
         );
         // Bad chunk extension.
         assert_eq!(
-            decode_chunked(b"5;ext=\r\nhello\r\n0\r\n\r\n", &limits()),
+            decode_chunked(b"5;ext=\r\nhello\r\n0\r\n\r\n", &limits(), 0),
             Err(HttpError::InvalidChunkExtension)
         );
         assert_eq!(
-            decode_chunked(b"5;\r\nhello\r\n0\r\n\r\n", &limits()),
+            decode_chunked(b"5;\r\nhello\r\n0\r\n\r\n", &limits(), 0),
             Err(HttpError::InvalidChunkExtension)
         );
         assert_eq!(
-            decode_chunked(b"5;\"x\"\r\nhello\r\n0\r\n\r\n", &limits()),
+            decode_chunked(b"5;\"x\"\r\nhello\r\n0\r\n\r\n", &limits(), 0),
             Err(HttpError::InvalidChunkExtension)
         );
         // Chunk data not followed by CRLF.
         assert_eq!(
-            decode_chunked(b"5\r\nhelloXX0\r\n\r\n", &limits()),
+            decode_chunked(b"5\r\nhelloXX0\r\n\r\n", &limits(), 0),
             Err(HttpError::InvalidChunkTerminator)
         );
         // Forbidden trailer fields.
         assert_eq!(
-            decode_chunked(b"0\r\nContent-Length: 5\r\n\r\n", &limits()),
+            decode_chunked(b"0\r\nContent-Length: 5\r\n\r\n", &limits(), 0),
             Err(HttpError::ForbiddenTrailer)
         );
         assert_eq!(
-            decode_chunked(b"0\r\nTE: trailers\r\n\r\n", &limits()),
+            decode_chunked(b"0\r\nTE: trailers\r\n\r\n", &limits(), 0),
             Err(HttpError::ForbiddenTrailer)
         );
         // Bare CR inside the chunked body.
         assert_eq!(
-            decode_chunked(b"5\rhello\r\n0\r\n\r\n", &limits()),
+            decode_chunked(b"5\rhello\r\n0\r\n\r\n", &limits(), 0),
             Err(HttpError::BareCr)
         );
     }
 
     #[test]
+    fn decode_chunked_huge_size_rejected_not_panicking() {
+        // B1: 16 hex F's (u64::MAX) must be a clean error, never a panic.
+        // This exact 18-byte message used to kill the process.
+        assert_eq!(
+            decode_chunked(b"FFFFFFFFFFFFFFFF\r\n", &limits(), 0),
+            Err(HttpError::ChunkTooLarge)
+        );
+        // Lowercase and near-max variants.
+        assert_eq!(
+            decode_chunked(b"ffffffffffffffff\r\n", &limits(), 0),
+            Err(HttpError::ChunkTooLarge)
+        );
+        assert_eq!(
+            decode_chunked(b"FFFFFFFFFFFFFFFE\r\n", &limits(), 0),
+            Err(HttpError::ChunkTooLarge)
+        );
+        // Just over the 16 MiB cap (0x1000001).
+        assert_eq!(
+            decode_chunked(b"1000001\r\n", &limits(), 0),
+            Err(HttpError::ChunkTooLarge)
+        );
+        // A chunk of exactly MAX_CHUNK_SIZE (0x1000000) is accepted
+        // size-wise: with a short buffer the decoder reports Incomplete.
+        assert_eq!(
+            decode_chunked(b"1000000\r\n", &limits(), 0),
+            Err(HttpError::Incomplete)
+        );
+        // And a full 16 MiB chunk decodes.
+        let mut body = Vec::from(b"1000000\r\n".as_slice());
+        body.extend_from_slice(&vec![b'x'; MAX_CHUNK_SIZE as usize]);
+        body.extend_from_slice(b"\r\n0\r\n\r\n");
+        let msg = decode_chunked(&body, &limits(), 0).unwrap();
+        assert_eq!(msg.chunks.len(), 1);
+        assert_eq!(msg.chunks[0].len(), MAX_CHUNK_SIZE as usize);
+        assert_eq!(msg.rest, b"");
+    }
+
+    #[test]
     fn decode_chunked_incomplete() {
-        assert_eq!(decode_chunked(b"", &limits()), Err(HttpError::Incomplete));
         assert_eq!(
-            decode_chunked(b"5\r\nhel", &limits()),
+            decode_chunked(b"", &limits(), 0),
             Err(HttpError::Incomplete)
         );
         assert_eq!(
-            decode_chunked(b"5\r\nhello\r\n", &limits()),
+            decode_chunked(b"5\r\nhel", &limits(), 0),
             Err(HttpError::Incomplete)
         );
         assert_eq!(
-            decode_chunked(b"5\r\nhello\r\n0\r\n", &limits()),
+            decode_chunked(b"5\r\nhello\r\n", &limits(), 0),
             Err(HttpError::Incomplete)
         );
         assert_eq!(
-            decode_chunked(b"5\r\nhello\r\n0\r\nX-A: 1\r\n", &limits()),
+            decode_chunked(b"5\r\nhello\r\n0\r\n", &limits(), 0),
+            Err(HttpError::Incomplete)
+        );
+        assert_eq!(
+            decode_chunked(b"5\r\nhello\r\n0\r\nX-A: 1\r\n", &limits(), 0),
             Err(HttpError::Incomplete)
         );
     }
@@ -1895,20 +2720,48 @@ mod tests {
     fn chunked_roundtrip() {
         let chunks: Vec<&[u8]> = vec![b"hello".as_slice(), b", ".as_slice(), b"world".as_slice()];
         let encoded = encode_chunked(&chunks, &[("X-Check", b"ok".as_slice())]).unwrap();
-        let msg = decode_chunked(&encoded, &limits()).unwrap();
+        let msg = decode_chunked(&encoded, &limits(), 0).unwrap();
         assert_eq!(msg.chunks, chunks);
         assert_eq!(msg.trailers.get("x-check"), Some(b"ok".as_slice()));
         assert_eq!(msg.rest, b"");
     }
 
+    #[test]
+    fn decode_chunked_enforces_body_limit_cumulatively() {
+        let capped = Limits {
+            max_body_bytes: 10,
+            ..Default::default()
+        };
+        // Each chunk fits alone, but the cumulative payload exceeds the cap.
+        let body = b"6\r\nhello!\r\n6\r\n world\r\n0\r\n\r\n";
+        assert_eq!(
+            decode_chunked(body, &capped, 0),
+            Err(HttpError::BodyTooLarge)
+        );
+        // A single oversized chunk is caught too.
+        let body = b"B\r\n0123456789A\r\n0\r\n\r\n";
+        assert_eq!(
+            decode_chunked(body, &capped, 0),
+            Err(HttpError::BodyTooLarge)
+        );
+        // Exactly at the cap passes.
+        let body = b"5\r\nhello\r\n5\r\nworld\r\n0\r\n\r\n";
+        let msg = decode_chunked(body, &capped, 0).unwrap();
+        assert_eq!(msg.chunks, vec![b"hello".as_slice(), b"world".as_slice()]);
+    }
+
     // -- streaming decoder -----------------------------------------------------
 
-    fn collect_stream(feeds: &[&[u8]]) -> (Vec<u8>, Vec<TrailerField>, bool) {
+    fn collect_stream(feeds: &[&[u8]]) -> (Vec<u8>, Vec<TrailerField>, bool, usize) {
         let mut dec = ChunkedDecoder::new(Limits::default());
         let mut data = Vec::new();
         let mut trailers = Vec::new();
+        let mut events = Vec::new();
+        let mut consumed = 0usize;
         for feed in feeds {
-            for ev in dec.feed(feed).unwrap() {
+            events.clear();
+            consumed += dec.feed(feed, &mut events).unwrap();
+            for ev in events.drain(..) {
                 match ev {
                     ChunkEvent::Data(d) => data.extend_from_slice(d),
                     ChunkEvent::Trailer(t) => trailers.push(t),
@@ -1916,19 +2769,20 @@ mod tests {
                 }
             }
         }
-        (data, trailers, dec.is_done())
+        (data, trailers, dec.is_done(), consumed)
     }
 
     #[test]
     fn streaming_byte_by_byte() {
         let input = b"5\r\nhello\r\n6\r\n world\r\n0\r\nX-T: 1\r\n\r\n";
         let feeds: Vec<&[u8]> = input.chunks(1).map(|c| c as &[u8]).collect();
-        let (data, trailers, done) = collect_stream(&feeds);
+        let (data, trailers, done, consumed) = collect_stream(&feeds);
         assert_eq!(data, b"hello world");
         assert_eq!(trailers.len(), 1);
         assert_eq!(trailers[0].name, "X-T");
         assert_eq!(trailers[0].value, b"1");
         assert!(done);
+        assert_eq!(consumed, input.len());
     }
 
     #[test]
@@ -1937,42 +2791,112 @@ mod tests {
         let feeds: &[&[u8]] = &[
             b"5", b"\r", b"\nhel", b"lo\r", b"\n0\r", b"\n", b"\r", b"\n",
         ];
-        let (data, trailers, done) = collect_stream(feeds);
+        let (data, trailers, done, consumed) = collect_stream(feeds);
         assert_eq!(data, b"hello");
         assert!(trailers.is_empty());
         assert!(done);
+        assert_eq!(consumed, feeds.iter().map(|f| f.len()).sum::<usize>());
     }
 
     #[test]
     fn streaming_one_shot_matches_incremental() {
         let input = b"3\r\nfoo\r\n0\r\n\r\n";
         let mut dec = ChunkedDecoder::new(Limits::default());
-        let events = dec.feed(input).unwrap();
+        let mut events = Vec::new();
+        let consumed = dec.feed(input, &mut events).unwrap();
+        assert_eq!(consumed, input.len());
         assert!(matches!(events[0], ChunkEvent::Data(b"foo")));
         assert!(matches!(events[1], ChunkEvent::End));
+        assert_eq!(consumed, input.len());
+        assert!(dec.is_done());
+        // Input after End is ignored: no events, nothing consumed.
+        events.clear();
+        let consumed = dec.feed(b"junk", &mut events).unwrap();
+        assert!(events.is_empty());
+        assert_eq!(consumed, 0);
+    }
+
+    #[test]
+    fn streaming_consumed_stops_at_pipelined_next_message() {
+        // The terminator is 5 bytes; the pipelined next request must be
+        // recoverable via &input[consumed..], not swallowed.
+        let input = b"0\r\n\r\nGET /next HTTP/1.1\r\n";
+        let mut dec = ChunkedDecoder::new(Limits::default());
+        let mut events = Vec::new();
+        let consumed = dec.feed(input, &mut events).unwrap();
+        assert!(matches!(events.as_slice(), [ChunkEvent::End]));
+        assert_eq!(consumed, 5);
+        assert_eq!(&input[consumed..], b"GET /next HTTP/1.1\r\n");
+        assert!(dec.is_done());
+    }
+
+    #[test]
+    fn streaming_consumed_sums_across_byte_at_a_time_feeds() {
+        let input = b"3\r\nfoo\r\n0\r\n\r\n";
+        let mut dec = ChunkedDecoder::new(Limits::default());
+        let mut total = 0usize;
+        let mut data = Vec::new();
+        let mut events = Vec::new();
+        for byte in input.chunks(1) {
+            events.clear();
+            let consumed = dec.feed(byte, &mut events).unwrap();
+            assert_eq!(consumed, byte.len());
+            total += consumed;
+            for ev in events.drain(..) {
+                if let ChunkEvent::Data(d) = ev {
+                    data.extend_from_slice(d);
+                }
+            }
+        }
+        assert_eq!(data, b"foo");
+        assert_eq!(total, input.len());
         assert!(dec.is_done());
         // Input after End is ignored.
-        assert!(dec.feed(b"junk").unwrap().is_empty());
+        events.clear();
+        assert_eq!(dec.feed(b"junk", &mut events).unwrap(), 0);
+        assert!(events.is_empty());
     }
 
     #[test]
     fn streaming_errors() {
         let mut dec = ChunkedDecoder::new(Limits::default());
-        assert_eq!(dec.feed(b"zz\r\n"), Err(HttpError::InvalidChunkSize));
+        let mut events = Vec::new();
+        assert_eq!(
+            dec.feed(b"zz\r\n", &mut events),
+            Err(HttpError::InvalidChunkSize)
+        );
 
         let mut dec = ChunkedDecoder::new(Limits::default());
-        assert!(
-            dec.feed(b"5\r\nhello")
-                .unwrap()
-                .iter()
-                .any(|e| matches!(e, ChunkEvent::Data(_)))
+        events.clear();
+        dec.feed(b"5\r\nhello", &mut events).unwrap();
+        assert!(events.iter().any(|e| matches!(e, ChunkEvent::Data(_))));
+        assert_eq!(
+            dec.feed(b"XX", &mut events),
+            Err(HttpError::InvalidChunkTerminator)
         );
-        assert_eq!(dec.feed(b"XX"), Err(HttpError::InvalidChunkTerminator));
 
         let mut dec = ChunkedDecoder::new(Limits::default());
         assert_eq!(
-            dec.feed(b"0\r\nContent-Length: 1\r\n\r\n"),
+            dec.feed(b"0\r\nContent-Length: 1\r\n\r\n", &mut events),
             Err(HttpError::ForbiddenTrailer)
+        );
+    }
+
+    #[test]
+    fn streaming_huge_chunk_size_rejected() {
+        // Same B1 fix as the one-shot path: an absurd chunk-size line is a
+        // clean error through the streaming decoder too.
+        let mut dec = ChunkedDecoder::new(Limits::default());
+        let mut events = Vec::new();
+        assert_eq!(
+            dec.feed(b"FFFFFFFFFFFFFFFF\r\n", &mut events),
+            Err(HttpError::ChunkTooLarge)
+        );
+        let mut dec = ChunkedDecoder::new(Limits::default());
+        let mut events = Vec::new();
+        assert_eq!(
+            dec.feed(b"1000001\r\n", &mut events),
+            Err(HttpError::ChunkTooLarge)
         );
     }
 
@@ -1983,7 +2907,150 @@ mod tests {
             ..Default::default()
         };
         let mut dec = ChunkedDecoder::new(tiny);
-        assert_eq!(dec.feed(b"12345\r\n"), Err(HttpError::LineTooLong));
+        let mut events = Vec::new();
+        assert_eq!(
+            dec.feed(b"12345\r\n", &mut events),
+            Err(HttpError::LineTooLong)
+        );
+    }
+
+    #[test]
+    fn streaming_trailers_share_max_headers_with_head() {
+        // Limits::max_headers covers headers + trailers: one head header
+        // leaves room for exactly one trailer field.
+        let limits = Limits {
+            max_headers: 2,
+            ..Default::default()
+        };
+        let mut dec = ChunkedDecoder::new_with_headers_seen(limits, 1);
+        let mut events = Vec::new();
+        dec.feed(b"0\r\nX-A: 1\r\n\r\n", &mut events).unwrap();
+        assert!(events.iter().any(|e| matches!(e, ChunkEvent::Trailer(_))));
+        assert!(dec.is_done());
+
+        let mut dec = ChunkedDecoder::new_with_headers_seen(limits, 1);
+        let mut events = Vec::new();
+        assert_eq!(
+            dec.feed(b"0\r\nX-A: 1\r\nX-B: 2\r\n\r\n", &mut events),
+            Err(HttpError::TooManyHeaders)
+        );
+        // A head that already exhausted the budget rejects any trailer.
+        let mut dec = ChunkedDecoder::new_with_headers_seen(limits, 2);
+        let mut events = Vec::new();
+        assert_eq!(
+            dec.feed(b"0\r\nX-A: 1\r\n\r\n", &mut events),
+            Err(HttpError::TooManyHeaders)
+        );
+    }
+
+    #[test]
+    fn streaming_lone_lf_terminator() {
+        // The streaming decoder tolerates a lone LF after chunk data, matching
+        // `decode_chunked` and `next_line` (m4).
+        let mut dec = ChunkedDecoder::new(Limits::default());
+        let mut events = Vec::new();
+        dec.feed(b"5\r\nhello\n0\r\n\r\n", &mut events).unwrap();
+        assert!(
+            events
+                .iter()
+                .any(|e| matches!(e, ChunkEvent::Data(b"hello")))
+        );
+        assert!(events.iter().any(|e| matches!(e, ChunkEvent::End)));
+        assert!(dec.is_done());
+        // Lone LF arriving in its own feed.
+        let mut dec = ChunkedDecoder::new(Limits::default());
+        let mut events = Vec::new();
+        dec.feed(b"5\r\nhello", &mut events).unwrap();
+        assert!(events.iter().any(|e| matches!(e, ChunkEvent::Data(_))));
+        events.clear();
+        dec.feed(b"\n0\r\n\r\n", &mut events).unwrap();
+        assert!(events.iter().any(|e| matches!(e, ChunkEvent::End)));
+        assert!(dec.is_done());
+        // A CR followed by a non-LF byte is still rejected, not tolerated.
+        let mut dec = ChunkedDecoder::new(Limits::default());
+        let mut events = Vec::new();
+        dec.feed(b"5\r\nhello", &mut events).unwrap();
+        assert_eq!(dec.feed(b"\rX", &mut events), Err(HttpError::BareCr));
+    }
+
+    #[test]
+    fn over_limit_line_with_bare_cr_reports_line_too_long_in_both_paths() {
+        // Error precedence is length-first in both the one-shot line parser
+        // and the streaming decoder: an over-limit line holding an interior
+        // CR (and no LF yet) is LineTooLong in both (m5).
+        let tiny = Limits {
+            max_line_bytes: 8,
+            ..Default::default()
+        };
+        let input = b"AAAAAAAAA\rBB"; // 12 bytes, interior CR, no LF.
+        assert_eq!(decode_chunked(input, &tiny, 0), Err(HttpError::LineTooLong));
+        let mut dec = ChunkedDecoder::new(tiny);
+        let mut events = Vec::new();
+        assert_eq!(dec.feed(input, &mut events), Err(HttpError::LineTooLong));
+    }
+
+    // Erroring poisons the decoder; reset() restores the initial state so
+    // a fresh message decodes successfully afterwards.
+    #[test]
+    fn streaming_reset_recovers_from_error() {
+        let mut dec = ChunkedDecoder::new(Limits::default());
+        let mut events = Vec::new();
+        assert_eq!(
+            dec.feed(b"zz\r\n", &mut events),
+            Err(HttpError::InvalidChunkSize)
+        );
+        assert!(!dec.is_done());
+        dec.reset();
+        let mut data = Vec::new();
+        events.clear();
+        dec.feed(b"5\r\nhello\r\n0\r\n\r\n", &mut events).unwrap();
+        for ev in events.drain(..) {
+            match ev {
+                ChunkEvent::Data(d) => data.extend_from_slice(d),
+                ChunkEvent::End => {}
+                ChunkEvent::Trailer(_) => panic!("no trailers expected"),
+            }
+        }
+        assert_eq!(data, b"hello");
+        assert!(dec.is_done());
+    }
+
+    #[test]
+    fn streaming_enforces_body_limit_cumulatively() {
+        let capped = Limits {
+            max_body_bytes: 10,
+            ..Default::default()
+        };
+        // Each chunk fits alone, but the cumulative payload across feeds
+        // exceeds the cap.
+        let mut dec = ChunkedDecoder::new(capped);
+        let mut events = Vec::new();
+        dec.feed(b"6\r\nhello!\r\n", &mut events).unwrap();
+        assert!(events.iter().any(|e| matches!(
+            e,
+            ChunkEvent::Data(d) if *d == b"hello!"
+        )));
+        events.clear();
+        assert_eq!(
+            dec.feed(b"6\r\n world\r\n", &mut events),
+            Err(HttpError::BodyTooLarge)
+        );
+        // Exactly at the cap passes, even split across feeds.
+        let mut dec = ChunkedDecoder::new(capped);
+        let feeds: &[&[u8]] = &[b"5\r\nhel", b"lo\r\n5\r\nwo", b"rld\r\n0\r\n\r\n"];
+        let mut data = Vec::new();
+        let mut events = Vec::new();
+        for feed in feeds {
+            events.clear();
+            dec.feed(feed, &mut events).unwrap();
+            for ev in events.drain(..) {
+                if let ChunkEvent::Data(d) = ev {
+                    data.extend_from_slice(d);
+                }
+            }
+        }
+        assert_eq!(data, b"helloworld");
+        assert!(dec.is_done());
     }
 
     // -- serialization --------------------------------------------------------
@@ -2087,5 +3154,6 @@ mod tests {
         assert_eq!(l.max_headers, 100);
         assert_eq!(l.max_head_bytes, 32 * 1024);
         assert_eq!(l.max_line_bytes, 8 * 1024);
+        assert_eq!(l.max_body_bytes, 256 * 1024 * 1024);
     }
 }
