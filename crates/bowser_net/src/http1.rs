@@ -243,6 +243,12 @@ fn validate_field_name(name: &[u8]) -> Result<(), HttpError> {
 }
 
 /// Request-target: visible ASCII or obs-text, never whitespace or CTLs.
+///
+/// Leniency (deliberate): raw non-ASCII bytes (≥ 0x80) are accepted even
+/// though RFC 3986 forbids them in a request-target — clients in the wild
+/// send raw UTF-8 without percent-encoding it. Callers using this parser
+/// on the server side should pre-validate the target if strict RFC 3986
+/// conformance matters to them.
 fn valid_target(target: &[u8]) -> bool {
     !target.is_empty()
         && target
@@ -479,6 +485,9 @@ fn parse_status_line(line: &[u8]) -> Result<(HttpVersion, u16, &str), HttpError>
 /// Parse a request head. Returns the head and the number of bytes consumed
 /// (the body, if any, starts there). [`HttpError::Incomplete`] means: feed
 /// more bytes and retry.
+///
+/// The request-target accepts raw non-ASCII bytes; see [`valid_target`]
+/// for the deliberate leniency rationale.
 pub fn parse_request_head<'a>(
     input: &'a [u8],
     limits: &Limits,
@@ -582,6 +591,12 @@ enum TransferOutcome {
 /// the final coding; any other non-`identity` coding is unsupported.
 /// When `Transfer-Encoding` is present it overrides `Content-Length`
 /// (RFC 9112 §6.3); callers implement that by checking this first.
+///
+/// Leniency (deliberate): transfer parameters after a `;` (e.g. the
+/// `q=0.8` in `gzip; q=0.8`) are accepted and ignored — only the coding
+/// token itself is validated. Real-world senders attach malformed or
+/// unknown parameters often enough that rejecting them breaks real
+/// traffic while buying little security.
 fn transfer_encoding(headers: &Headers) -> Result<TransferOutcome, HttpError> {
     let mut codings: Vec<&[u8]> = Vec::new();
     for value in headers.get_all("transfer-encoding") {
@@ -667,7 +682,11 @@ pub fn response_body_spec(
 // ---------------------------------------------------------------------------
 
 /// The tokens of every `Connection` header field, in order, OWS-trimmed.
-/// Non-UTF-8 tokens are skipped.
+///
+/// Non-UTF-8 tokens are skipped rather than failing the whole parse: a
+/// garbage byte sequence can never equal an ASCII token such as `close`
+/// or `keep-alive`, so dropping it cannot change the persistence decision —
+/// it only keeps one malformed field from tearing down the connection.
 pub fn connection_tokens<'a>(headers: &'a Headers<'a>) -> impl Iterator<Item = &'a str> + 'a {
     headers
         .iter()
@@ -940,6 +959,12 @@ enum DecoderState {
 /// Feed it arbitrary slices; it emits [`ChunkEvent::Data`] slices that
 /// borrow the fed input, so the data path never copies. Only trailer
 /// fields are copied into owned values.
+///
+/// Poison-on-error contract: after [`feed`](Self::feed) returns an
+/// error the decoder is in an indeterminate state and must not be fed
+/// further input. Call [`reset`](Self::reset) to restore the initial
+/// state before decoding another message; dropping the decoder and
+/// creating a new one works too.
 pub struct ChunkedDecoder {
     state: DecoderState,
     line: Vec<u8>,
@@ -962,8 +987,23 @@ impl ChunkedDecoder {
         self.state == DecoderState::Done
     }
 
+    /// Restore the decoder to its initial state, as after
+    /// [`new`](Self::new). Buffered partial line data and any decoded
+    /// state are discarded; the configured [`Limits`] are kept.
+    ///
+    /// This is the way to recover after [`feed`](Self::feed) returned an
+    /// error: an errored decoder is poisoned, and this resets it so it can
+    /// decode a fresh message.
+    pub fn reset(&mut self) {
+        self.state = DecoderState::ChunkSize;
+        self.line.clear();
+        self.trailer_count = 0;
+    }
+
     /// Feed input bytes; returns the events they complete. After
-    /// [`is_done`](Self::is_done) further input is ignored.
+    /// [`is_done`](Self::is_done) further input is ignored. If an error is
+    /// returned the decoder is poisoned (see the struct docs) — call
+    /// [`reset`](Self::reset) before feeding more.
     pub fn feed<'a>(&mut self, mut input: &'a [u8]) -> Result<Vec<ChunkEvent<'a>>, HttpError> {
         let mut events = Vec::new();
         while !input.is_empty() {
@@ -1573,6 +1613,30 @@ mod tests {
         );
     }
 
+    // Transfer parameters are accepted and ignored (deliberate leniency:
+    // only the coding token is validated). Pinned so the behavior cannot
+    // change silently.
+    #[test]
+    fn transfer_encoding_parameters_accepted_and_ignored() {
+        assert_eq!(
+            te_spec(b"Transfer-Encoding: chunked;"),
+            Ok(BodySpec::Chunked)
+        );
+        assert_eq!(
+            te_spec(b"Transfer-Encoding: chunked; garbage"),
+            Ok(BodySpec::Chunked)
+        );
+        assert_eq!(
+            te_spec(b"Transfer-Encoding: chunked; q=0.8; foo"),
+            Ok(BodySpec::Chunked)
+        );
+        // Parameters do not make the token matching any less strict.
+        assert_eq!(
+            te_spec(b"Transfer-Encoding: gzip; q=0.8, chunked"),
+            Err(HttpError::UnsupportedTransferEncoding)
+        );
+    }
+
     #[test]
     fn transfer_encoding_identity_is_no_coding() {
         assert_eq!(te_spec(b"Transfer-Encoding: identity"), Ok(BodySpec::Empty));
@@ -1984,6 +2048,26 @@ mod tests {
         };
         let mut dec = ChunkedDecoder::new(tiny);
         assert_eq!(dec.feed(b"12345\r\n"), Err(HttpError::LineTooLong));
+    }
+
+    // Erroring poisons the decoder; reset() restores the initial state so
+    // a fresh message decodes successfully afterwards.
+    #[test]
+    fn streaming_reset_recovers_from_error() {
+        let mut dec = ChunkedDecoder::new(Limits::default());
+        assert_eq!(dec.feed(b"zz\r\n"), Err(HttpError::InvalidChunkSize));
+        assert!(!dec.is_done());
+        dec.reset();
+        let mut data = Vec::new();
+        for ev in dec.feed(b"5\r\nhello\r\n0\r\n\r\n").unwrap() {
+            match ev {
+                ChunkEvent::Data(d) => data.extend_from_slice(d),
+                ChunkEvent::End => {}
+                ChunkEvent::Trailer(_) => panic!("no trailers expected"),
+            }
+        }
+        assert_eq!(data, b"hello");
+        assert!(dec.is_done());
     }
 
     // -- serialization --------------------------------------------------------
