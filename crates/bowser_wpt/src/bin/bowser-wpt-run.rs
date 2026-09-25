@@ -127,6 +127,9 @@ fn main() {
             bowser_wpt::runner::TestOutcome::Reftest { passed, .. } => {
                 format!("reftest {}", if *passed { "PASS" } else { "FAIL" })
             }
+            bowser_wpt::runner::TestOutcome::Crashtest { passed } => {
+                format!("crashtest {}", if *passed { "PASS" } else { "FAIL" })
+            }
             bowser_wpt::runner::TestOutcome::Skipped { reason } => format!("SKIP ({reason})"),
             bowser_wpt::runner::TestOutcome::DriverFailed(e) => format!("DRIVER-FAIL ({e})"),
         };

@@ -78,6 +78,13 @@ pub trait BrowserDriver {
         timeout: Duration,
     ) -> Result<HarnessResult, DriverError>;
 
+    /// Load `url` and report whether the browser survived: `Ok(())` means the
+    /// page loaded without crashing the browser. This is the crashtest path:
+    /// crashtests contain no `testharness.js`, so there is no completion
+    /// callback to wait for. A crash surfaces as
+    /// [`DriverError::BrowserGone`].
+    fn load_without_crash(&mut self, url: &str) -> Result<(), DriverError>;
+
     /// Render `test.url` in `viewport` and return the screenshot.
     fn render(&mut self, test: &TestItem, viewport: Viewport) -> Result<Screenshot, DriverError>;
 
@@ -111,6 +118,12 @@ impl BrowserDriver for StubDriver {
         Err(DriverError::Unimplemented(format!(
             "no browser behind the driver yet; cannot render {}",
             test.id
+        )))
+    }
+
+    fn load_without_crash(&mut self, url: &str) -> Result<(), DriverError> {
+        Err(DriverError::Unimplemented(format!(
+            "no browser behind the driver yet; cannot load {url}"
         )))
     }
 
@@ -177,6 +190,9 @@ mod tests {
         assert!(err.to_string().contains("dom/a.html"));
         let err = d.render(&item(), Viewport::DEFAULT).unwrap_err();
         assert!(matches!(err, DriverError::Unimplemented(_)));
+        let err = d.load_without_crash("/crash/x.html").unwrap_err();
+        assert!(matches!(err, DriverError::Unimplemented(_)));
+        assert!(err.to_string().contains("/crash/x.html"));
     }
 
     #[test]

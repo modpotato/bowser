@@ -3,6 +3,9 @@
 //! [`Runner`] filters a [`Manifest`](crate::manifest::Manifest), hands each
 //! test to the driver, and collects a [`RunReport`]. Testharness tests go
 //! through [`BrowserDriver::run_testharness`](crate::driver::BrowserDriver::run_testharness);
+//! crashtests go through [`BrowserDriver::load_without_crash`](crate::driver::BrowserDriver::load_without_crash)
+//! (a crashtest passes iff the browser survives the load; it contains no
+//! testharness.js, so there is no completion callback to wait for);
 //! reftests are rendered alongside each of their references and compared with
 //! [`compare`](crate::reftest::compare).
 
@@ -66,6 +69,8 @@ impl RunConfig {
 pub enum TestOutcome {
     /// A testharness test produced a report.
     Harness(HarnessResult),
+    /// A crashtest loaded; `passed` is true iff the browser survived.
+    Crashtest { passed: bool },
     /// A reftest rendered and compared against its references.
     Reftest { passed: bool, checks: Vec<RefCheck> },
     /// Not attempted; `reason` says why (manual test, no references, ...).
@@ -79,6 +84,7 @@ impl TestOutcome {
     pub fn passed(&self) -> bool {
         match self {
             TestOutcome::Harness(r) => r.is_green(),
+            TestOutcome::Crashtest { passed } => *passed,
             TestOutcome::Reftest { passed, .. } => *passed,
             TestOutcome::Skipped { .. } | TestOutcome::DriverFailed(_) => false,
         }
@@ -109,6 +115,8 @@ pub struct RunSummary {
     pub total: usize,
     pub harness_pass: usize,
     pub harness_fail: usize,
+    pub crashtest_pass: usize,
+    pub crashtest_fail: usize,
     pub reftest_pass: usize,
     pub reftest_fail: usize,
     pub skipped: usize,
@@ -117,7 +125,7 @@ pub struct RunSummary {
 
 impl RunSummary {
     pub fn passed(&self) -> usize {
-        self.harness_pass + self.reftest_pass
+        self.harness_pass + self.crashtest_pass + self.reftest_pass
     }
 }
 
@@ -137,6 +145,7 @@ impl RunReport {
             "driver: {}\n\
              total: {}\n\
              testharness: {} passed, {} failed\n\
+             crashtest: {} passed, {} failed\n\
              reftest: {} passed, {} failed\n\
              skipped: {}\n\
              driver failures: {}",
@@ -144,6 +153,8 @@ impl RunReport {
             s.total,
             s.harness_pass,
             s.harness_fail,
+            s.crashtest_pass,
+            s.crashtest_fail,
             s.reftest_pass,
             s.reftest_fail,
             s.skipped,
@@ -191,6 +202,8 @@ impl<D: BrowserDriver> Runner<D> {
             match &r.outcome {
                 TestOutcome::Harness(h) if h.is_green() => summary.harness_pass += 1,
                 TestOutcome::Harness(_) => summary.harness_fail += 1,
+                TestOutcome::Crashtest { passed: true } => summary.crashtest_pass += 1,
+                TestOutcome::Crashtest { passed: false } => summary.crashtest_fail += 1,
                 TestOutcome::Reftest { passed: true, .. } => summary.reftest_pass += 1,
                 TestOutcome::Reftest { passed: false, .. } => summary.reftest_fail += 1,
                 TestOutcome::Skipped { .. } => summary.skipped += 1,
@@ -207,16 +220,23 @@ impl<D: BrowserDriver> Runner<D> {
     pub(crate) fn run_one(&mut self, item: &TestItem) -> TestOutcome {
         if !item.kind.is_automated() {
             return TestOutcome::Skipped {
-                reason: format!("{} tests need a human", item.kind),
+                reason: format!("{} tests need a human; cannot run headless", item.kind),
             };
         }
         match item.kind {
-            TestKind::Testharness | TestKind::Crashtest => {
-                match self.driver.run_testharness(item, self.config.timeout) {
-                    Ok(result) => TestOutcome::Harness(result),
-                    Err(e) => TestOutcome::DriverFailed(e),
-                }
-            }
+            TestKind::Testharness => match self.driver.run_testharness(item, self.config.timeout) {
+                Ok(result) => TestOutcome::Harness(result),
+                Err(e) => TestOutcome::DriverFailed(e),
+            },
+            // Crashtests carry no testharness.js, so there is no completion
+            // callback to wait for: load the page and pass iff the browser
+            // survives. A dead browser is a crashtest failure, not a driver
+            // failure; anything else (timeout, bad load) is the driver's.
+            TestKind::Crashtest => match self.driver.load_without_crash(&item.url) {
+                Ok(()) => TestOutcome::Crashtest { passed: true },
+                Err(DriverError::BrowserGone(_)) => TestOutcome::Crashtest { passed: false },
+                Err(e) => TestOutcome::DriverFailed(e),
+            },
             TestKind::Reftest | TestKind::PrintReftest => self.run_reftest(item),
             _ => TestOutcome::Skipped {
                 reason: format!("no runner for {}", item.kind),
@@ -320,6 +340,10 @@ mod tests {
             Ok(self.report.clone())
         }
 
+        fn load_without_crash(&mut self, _url: &str) -> Result<(), DriverError> {
+            Ok(())
+        }
+
         fn render(
             &mut self,
             _test: &TestItem,
@@ -407,7 +431,7 @@ mod tests {
     }
 
     #[test]
-    fn manual_tests_are_skipped() {
+    fn manual_tests_are_skipped_with_reason() {
         let m = manifest_of(vec![item("html/m.html", TestKind::Manual)]);
         let mut r = Runner::new(
             FakeDriver {
@@ -418,10 +442,108 @@ mod tests {
         );
         let report = r.run(&m);
         assert_eq!(report.summary.skipped, 1);
+        match &report.reports[0].outcome {
+            TestOutcome::Skipped { reason } => {
+                assert!(reason.contains("manual"), "reason was: {reason}");
+            }
+            o => panic!("unexpected outcome: {o:?}"),
+        }
+    }
+
+    /// A driver that records which entry point the runner used, so tests can
+    /// prove crashtests never wait on the testharness completion callback.
+    struct CrashDriver {
+        /// What `load_without_crash` returns; `None` means `Ok(())`.
+        crash: Option<DriverError>,
+        load_calls: Vec<String>,
+        harness_calls: usize,
+    }
+
+    impl BrowserDriver for CrashDriver {
+        fn run_testharness(
+            &mut self,
+            _test: &TestItem,
+            _timeout: Duration,
+        ) -> Result<HarnessResult, DriverError> {
+            self.harness_calls += 1;
+            panic!("crashtests must not wait for a testharness.js completion callback");
+        }
+
+        fn load_without_crash(&mut self, url: &str) -> Result<(), DriverError> {
+            self.load_calls.push(url.to_owned());
+            match self.crash.take() {
+                Some(e) => Err(e),
+                None => Ok(()),
+            }
+        }
+
+        fn render(
+            &mut self,
+            _test: &TestItem,
+            _viewport: Viewport,
+        ) -> Result<Screenshot, DriverError> {
+            unimplemented!("crashtest path never renders")
+        }
+
+        fn name(&self) -> &str {
+            "crash-fake"
+        }
+    }
+
+    #[test]
+    fn crashtest_passes_without_harness_callback() {
+        let mut r = Runner::new(
+            CrashDriver {
+                crash: None,
+                load_calls: Vec::new(),
+                harness_calls: 0,
+            },
+            RunConfig::default(),
+        );
+        let outcome = r.run_one(&item("crash/x.html", TestKind::Crashtest));
+        assert!(matches!(outcome, TestOutcome::Crashtest { passed: true }));
+        assert!(outcome.passed());
+        assert_eq!(r.driver().harness_calls, 0);
+        assert_eq!(r.driver().load_calls, vec!["/crash/x.html".to_owned()]);
+    }
+
+    #[test]
+    fn crashtest_browser_crash_is_a_test_failure() {
+        let mut r = Runner::new(
+            CrashDriver {
+                crash: Some(DriverError::BrowserGone("segfault".into())),
+                load_calls: Vec::new(),
+                harness_calls: 0,
+            },
+            RunConfig::default(),
+        );
+        let m = manifest_of(vec![item("crash/y.html", TestKind::Crashtest)]);
+        let report = r.run(&m);
+        assert_eq!(report.summary.crashtest_fail, 1);
+        assert_eq!(report.summary.crashtest_pass, 0);
+        assert_eq!(report.summary.driver_failed, 0);
         assert!(matches!(
             report.reports[0].outcome,
-            TestOutcome::Skipped { .. }
+            TestOutcome::Crashtest { passed: false }
         ));
+        assert!(!report.reports[0].outcome.passed());
+    }
+
+    #[test]
+    fn crashtest_driver_errors_are_driver_failures() {
+        let mut r = Runner::new(
+            CrashDriver {
+                crash: Some(DriverError::Timeout {
+                    test: "crash/z.html".into(),
+                    after: Duration::from_secs(1),
+                }),
+                load_calls: Vec::new(),
+                harness_calls: 0,
+            },
+            RunConfig::default(),
+        );
+        let outcome = r.run_one(&item("crash/z.html", TestKind::Crashtest));
+        assert!(matches!(outcome, TestOutcome::DriverFailed(_)));
     }
 
     #[test]
