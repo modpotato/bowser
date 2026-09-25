@@ -9,13 +9,20 @@
 //!    `.html`/`.htm` files with cheap content heuristics. Useful when no
 //!    manifest has been generated yet.
 //!
-//! `MANIFEST.json` shape (v8/v9):
+//! `MANIFEST.json` shape (v9, as written by `wpt manifest`):
 //! ```json
 //! {"version": 9, "url_base": "/", "items": {
-//!   "testharness": {"dom/x.html": ["item", ["/dom/x.html", {}]]},
-//!   "reftest":     {"css/y.html": ["item", ["/css/y.html", {}]]}
+//!   "testharness": {"dom": {"x.html": ["da39a3ee5e6b4b0d3255bfef95601890afd80709", [null, {}]]}},
+//!   "reftest":     {"css": {"y.html": ["0beec7b5ea3f0c415baa777ef162b3c5a237762", ["/css/y.html", {}]]}}
 //! }}
 //! ```
+//!
+//! `items` nests one path segment per object level; each leaf is
+//! `[<40-char hex file hash>, item-tuple, ...]` where a tuple is
+//! `[url-or-null, ...]`. A null url means the test is served at
+//! `url_base` + the key path (wpt's `URLManifestItem.to_json` emits
+//! `rel_url=None` when the url equals the path). One path may carry
+//! several tuples (multi-global `.any.js` variants).
 
 use std::fmt;
 use std::io;
@@ -94,34 +101,40 @@ pub struct Manifest {
 }
 
 impl Manifest {
-    /// Parse a `MANIFEST.json` document.
+    /// Parse a `MANIFEST.json` document (v9, as written by `wpt manifest`).
+    ///
+    /// A malformed item-type section or entry is skipped and counted in
+    /// [`Manifest::skipped`]; only a wrong `version` or a structurally
+    /// broken document is an error.
     pub fn from_json(text: &str) -> Result<Manifest, ManifestError> {
         let doc = json::parse(text).map_err(|e| ManifestError::Invalid(e.to_string()))?;
+        // wpt raises ManifestVersionMismatch on anything but the current version.
+        if !version_supported(&doc) {
+            return Err(ManifestError::VersionMismatch(describe_value(
+                doc.get("version"),
+            )));
+        }
         let url_base = doc.get("url_base").and_then(Json::as_str).unwrap_or("/");
         let items_obj = doc.get("items").and_then(Json::as_obj).ok_or_else(|| {
             ManifestError::Invalid("MANIFEST.json has no \"items\" object".into())
         })?;
 
         let mut manifest = Manifest::default();
-        for (type_name, entries) in items_obj {
+        for (type_name, section) in items_obj {
             let kind = TestKind::from_manifest_type(type_name);
-            let entries = entries.as_obj().ok_or_else(|| {
-                ManifestError::Invalid(format!("items.{type_name} is not an object"))
-            })?;
-            for (id, item) in entries {
-                match manifest_url(item) {
-                    Some(url) => manifest.items.push(TestItem {
-                        id: id.clone(),
-                        url: join_url(url_base, &url),
-                        kind: kind.clone(),
-                        path: None,
-                    }),
-                    None => manifest.skipped += 1,
+            match section.as_obj() {
+                Some(tree) => {
+                    let mut segments = Vec::new();
+                    walk_items(tree, &mut segments, url_base, &kind, &mut manifest);
                 }
+                // One malformed section must not abort the whole manifest.
+                None => manifest.skipped += 1,
             }
         }
         // Deterministic order regardless of JSON key order.
-        manifest.items.sort_by(|a, b| a.id.cmp(&b.id));
+        manifest
+            .items
+            .sort_by(|a, b| a.id.cmp(&b.id).then_with(|| a.url.cmp(&b.url)));
         Ok(manifest)
     }
 
@@ -179,14 +192,115 @@ impl Manifest {
     }
 }
 
-/// Extract the served URL from a manifest item entry: `["item", [url, ...]]`.
-fn manifest_url(item: &Json) -> Option<String> {
-    let pair = item.as_arr()?;
-    if pair.first()?.as_str() != Some("item") {
-        return None;
+/// The only `MANIFEST.json` format version this parser understands.
+/// Matches wpt's `Manifest.CURRENT_VERSION`.
+const MANIFEST_VERSION: f64 = 9.0;
+
+fn version_supported(doc: &Json) -> bool {
+    matches!(doc.get("version"), Some(Json::Num(n)) if *n == MANIFEST_VERSION)
+}
+
+/// Human-readable rendering of a JSON value for error messages.
+fn describe_value(value: Option<&Json>) -> String {
+    match value {
+        None => "missing".to_owned(),
+        Some(Json::Null) => "null".to_owned(),
+        Some(Json::Bool(b)) => b.to_string(),
+        Some(Json::Num(n)) => {
+            if n.fract() == 0.0 && n.abs() < 1e15 {
+                format!("{}", *n as i64)
+            } else {
+                n.to_string()
+            }
+        }
+        Some(Json::Str(s)) => format!("{s:?}"),
+        Some(Json::Arr(_)) => "array".to_owned(),
+        Some(Json::Obj(_)) => "object".to_owned(),
     }
-    let inner = pair.get(1)?.as_arr()?;
-    inner.first()?.as_str().map(str::to_owned)
+}
+
+/// Walk one item-type section of a v9 manifest. Intermediate objects nest
+/// one path segment per level; leaves are `[file-hash, item-tuple, ...]`
+/// arrays keyed by the final segment.
+fn walk_items<'a>(
+    node: &'a [(String, Json)],
+    segments: &mut Vec<&'a str>,
+    url_base: &str,
+    kind: &TestKind,
+    manifest: &mut Manifest,
+) {
+    for (segment, value) in node {
+        match value {
+            Json::Obj(children) => {
+                segments.push(segment);
+                walk_items(children, segments, url_base, kind, manifest);
+                segments.pop();
+            }
+            Json::Arr(leaf) => {
+                let id = join_segments(segments, segment);
+                parse_leaf(&id, leaf, url_base, kind, manifest);
+            }
+            _ => manifest.skipped += 1,
+        }
+    }
+}
+
+/// Join nested path segments into a manifest id (a checkout-relative path
+/// with forward slashes), normalizing backslashes the way
+/// [`Manifest::walk`] does.
+fn join_segments(segments: &[&str], leaf: &str) -> String {
+    let mut id = String::new();
+    for segment in segments {
+        id.push_str(segment);
+        id.push('/');
+    }
+    id.push_str(leaf);
+    id.replace('\\', "/")
+}
+
+/// Parse one manifest leaf: `[<40-char hex file hash>, item-tuple, ...]`.
+/// Each tuple is `[url-or-null, ...]` and yields one [`TestItem`]; a path
+/// may carry several tuples (e.g. multi-global `.any.js` variants).
+fn parse_leaf(id: &str, leaf: &[Json], url_base: &str, kind: &TestKind, manifest: &mut Manifest) {
+    let [Json::Str(hash), tuples @ ..] = leaf else {
+        manifest.skipped += 1;
+        return;
+    };
+    if !is_file_hash(hash) || tuples.is_empty() {
+        manifest.skipped += 1;
+        return;
+    }
+    for tuple in tuples {
+        match tuple_url(tuple, id, url_base) {
+            Some(url) => manifest.items.push(TestItem {
+                id: id.to_owned(),
+                url,
+                kind: kind.clone(),
+                path: None,
+            }),
+            None => manifest.skipped += 1,
+        }
+    }
+}
+
+/// The leaf's first element is the file's git blob hash: 40 hex chars.
+fn is_file_hash(s: &str) -> bool {
+    s.len() == 40 && s.bytes().all(|b| b.is_ascii_hexdigit())
+}
+
+/// Resolve the served URL for one item tuple, `[url-or-null, ...]`.
+///
+/// A null url element means the test is served at `url_base` + the manifest
+/// key path (wpt's `URLManifestItem.to_json` emits `rel_url=None` when the
+/// url equals the path). Item types with no url slot at all (e.g. crashtest
+/// tuples are just `[extras]`) resolve the same way.
+fn tuple_url(tuple: &Json, id: &str, url_base: &str) -> Option<String> {
+    let elems = tuple.as_arr()?;
+    match elems.first() {
+        Some(Json::Str(url)) => Some(join_url(url_base, url)),
+        Some(Json::Null) | Some(Json::Obj(_)) => Some(join_url(url_base, id)),
+        _ => None,
+    }
 }
 
 fn join_url(base: &str, url: &str) -> String {
@@ -287,6 +401,9 @@ fn has_rel(lower: &str, value: &str) -> bool {
 pub enum ManifestError {
     Io(io::Error),
     Invalid(String),
+    /// `MANIFEST.json` has a `version` this parser does not understand.
+    /// Carries a description of the version value that was found.
+    VersionMismatch(String),
 }
 
 impl fmt::Display for ManifestError {
@@ -294,6 +411,9 @@ impl fmt::Display for ManifestError {
         match self {
             ManifestError::Io(e) => write!(f, "manifest I/O error: {e}"),
             ManifestError::Invalid(msg) => write!(f, "invalid manifest: {msg}"),
+            ManifestError::VersionMismatch(found) => {
+                write!(f, "unsupported manifest version {found}: expected v9")
+            }
         }
     }
 }
@@ -302,7 +422,7 @@ impl std::error::Error for ManifestError {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
         match self {
             ManifestError::Io(e) => Some(e),
-            ManifestError::Invalid(_) => None,
+            ManifestError::Invalid(_) | ManifestError::VersionMismatch(_) => None,
         }
     }
 }
@@ -362,44 +482,95 @@ mod tests {
 
     const PLAIN_HTML: &str = "<!doctype html><title>not a test</title>";
 
+    /// 40-char hex file hashes, as v9 leaves carry.
+    const H1: &str = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+    const H2: &str = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
+    const H3: &str = "cccccccccccccccccccccccccccccccccccccccc";
+    const H4: &str = "dddddddddddddddddddddddddddddddddddddddd";
+    const H5: &str = "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee";
+    const H6: &str = "ffffffffffffffffffffffffffffffffffffffff";
+    const H7: &str = "1111111111111111111111111111111111111111";
+
     #[test]
-    fn from_json_reads_types_and_urls() {
-        let json = r#"{
+    fn from_json_reads_real_v9_shape() {
+        let json = format!(
+            r#"{{
             "version": 9,
             "url_base": "/",
-            "items": {
-                "testharness": {
-                    "dom/a.html": ["item", ["/dom/a.html", {}]],
-                    "dom/b.html": ["item", ["/dom/b.html", {"timeout": "long"}]]
-                },
-                "reftest": {
-                    "css/c.html": ["item", ["/css/c.html", {}]]
-                },
-                "manual": {
-                    "html/d.html": ["item", ["/html/d.html", {}]]
-                },
-                "wdspec": {
-                    "webdriver/e.py": ["item", ["/webdriver/e.py", {}]]
-                },
-                "testharness-broken": []
-            }
-        }"#;
-        // "testharness-broken" is not an object of entries; parsing must fail.
-        assert!(Manifest::from_json(json).is_err());
-
-        let json = json.replace(
-            r#""testharness-broken": []"#,
-            r#""crashtest": {
-                    "x/y.html": ["bogus-shape"]
-                }"#,
+            "items": {{
+                "testharness": {{
+                    "dom": {{
+                        "a.html": ["{H1}", [null, {{}}]],
+                        "b.html": ["{H2}", ["/dom/b.html", {{"timeout": "long"}}]]
+                    }},
+                    "html": {{
+                        "multi.any.js": [
+                            "{H3}",
+                            [null, {{}}, []],
+                            ["/html/multi.any.worker.html", {{}}, []]
+                        ]
+                    }},
+                    "bogus-leaf": ["not-a-hash", [null, {{}}]],
+                    "bad-leaf": [["no", "hash", "here"]]
+                }},
+                "reftest": {{
+                    "css": {{
+                        "c.html": ["{H4}", [null, [["==", "/css/ref.html"]]]]
+                    }}
+                }},
+                "manual": {{
+                    "html": {{
+                        "d.html": ["{H5}", [null, {{}}]]
+                    }}
+                }},
+                "wdspec": {{
+                    "webdriver": {{
+                        "e.py": ["{H6}", [null, {{}}]]
+                    }}
+                }},
+                "crashtest": {{
+                    "x": {{
+                        "y.html": ["{H7}", [{{}}]]
+                    }}
+                }},
+                "broken-section": [1, 2, 3]
+            }}
+        }}"#
         );
         let m = Manifest::from_json(&json).unwrap();
-        assert_eq!(m.len(), 5);
-        assert_eq!(m.skipped, 1); // the bogus-shape entry
-        assert_eq!(m.by_kind(&TestKind::Testharness).len(), 2);
+        // 2 testharness + 2 multi-global variants + reftest + manual + wdspec + crashtest.
+        assert_eq!(m.len(), 8);
+        // bogus-leaf (bad hash), bad-leaf (not a leaf array), broken-section
+        // (not an object): skipped and counted, never fatal.
+        assert_eq!(m.skipped, 3);
+
+        assert_eq!(m.by_kind(&TestKind::Testharness).len(), 4);
         assert_eq!(m.by_kind(&TestKind::Reftest).len(), 1);
         assert_eq!(m.by_kind(&TestKind::Manual).len(), 1);
         assert_eq!(m.by_kind(&TestKind::Other("wdspec".into())).len(), 1);
+        assert_eq!(m.by_kind(&TestKind::Crashtest).len(), 1);
+
+        // Null urls resolve to url_base + the key path.
+        let a = m.items().iter().find(|t| t.id == "dom/a.html").unwrap();
+        assert_eq!(a.url, "/dom/a.html");
+        // Explicit urls are honored.
+        let b = m.items().iter().find(|t| t.id == "dom/b.html").unwrap();
+        assert_eq!(b.url, "/dom/b.html");
+        // Multi-tuple paths yield one item per tuple.
+        let variants: Vec<&TestItem> = m
+            .items()
+            .iter()
+            .filter(|t| t.id == "html/multi.any.js")
+            .collect();
+        assert_eq!(variants.len(), 2);
+        assert_eq!(variants[0].url, "/html/multi.any.js");
+        assert_eq!(variants[1].url, "/html/multi.any.worker.html");
+        // Crashtest tuples carry no url slot; the path is the url.
+        let y = m.items().iter().find(|t| t.id == "x/y.html").unwrap();
+        assert_eq!(y.url, "/x/y.html");
+        assert_eq!(y.kind, TestKind::Crashtest);
+
+        // Deterministic order regardless of JSON key order.
         let first = &m.items()[0];
         assert_eq!(first.id, "css/c.html");
         assert_eq!(first.url, "/css/c.html");
@@ -407,19 +578,69 @@ mod tests {
     }
 
     #[test]
+    fn from_json_rejects_wrong_version() {
+        for version in ["8", "10", "\"9\"", "null"] {
+            let json = format!(r#"{{"version": {version}, "url_base": "/", "items": {{}}}}"#);
+            let err = Manifest::from_json(&json).unwrap_err();
+            assert!(
+                matches!(err, ManifestError::VersionMismatch(_)),
+                "version {version}: {err:?}"
+            );
+        }
+        // A missing version is a mismatch too, like wpt's ManifestVersionMismatch.
+        let err = Manifest::from_json(r#"{"url_base": "/", "items": {}}"#).unwrap_err();
+        assert!(matches!(err, ManifestError::VersionMismatch(_)));
+    }
+
+    #[test]
     fn from_json_rejects_garbage() {
         assert!(Manifest::from_json("not json").is_err());
-        assert!(Manifest::from_json(r#"{"version": 9}"#).is_err());
-        assert!(Manifest::from_json(r#"{"items": []}"#).is_err());
+        // Right version, but no items object.
+        let err = Manifest::from_json(r#"{"version": 9}"#).unwrap_err();
+        assert!(matches!(err, ManifestError::Invalid(_)));
+        assert!(Manifest::from_json(r#"{"version": 9, "items": []}"#).is_err());
     }
 
     #[test]
     fn from_json_applies_url_base() {
-        let json = r#"{"version": 9, "url_base": "/_wpt_/", "items": {
-            "testharness": {"a.html": ["item", ["a.html", {}]]}
-        }}"#;
-        let m = Manifest::from_json(json).unwrap();
-        assert_eq!(m.items()[0].url, "/_wpt_/a.html");
+        let json = format!(
+            r#"{{"version": 9, "url_base": "/_wpt_/", "items": {{
+            "testharness": {{"sub": {{
+                "a.html": ["{H1}", [null, {{}}]],
+                "b.html": ["{H2}", ["b.html", {{}}]]
+            }}}}
+        }}}}"#
+        );
+        let m = Manifest::from_json(&json).unwrap();
+        // Null url: url_base + key path.
+        assert_eq!(m.items()[0].id, "sub/a.html");
+        assert_eq!(m.items()[0].url, "/_wpt_/sub/a.html");
+        // Relative explicit url: joined onto url_base.
+        assert_eq!(m.items()[1].url, "/_wpt_/b.html");
+    }
+
+    #[test]
+    fn from_json_normalizes_backslash_ids() {
+        let json = format!(
+            r#"{{"version": 9, "url_base": "/", "items": {{
+            "testharness": {{"dom": {{"sub\\dir\\f.html": ["{H1}", [null, {{}}]]}}}}
+        }}}}"#
+        );
+        let m = Manifest::from_json(&json).unwrap();
+        assert_eq!(m.items()[0].id, "dom/sub/dir/f.html");
+        assert_eq!(m.items()[0].url, "/dom/sub/dir/f.html");
+    }
+
+    #[test]
+    fn from_json_handles_root_level_files() {
+        let json = format!(
+            r#"{{"version": 9, "url_base": "/", "items": {{
+            "testharness": {{"top.html": ["{H1}", [null, {{}}]]}}
+        }}}}"#
+        );
+        let m = Manifest::from_json(&json).unwrap();
+        assert_eq!(m.items()[0].id, "top.html");
+        assert_eq!(m.items()[0].url, "/top.html");
     }
 
     #[test]

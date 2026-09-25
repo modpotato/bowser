@@ -347,7 +347,9 @@ mod tests {
     }
 
     /// Build a [`Manifest`] from items via the JSON parser, so tests exercise
-    /// the same path as a real MANIFEST.json.
+    /// the same path as a real MANIFEST.json (v9 shape: `[<40-hex hash>,
+    /// [url, extras]]` leaves; flat path keys are equivalent to one-segment
+    /// nesting for `from_json`).
     fn manifest_of(items: Vec<TestItem>) -> Manifest {
         let mut by_kind: std::collections::HashMap<String, Vec<&TestItem>> =
             std::collections::HashMap::new();
@@ -358,11 +360,18 @@ mod tests {
         for (kind, ts) in &by_kind {
             let es: Vec<String> = ts
                 .iter()
-                .map(|t| format!("\"{}\": [\"item\", [\"/{}\", {{}}]]", t.id, t.id))
+                .map(|t| {
+                    format!(
+                        "\"{}\": [\"{}\", [\"/{}\", {{}}]]",
+                        t.id,
+                        "0".repeat(40),
+                        t.id
+                    )
+                })
                 .collect();
             objs.push(format!("\"{kind}\": {{{}}}", es.join(",")));
         }
-        let json = format!("{{\"items\": {{{}}}}}", objs.join(","));
+        let json = format!("{{\"version\": 9, \"items\": {{{}}}}}", objs.join(","));
         Manifest::from_json(&json).unwrap()
     }
 
