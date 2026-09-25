@@ -6,16 +6,25 @@
 //!    `wpt manifest`). This is the accurate path: the manifest already knows
 //!    each test's type.
 //! 2. [`Manifest::walk`] scans the checkout directory directly and classifies
-//!    `.html`/`.htm` files with cheap content heuristics. Useful when no
-//!    manifest has been generated yet.
+//!    `.html`/`.htm`/`.xhtml`/`.xht` files with cheap content heuristics.
+//!    Useful when no manifest has been generated yet.
 //!
-//! `MANIFEST.json` shape (v8/v9):
+//! `MANIFEST.json` shape (v9, exactly as `wpt manifest` writes it):
 //! ```json
 //! {"version": 9, "url_base": "/", "items": {
-//!   "testharness": {"dom/x.html": ["item", ["/dom/x.html", {}]]},
-//!   "reftest":     {"css/y.html": ["item", ["/css/y.html", {}]]}
+//!   "testharness": {"dom/x.html": [[null, {}]]},
+//!   "reftest":     {"css/y.html": [[null, [["/css/y-ref.html", "=="]], {}]]}
 //! }}
 //! ```
+//!
+//! - `version` must be 9; anything else is rejected (regenerate the manifest).
+//! - Each path maps to a *list* of items: one file can yield several tests
+//!   (multi-global variants like `?1=1`, `?2=2`).
+//! - A testharness item is `[url, extras]`; a reftest item is
+//!   `[url, references, extras]`. `url` is `null` when it equals the path,
+//!   and the served URL is `url_base` + path then.
+//! - Entries whose shape is not understood are skipped and counted in
+//!   [`Manifest::skipped`]; they never fail the parse.
 
 use std::fmt;
 use std::io;
@@ -133,9 +142,10 @@ impl Manifest {
 
     /// Walk a WPT checkout and classify test files with content heuristics.
     ///
-    /// Only `.html`/`.htm`/`.xhtml` files are considered. Infrastructure
-    /// directories (`tools/`, `resources/`, `infrastructure/`, `.git/`) are
-    /// skipped. Classification:
+    /// Only `.html`/`.htm`/`.xhtml`/`.xht` files are considered. Files whose
+    /// name ends in `-ref` are reference files, not tests, and are skipped.
+    /// Infrastructure directories (`tools/`, `resources/`, `infrastructure/`,
+    /// `.git/`) are skipped. Classification:
     ///
     /// - contains a `<link rel=match|mismatch>` → [`TestKind::Reftest`]
     /// - references `testharness.js` → [`TestKind::Testharness`]
@@ -179,7 +189,11 @@ impl Manifest {
     }
 }
 
-/// Extract the served URL from a manifest item entry: `["item", [url, ...]]`.
+/// Extract the served URL from one v9 manifest item entry.
+///
+/// `item` is one element of the per-path item list: `[url, extras]` for most
+/// types, `[url, references, extras]` for reftests. `url` is null when it
+/// equals the path; the caller substitutes the path then.
 fn manifest_url(item: &Json) -> Option<String> {
     let pair = item.as_arr()?;
     if pair.first()?.as_str() != Some("item") {

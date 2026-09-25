@@ -40,6 +40,32 @@ cd wpt
 This needs Python 3; it is the same manifest `wpt run` uses. Regenerate it
 after pulling.
 
+### The v9 format bowser reads
+
+`./wpt manifest` writes version 9, and bowser parses exactly that shape —
+not an approximation of it:
+
+```json
+{"version": 9, "url_base": "/", "items": {
+  "testharness": {"dom/a.html": [[null, {}]]},
+  "reftest":     {"css/b.html": [[null, [["/css/b-ref.html", "=="]], {}]]}
+}}
+```
+
+- `version` must be `9`. Anything else — including a missing version — is
+  an error, not a guess: the manifest is stale or came from another tool,
+  so regenerate it with `./wpt manifest`.
+- Each path maps to a **list** of items, not a single item. One file can
+  produce several tests (multi-global variants such as `?1=1`, `?2=2`).
+- A testharness item is `[url, extras]`; a reftest item is
+  `[url, references, extras]`. `url` is `null` when it equals the path —
+  the common case — and the served URL is `url_base` + path then. Real
+  manifests store urls without a leading slash.
+- Entries whose shape bowser does not understand are skipped and counted
+  (reported as "unknown shape" by `bowser-wpt-run`); they never abort the
+  run. A manifest where *every* entry is skipped usually means the file is
+  not actually v9 — check the `version` field.
+
 ## Running the harness
 
 ```sh
@@ -61,6 +87,17 @@ bowser-wpt-run --manifest wpt/MANIFEST.json --include html/ --timeout-secs 30
 - Drive a real browser. `BrowserDriver` is a trait with only a stub
   implementation until the renderer exists.
 - Screenshot comparison at scale (see `reftest-design.md`).
+- Honor manifest `extras`. `timeout`, `pac`, `fuzzy`, `viewport_size` and
+  friends are parsed but ignored: every testharness test gets the CLI
+  `--timeout-secs`, every reftest the default exact comparison. In
+  particular, `<meta name="fuzzy">` annotations are not mapped to
+  comparison tolerances yet.
+- Use reftest `references` from the manifest. The runner extracts
+  `<link rel=match|mismatch>` from the test file on disk instead, so
+  reftests only run in `--wpt-root` (walk) mode, where the files are
+  present.
+- The JSON parser is deliberately small and std-only; it rejects inputs
+  nested beyond its depth limit instead of recursing forever.
 
 ## Test selection guidance
 
