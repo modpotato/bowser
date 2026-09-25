@@ -97,6 +97,9 @@ pub enum HttpError {
     UnsupportedTransferEncoding,
     /// `chunked` appears but is not the final transfer coding.
     ChunkedNotFinal,
+    /// A `Transfer-Encoding` field was present on an HTTP/1.0 (or earlier)
+    /// message; the framing must be treated as faulty (RFC 9112 §6.1).
+    TransferEncodingOnHttp10,
     /// A chunk-size line has no valid hexadecimal size.
     InvalidChunkSize,
     /// A chunk extension is malformed.
@@ -131,6 +134,9 @@ impl fmt::Display for HttpError {
             Self::InvalidTransferEncoding => "invalid Transfer-Encoding value",
             Self::UnsupportedTransferEncoding => "unsupported transfer coding",
             Self::ChunkedNotFinal => "chunked is not the final transfer coding",
+            Self::TransferEncodingOnHttp10 => {
+                "Transfer-Encoding is not allowed in HTTP/1.0 messages"
+            }
             Self::InvalidChunkSize => "invalid chunk-size",
             Self::InvalidChunkExtension => "invalid chunk extension",
             Self::InvalidChunkTerminator => "chunk data not followed by CRLF",
@@ -582,7 +588,16 @@ enum TransferOutcome {
 /// the final coding; any other non-`identity` coding is unsupported.
 /// When `Transfer-Encoding` is present it overrides `Content-Length`
 /// (RFC 9112 §6.3); callers implement that by checking this first.
-fn transfer_encoding(headers: &Headers) -> Result<TransferOutcome, HttpError> {
+///
+/// A `Transfer-Encoding` field on an HTTP/1.0 (or earlier) message is faulty
+/// framing (RFC 9112 §6.1).
+fn transfer_encoding(
+    version: HttpVersion,
+    headers: &Headers,
+) -> Result<TransferOutcome, HttpError> {
+    if version == HttpVersion::HTTP_10 && headers.get_all("transfer-encoding").next().is_some() {
+        return Err(HttpError::TransferEncodingOnHttp10);
+    }
     let mut codings: Vec<&[u8]> = Vec::new();
     for value in headers.get_all("transfer-encoding") {
         for part in value.split(|&b| b == b',') {
@@ -629,7 +644,7 @@ fn transfer_encoding(headers: &Headers) -> Result<TransferOutcome, HttpError> {
 /// How a request's body is framed. With neither `Transfer-Encoding` nor
 /// `Content-Length` the body length is zero (RFC 9112 §6.3).
 pub fn request_body_spec(head: &RequestHead) -> Result<BodySpec, HttpError> {
-    match transfer_encoding(&head.headers)? {
+    match transfer_encoding(head.version, &head.headers)? {
         TransferOutcome::Chunked => Ok(BodySpec::Chunked),
         TransferOutcome::None => Ok(match content_length(&head.headers)? {
             Some(n) => BodySpec::ContentLength(n),
@@ -653,7 +668,7 @@ pub fn response_body_spec(
         100..=199 | 204 | 304 => return Ok(BodySpec::Empty),
         _ => {}
     }
-    match transfer_encoding(&head.headers)? {
+    match transfer_encoding(head.version, &head.headers)? {
         TransferOutcome::Chunked => Ok(BodySpec::Chunked),
         TransferOutcome::None => Ok(match content_length(&head.headers)? {
             Some(n) => BodySpec::ContentLength(n),
@@ -1668,6 +1683,51 @@ mod tests {
         assert_eq!(
             res_spec(b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked", b"HEAD"),
             Ok(BodySpec::Empty)
+        );
+    }
+
+    #[test]
+    fn transfer_encoding_rejected_on_http10_request() {
+        // RFC 9112 §6.1: TE on an HTTP/1.0 message is faulty framing,
+        // even `identity`.
+        let (head, _) = req(b"POST / HTTP/1.0\r\nTransfer-Encoding: chunked\r\n\r\n").unwrap();
+        assert_eq!(
+            request_body_spec(&head),
+            Err(HttpError::TransferEncodingOnHttp10)
+        );
+        let (head, _) = req(b"POST / HTTP/1.0\r\nTransfer-Encoding: identity\r\n\r\n").unwrap();
+        assert_eq!(
+            request_body_spec(&head),
+            Err(HttpError::TransferEncodingOnHttp10)
+        );
+        // Content-Length framing on HTTP/1.0 is unaffected.
+        let (head, _) = req(b"POST / HTTP/1.0\r\nContent-Length: 5\r\n\r\n").unwrap();
+        assert_eq!(request_body_spec(&head), Ok(BodySpec::ContentLength(5)));
+        // HTTP/1.1 with TE: chunked still works.
+        let (head, _) = req(b"POST / HTTP/1.1\r\nTransfer-Encoding: chunked\r\n\r\n").unwrap();
+        assert_eq!(request_body_spec(&head), Ok(BodySpec::Chunked));
+    }
+
+    #[test]
+    fn transfer_encoding_rejected_on_http10_response() {
+        // RFC 9112 §6.1: TE on an HTTP/1.0 message is faulty framing.
+        assert_eq!(
+            res_spec(b"HTTP/1.0 200 OK\r\nTransfer-Encoding: chunked", b"GET"),
+            Err(HttpError::TransferEncodingOnHttp10)
+        );
+        assert_eq!(
+            res_spec(b"HTTP/1.0 200 OK\r\nTransfer-Encoding: identity", b"GET"),
+            Err(HttpError::TransferEncodingOnHttp10)
+        );
+        // Content-Length framing on HTTP/1.0 is unaffected.
+        assert_eq!(
+            res_spec(b"HTTP/1.0 200 OK\r\nContent-Length: 5", b"GET"),
+            Ok(BodySpec::ContentLength(5))
+        );
+        // HTTP/1.1 with TE: chunked still works.
+        assert_eq!(
+            res_spec(b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked", b"GET"),
+            Ok(BodySpec::Chunked)
         );
     }
 
