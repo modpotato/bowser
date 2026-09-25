@@ -1,17 +1,39 @@
 //! Parsing `testharness.js` completion reports.
 //!
-//! When the driver finishes a testharness test it produces one JSON report.
-//! The Bowser-native shape (emitted by the driver's injected completion
-//! callback) is:
+//! Two schemas, one per entry point, with no cross-fallback: each parser
+//! accepts only its own schema and rejects the other, so a report from the
+//! wrong schema can never be silently reinterpreted.
+//!
+//! The Bowser-native schema (emitted by the driver's injected completion
+//! callback, accepted only by [`HarnessResult::from_json`]):
 //!
 //! ```json
 //! {"test": "/dom/a.html", "harness_status": "OK", "duration_ms": 12,
 //!  "tests": [{"name": "smoke", "status": "PASS", "message": null}]}
 //! ```
 //!
-//! [`parse_wptreport`] additionally reads the `wpt run --log-wptreport`
-//! format (`{"results": [{"test": ..., "status": ..., "subtests": [...]}]}`)
-//! so runs recorded by other harnesses can be imported.
+//! Required: `test` (string), `harness_status` (string; unknown strings are
+//! kept as [`HarnessStatus::Unknown`]), `tests` (array of subtest objects,
+//! each with required `name` and `status` strings and an optional `message`).
+//! Optional: `duration_ms` (number; `null` or other types are ignored). Any
+//! other field — including the wptreport names `status` and `subtests` — is
+//! an error.
+//!
+//! The wptreport schema (produced by `wpt run --log-wptreport`, accepted
+//! only by [`parse_wptreport`]):
+//!
+//! ```json
+//! {"results": [{"test": "/a.html", "status": "OK",
+//!               "subtests": [{"name": "one", "status": "PASS"}]}]}
+//! ```
+//!
+//! Each entry requires `test` and `status` strings; `subtests` is optional
+//! and has the same subtest shape as the native schema (required `name` and
+//! `status`, optional `message`). Entries that are missing `test` or
+//! `status`, or that carry the Bowser-native fields `harness_status` or
+//! `tests`, are skipped and counted in the skip count — never parsed.
+//! Other unknown fields on an entry are ignored, since real wptreport logs
+//! carry many optional ones (`message`, `expected`, `duration`, ...).
 
 use std::fmt;
 
@@ -106,9 +128,13 @@ pub struct HarnessResult {
 
 impl HarnessResult {
     /// Parse one Bowser-native completion report.
+    ///
+    /// Accepts only the Bowser-native schema documented in the module docs:
+    /// a missing or mistyped required field, or any unknown field (notably
+    /// the wptreport names `status` and `subtests`), is an error.
     pub fn from_json(text: &str) -> Result<HarnessResult, ResultsError> {
         let doc = json::parse(text).map_err(|e| ResultsError::invalid(e.to_string()))?;
-        parse_report(&doc)
+        parse_native_report(&doc)
     }
 
     /// True when the harness finished and every subtest passed.
@@ -136,7 +162,25 @@ impl HarnessResult {
     }
 }
 
-fn parse_report(doc: &Json) -> Result<HarnessResult, ResultsError> {
+/// Parse one Bowser-native completion report.
+///
+/// Strict: only the fields `test`, `harness_status`, `duration_ms`, `tests`
+/// exist in this schema. There is no fallback to the wptreport names
+/// `status`/`subtests`; a document using those is rejected outright.
+fn parse_native_report(doc: &Json) -> Result<HarnessResult, ResultsError> {
+    let obj = doc
+        .as_obj()
+        .ok_or_else(|| ResultsError::invalid("report is not an object".into()))?;
+    for (k, _) in obj {
+        if !matches!(
+            k.as_str(),
+            "test" | "harness_status" | "duration_ms" | "tests"
+        ) {
+            return Err(ResultsError::invalid(format!(
+                "report has unknown field {k:?}"
+            )));
+        }
+    }
     let test = doc
         .get("test")
         .and_then(Json::as_str)
@@ -144,23 +188,20 @@ fn parse_report(doc: &Json) -> Result<HarnessResult, ResultsError> {
         .to_owned();
     let status = doc
         .get("harness_status")
-        .or_else(|| doc.get("status"))
         .and_then(Json::as_str)
         .map(HarnessStatus::parse)
-        .unwrap_or(HarnessStatus::Unknown("missing".into()));
+        .ok_or_else(|| ResultsError::invalid("report has no \"harness_status\"".into()))?;
     let duration_ms = doc.get("duration_ms").and_then(|v| match v {
         Json::Num(n) if *n >= 0.0 => Some(*n as u64),
         _ => None,
     });
-    let mut subtests = Vec::new();
-    if let Some(tests) = doc
+    let tests = doc
         .get("tests")
-        .or_else(|| doc.get("subtests"))
         .and_then(Json::as_arr)
-    {
-        for t in tests {
-            subtests.push(parse_subtest(t)?);
-        }
+        .ok_or_else(|| ResultsError::invalid("report has no \"tests\"".into()))?;
+    let mut subtests = Vec::with_capacity(tests.len());
+    for t in tests {
+        subtests.push(parse_native_subtest(t)?);
     }
     Ok(HarnessResult {
         test,
@@ -170,7 +211,20 @@ fn parse_report(doc: &Json) -> Result<HarnessResult, ResultsError> {
     })
 }
 
-fn parse_subtest(t: &Json) -> Result<SubtestResult, ResultsError> {
+/// Parse one subtest of a Bowser-native report.
+///
+/// Strict: only `name`, `status`, `message` are allowed.
+fn parse_native_subtest(t: &Json) -> Result<SubtestResult, ResultsError> {
+    let obj = t
+        .as_obj()
+        .ok_or_else(|| ResultsError::invalid("subtest is not an object".into()))?;
+    for (k, _) in obj {
+        if !matches!(k.as_str(), "name" | "status" | "message") {
+            return Err(ResultsError::invalid(format!(
+                "subtest has unknown field {k:?}"
+            )));
+        }
+    }
     let name = t
         .get("name")
         .and_then(Json::as_str)
@@ -180,7 +234,69 @@ fn parse_subtest(t: &Json) -> Result<SubtestResult, ResultsError> {
         .get("status")
         .and_then(Json::as_str)
         .map(SubtestStatus::parse)
-        .unwrap_or(SubtestStatus::Unknown("missing".into()));
+        .ok_or_else(|| ResultsError::invalid("subtest has no \"status\"".into()))?;
+    let message = t.get("message").and_then(Json::as_str).map(str::to_owned);
+    Ok(SubtestResult {
+        name,
+        status,
+        message,
+    })
+}
+
+/// Parse one entry of a `wpt run --log-wptreport` document.
+///
+/// Strict: only the wptreport names `status`/`subtests` are read. Entries
+/// carrying the Bowser-native fields `harness_status`/`tests` indicate a
+/// schema mix-up and are rejected (never reinterpreted); all other unknown
+/// fields are ignored since real wptreport logs carry many optional ones.
+fn parse_wptreport_entry(r: &Json) -> Result<HarnessResult, ResultsError> {
+    for key in ["harness_status", "tests"] {
+        if r.get(key).is_some() {
+            return Err(ResultsError::invalid(format!(
+                "wptreport entry has Bowser-native field {key:?}"
+            )));
+        }
+    }
+    let test = r
+        .get("test")
+        .and_then(Json::as_str)
+        .ok_or_else(|| ResultsError::invalid("wptreport entry has no \"test\"".into()))?
+        .to_owned();
+    let status = r
+        .get("status")
+        .and_then(Json::as_str)
+        .map(HarnessStatus::parse)
+        .ok_or_else(|| ResultsError::invalid("wptreport entry has no \"status\"".into()))?;
+    let mut subtests = Vec::new();
+    if let Some(tests) = r.get("subtests").and_then(Json::as_arr) {
+        for t in tests {
+            subtests.push(parse_wpt_subtest(t)?);
+        }
+    }
+    Ok(HarnessResult {
+        test,
+        status,
+        duration_ms: None,
+        subtests,
+    })
+}
+
+/// Parse one subtest of a wptreport entry.
+///
+/// Same field names as the native subtest shape (`name`, `status`,
+/// `message`), so no cross-schema ambiguity can arise here; other unknown
+/// fields are ignored like on the entry itself.
+fn parse_wpt_subtest(t: &Json) -> Result<SubtestResult, ResultsError> {
+    let name = t
+        .get("name")
+        .and_then(Json::as_str)
+        .ok_or_else(|| ResultsError::invalid("subtest has no \"name\"".into()))?
+        .to_owned();
+    let status = t
+        .get("status")
+        .and_then(Json::as_str)
+        .map(SubtestStatus::parse)
+        .ok_or_else(|| ResultsError::invalid("subtest has no \"status\"".into()))?;
     let message = t.get("message").and_then(Json::as_str).map(str::to_owned);
     Ok(SubtestResult {
         name,
@@ -191,9 +307,11 @@ fn parse_subtest(t: &Json) -> Result<SubtestResult, ResultsError> {
 
 /// Parse a `wpt run --log-wptreport` document into per-test results.
 ///
-/// Unknown `status` strings and missing `subtests` arrays are tolerated;
-/// entries without a `test` field are skipped and counted in the returned
-/// skip count.
+/// Accepts only the wptreport schema documented in the module docs: each
+/// entry must carry `test` and `status` (with an optional `subtests` array).
+/// Entries that do not — including entries in the Bowser-native shape — are
+/// skipped and counted in the returned skip count. Unknown `status` strings
+/// and missing `subtests` arrays are tolerated.
 pub fn parse_wptreport(text: &str) -> Result<(Vec<HarnessResult>, usize), ResultsError> {
     let doc = json::parse(text).map_err(|e| ResultsError::invalid(e.to_string()))?;
     let results = doc
@@ -203,7 +321,7 @@ pub fn parse_wptreport(text: &str) -> Result<(Vec<HarnessResult>, usize), Result
     let mut out = Vec::with_capacity(results.len());
     let mut skipped = 0;
     for r in results {
-        match parse_report(r) {
+        match parse_wptreport_entry(r) {
             Ok(h) => out.push(h),
             Err(_) => skipped += 1,
         }
@@ -291,10 +409,61 @@ mod tests {
     }
 
     #[test]
-    fn missing_subtests_is_empty() {
-        let r = HarnessResult::from_json(r#"{"test": "x", "harness_status": "OK"}"#).unwrap();
-        assert!(r.subtests.is_empty());
-        assert!(!r.is_green());
+    fn native_schema_requires_tests() {
+        assert!(HarnessResult::from_json(r#"{"test": "x", "harness_status": "OK"}"#).is_err());
+    }
+
+    #[test]
+    fn from_json_rejects_wptreport_shape() {
+        // no silent cross-fallback: the wptreport names are unknown here.
+        let wpt_shaped = r#"{"test": "/a.html", "status": "OK",
+            "subtests": [{"name": "one", "status": "PASS"}]}"#;
+        assert!(HarnessResult::from_json(wpt_shaped).is_err());
+    }
+
+    #[test]
+    fn from_json_rejects_unrelated_status_field() {
+        // the W14 scenario: missing harness_status plus an unrelated status
+        // field must not parse "successfully".
+        let report = r#"{"test": "/a.html", "status": "SOMETHING_ELSE",
+            "tests": [{"name": "one", "status": "PASS"}]}"#;
+        assert!(HarnessResult::from_json(report).is_err());
+    }
+
+    #[test]
+    fn from_json_rejects_unknown_fields() {
+        assert!(
+            HarnessResult::from_json(
+                r#"{"test": "x", "harness_status": "OK", "bogus": 1, "tests": []}"#,
+            )
+            .is_err()
+        );
+        assert!(
+            HarnessResult::from_json(
+                r#"{"test": "x", "harness_status": "OK",
+                "tests": [{"name": "a", "status": "PASS", "extra": 1}]}"#,
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn from_json_rejects_mistyped_required_fields() {
+        assert!(
+            HarnessResult::from_json(r#"{"test": "x", "harness_status": 42, "tests": []}"#,)
+                .is_err()
+        );
+        assert!(
+            HarnessResult::from_json(r#"{"test": "x", "harness_status": "OK", "tests": {}}"#,)
+                .is_err()
+        );
+        assert!(
+            HarnessResult::from_json(
+                r#"{"test": "x", "harness_status": "OK",
+                "tests": [{"name": "a"}]}"#,
+            )
+            .is_err()
+        );
     }
 
     #[test]
@@ -328,5 +497,24 @@ mod tests {
     #[test]
     fn wptreport_requires_results_array() {
         assert!(parse_wptreport(r#"{"run_info": {}}"#).is_err());
+    }
+
+    #[test]
+    fn wptreport_skips_native_shape() {
+        // no silent cross-fallback in the other direction: a Bowser-native
+        // entry is skipped, not reinterpreted.
+        let doc = r#"{"results": [
+            {"test": "/a.html", "harness_status": "OK",
+             "tests": [{"name": "one", "status": "PASS"}]},
+            {"test": "/b.html", "status": "OK",
+             "subtests": [{"name": "two", "status": "PASS"}]},
+            {"test": "/c.html", "subtests": []}
+        ]}"#;
+        let (results, skipped) = parse_wptreport(doc).unwrap();
+        assert_eq!(results.len(), 1);
+        assert_eq!(skipped, 2);
+        assert_eq!(results[0].test, "/b.html");
+        assert_eq!(results[0].status, HarnessStatus::Ok);
+        assert!(results[0].is_green());
     }
 }
