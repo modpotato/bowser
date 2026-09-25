@@ -149,7 +149,10 @@ pub struct Comparison {
 ///
 /// Both screenshots must have identical dimensions; a size mismatch is an
 /// error, not a pass or fail, because it usually means the driver or the
-/// test setup is broken rather than the rendering.
+/// test setup is broken rather than the rendering. Each screenshot's pixel
+/// buffer must also hold exactly `width * height * 4` bytes: a short or
+/// overlong buffer means the driver produced garbage, and comparing it
+/// anyway would silently truncate to the shorter buffer.
 pub fn compare(
     a: &Screenshot,
     b: &Screenshot,
@@ -160,6 +163,17 @@ pub fn compare(
             a: (a.width, a.height),
             b: (b.width, b.height),
         });
+    }
+    // Dimensions match, so the expected buffer length is the same for both.
+    let expected = a.width as usize * a.height as usize * 4;
+    for (which, shot) in [("a", a), ("b", b)] {
+        if shot.rgba.len() != expected {
+            return Err(ReftestError::BadPixelBuffer {
+                which,
+                expected,
+                got: shot.rgba.len(),
+            });
+        }
     }
     let total = a.width as u64 * a.height as u64;
     let mut diff_pixels: u64 = 0;
@@ -194,7 +208,17 @@ pub fn compare(
 #[derive(Debug)]
 pub enum ReftestError {
     Io(std::io::Error),
-    SizeMismatch { a: (u32, u32), b: (u32, u32) },
+    SizeMismatch {
+        a: (u32, u32),
+        b: (u32, u32),
+    },
+    /// A screenshot's pixel buffer is not `width * height * 4` bytes long.
+    BadPixelBuffer {
+        /// Which side was malformed: `"a"` or `"b"`.
+        which: &'static str,
+        expected: usize,
+        got: usize,
+    },
 }
 
 impl fmt::Display for ReftestError {
@@ -208,6 +232,16 @@ impl fmt::Display for ReftestError {
                     a.0, a.1, b.0, b.1
                 )
             }
+            ReftestError::BadPixelBuffer {
+                which,
+                expected,
+                got,
+            } => {
+                write!(
+                    f,
+                    "screenshot {which} pixel buffer length mismatch: expected {expected} bytes, got {got}"
+                )
+            }
         }
     }
 }
@@ -216,7 +250,7 @@ impl std::error::Error for ReftestError {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
         match self {
             ReftestError::Io(e) => Some(e),
-            ReftestError::SizeMismatch { .. } => None,
+            _ => None,
         }
     }
 }
@@ -313,5 +347,92 @@ mod tests {
         let err = compare(&a, &b, ReftestTolerance::EXACT).unwrap_err();
         assert!(matches!(err, ReftestError::SizeMismatch { .. }));
         assert!(err.to_string().contains("4x4 vs 8x4"));
+    }
+
+    #[test]
+    fn mismatched_buffer_lengths_are_error() {
+        // The reviewer's verified case: 20 bytes vs 16 bytes for a 2x2
+        // image used to return Ok(equal=true); it must be an error.
+        let a = Screenshot {
+            width: 2,
+            height: 2,
+            rgba: vec![0u8; 20],
+        };
+        let b = Screenshot {
+            width: 2,
+            height: 2,
+            rgba: vec![0u8; 16],
+        };
+        let err = compare(&a, &b, ReftestTolerance::EXACT).unwrap_err();
+        assert!(
+            matches!(
+                err,
+                ReftestError::BadPixelBuffer {
+                    which: "a",
+                    expected: 16,
+                    got: 20
+                }
+            ),
+            "unexpected error: {err:?}"
+        );
+        let err = compare(&b, &a, ReftestTolerance::EXACT).unwrap_err();
+        assert!(
+            matches!(
+                err,
+                ReftestError::BadPixelBuffer {
+                    which: "b",
+                    expected: 16,
+                    got: 20
+                }
+            ),
+            "unexpected error: {err:?}"
+        );
+        assert!(err.to_string().contains("expected 16 bytes, got 20"));
+    }
+
+    #[test]
+    fn wrong_length_for_dimensions_is_error() {
+        // Same length on both sides, but not width*height*4: still an error,
+        // not a pass. Also covers a length that is not a multiple of 4.
+        let a = Screenshot {
+            width: 2,
+            height: 2,
+            rgba: vec![0u8; 20],
+        };
+        let b = Screenshot {
+            width: 2,
+            height: 2,
+            rgba: vec![0u8; 20],
+        };
+        let err = compare(&a, &b, ReftestTolerance::EXACT).unwrap_err();
+        assert!(matches!(err, ReftestError::BadPixelBuffer { .. }));
+        let short = Screenshot {
+            width: 2,
+            height: 2,
+            rgba: vec![0u8; 15],
+        };
+        let good = Screenshot::solid(2, 2, 0, 0, 0, 255);
+        let err = compare(&short, &good, ReftestTolerance::EXACT).unwrap_err();
+        assert!(
+            matches!(
+                err,
+                ReftestError::BadPixelBuffer {
+                    which: "a",
+                    expected: 16,
+                    got: 15
+                }
+            ),
+            "unexpected error: {err:?}"
+        );
+    }
+
+    #[test]
+    fn equal_images_still_pass() {
+        let a = Screenshot::solid(4, 4, 10, 20, 30, 255);
+        let b = Screenshot::solid(4, 4, 10, 20, 30, 255);
+        let r = compare(&a, &b, ReftestTolerance::EXACT).unwrap();
+        assert!(r.equal);
+        assert_eq!(r.diff_pixels, 0);
+        assert_eq!(r.diff_fraction, 0.0);
     }
 }
