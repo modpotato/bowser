@@ -709,11 +709,59 @@ pub fn is_persistent(version: HttpVersion, headers: &Headers) -> bool {
 
 /// Trailer fields that must never appear in a trailer section
 /// (RFC 9112 §7.1.2).
+///
+/// Trailers arrive after the body, so a sender MUST NOT generate a trailer
+/// section containing fields that are needed *before* the content is fully
+/// received. The RFC forbids fields for message framing, routing, request
+/// modifiers, authentication, response control data, and payload processing;
+/// the list below covers those categories explicitly. Comparison is
+/// case-insensitive (field names are case-insensitive per RFC 9110 §5.1).
+const FORBIDDEN_TRAILERS: &[&str] = &[
+    // Framing: must be known before the body is read.
+    "content-length",
+    "transfer-encoding",
+    "trailer",
+    "te",
+    // Routing.
+    "host",
+    // Request modifiers: controls and conditionals (affect how the
+    // request is dispatched or evaluated, before the body completes).
+    "expect",
+    "max-forwards",
+    "range",
+    "if-match",
+    "if-none-match",
+    "if-modified-since",
+    "if-unmodified-since",
+    "if-range",
+    // Authentication (RFC 9112 §7.1.2 cites RFC 7616 and RFC 8174).
+    "authorization",
+    "proxy-authenticate",
+    "proxy-authorization",
+    "www-authenticate",
+    // Response control data (RFC 9110 §7.1): caching and freshness
+    // metadata that a recipient must see before consuming the content.
+    "age",
+    "cache-control",
+    "expires",
+    "date",
+    "location",
+    "retry-after",
+    "vary",
+    "warning",
+    // Payload processing: how to interpret the content itself.
+    "content-encoding",
+    "content-type",
+    "content-range",
+    "content-language",
+    "content-location",
+    "digest",
+];
+
 fn is_forbidden_trailer(name: &str) -> bool {
-    name.eq_ignore_ascii_case("content-length")
-        || name.eq_ignore_ascii_case("transfer-encoding")
-        || name.eq_ignore_ascii_case("trailer")
-        || name.eq_ignore_ascii_case("te")
+    FORBIDDEN_TRAILERS
+        .iter()
+        .any(|f| name.eq_ignore_ascii_case(f))
 }
 
 /// Encode a body with chunked transfer-coding, optionally with trailers.
@@ -1754,6 +1802,95 @@ mod tests {
             encode_chunked(&[b"hi".as_slice()], &[("X", b"a\rb".as_slice())]),
             Err(HttpError::InvalidHeaderValue)
         );
+    }
+
+    #[test]
+    fn forbidden_trailers_cover_rfc9112_categories() {
+        // Every field newly forbidden by the RFC 9112 §7.1.2 categories
+        // (routing, request modifiers, authentication, response control
+        // data, payload processing) must be rejected on every path that
+        // accepts trailers.
+        let forbidden = [
+            // Routing.
+            "Host",
+            // Request modifiers: controls and conditionals.
+            "Expect",
+            "Max-Forwards",
+            "Range",
+            "If-Match",
+            "If-None-Match",
+            "If-Modified-Since",
+            "If-Unmodified-Since",
+            "If-Range",
+            // Authentication.
+            "Authorization",
+            "Proxy-Authenticate",
+            "Proxy-Authorization",
+            "WWW-Authenticate",
+            // Response control data (RFC 9110 §7.1).
+            "Age",
+            "Cache-Control",
+            "Expires",
+            "Date",
+            "Location",
+            "Retry-After",
+            "Vary",
+            "Warning",
+            // Payload processing.
+            "Content-Encoding",
+            "Content-Type",
+            "Content-Range",
+            "Content-Language",
+            "Content-Location",
+            "Digest",
+        ];
+        for name in forbidden {
+            // Encoder.
+            assert_eq!(
+                encode_chunked(&[b"hi".as_slice()], &[(name, b"v".as_slice())]),
+                Err(HttpError::ForbiddenTrailer),
+                "encode: {name} must be a forbidden trailer"
+            );
+            // One-shot decoder, both canonical and lowercase spellings
+            // (field names are case-insensitive).
+            let raw = format!("0\r\n{name}: v\r\n\r\n");
+            assert_eq!(
+                decode_chunked(raw.as_bytes(), &limits()),
+                Err(HttpError::ForbiddenTrailer),
+                "decode: {name} must be a forbidden trailer"
+            );
+            let lower = format!("0\r\n{}: v\r\n\r\n", name.to_ascii_lowercase());
+            assert_eq!(
+                decode_chunked(lower.as_bytes(), &limits()),
+                Err(HttpError::ForbiddenTrailer),
+                "decode (lowercase): {name} must be a forbidden trailer"
+            );
+            // Streaming decoder.
+            let mut dec = ChunkedDecoder::new(Limits::default());
+            assert_eq!(
+                dec.feed(raw.as_bytes()),
+                Err(HttpError::ForbiddenTrailer),
+                "streaming decode: {name} must be a forbidden trailer"
+            );
+        }
+    }
+
+    #[test]
+    fn legitimate_trailers_still_accepted() {
+        // X-Checksum is an ordinary integrity trailer: it fits none of the
+        // RFC 9112 §7.1.2 forbidden categories and must keep working.
+        let out =
+            encode_chunked(&[b"hi".as_slice()], &[("X-Checksum", b"abc".as_slice())]).unwrap();
+        assert_eq!(out, b"2\r\nhi\r\n0\r\nX-Checksum: abc\r\n\r\n");
+        let msg = decode_chunked(b"0\r\nX-Checksum: abc\r\n\r\n", &limits()).unwrap();
+        assert_eq!(msg.trailers.get("x-checksum"), Some(b"abc".as_slice()));
+        let mut dec = ChunkedDecoder::new(Limits::default());
+        let events = dec.feed(b"0\r\nX-Checksum: abc\r\n\r\n").unwrap();
+        assert!(events.iter().any(|e| matches!(
+            e,
+            ChunkEvent::Trailer(t) if t.name == "X-Checksum" && t.value == b"abc"
+        )));
+        assert!(dec.is_done());
     }
 
     #[test]
