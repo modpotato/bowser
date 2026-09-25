@@ -242,14 +242,14 @@ impl<D: BrowserDriver> Runner<D> {
                 reason: "no <link rel=match|mismatch> references found".into(),
             };
         }
-        let test_shot = match self.driver.render(item, self.config.viewport) {
+        let test_shot = match self.driver.render(&item.url, self.config.viewport) {
             Ok(s) => s,
             Err(e) => return TestOutcome::DriverFailed(e),
         };
         let mut checks = Vec::with_capacity(refs.len());
         for r in refs {
-            let ref_item = reference_item(item, &path, &r.href);
-            let ref_shot: Screenshot = match self.driver.render(&ref_item, self.config.viewport) {
+            let ref_url = reference_url(&item.url, &r.href);
+            let ref_shot: Screenshot = match self.driver.render(&ref_url, self.config.viewport) {
                 Ok(s) => s,
                 Err(e) => return TestOutcome::DriverFailed(e),
             };
@@ -273,18 +273,18 @@ impl<D: BrowserDriver> Runner<D> {
     }
 }
 
-/// Build a [`TestItem`] for a reftest reference: `href` resolved against the
-/// test file's directory.
-fn reference_item(test: &TestItem, test_path: &std::path::Path, href: &str) -> TestItem {
-    let dir = test_path
-        .parent()
-        .unwrap_or_else(|| std::path::Path::new(""));
-    let path = dir.join(href);
-    TestItem {
-        id: format!("{} -> {href}", test.id),
-        url: href.to_owned(),
-        kind: TestKind::Reftest,
-        path: Some(path),
+/// Resolve a reftest reference `href` against the test's URL.
+///
+/// Absolute-path hrefs (`/css/ref.html`) are used as-is; anything else is
+/// resolved against the directory of `test_url`, the way a browser would
+/// resolve it (`/css/t.html` + `ref.html` becomes `/css/ref.html`).
+fn reference_url(test_url: &str, href: &str) -> String {
+    if href.starts_with('/') {
+        return href.to_owned();
+    }
+    match test_url.rfind('/') {
+        Some(i) => format!("{}/{}", &test_url[..i], href),
+        None => href.to_owned(),
     }
 }
 
@@ -313,18 +313,14 @@ mod tests {
 
     impl BrowserDriver for FakeDriver {
         fn run_testharness(
-            &mut self,
+            &self,
             _test: &TestItem,
             _timeout: Duration,
         ) -> Result<HarnessResult, DriverError> {
             Ok(self.report.clone())
         }
 
-        fn render(
-            &mut self,
-            _test: &TestItem,
-            _viewport: Viewport,
-        ) -> Result<Screenshot, DriverError> {
+        fn render(&self, _url: &str, _viewport: Viewport) -> Result<Screenshot, DriverError> {
             Ok(self.shot.clone())
         }
 
@@ -364,6 +360,16 @@ mod tests {
         }
         let json = format!("{{\"items\": {{{}}}}}", objs.join(","));
         Manifest::from_json(&json).unwrap()
+    }
+
+    #[test]
+    fn reference_url_resolves_like_a_browser() {
+        assert_eq!(reference_url("/css/t.html", "ref.html"), "/css/ref.html");
+        assert_eq!(
+            reference_url("/css/t.html", "/other/r.html"),
+            "/other/r.html"
+        );
+        assert_eq!(reference_url("t.html", "ref.html"), "ref.html");
     }
 
     #[test]
