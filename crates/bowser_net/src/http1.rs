@@ -847,9 +847,19 @@ fn skip_quoted_string(s: &[u8]) -> Result<&[u8], HttpError> {
 }
 
 /// Parse the trailer section after the zero-size chunk. Rejects forbidden
-/// trailer fields.
-fn parse_trailers<'a>(input: &'a [u8], limits: &Limits) -> Result<(Headers<'a>, usize), HttpError> {
-    let (headers, len) = parse_headers(input, limits, 0)?;
+/// trailer fields. `headers_seen` is the number of header fields already
+/// parsed in the message head; trailers share the remaining
+/// [`Limits::max_headers`] budget with them.
+fn parse_trailers<'a>(
+    input: &'a [u8],
+    limits: &Limits,
+    headers_seen: usize,
+) -> Result<(Headers<'a>, usize), HttpError> {
+    let trailer_limits = Limits {
+        max_headers: limits.max_headers.saturating_sub(headers_seen),
+        ..*limits
+    };
+    let (headers, len) = parse_headers(input, &trailer_limits, 0)?;
     for h in headers.iter() {
         if is_forbidden_trailer(h.name) {
             return Err(HttpError::ForbiddenTrailer);
@@ -868,11 +878,14 @@ pub struct ChunkedMessage<'a> {
 }
 
 /// Decode a complete chunked body in one shot. Chunk payloads are slices of
-/// `input` — no copying. Returns [`HttpError::Incomplete`] if the buffer
-/// does not yet hold the whole body.
+/// `input` — no copying. `headers_seen` is the number of header fields
+/// already parsed in the message head; trailer fields share the remaining
+/// [`Limits::max_headers`] budget with them (headers + trailers). Returns
+/// [`HttpError::Incomplete`] if the buffer does not yet hold the whole body.
 pub fn decode_chunked<'a>(
     input: &'a [u8],
     limits: &Limits,
+    headers_seen: usize,
 ) -> Result<ChunkedMessage<'a>, HttpError> {
     let mut chunks = Vec::new();
     let mut pos = 0usize;
@@ -881,7 +894,7 @@ pub fn decode_chunked<'a>(
         pos += line.consumed;
         let (size, is_last) = parse_chunk_size(line.bytes)?;
         if is_last {
-            let (trailers, tlen) = parse_trailers(&input[pos..], limits)?;
+            let (trailers, tlen) = parse_trailers(&input[pos..], limits, headers_seen)?;
             pos += tlen;
             return Ok(ChunkedMessage {
                 chunks,
@@ -940,19 +953,32 @@ enum DecoderState {
 /// Feed it arbitrary slices; it emits [`ChunkEvent::Data`] slices that
 /// borrow the fed input, so the data path never copies. Only trailer
 /// fields are copied into owned values.
+///
+/// Trailer fields share the [`Limits::max_headers`] budget with the header
+/// fields already parsed in the message head; tell the decoder about them
+/// with [`ChunkedDecoder::new_with_headers_seen`].
 pub struct ChunkedDecoder {
     state: DecoderState,
     line: Vec<u8>,
     limits: Limits,
+    headers_seen: usize,
     trailer_count: usize,
 }
 
 impl ChunkedDecoder {
     pub fn new(limits: Limits) -> Self {
+        Self::new_with_headers_seen(limits, 0)
+    }
+
+    /// Create a decoder for a body whose message head already yielded
+    /// `headers_seen` header fields. Trailer fields share the remaining
+    /// [`Limits::max_headers`] budget with them (headers + trailers).
+    pub fn new_with_headers_seen(limits: Limits, headers_seen: usize) -> Self {
         Self {
             state: DecoderState::ChunkSize,
             line: Vec::new(),
             limits,
+            headers_seen,
             trailer_count: 0,
         }
     }
@@ -1048,7 +1074,7 @@ impl ChunkedDecoder {
                 events.push(ChunkEvent::End);
                 return Ok(());
             }
-            if self.trailer_count >= self.limits.max_headers {
+            if self.headers_seen.saturating_add(self.trailer_count) >= self.limits.max_headers {
                 return Err(HttpError::TooManyHeaders);
             }
             let field = parse_header_line(&line)?;
@@ -1767,7 +1793,7 @@ mod tests {
 
     #[test]
     fn decode_chunked_basic() {
-        let msg = decode_chunked(b"5\r\nhello\r\n6\r\n world\r\n0\r\n\r\n", &limits()).unwrap();
+        let msg = decode_chunked(b"5\r\nhello\r\n6\r\n world\r\n0\r\n\r\n", &limits(), 0).unwrap();
         assert_eq!(msg.chunks, vec![b"hello".as_slice(), b" world".as_slice()]);
         assert!(msg.trailers.is_empty());
         assert_eq!(msg.rest, b"");
@@ -1775,7 +1801,8 @@ mod tests {
 
     #[test]
     fn decode_chunked_keeps_rest() {
-        let msg = decode_chunked(b"2\r\nhi\r\n0\r\n\r\nGET /next HTTP/1.1\r\n", &limits()).unwrap();
+        let msg =
+            decode_chunked(b"2\r\nhi\r\n0\r\n\r\nGET /next HTTP/1.1\r\n", &limits(), 0).unwrap();
         assert_eq!(msg.chunks, vec![b"hi".as_slice()]);
         assert_eq!(msg.rest, b"GET /next HTTP/1.1\r\n");
     }
@@ -1783,10 +1810,31 @@ mod tests {
     #[test]
     fn decode_chunked_trailers() {
         let msg =
-            decode_chunked(b"3\r\nfoo\r\n0\r\nX-A: 1\r\nX-B: two\r\n\r\n", &limits()).unwrap();
+            decode_chunked(b"3\r\nfoo\r\n0\r\nX-A: 1\r\nX-B: two\r\n\r\n", &limits(), 0).unwrap();
         assert_eq!(msg.trailers.len(), 2);
         assert_eq!(msg.trailers.get("x-a"), Some(b"1".as_slice()));
         assert_eq!(msg.trailers.get("x-b"), Some(b"two".as_slice()));
+    }
+
+    #[test]
+    fn decode_chunked_trailers_share_max_headers_with_head() {
+        // Limits::max_headers covers headers + trailers: one head header
+        // leaves room for exactly one trailer field.
+        let limits = Limits {
+            max_headers: 2,
+            ..Default::default()
+        };
+        assert_eq!(
+            decode_chunked(b"0\r\nX-A: 1\r\nX-B: 2\r\n\r\n", &limits, 1),
+            Err(HttpError::TooManyHeaders)
+        );
+        let msg = decode_chunked(b"0\r\nX-A: 1\r\n\r\n", &limits, 1).unwrap();
+        assert_eq!(msg.trailers.len(), 1);
+        // A head that already exhausted the budget rejects any trailer.
+        assert_eq!(
+            decode_chunked(b"0\r\nX-A: 1\r\n\r\n", &limits, 2),
+            Err(HttpError::TooManyHeaders)
+        );
     }
 
     #[test]
@@ -1794,6 +1842,7 @@ mod tests {
         let msg = decode_chunked(
             b"5;ext=1;foo=\"bar\\\"baz\";flag\r\nhello\r\n0\r\n\r\n",
             &limits(),
+            0,
         )
         .unwrap();
         assert_eq!(msg.chunks, vec![b"hello".as_slice()]);
@@ -1801,15 +1850,15 @@ mod tests {
 
     #[test]
     fn decode_chunked_hex_variants() {
-        let msg = decode_chunked(b"A\r\n0123456789\r\n0\r\n\r\n", &limits()).unwrap();
+        let msg = decode_chunked(b"A\r\n0123456789\r\n0\r\n\r\n", &limits(), 0).unwrap();
         assert_eq!(msg.chunks, vec![b"0123456789".as_slice()]);
-        let msg = decode_chunked(b"005\r\nhello\r\n0\r\n\r\n", &limits()).unwrap();
+        let msg = decode_chunked(b"005\r\nhello\r\n0\r\n\r\n", &limits(), 0).unwrap();
         assert_eq!(msg.chunks, vec![b"hello".as_slice()]);
     }
 
     #[test]
     fn decode_chunked_empty_body() {
-        let msg = decode_chunked(b"0\r\n\r\n", &limits()).unwrap();
+        let msg = decode_chunked(b"0\r\n\r\n", &limits(), 0).unwrap();
         assert!(msg.chunks.is_empty());
         assert!(msg.trailers.is_empty());
     }
@@ -1818,75 +1867,78 @@ mod tests {
     fn decode_chunked_malformed_rejected() {
         // Bad hex.
         assert_eq!(
-            decode_chunked(b"zz\r\nhello\r\n0\r\n\r\n", &limits()),
+            decode_chunked(b"zz\r\nhello\r\n0\r\n\r\n", &limits(), 0),
             Err(HttpError::InvalidChunkSize)
         );
         // Empty size line.
         assert_eq!(
-            decode_chunked(b"\r\n0\r\n\r\n", &limits()),
+            decode_chunked(b"\r\n0\r\n\r\n", &limits(), 0),
             Err(HttpError::InvalidChunkSize)
         );
         // 17 hex digits: cannot fit in u64.
         assert_eq!(
-            decode_chunked(b"10000000000000000\r\n0\r\n\r\n", &limits()),
+            decode_chunked(b"10000000000000000\r\n0\r\n\r\n", &limits(), 0),
             Err(HttpError::InvalidChunkSize)
         );
         // Space inside the size.
         assert_eq!(
-            decode_chunked(b"5 \r\nhello\r\n0\r\n\r\n", &limits()),
+            decode_chunked(b"5 \r\nhello\r\n0\r\n\r\n", &limits(), 0),
             Err(HttpError::InvalidChunkSize)
         );
         // Bad chunk extension.
         assert_eq!(
-            decode_chunked(b"5;ext=\r\nhello\r\n0\r\n\r\n", &limits()),
+            decode_chunked(b"5;ext=\r\nhello\r\n0\r\n\r\n", &limits(), 0),
             Err(HttpError::InvalidChunkExtension)
         );
         assert_eq!(
-            decode_chunked(b"5;\r\nhello\r\n0\r\n\r\n", &limits()),
+            decode_chunked(b"5;\r\nhello\r\n0\r\n\r\n", &limits(), 0),
             Err(HttpError::InvalidChunkExtension)
         );
         assert_eq!(
-            decode_chunked(b"5;\"x\"\r\nhello\r\n0\r\n\r\n", &limits()),
+            decode_chunked(b"5;\"x\"\r\nhello\r\n0\r\n\r\n", &limits(), 0),
             Err(HttpError::InvalidChunkExtension)
         );
         // Chunk data not followed by CRLF.
         assert_eq!(
-            decode_chunked(b"5\r\nhelloXX0\r\n\r\n", &limits()),
+            decode_chunked(b"5\r\nhelloXX0\r\n\r\n", &limits(), 0),
             Err(HttpError::InvalidChunkTerminator)
         );
         // Forbidden trailer fields.
         assert_eq!(
-            decode_chunked(b"0\r\nContent-Length: 5\r\n\r\n", &limits()),
+            decode_chunked(b"0\r\nContent-Length: 5\r\n\r\n", &limits(), 0),
             Err(HttpError::ForbiddenTrailer)
         );
         assert_eq!(
-            decode_chunked(b"0\r\nTE: trailers\r\n\r\n", &limits()),
+            decode_chunked(b"0\r\nTE: trailers\r\n\r\n", &limits(), 0),
             Err(HttpError::ForbiddenTrailer)
         );
         // Bare CR inside the chunked body.
         assert_eq!(
-            decode_chunked(b"5\rhello\r\n0\r\n\r\n", &limits()),
+            decode_chunked(b"5\rhello\r\n0\r\n\r\n", &limits(), 0),
             Err(HttpError::BareCr)
         );
     }
 
     #[test]
     fn decode_chunked_incomplete() {
-        assert_eq!(decode_chunked(b"", &limits()), Err(HttpError::Incomplete));
         assert_eq!(
-            decode_chunked(b"5\r\nhel", &limits()),
+            decode_chunked(b"", &limits(), 0),
             Err(HttpError::Incomplete)
         );
         assert_eq!(
-            decode_chunked(b"5\r\nhello\r\n", &limits()),
+            decode_chunked(b"5\r\nhel", &limits(), 0),
             Err(HttpError::Incomplete)
         );
         assert_eq!(
-            decode_chunked(b"5\r\nhello\r\n0\r\n", &limits()),
+            decode_chunked(b"5\r\nhello\r\n", &limits(), 0),
             Err(HttpError::Incomplete)
         );
         assert_eq!(
-            decode_chunked(b"5\r\nhello\r\n0\r\nX-A: 1\r\n", &limits()),
+            decode_chunked(b"5\r\nhello\r\n0\r\n", &limits(), 0),
+            Err(HttpError::Incomplete)
+        );
+        assert_eq!(
+            decode_chunked(b"5\r\nhello\r\n0\r\nX-A: 1\r\n", &limits(), 0),
             Err(HttpError::Incomplete)
         );
     }
@@ -1895,7 +1947,7 @@ mod tests {
     fn chunked_roundtrip() {
         let chunks: Vec<&[u8]> = vec![b"hello".as_slice(), b", ".as_slice(), b"world".as_slice()];
         let encoded = encode_chunked(&chunks, &[("X-Check", b"ok".as_slice())]).unwrap();
-        let msg = decode_chunked(&encoded, &limits()).unwrap();
+        let msg = decode_chunked(&encoded, &limits(), 0).unwrap();
         assert_eq!(msg.chunks, chunks);
         assert_eq!(msg.trailers.get("x-check"), Some(b"ok".as_slice()));
         assert_eq!(msg.rest, b"");
@@ -1984,6 +2036,32 @@ mod tests {
         };
         let mut dec = ChunkedDecoder::new(tiny);
         assert_eq!(dec.feed(b"12345\r\n"), Err(HttpError::LineTooLong));
+    }
+
+    #[test]
+    fn streaming_trailers_share_max_headers_with_head() {
+        // Limits::max_headers covers headers + trailers: one head header
+        // leaves room for exactly one trailer field.
+        let limits = Limits {
+            max_headers: 2,
+            ..Default::default()
+        };
+        let mut dec = ChunkedDecoder::new_with_headers_seen(limits, 1);
+        let events = dec.feed(b"0\r\nX-A: 1\r\n\r\n").unwrap();
+        assert!(events.iter().any(|e| matches!(e, ChunkEvent::Trailer(_))));
+        assert!(dec.is_done());
+
+        let mut dec = ChunkedDecoder::new_with_headers_seen(limits, 1);
+        assert_eq!(
+            dec.feed(b"0\r\nX-A: 1\r\nX-B: 2\r\n\r\n"),
+            Err(HttpError::TooManyHeaders)
+        );
+        // A head that already exhausted the budget rejects any trailer.
+        let mut dec = ChunkedDecoder::new_with_headers_seen(limits, 2);
+        assert_eq!(
+            dec.feed(b"0\r\nX-A: 1\r\n\r\n"),
+            Err(HttpError::TooManyHeaders)
+        );
     }
 
     // -- serialization --------------------------------------------------------
