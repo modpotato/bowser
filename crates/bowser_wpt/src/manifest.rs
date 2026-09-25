@@ -6,8 +6,9 @@
 //!    `wpt manifest`). This is the accurate path: the manifest already knows
 //!    each test's type.
 //! 2. [`Manifest::walk`] scans the checkout directory directly and classifies
-//!    `.html`/`.htm` files with cheap content heuristics. Useful when no
-//!    manifest has been generated yet.
+//!    `.html`/`.htm`/`.xhtml`/`.xht` files with cheap content heuristics.
+//!    Useful when no manifest has been generated yet. Non-test directories
+//!    and reftest reference files are skipped.
 //!
 //! `MANIFEST.json` shape (v8/v9):
 //! ```json
@@ -133,9 +134,12 @@ impl Manifest {
 
     /// Walk a WPT checkout and classify test files with content heuristics.
     ///
-    /// Only `.html`/`.htm`/`.xhtml` files are considered. Infrastructure
-    /// directories (`tools/`, `resources/`, `infrastructure/`, `.git/`) are
-    /// skipped. Classification:
+    /// Only `.html`/`.htm`/`.xhtml`/`.xht` files are considered. Support and
+    /// infrastructure directories (`tools/`, `resources/`, `support/`,
+    /// `common/`, `conformance-checkers/`, `reference/`, `infrastructure/`,
+    /// `.git/`) are skipped at any depth, as are reftest reference files
+    /// (`*-ref.html` and friends, mirroring wpt's `reference_file_re`).
+    /// Classification:
     ///
     /// - contains a `<link rel=match|mismatch>` → [`TestKind::Reftest`]
     /// - references `testharness.js` → [`TestKind::Testharness`]
@@ -199,10 +203,31 @@ fn join_url(base: &str, url: &str) -> String {
 }
 
 /// Directories in a WPT checkout that never contain runnable tests.
-const SKIP_DIRS: &[&str] = &[".git", "tools", "resources", "infrastructure", ".github"];
+///
+/// Mirrors upstream wpt `tools/manifest/sourcefile.py`: `dir_non_test =
+/// {"resources", "support", "tools"}`, `root_dir_non_test = {"common"}`,
+/// `in_conformance_checker_dir()` (`conformance-checkers/`), and the
+/// `/reference/` check in `name_is_reference`. Matched at any depth
+/// (upstream only requires some of them at any depth; walk mode is
+/// stricter by design since it only enumerates tests).
+const SKIP_DIRS: &[&str] = &[
+    ".git",
+    ".github",
+    "infrastructure",
+    "tools",
+    "resources",
+    "support",
+    "common",
+    "conformance-checkers",
+    "reference",
+];
 
-/// HTML-ish extensions we bother classifying.
-const TEST_EXTENSIONS: &[&str] = &["html", "htm", "xhtml"];
+/// Filename extensions we bother classifying. Upstream wpt
+/// `tools/manifest/sourcefile.py::markup_type` recognizes `html`/`htm` as
+/// HTML and `xhtml`/`xht`/`xml` as XHTML; walk mode classifies the HTML
+/// family (`.xml` files in a checkout are overwhelmingly resources, and
+/// the content classifier only understands HTML markers).
+const TEST_EXTENSIONS: &[&str] = &["html", "htm", "xhtml", "xht"];
 
 fn walk_dir(root: &Path, dir: &Path, manifest: &mut Manifest) -> Result<(), ManifestError> {
     let mut entries: Vec<PathBuf> = std::fs::read_dir(dir)?
@@ -222,6 +247,14 @@ fn walk_dir(root: &Path, dir: &Path, manifest: &mut Manifest) -> Result<(), Mani
                 walk_dir(root, &path, manifest)?;
             }
         } else if meta.is_file() && has_test_extension(&name) {
+            // Reftest reference files are not tests (upstream `name_is_reference`).
+            let stem = path
+                .file_stem()
+                .and_then(|s| s.to_str())
+                .unwrap_or_default();
+            if is_reference_name(stem) {
+                continue;
+            }
             let id = path
                 .strip_prefix(root)
                 .map_err(|_| ManifestError::Invalid("path escapes root".into()))?
@@ -244,6 +277,49 @@ fn has_test_extension(name: &str) -> bool {
         let ext = ext.to_ascii_lowercase();
         TEST_EXTENSIONS.iter().any(|want| *want == ext)
     })
+}
+
+/// Whether a file stem names a reftest *reference* file rather than a test.
+///
+/// Mirrors upstream wpt `tools/manifest/sourcefile.py`:
+/// `reference_file_re = re.compile(r'(^|[\-_])(not)?ref[0-9]*([\-_]|$)')`,
+/// searched (not full-matched) against the file stem. Case-sensitive, like
+/// upstream.
+fn is_reference_name(stem: &str) -> bool {
+    let bytes = stem.as_bytes();
+    // Equivalent to `re.search`: try the anchored match at every position,
+    // with both alternatives of `(^|[\-_])` where they apply.
+    (0..=bytes.len()).any(|start| {
+        match_reference_at(bytes, start, true) || match_reference_at(bytes, start, false)
+    })
+}
+
+/// Try the upstream `reference_file_re` anchored at `start`. `use_caret`
+/// selects the `^` alternative of `(^|[\-_])`, otherwise the `[\-_]` one.
+fn match_reference_at(bytes: &[u8], start: usize, use_caret: bool) -> bool {
+    let mut i = start;
+    if use_caret {
+        if start != 0 {
+            return false;
+        }
+        // `^` matches without consuming input
+    } else if bytes.get(start).is_some_and(|c| *c == b'-' || *c == b'_') {
+        i += 1;
+    } else {
+        return false;
+    }
+    // `(not)?ref`
+    let tail = &bytes[i..];
+    let tail = tail.strip_prefix(b"not").unwrap_or(tail);
+    let Some(tail) = tail.strip_prefix(b"ref") else {
+        return false;
+    };
+    // `[0-9]*([\-_]|$)`
+    let mut tail = tail;
+    while tail.first().is_some_and(|c| c.is_ascii_digit()) {
+        tail = &tail[1..];
+    }
+    tail.is_empty() || tail[0] == b'-' || tail[0] == b'_'
 }
 
 /// Classify one HTML file by looking for reftest/testharness markers.
@@ -453,6 +529,47 @@ mod tests {
             ]
         );
         assert!(m.items().iter().all(|t| t.path.is_some()));
+    }
+
+    #[test]
+    fn walk_classifies_xht_and_skips_reference_and_support() {
+        let tree = FixtureTree::new(&[
+            ("css/a.xht", TESTHARNESS_HTML),          // .xht is a test extension
+            ("css/a-ref.xht", REFTHTEST_HTML),        // reference name: excluded
+            ("css/b-ref.html", REFTHTEST_HTML),       // *-ref.html: excluded
+            ("css/b-notref.html", REFTHTEST_HTML),    // *-notref.html: excluded
+            ("css/reference/c.html", REFTHTEST_HTML), // under reference/: excluded
+            ("css/d.html", TESTHARNESS_HTML),
+            ("css/support/e.html", TESTHARNESS_HTML), // support/ at depth: excluded
+            ("a/b/resources/f.html", TESTHARNESS_HTML), // resources/ at depth: excluded
+            ("conformance-checkers/g.html", TESTHARNESS_HTML), // excluded
+            ("css/common/h.html", TESTHARNESS_HTML),  // common/ at depth: excluded
+        ]);
+        let m = Manifest::walk(&tree.root).unwrap();
+        let ids: Vec<&str> = m.items().iter().map(|t| t.id.as_str()).collect();
+        assert_eq!(ids, ["css/a.xht", "css/d.html"]);
+        assert_eq!(m.by_kind(&TestKind::Testharness).len(), 2);
+    }
+
+    #[test]
+    fn reference_name_regex_matches_upstream() {
+        // Mirrors wpt's reference_file_re: (^|[\-_])(not)?ref[0-9]*([\-_]|$)
+        for stem in [
+            "a-ref", "a-notref", "a-ref-2", "ref", "ref2", "-ref", "_notref_", "a_ref_1",
+        ] {
+            assert!(is_reference_name(stem), "{stem}");
+        }
+        for stem in [
+            "reference",
+            "myref",
+            "refer",
+            "a-refx",
+            "prefer",
+            "refactor",
+            "a",
+        ] {
+            assert!(!is_reference_name(stem), "{stem}");
+        }
     }
 
     #[test]
