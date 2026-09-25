@@ -538,6 +538,11 @@ pub enum BodySpec {
     Chunked,
     /// The body runs until the connection closes.
     UntilClose,
+    /// The connection becomes an opaque tunnel after the head
+    /// (2xx response to CONNECT, RFC 9112 §6.3 rule 2).
+    /// Framing headers are ignored; the bytes after the head are
+    /// not an HTTP/1.x body.
+    Tunnel,
 }
 
 fn parse_decimal(digits: &[u8]) -> Option<u64> {
@@ -642,6 +647,8 @@ pub fn request_body_spec(head: &RequestHead) -> Result<BodySpec, HttpError> {
 ///
 /// `request_method` is the method of the request this responds to: responses
 /// to `HEAD`, and responses with status 1xx/204/304, never carry a body.
+/// A 2xx response to `CONNECT` turns the connection into a tunnel: the client
+/// must ignore `Content-Length`/`Transfer-Encoding` (`BodySpec::Tunnel`).
 pub fn response_body_spec(
     head: &ResponseHead,
     request_method: &[u8],
@@ -652,6 +659,9 @@ pub fn response_body_spec(
     match head.status {
         100..=199 | 204 | 304 => return Ok(BodySpec::Empty),
         _ => {}
+    }
+    if request_method == b"CONNECT" && (200..=299).contains(&head.status) {
+        return Ok(BodySpec::Tunnel);
     }
     match transfer_encoding(&head.headers)? {
         TransferOutcome::Chunked => Ok(BodySpec::Chunked),
@@ -1667,6 +1677,46 @@ mod tests {
         );
         assert_eq!(
             res_spec(b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked", b"HEAD"),
+            Ok(BodySpec::Empty)
+        );
+    }
+
+    #[test]
+    fn connect_2xx_becomes_tunnel() {
+        // RFC 9112 §6.3 rule 2: any 2xx response to CONNECT turns the
+        // connection into a tunnel; framing headers must be ignored.
+        assert_eq!(
+            res_spec(b"HTTP/1.1 200 OK\r\nContent-Length: 5", b"CONNECT"),
+            Ok(BodySpec::Tunnel)
+        );
+        assert_eq!(
+            res_spec(b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked", b"CONNECT"),
+            Ok(BodySpec::Tunnel)
+        );
+        assert_eq!(
+            res_spec(b"HTTP/1.1 200 Connection Established", b"CONNECT"),
+            Ok(BodySpec::Tunnel)
+        );
+        // Other 2xx codes tunnel as well.
+        assert_eq!(
+            res_spec(b"HTTP/1.1 299 X\r\nContent-Length: 5", b"CONNECT"),
+            Ok(BodySpec::Tunnel)
+        );
+        // Non-2xx responses to CONNECT use normal framing.
+        assert_eq!(
+            res_spec(
+                b"HTTP/1.1 407 Proxy Auth Required\r\nContent-Length: 5",
+                b"CONNECT"
+            ),
+            Ok(BodySpec::ContentLength(5))
+        );
+        assert_eq!(
+            res_spec(b"HTTP/1.1 502 Bad Gateway", b"CONNECT"),
+            Ok(BodySpec::UntilClose)
+        );
+        // 204 to CONNECT stays bodiless (rule 1 wins over rule 2).
+        assert_eq!(
+            res_spec(b"HTTP/1.1 204 No Content\r\nContent-Length: 5", b"CONNECT"),
             Ok(BodySpec::Empty)
         );
     }
