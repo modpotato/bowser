@@ -47,6 +47,16 @@ fn extract_references_from_str(text: &str) -> Vec<Reference> {
     // tracking byte offsets.
     let mut offset = 0;
     while let Some(i) = rest.find("<link") {
+        // The tag name must end here: `<linkfoo` is not a link tag.
+        let is_tag = rest[i + "<link".len()..]
+            .chars()
+            .next()
+            .is_some_and(|c| c.is_whitespace() || c == '/' || c == '>');
+        if !is_tag {
+            offset += i + "<link".len();
+            rest = &lower[offset..];
+            continue;
+        }
         let tag_start = offset + i;
         let tag_end = match lower[tag_start..].find('>') {
             Some(j) => tag_start + j,
@@ -93,8 +103,15 @@ fn attr(tag_lower: &str, tag_orig: &str, name: &str) -> Option<String> {
         }
         let after = rest[i + name.len()..].trim_start();
         let after_orig = orig_rest[i + name.len()..].trim_start();
-        let value_start = after.strip_prefix('=')?;
-        let value_start_orig = after_orig.strip_prefix('=')?;
+        // A same-prefix lookalike (`relx="..."`) leaves junk instead of `=`;
+        // skip past it and keep searching rather than aborting the scan.
+        let (Some(value_start), Some(value_start_orig)) =
+            (after.strip_prefix('='), after_orig.strip_prefix('='))
+        else {
+            rest = &rest[i + name.len()..];
+            orig_rest = &orig_rest[i + name.len()..];
+            continue;
+        };
         let value = value_start.trim_start();
         let value_orig = value_start_orig.trim_start();
         let raw: &str = if let Some(stripped) = value.strip_prefix('"') {
@@ -104,8 +121,9 @@ fn attr(tag_lower: &str, tag_orig: &str, name: &str) -> Option<String> {
             let end = stripped.find('\'')?;
             &value_orig[1..1 + end]
         } else {
+            // Unquoted values run to whitespace or `>`; `/` is legal inside.
             let end = value
-                .find(|c: char| c.is_whitespace() || c == '>' || c == '/')
+                .find(|c: char| c.is_whitespace() || c == '>')
                 .unwrap_or(value.len());
             &value_orig[..end]
         };
@@ -149,7 +167,10 @@ pub struct Comparison {
 ///
 /// Both screenshots must have identical dimensions; a size mismatch is an
 /// error, not a pass or fail, because it usually means the driver or the
-/// test setup is broken rather than the rendering.
+/// test setup is broken rather than the rendering. Each screenshot's pixel
+/// buffer must also hold exactly `width * height * 4` bytes: a short or
+/// overlong buffer means the driver produced garbage, and comparing it
+/// anyway would silently truncate to the shorter buffer.
 pub fn compare(
     a: &Screenshot,
     b: &Screenshot,
@@ -160,6 +181,17 @@ pub fn compare(
             a: (a.width, a.height),
             b: (b.width, b.height),
         });
+    }
+    // Dimensions match, so the expected buffer length is the same for both.
+    let expected = a.width as usize * a.height as usize * 4;
+    for (which, shot) in [("a", a), ("b", b)] {
+        if shot.rgba.len() != expected {
+            return Err(ReftestError::BadPixelBuffer {
+                which,
+                expected,
+                got: shot.rgba.len(),
+            });
+        }
     }
     let total = a.width as u64 * a.height as u64;
     let mut diff_pixels: u64 = 0;
@@ -194,7 +226,17 @@ pub fn compare(
 #[derive(Debug)]
 pub enum ReftestError {
     Io(std::io::Error),
-    SizeMismatch { a: (u32, u32), b: (u32, u32) },
+    SizeMismatch {
+        a: (u32, u32),
+        b: (u32, u32),
+    },
+    /// A screenshot's pixel buffer is not `width * height * 4` bytes long.
+    BadPixelBuffer {
+        /// Which side was malformed: `"a"` or `"b"`.
+        which: &'static str,
+        expected: usize,
+        got: usize,
+    },
 }
 
 impl fmt::Display for ReftestError {
@@ -208,6 +250,16 @@ impl fmt::Display for ReftestError {
                     a.0, a.1, b.0, b.1
                 )
             }
+            ReftestError::BadPixelBuffer {
+                which,
+                expected,
+                got,
+            } => {
+                write!(
+                    f,
+                    "screenshot {which} pixel buffer length mismatch: expected {expected} bytes, got {got}"
+                )
+            }
         }
     }
 }
@@ -216,7 +268,7 @@ impl std::error::Error for ReftestError {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
         match self {
             ReftestError::Io(e) => Some(e),
-            ReftestError::SizeMismatch { .. } => None,
+            _ => None,
         }
     }
 }
@@ -263,6 +315,31 @@ mod tests {
     fn extracts_nothing_without_ref_links() {
         assert!(extract_references_from_str("<link rel=stylesheet href=x>").is_empty());
         assert!(extract_references_from_str("no tags here").is_empty());
+    }
+
+    #[test]
+    fn unquoted_href_keeps_slashes() {
+        let refs = extract_references_from_str("<link rel=match href=other/ref2.html>");
+        assert_eq!(refs.len(), 1);
+        assert_eq!(refs[0].href, "other/ref2.html");
+    }
+
+    #[test]
+    fn same_prefix_lookalike_does_not_abort_scan() {
+        let refs = extract_references_from_str(r#"<link relx="y" rel="match" href="z.html">"#);
+        assert_eq!(refs.len(), 1);
+        assert_eq!(refs[0].rel, RefRel::Match);
+        assert_eq!(refs[0].href, "z.html");
+    }
+
+    #[test]
+    fn linkfoo_is_not_a_link_tag() {
+        assert!(extract_references_from_str(r#"<linkfoo rel=match href="x.html">"#).is_empty());
+        let refs = extract_references_from_str(
+            r#"<linkfoo rel=match href="x.html"><link rel=match href="y.html">"#,
+        );
+        assert_eq!(refs.len(), 1);
+        assert_eq!(refs[0].href, "y.html");
     }
 
     #[test]
@@ -313,5 +390,92 @@ mod tests {
         let err = compare(&a, &b, ReftestTolerance::EXACT).unwrap_err();
         assert!(matches!(err, ReftestError::SizeMismatch { .. }));
         assert!(err.to_string().contains("4x4 vs 8x4"));
+    }
+
+    #[test]
+    fn mismatched_buffer_lengths_are_error() {
+        // The reviewer's verified case: 20 bytes vs 16 bytes for a 2x2
+        // image used to return Ok(equal=true); it must be an error.
+        let a = Screenshot {
+            width: 2,
+            height: 2,
+            rgba: vec![0u8; 20],
+        };
+        let b = Screenshot {
+            width: 2,
+            height: 2,
+            rgba: vec![0u8; 16],
+        };
+        let err = compare(&a, &b, ReftestTolerance::EXACT).unwrap_err();
+        assert!(
+            matches!(
+                err,
+                ReftestError::BadPixelBuffer {
+                    which: "a",
+                    expected: 16,
+                    got: 20
+                }
+            ),
+            "unexpected error: {err:?}"
+        );
+        let err = compare(&b, &a, ReftestTolerance::EXACT).unwrap_err();
+        assert!(
+            matches!(
+                err,
+                ReftestError::BadPixelBuffer {
+                    which: "b",
+                    expected: 16,
+                    got: 20
+                }
+            ),
+            "unexpected error: {err:?}"
+        );
+        assert!(err.to_string().contains("expected 16 bytes, got 20"));
+    }
+
+    #[test]
+    fn wrong_length_for_dimensions_is_error() {
+        // Same length on both sides, but not width*height*4: still an error,
+        // not a pass. Also covers a length that is not a multiple of 4.
+        let a = Screenshot {
+            width: 2,
+            height: 2,
+            rgba: vec![0u8; 20],
+        };
+        let b = Screenshot {
+            width: 2,
+            height: 2,
+            rgba: vec![0u8; 20],
+        };
+        let err = compare(&a, &b, ReftestTolerance::EXACT).unwrap_err();
+        assert!(matches!(err, ReftestError::BadPixelBuffer { .. }));
+        let short = Screenshot {
+            width: 2,
+            height: 2,
+            rgba: vec![0u8; 15],
+        };
+        let good = Screenshot::solid(2, 2, 0, 0, 0, 255);
+        let err = compare(&short, &good, ReftestTolerance::EXACT).unwrap_err();
+        assert!(
+            matches!(
+                err,
+                ReftestError::BadPixelBuffer {
+                    which: "a",
+                    expected: 16,
+                    got: 15
+                }
+            ),
+            "unexpected error: {err:?}"
+        );
+    }
+
+    #[test]
+    fn equal_images_still_pass() {
+        let a = Screenshot::solid(4, 4, 10, 20, 30, 255);
+        let b = Screenshot::solid(4, 4, 10, 20, 30, 255);
+        let r = compare(&a, &b, ReftestTolerance::EXACT).unwrap();
+        assert!(r.equal);
+        assert_eq!(r.diff_pixels, 0);
+        assert_eq!(r.diff_fraction, 0.0);
     }
 }

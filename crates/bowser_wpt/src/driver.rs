@@ -69,17 +69,36 @@ impl Screenshot {
 }
 
 /// How the driver talks to the browser under test.
+///
+/// All methods take `&self`: a driver is expected to be shareable between
+/// threads, so a future parallel runner can hand one driver to many
+/// workers. An implementation that holds mutable session state (a browser
+/// process handle, an HTTP server) synchronizes it internally, e.g. behind
+/// a `Mutex`.
 pub trait BrowserDriver {
     /// Load `test.url`, wait for the `testharness.js` completion callback,
     /// and return the parsed report. Must respect `timeout`.
     fn run_testharness(
-        &mut self,
+        &self,
         test: &TestItem,
         timeout: Duration,
     ) -> Result<HarnessResult, DriverError>;
 
-    /// Render `test.url` in `viewport` and return the screenshot.
-    fn render(&mut self, test: &TestItem, viewport: Viewport) -> Result<Screenshot, DriverError>;
+    /// Render `url` in `viewport` and return the screenshot.
+    fn render(&self, url: &str, viewport: Viewport) -> Result<Screenshot, DriverError>;
+
+    /// Load `url` and return `Ok(())` if the browser survives the load,
+    /// `Err(DriverError::BrowserGone)` if it crashes. Crashtests assert the
+    /// browser does not die on their content; other test kinds go through
+    /// [`BrowserDriver::run_testharness`] or [`BrowserDriver::render`].
+    ///
+    /// The default implementation fails with [`DriverError::Unimplemented`]
+    /// so drivers that do not support crashtests need not touch this.
+    fn load_without_crash(&self, url: &str) -> Result<(), DriverError> {
+        Err(DriverError::Unimplemented(format!(
+            "load_without_crash is not implemented by this driver ({url})"
+        )))
+    }
 
     /// Human-readable name for logs (e.g. "bowser-headless/0.1.0").
     fn name(&self) -> &str {
@@ -97,7 +116,7 @@ pub struct StubDriver;
 
 impl BrowserDriver for StubDriver {
     fn run_testharness(
-        &mut self,
+        &self,
         test: &TestItem,
         _timeout: Duration,
     ) -> Result<HarnessResult, DriverError> {
@@ -107,10 +126,15 @@ impl BrowserDriver for StubDriver {
         )))
     }
 
-    fn render(&mut self, test: &TestItem, _viewport: Viewport) -> Result<Screenshot, DriverError> {
+    fn render(&self, url: &str, _viewport: Viewport) -> Result<Screenshot, DriverError> {
         Err(DriverError::Unimplemented(format!(
-            "no browser behind the driver yet; cannot render {}",
-            test.id
+            "no browser behind the driver yet; cannot render {url}"
+        )))
+    }
+
+    fn load_without_crash(&self, url: &str) -> Result<(), DriverError> {
+        Err(DriverError::Unimplemented(format!(
+            "no browser behind the driver yet; cannot load {url}"
         )))
     }
 
@@ -163,20 +187,25 @@ mod tests {
             url: "/dom/a.html".into(),
             kind: TestKind::Testharness,
             path: None,
+            references: Vec::new(),
         }
     }
 
     #[test]
     fn stub_driver_is_unimplemented() {
-        let mut d = StubDriver;
+        let d = StubDriver;
         assert_eq!(d.name(), "stub");
         let err = d
             .run_testharness(&item(), Duration::from_secs(1))
             .unwrap_err();
         assert!(matches!(err, DriverError::Unimplemented(_)));
         assert!(err.to_string().contains("dom/a.html"));
-        let err = d.render(&item(), Viewport::DEFAULT).unwrap_err();
+        let err = d.render("/dom/a.html", Viewport::DEFAULT).unwrap_err();
         assert!(matches!(err, DriverError::Unimplemented(_)));
+        assert!(err.to_string().contains("/dom/a.html"));
+        let err = d.load_without_crash("/dom/a.html").unwrap_err();
+        assert!(matches!(err, DriverError::Unimplemented(_)));
+        assert!(err.to_string().contains("/dom/a.html"));
     }
 
     #[test]
