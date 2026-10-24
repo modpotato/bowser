@@ -1,0 +1,6 @@
+CASE bytes=47 quirks=Quirks id=pending-spec-changes.dat#0
+<html><head></head><frameset></frameset></html>
+CASE bytes=105 quirks=NoQuirks id=pending-spec-changes.dat#1
+<!DOCTYPE html><html><head></head><body><table><caption><svg>foo</svg></caption></table>bar</body></html>
+CASE bytes=137 quirks=Quirks id=pending-spec-changes.dat#2
+<html><head></head><body><table><tbody><tr><td><svg><desc></desc></svg></td><td><circle></circle></td></tr></tbody></table></body></html>

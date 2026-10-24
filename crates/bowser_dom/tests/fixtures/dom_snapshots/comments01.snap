@@ -1,0 +1,33 @@
+CASE bytes=57 quirks=Quirks id=comments01.dat#0
+<html><head></head><body>FOO<!-- BAR -->BAZ</body></html>
+CASE bytes=57 quirks=Quirks id=comments01.dat#1
+<html><head></head><body>FOO<!-- BAR -->BAZ</body></html>
+CASE bytes=62 quirks=Quirks id=comments01.dat#2
+<html><head></head><body>FOO<!-- BAR --! >BAZ--></body></html>
+CASE bytes=62 quirks=Quirks id=comments01.dat#3
+<html><head></head><body>FOO<!-- BAR --!
+>BAZ--></body></html>
+CASE bytes=63 quirks=Quirks id=comments01.dat#4
+<html><head></head><body>FOO<!-- BAR --   >BAZ--></body></html>
+CASE bytes=73 quirks=Quirks id=comments01.dat#5
+<html><head></head><body>FOO<!-- BAR -- <QUX> -- MUX -->BAZ</body></html>
+CASE bytes=73 quirks=Quirks id=comments01.dat#6
+<html><head></head><body>FOO<!-- BAR -- <QUX> -- MUX -->BAZ</body></html>
+CASE bytes=77 quirks=Quirks id=comments01.dat#7
+<html><head></head><body>FOO<!-- BAR -- <QUX> -- MUX -- >BAZ--></body></html>
+CASE bytes=52 quirks=Quirks id=comments01.dat#8
+<html><head></head><body>FOO<!---->BAZ</body></html>
+CASE bytes=52 quirks=Quirks id=comments01.dat#9
+<html><head></head><body>FOO<!---->BAZ</body></html>
+CASE bytes=52 quirks=Quirks id=comments01.dat#10
+<html><head></head><body>FOO<!---->BAZ</body></html>
+CASE bytes=66 quirks=Quirks id=comments01.dat#11
+<!--?xml version="1.0"--><html><head></head><body>Hi</body></html>
+CASE bytes=64 quirks=Quirks id=comments01.dat#12
+<!--?xml version="1.0"--><html><head></head><body></body></html>
+CASE bytes=58 quirks=Quirks id=comments01.dat#13
+<!--?xml version--><html><head></head><body></body></html>
+CASE bytes=53 quirks=Quirks id=comments01.dat#14
+<html><head></head><body>FOO<!----->BAZ</body></html>
+CASE bytes=89 quirks=Quirks id=comments01.dat#15
+<html><!-- comment --><head><title>Comment before head</title></head><body></body></html>

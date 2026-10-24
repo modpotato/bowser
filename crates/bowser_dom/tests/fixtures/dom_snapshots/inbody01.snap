@@ -1,0 +1,8 @@
+CASE bytes=57 quirks=Quirks id=inbody01.dat#0
+<html><head></head><body><button>1</button></body></html>
+CASE bytes=59 quirks=Quirks id=inbody01.dat#1
+<html><head></head><body><foo>1<p>2</p></foo></body></html>
+CASE bytes=49 quirks=Quirks id=inbody01.dat#2
+<html><head></head><body><dd>1</dd></body></html>
+CASE bytes=61 quirks=Quirks id=inbody01.dat#3
+<html><head></head><body><foo>1<dd>2</dd></foo></body></html>

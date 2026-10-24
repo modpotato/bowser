@@ -1,0 +1,6 @@
+CASE bytes=90 quirks=NoQuirks id=main-element.dat#0
+<!DOCTYPE html><html><head></head><body><p>foo</p><main>bar<p>baz</p></main></body></html>
+CASE bytes=80 quirks=NoQuirks id=main-element.dat#1
+<!DOCTYPE html><html><head></head><body><main><p>foo</p></main>bar</body></html>
+CASE bytes=109 quirks=NoQuirks id=main-element.dat#2
+<!DOCTYPE html><html><head></head><body>xxx<svg><x><g><a><main></main></a></g></x></svg><b></b></body></html>

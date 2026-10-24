@@ -1,0 +1,52 @@
+CASE bytes=69 quirks=Quirks id=scriptdata01.dat#0
+<html><head></head><body>FOO<script>'Hello'</script>BAR</body></html>
+CASE bytes=62 quirks=Quirks id=scriptdata01.dat#1
+<html><head></head><body>FOO<script></script>BAR</body></html>
+CASE bytes=62 quirks=Quirks id=scriptdata01.dat#2
+<html><head></head><body>FOO<script></script>BAR</body></html>
+CASE bytes=62 quirks=Quirks id=scriptdata01.dat#3
+<html><head></head><body>FOO<script></script>BAR</body></html>
+CASE bytes=62 quirks=Quirks id=scriptdata01.dat#4
+<html><head></head><body>FOO<script></script>BAR</body></html>
+CASE bytes=90 quirks=Quirks id=scriptdata01.dat#5
+<html><head></head><body>FOO<script type="text/plain"></scriptx>BAR</script></body></html>
+CASE bytes=62 quirks=Quirks id=scriptdata01.dat#6
+<html><head></head><body>FOO<script></script>BAR</body></html>
+CASE bytes=65 quirks=Quirks id=scriptdata01.dat#7
+<html><head></head><body>FOO<script>'<'</script>BAR</body></html>
+CASE bytes=66 quirks=Quirks id=scriptdata01.dat#8
+<html><head></head><body>FOO<script>'<!'</script>BAR</body></html>
+CASE bytes=67 quirks=Quirks id=scriptdata01.dat#9
+<html><head></head><body>FOO<script>'<!-'</script>BAR</body></html>
+CASE bytes=68 quirks=Quirks id=scriptdata01.dat#10
+<html><head></head><body>FOO<script>'<!--'</script>BAR</body></html>
+CASE bytes=69 quirks=Quirks id=scriptdata01.dat#11
+<html><head></head><body>FOO<script>'<!---'</script>BAR</body></html>
+CASE bytes=69 quirks=Quirks id=scriptdata01.dat#12
+<html><head></head><body>FOO<script>'<!-->'</script>BAR</body></html>
+CASE bytes=75 quirks=Quirks id=scriptdata01.dat#13
+<html><head></head><body>FOO<script>'<!-- potato'</script>BAR</body></html>
+CASE bytes=76 quirks=Quirks id=scriptdata01.dat#14
+<html><head></head><body>FOO<script>'<!-- <sCrIpt'</script>BAR</body></html>
+CASE bytes=104 quirks=Quirks id=scriptdata01.dat#15
+<html><head></head><body>FOO<script type="text/plain">'<!-- <sCrIpt>'</script>BAR</script></body></html>
+CASE bytes=106 quirks=Quirks id=scriptdata01.dat#16
+<html><head></head><body>FOO<script type="text/plain">'<!-- <sCrIpt> -'</script>BAR</script></body></html>
+CASE bytes=107 quirks=Quirks id=scriptdata01.dat#17
+<html><head></head><body>FOO<script type="text/plain">'<!-- <sCrIpt> --'</script>BAR</script></body></html>
+CASE bytes=81 quirks=Quirks id=scriptdata01.dat#18
+<html><head></head><body>FOO<script>'<!-- <sCrIpt> -->'</script>BAR</body></html>
+CASE bytes=109 quirks=Quirks id=scriptdata01.dat#19
+<html><head></head><body>FOO<script type="text/plain">'<!-- <sCrIpt> --!>'</script>BAR</script></body></html>
+CASE bytes=109 quirks=Quirks id=scriptdata01.dat#20
+<html><head></head><body>FOO<script type="text/plain">'<!-- <sCrIpt> -- >'</script>BAR</script></body></html>
+CASE bytes=104 quirks=Quirks id=scriptdata01.dat#21
+<html><head></head><body>FOO<script type="text/plain">'<!-- <sCrIpt '</script>BAR</script></body></html>
+CASE bytes=104 quirks=Quirks id=scriptdata01.dat#22
+<html><head></head><body>FOO<script type="text/plain">'<!-- <sCrIpt/'</script>BAR</script></body></html>
+CASE bytes=95 quirks=Quirks id=scriptdata01.dat#23
+<html><head></head><body>FOO<script type="text/plain">'<!-- <sCrIpt\'</script>BAR</body></html>
+CASE bytes=107 quirks=Quirks id=scriptdata01.dat#24
+<html><head></head><body>FOO<script type="text/plain">'<!-- <sCrIpt/'</script>BAR</script>QUX</body></html>
+CASE bytes=88 quirks=Quirks id=scriptdata01.dat#25
+<html><head></head><body>FOO<script><!--<script>-></script>--></script>QUX</body></html>

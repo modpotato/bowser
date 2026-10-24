@@ -1,0 +1,120 @@
+<!doctype html>
+<html>
+<head><meta charset="utf-8"><title>testdriver action_sequence e2e</title></head>
+<body>
+<div id="a" style="position:absolute;left:10px;top:10px;width:80px;height:40px;">A</div>
+<div id="b" style="position:absolute;left:200px;top:10px;width:80px;height:40px;">B</div>
+<div id="tall" style="height:2000px;">tall</div>
+<script src="/resources/testdriver.js"></script>
+<script>
+(function() {
+  "use strict";
+  // Phase 2: exercises test_driver.action_sequence (WebDriver Actions)
+  // through the real upstream testdriver.js, the vendor shim, and the
+  // native bridge into the embedder executor. Same gating as the
+  // phase-1 fixture: wait for load (bridge installed) and for layout
+  // (non-empty getClientRects) before running. Reports one marker
+  // line on the child's stdout; the Rust test asserts on it.
+  window.addEventListener("load", function() {
+    var a = document.getElementById("a");
+    var tries = 0;
+    function waitForLayout() {
+      tries++;
+      if (a.getClientRects().length === 0 && tries < 50) {
+        setTimeout(waitForLayout, 100);
+        return;
+      }
+      runTests();
+    }
+    function runTests() {
+      var results = [];
+      function report(name, ok, detail) {
+        results.push(name + "=" + (ok ? "PASS" : "FAIL") + (detail ? "(" + detail + ")" : ""));
+        if (results.length === 4) console.log("TESTDRIVER_ACTIONS2 " + results.join(" "));
+      }
+      function fail(name) {
+        return function(e) { report(name, false, "rejected:" + (e && e.message)); };
+      }
+
+      var log = [];
+      ["a", "b"].forEach(function(id) {
+        var el = document.getElementById(id);
+        ["pointerdown", "pointerup", "mouseup", "click"].forEach(function(t) {
+          el.addEventListener(t, function() { log.push(t + "@" + id); });
+        });
+        el.addEventListener("mousedown", function(e) {
+          log.push("mousedown@" + id + ":shift=" + e.shiftKey);
+        });
+      });
+      var b = document.getElementById("b");
+      a.addEventListener("keydown", function(e) { log.push("keydown@a:" + e.key); });
+
+      function mouseSource(actions) {
+        return { type: "pointer", id: "mouse",
+                 parameters: { pointerType: "mouse" }, actions: actions };
+      }
+      function delta(from) { return log.slice(from).join(","); }
+
+      // 1. Drag: press on #a, move to #b, release. Down events land
+      // on #a, up events on #b, and no click fires anywhere.
+      var mark = 0;
+      test_driver.action_sequence([mouseSource([
+        { type: "pointerMove", duration: 0, origin: a, x: 0, y: 0 },
+        { type: "pointerDown", button: 0 },
+        { type: "pointerMove", duration: 0, origin: b, x: 0, y: 0 },
+        { type: "pointerUp", button: 0 }
+      ])]).then(function() {
+        var d = delta(mark);
+        report("drag",
+               d === "pointerdown@a,mousedown@a:shift=false,pointerup@b,mouseup@b", d);
+        mark = log.length;
+        // 2. Plain click on #a: click fires after mouseup, same target.
+        return test_driver.action_sequence([mouseSource([
+          { type: "pointerMove", duration: 0, origin: a, x: 0, y: 0 },
+          { type: "pointerDown", button: 0 },
+          { type: "pointerUp", button: 0 }
+        ])]);
+      }, fail("drag")).then(function() {
+        var d = delta(mark);
+        report("click",
+               d === "pointerdown@a,mousedown@a:shift=false,pointerup@a,mouseup@a,click@a", d);
+        mark = log.length;
+        // 3. Key chord tick-aligned with a pointer press: Shift is
+        // held across ticks, so the mousedown synthesized on tick 1
+        // carries shiftKey, and 'a' keydown targets the focused #a.
+        return test_driver.action_sequence([
+          { type: "key", id: "keyboard", actions: [
+            { type: "keyDown", value: "\uE008" },
+            { type: "keyDown", value: "a" },
+            { type: "keyUp", value: "a" },
+            { type: "keyUp", value: "\uE008" }
+          ]},
+          mouseSource([
+            { type: "pause", duration: 0 },
+            { type: "pointerDown", button: 0 },
+            { type: "pointerUp", button: 0 },
+            { type: "pause", duration: 0 }
+          ])
+        ]);
+      }, fail("click")).then(function() {
+        var d = delta(mark);
+        report("chord",
+               d === "keydown@a:Shift,keydown@a:a,pointerdown@a,mousedown@a:shift=true," +
+                     "pointerup@a,mouseup@a,click@a", d);
+        // 4. Wheel: scroll the viewport by deltaY=120 at (10, 10);
+        // the default scroll moves window.scrollY.
+        return test_driver.action_sequence([
+          { type: "wheel", id: "wheel", actions: [
+            { type: "scroll", x: 10, y: 10, deltaX: 0, deltaY: 120 }
+          ]}
+        ]);
+      }, fail("chord")).then(function() {
+        report("wheel", window.scrollY === 120, String(window.scrollY));
+      }, fail("wheel"));
+    }
+    waitForLayout();
+  });
+})();
+</script>
+</body>
+</html>

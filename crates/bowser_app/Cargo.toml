@@ -3,4 +3,40 @@ name = "bowser_app"
 version = "0.1.0"
 edition = "2024"
 
+[[bin]]
+name = "bowser"
+path = "src/main.rs"
+
+[[bin]]
+name = "bowser-wpt"
+path = "src/bin/bowser-wpt.rs"
+required-features = ["wpt-driver"]
+
 [dependencies]
+bowser_url = { path = "../bowser_url" }
+bowser_net = { path = "../bowser_net" }
+bowser_dom = { path = "../bowser_dom" }
+bowser_css = { path = "../bowser_css" }
+bowser_layout = { path = "../bowser_layout" }
+bowser_paint = { path = "../bowser_paint" }
+bowser_js = { path = "../bowser_js" }
+bowser_wpt = { path = "../bowser_wpt", optional = true }
+winit = { version = "0.30", default-features = false, features = ["rwh_06", "x11", "wayland", "wayland-dlopen"] }
+wgpu = { version = "=30.0.1", default-features = false, features = ["wgsl", "vulkan"] }
+
+[features]
+default = []
+# Test-only WPT harness: `wpt_driver` (the `BowserDriver` + fixture server)
+# exists solely to serve `tests/wpt_render.rs` and a few lib unit tests.
+# Off by default so the shipping `bowser` binary carries no test infra.
+wpt-driver = ["dep:bowser_wpt"]
+
+[[test]]
+name = "wpt_render"
+path = "tests/wpt_render.rs"
+required-features = ["wpt-driver"]
+
+[[test]]
+name = "wpt_testdriver"
+path = "tests/wpt_testdriver.rs"
+required-features = ["wpt-driver"]

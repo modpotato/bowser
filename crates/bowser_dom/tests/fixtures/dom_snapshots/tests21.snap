@@ -1,0 +1,46 @@
+CASE bytes=53 quirks=Quirks id=tests21.dat#0
+<html><head></head><body><svg>foo</svg></body></html>
+CASE bytes=55 quirks=Quirks id=tests21.dat#1
+<html><head></head><body><math>foo</math></body></html>
+CASE bytes=69 quirks=Quirks id=tests21.dat#2
+<html><head></head><body><div><!--[CDATA[foo]]--></div></body></html>
+CASE bytes=53 quirks=Quirks id=tests21.dat#3
+<html><head></head><body><svg>foo</svg></body></html>
+CASE bytes=50 quirks=Quirks id=tests21.dat#4
+<html><head></head><body><svg></svg></body></html>
+CASE bytes=50 quirks=Quirks id=tests21.dat#5
+<html><head></head><body><svg></svg></body></html>
+CASE bytes=57 quirks=Quirks id=tests21.dat#6
+<html><head></head><body><svg>]] &gt;</svg></body></html>
+CASE bytes=52 quirks=Quirks id=tests21.dat#7
+<html><head></head><body><svg>]]</svg></body></html>
+CASE bytes=51 quirks=Quirks id=tests21.dat#8
+<html><head></head><body><svg>]</svg></body></html>
+CASE bytes=56 quirks=Quirks id=tests21.dat#9
+<html><head></head><body><svg>]&gt;a</svg></body></html>
+CASE bytes=69 quirks=NoQuirks id=tests21.dat#10
+<!DOCTYPE html><html><head></head><body><svg>foo]</svg></body></html>
+CASE bytes=70 quirks=NoQuirks id=tests21.dat#11
+<!DOCTYPE html><html><head></head><body><svg>foo]]</svg></body></html>
+CASE bytes=71 quirks=NoQuirks id=tests21.dat#12
+<!DOCTYPE html><html><head></head><body><svg>foo]]]</svg></body></html>
+CASE bytes=111 quirks=Quirks id=tests21.dat#13
+<html><head></head><body><svg><foreignObject><div><!--[CDATA[foo]]--></div></foreignObject></svg></body></html>
+CASE bytes=61 quirks=Quirks id=tests21.dat#14
+<html><head></head><body><svg>&lt;svg&gt;</svg></body></html>
+CASE bytes=63 quirks=Quirks id=tests21.dat#15
+<html><head></head><body><svg>&lt;/svg&gt;a</svg></body></html>
+CASE bytes=62 quirks=Quirks id=tests21.dat#16
+<html><head></head><body><svg>&lt;svg&gt;a</svg></body></html>
+CASE bytes=63 quirks=Quirks id=tests21.dat#17
+<html><head></head><body><svg>&lt;/svg&gt;a</svg></body></html>
+CASE bytes=74 quirks=Quirks id=tests21.dat#18
+<html><head></head><body><svg>&lt;svg&gt;<path></path></svg></body></html>
+CASE bytes=61 quirks=Quirks id=tests21.dat#19
+<html><head></head><body><svg>&lt;svg&gt;</svg></body></html>
+CASE bytes=72 quirks=Quirks id=tests21.dat#20
+<html><head></head><body><svg>&lt;svg&gt;<!--path--></svg></body></html>
+CASE bytes=65 quirks=Quirks id=tests21.dat#21
+<html><head></head><body><svg>&lt;svg&gt;path</svg></body></html>
+CASE bytes=66 quirks=Quirks id=tests21.dat#22
+<html><head></head><body><svg>&lt;!--svg--&gt;</svg></body></html>

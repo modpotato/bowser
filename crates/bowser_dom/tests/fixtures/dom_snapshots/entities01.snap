@@ -1,0 +1,150 @@
+CASE bytes=49 quirks=Quirks id=entities01.dat#0
+<html><head></head><body>FOO&gt;BAR</body></html>
+CASE bytes=49 quirks=Quirks id=entities01.dat#1
+<html><head></head><body>FOO&gt;BAR</body></html>
+CASE bytes=50 quirks=Quirks id=entities01.dat#2
+<html><head></head><body>FOO&gt; BAR</body></html>
+CASE bytes=51 quirks=Quirks id=entities01.dat#3
+<html><head></head><body>FOO&gt;;;BAR</body></html>
+CASE bytes=59 quirks=Quirks id=entities01.dat#4
+<html><head></head><body>I'm ¬it; I tell you</body></html>
+CASE bytes=57 quirks=Quirks id=entities01.dat#5
+<html><head></head><body>I'm ∉ I tell you</body></html>
+CASE bytes=50 quirks=Quirks id=entities01.dat#6
+<html><head></head><body>&amp;ammmp;</body></html>
+CASE bytes=993 quirks=Quirks id=entities01.dat#7
+<html><head></head><body>&amp;ammmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmp;</body></html>
+CASE bytes=51 quirks=Quirks id=entities01.dat#8
+<html><head></head><body>FOO&amp; BAR</body></html>
+CASE bytes=58 quirks=Quirks id=entities01.dat#9
+<html><head></head><body>FOO&amp;<bar></bar></body></html>
+CASE bytes=64 quirks=Quirks id=entities01.dat#10
+<html><head></head><body>FOO&amp;&amp;&amp;&gt;BAR</body></html>
+CASE bytes=46 quirks=Quirks id=entities01.dat#11
+<html><head></head><body>FOO)BAR</body></html>
+CASE bytes=46 quirks=Quirks id=entities01.dat#12
+<html><head></head><body>FOOABAR</body></html>
+CASE bytes=46 quirks=Quirks id=entities01.dat#13
+<html><head></head><body>FOOABAR</body></html>
+CASE bytes=51 quirks=Quirks id=entities01.dat#14
+<html><head></head><body>FOO&amp;#BAR</body></html>
+CASE bytes=51 quirks=Quirks id=entities01.dat#15
+<html><head></head><body>FOO&amp;#ZOO</body></html>
+CASE bytes=45 quirks=Quirks id=entities01.dat#16
+<html><head></head><body>FOOºR</body></html>
+CASE bytes=52 quirks=Quirks id=entities01.dat#17
+<html><head></head><body>FOO&amp;#xZOO</body></html>
+CASE bytes=52 quirks=Quirks id=entities01.dat#18
+<html><head></head><body>FOO&amp;#XZOO</body></html>
+CASE bytes=46 quirks=Quirks id=entities01.dat#19
+<html><head></head><body>FOO)BAR</body></html>
+CASE bytes=46 quirks=Quirks id=entities01.dat#20
+<html><head></head><body>FOO䆺R</body></html>
+CASE bytes=46 quirks=Quirks id=entities01.dat#21
+<html><head></head><body>FOOAZOO</body></html>
+CASE bytes=48 quirks=Quirks id=entities01.dat#22
+<html><head></head><body>FOO�ZOO</body></html>
+CASE bytes=46 quirks=Quirks id=entities01.dat#23
+<html><head></head><body>FOOxZOO</body></html>
+CASE bytes=46 quirks=Quirks id=entities01.dat#24
+<html><head></head><body>FOOyZOO</body></html>
+CASE bytes=48 quirks=Quirks id=entities01.dat#25
+<html><head></head><body>FOO€ZOO</body></html>
+CASE bytes=47 quirks=Quirks id=entities01.dat#26
+<html><head></head><body>FOOZOO</body></html>
+CASE bytes=48 quirks=Quirks id=entities01.dat#27
+<html><head></head><body>FOO‚ZOO</body></html>
+CASE bytes=47 quirks=Quirks id=entities01.dat#28
+<html><head></head><body>FOOƒZOO</body></html>
+CASE bytes=48 quirks=Quirks id=entities01.dat#29
+<html><head></head><body>FOO„ZOO</body></html>
+CASE bytes=48 quirks=Quirks id=entities01.dat#30
+<html><head></head><body>FOO…ZOO</body></html>
+CASE bytes=48 quirks=Quirks id=entities01.dat#31
+<html><head></head><body>FOO†ZOO</body></html>
+CASE bytes=48 quirks=Quirks id=entities01.dat#32
+<html><head></head><body>FOO‡ZOO</body></html>
+CASE bytes=47 quirks=Quirks id=entities01.dat#33
+<html><head></head><body>FOOˆZOO</body></html>
+CASE bytes=48 quirks=Quirks id=entities01.dat#34
+<html><head></head><body>FOO‰ZOO</body></html>
+CASE bytes=47 quirks=Quirks id=entities01.dat#35
+<html><head></head><body>FOOŠZOO</body></html>
+CASE bytes=48 quirks=Quirks id=entities01.dat#36
+<html><head></head><body>FOO‹ZOO</body></html>
+CASE bytes=47 quirks=Quirks id=entities01.dat#37
+<html><head></head><body>FOOŒZOO</body></html>
+CASE bytes=47 quirks=Quirks id=entities01.dat#38
+<html><head></head><body>FOOZOO</body></html>
+CASE bytes=47 quirks=Quirks id=entities01.dat#39
+<html><head></head><body>FOOŽZOO</body></html>
+CASE bytes=47 quirks=Quirks id=entities01.dat#40
+<html><head></head><body>FOOZOO</body></html>
+CASE bytes=47 quirks=Quirks id=entities01.dat#41
+<html><head></head><body>FOOZOO</body></html>
+CASE bytes=48 quirks=Quirks id=entities01.dat#42
+<html><head></head><body>FOO‘ZOO</body></html>
+CASE bytes=48 quirks=Quirks id=entities01.dat#43
+<html><head></head><body>FOO’ZOO</body></html>
+CASE bytes=48 quirks=Quirks id=entities01.dat#44
+<html><head></head><body>FOO“ZOO</body></html>
+CASE bytes=48 quirks=Quirks id=entities01.dat#45
+<html><head></head><body>FOO”ZOO</body></html>
+CASE bytes=48 quirks=Quirks id=entities01.dat#46
+<html><head></head><body>FOO•ZOO</body></html>
+CASE bytes=48 quirks=Quirks id=entities01.dat#47
+<html><head></head><body>FOO–ZOO</body></html>
+CASE bytes=48 quirks=Quirks id=entities01.dat#48
+<html><head></head><body>FOO—ZOO</body></html>
+CASE bytes=47 quirks=Quirks id=entities01.dat#49
+<html><head></head><body>FOO˜ZOO</body></html>
+CASE bytes=48 quirks=Quirks id=entities01.dat#50
+<html><head></head><body>FOO™ZOO</body></html>
+CASE bytes=47 quirks=Quirks id=entities01.dat#51
+<html><head></head><body>FOOšZOO</body></html>
+CASE bytes=48 quirks=Quirks id=entities01.dat#52
+<html><head></head><body>FOO›ZOO</body></html>
+CASE bytes=47 quirks=Quirks id=entities01.dat#53
+<html><head></head><body>FOOœZOO</body></html>
+CASE bytes=47 quirks=Quirks id=entities01.dat#54
+<html><head></head><body>FOOZOO</body></html>
+CASE bytes=47 quirks=Quirks id=entities01.dat#55
+<html><head></head><body>FOOžZOO</body></html>
+CASE bytes=47 quirks=Quirks id=entities01.dat#56
+<html><head></head><body>FOOŸZOO</body></html>
+CASE bytes=51 quirks=Quirks id=entities01.dat#57
+<html><head></head><body>FOO&nbsp;ZOO</body></html>
+CASE bytes=48 quirks=Quirks id=entities01.dat#58
+<html><head></head><body>FOO퟿ZOO</body></html>
+CASE bytes=48 quirks=Quirks id=entities01.dat#59
+<html><head></head><body>FOO�ZOO</body></html>
+CASE bytes=48 quirks=Quirks id=entities01.dat#60
+<html><head></head><body>FOO�ZOO</body></html>
+CASE bytes=48 quirks=Quirks id=entities01.dat#61
+<html><head></head><body>FOO�ZOO</body></html>
+CASE bytes=48 quirks=Quirks id=entities01.dat#62
+<html><head></head><body>FOO�ZOO</body></html>
+CASE bytes=48 quirks=Quirks id=entities01.dat#63
+<html><head></head><body>FOOZOO</body></html>
+CASE bytes=49 quirks=Quirks id=entities01.dat#64
+<html><head></head><body>FOO􏿾ZOO</body></html>
+CASE bytes=49 quirks=Quirks id=entities01.dat#65
+<html><head></head><body>FOO􈟔ZOO</body></html>
+CASE bytes=49 quirks=Quirks id=entities01.dat#66
+<html><head></head><body>FOO􏿿ZOO</body></html>
+CASE bytes=48 quirks=Quirks id=entities01.dat#67
+<html><head></head><body>FOO�ZOO</body></html>
+CASE bytes=48 quirks=Quirks id=entities01.dat#68
+<html><head></head><body>FOO�ZOO</body></html>
+CASE bytes=45 quirks=Quirks id=entities01.dat#69
+<html><head></head><body>FOO�</body></html>
+CASE bytes=45 quirks=Quirks id=entities01.dat#70
+<html><head></head><body>FOO�</body></html>
+CASE bytes=45 quirks=Quirks id=entities01.dat#71
+<html><head></head><body>FOO�</body></html>
+CASE bytes=48 quirks=Quirks id=entities01.dat#72
+<html><head></head><body>FOO�ZOO</body></html>
+CASE bytes=48 quirks=Quirks id=entities01.dat#73
+<html><head></head><body>FOO�ZOO</body></html>
+CASE bytes=48 quirks=Quirks id=entities01.dat#74
+<html><head></head><body>FOO�ZOO</body></html>

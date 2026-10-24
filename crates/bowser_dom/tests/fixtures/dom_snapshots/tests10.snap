@@ -1,0 +1,108 @@
+CASE bytes=65 quirks=NoQuirks id=tests10.dat#0
+<!DOCTYPE html><html><head></head><body><svg></svg></body></html>
+CASE bytes=82 quirks=NoQuirks id=tests10.dat#1
+<!DOCTYPE html><html><head></head><body><svg></svg><!--[CDATA[a]]--></body></html>
+CASE bytes=65 quirks=NoQuirks id=tests10.dat#2
+<!DOCTYPE html><html><head></head><body><svg></svg></body></html>
+CASE bytes=82 quirks=NoQuirks id=tests10.dat#3
+<!DOCTYPE html><html><head></head><body><select><svg></svg></select></body></html>
+CASE bytes=99 quirks=NoQuirks id=tests10.dat#4
+<!DOCTYPE html><html><head></head><body><select><option><svg></svg></option></select></body></html>
+CASE bytes=80 quirks=NoQuirks id=tests10.dat#5
+<!DOCTYPE html><html><head></head><body><svg></svg><table></table></body></html>
+CASE bytes=90 quirks=NoQuirks id=tests10.dat#6
+<!DOCTYPE html><html><head></head><body><svg><g>foo</g></svg><table></table></body></html>
+CASE bytes=100 quirks=NoQuirks id=tests10.dat#7
+<!DOCTYPE html><html><head></head><body><svg><g>foo</g><g>bar</g></svg><table></table></body></html>
+CASE bytes=115 quirks=NoQuirks id=tests10.dat#8
+<!DOCTYPE html><html><head></head><body><svg><g>foo</g><g>bar</g></svg><table><tbody></tbody></table></body></html>
+CASE bytes=124 quirks=NoQuirks id=tests10.dat#9
+<!DOCTYPE html><html><head></head><body><svg><g>foo</g><g>bar</g></svg><table><tbody><tr></tr></tbody></table></body></html>
+CASE bytes=133 quirks=NoQuirks id=tests10.dat#10
+<!DOCTYPE html><html><head></head><body><table><tbody><tr><td><svg><g>foo</g><g>bar</g></svg></td></tr></tbody></table></body></html>
+CASE bytes=143 quirks=NoQuirks id=tests10.dat#11
+<!DOCTYPE html><html><head></head><body><table><tbody><tr><td><svg><g>foo</g><g>bar</g></svg><p>baz</p></td></tr></tbody></table></body></html>
+CASE bytes=129 quirks=NoQuirks id=tests10.dat#12
+<!DOCTYPE html><html><head></head><body><table><caption><svg><g>foo</g><g>bar</g></svg><p>baz</p></caption></table></body></html>
+CASE bytes=140 quirks=NoQuirks id=tests10.dat#13
+<!DOCTYPE html><html><head></head><body><table><caption><svg><g>foo</g><g>bar</g></svg><p>baz</p></caption></table><p>quux</p></body></html>
+CASE bytes=133 quirks=NoQuirks id=tests10.dat#14
+<!DOCTYPE html><html><head></head><body><table><caption><svg><g>foo</g><g>bar</g>baz</svg></caption></table><p>quux</p></body></html>
+CASE bytes=142 quirks=NoQuirks id=tests10.dat#15
+<!DOCTYPE html><html><head></head><body><svg><g>foo</g><g>bar</g></svg><p>baz</p><table><colgroup></colgroup></table><p>quux</p></body></html>
+CASE bytes=171 quirks=NoQuirks id=tests10.dat#16
+<!DOCTYPE html><html><head></head><body><table><tbody><tr><td><select><svg><g>foo</g><g>bar</g></svg><p>baz</p></select></td></tr></tbody></table><p>quux</p></body></html>
+CASE bytes=138 quirks=NoQuirks id=tests10.dat#17
+<!DOCTYPE html><html><head></head><body><select><svg><g>foo</g><g>bar</g></svg><p>baz</p></select><table></table><p>quux</p></body></html>
+CASE bytes=95 quirks=NoQuirks id=tests10.dat#18
+<!DOCTYPE html><html><head></head><body><svg><g>foo</g><g>bar</g></svg><p>baz</p></body></html>
+CASE bytes=95 quirks=NoQuirks id=tests10.dat#19
+<!DOCTYPE html><html><head></head><body><svg><g>foo</g><g>bar</g></svg><p>baz</p></body></html>
+CASE bytes=62 quirks=NoQuirks id=tests10.dat#20
+<!DOCTYPE html><html><head></head><frameset></frameset></html>
+CASE bytes=62 quirks=NoQuirks id=tests10.dat#21
+<!DOCTYPE html><html><head></head><frameset></frameset></html>
+CASE bytes=99 quirks=NoQuirks id=tests10.dat#22
+<!DOCTYPE html><html><head></head><body xlink:href="foo"><svg xlink:href="foo"></svg></body></html>
+CASE bytes=134 quirks=NoQuirks id=tests10.dat#23
+<!DOCTYPE html><html><head></head><body xlink:href="foo" xml:lang="en"><svg><g xml:lang="en" xlink:href="foo"></g></svg></body></html>
+CASE bytes=134 quirks=NoQuirks id=tests10.dat#24
+<!DOCTYPE html><html><head></head><body xlink:href="foo" xml:lang="en"><svg><g xml:lang="en" xlink:href="foo"></g></svg></body></html>
+CASE bytes=137 quirks=NoQuirks id=tests10.dat#25
+<!DOCTYPE html><html><head></head><body xlink:href="foo" xml:lang="en"><svg><g xml:lang="en" xlink:href="foo"></g>bar</svg></body></html>
+CASE bytes=50 quirks=Quirks id=tests10.dat#26
+<html><head></head><body><svg></svg></body></html>
+CASE bytes=62 quirks=Quirks id=tests10.dat#27
+<html><head></head><body><div><svg></svg></div>a</body></html>
+CASE bytes=75 quirks=Quirks id=tests10.dat#28
+<html><head></head><body><div><svg><path></path></svg></div>a</body></html>
+CASE bytes=87 quirks=Quirks id=tests10.dat#29
+<html><head></head><body><div><svg><path></path></svg><path></path></div></body></html>
+CASE bytes=119 quirks=Quirks id=tests10.dat#30
+<html><head></head><body><div><svg><path><foreignObject><math>a</math></foreignObject></path></svg></div></body></html>
+CASE bytes=113 quirks=Quirks id=tests10.dat#31
+<html><head></head><body><div><svg><path><foreignObject><p>a</p></foreignObject></path></svg></div></body></html>
+CASE bytes=110 quirks=NoQuirks id=tests10.dat#32
+<!DOCTYPE html><html><head></head><body><svg><desc><div><svg></svg><ul>a</ul></div></desc></svg></body></html>
+CASE bytes=99 quirks=NoQuirks id=tests10.dat#33
+<!DOCTYPE html><html><head></head><body><svg><desc><svg></svg><ul>a</ul></desc></svg></body></html>
+CASE bytes=92 quirks=NoQuirks id=tests10.dat#34
+<!DOCTYPE html><html><head></head><body><p><svg><desc><p></p></desc></svg></p></body></html>
+CASE bytes=94 quirks=NoQuirks id=tests10.dat#35
+<!DOCTYPE html><html><head></head><body><p><svg><title><p></p></title></svg></p></body></html>
+CASE bytes=119 quirks=Quirks id=tests10.dat#36
+<html><head></head><body><div><svg><path><foreignObject><p></p><p></p></foreignObject></path></svg></div></body></html>
+CASE bytes=122 quirks=Quirks id=tests10.dat#37
+<html><head></head><body><math><mi><div><object><div><span></span></div></object></div></mi><mi></mi></math></body></html>
+CASE bytes=134 quirks=Quirks id=tests10.dat#38
+<html><head></head><body><math><mi><svg><foreignObject><div><div></div></div></foreignObject></svg></mi><mi></mi></math></body></html>
+CASE bytes=80 quirks=Quirks id=tests10.dat#39
+<html><head></head><body><svg><script></script><path></path></svg></body></html>
+CASE bytes=89 quirks=Quirks id=tests10.dat#40
+<html><head></head><body><svg></svg><table><tbody><tr></tr></tbody></table></body></html>
+CASE bytes=78 quirks=Quirks id=tests10.dat#41
+<html><head></head><body><math><mi><mglyph></mglyph></mi></math></body></html>
+CASE bytes=86 quirks=Quirks id=tests10.dat#42
+<html><head></head><body><math><mi><malignmark></malignmark></mi></math></body></html>
+CASE bytes=78 quirks=Quirks id=tests10.dat#43
+<html><head></head><body><math><mo><mglyph></mglyph></mo></math></body></html>
+CASE bytes=86 quirks=Quirks id=tests10.dat#44
+<html><head></head><body><math><mo><malignmark></malignmark></mo></math></body></html>
+CASE bytes=78 quirks=Quirks id=tests10.dat#45
+<html><head></head><body><math><mn><mglyph></mglyph></mn></math></body></html>
+CASE bytes=86 quirks=Quirks id=tests10.dat#46
+<html><head></head><body><math><mn><malignmark></malignmark></mn></math></body></html>
+CASE bytes=78 quirks=Quirks id=tests10.dat#47
+<html><head></head><body><math><ms><mglyph></mglyph></ms></math></body></html>
+CASE bytes=86 quirks=Quirks id=tests10.dat#48
+<html><head></head><body><math><ms><malignmark></malignmark></ms></math></body></html>
+CASE bytes=84 quirks=Quirks id=tests10.dat#49
+<html><head></head><body><math><mtext><mglyph></mglyph></mtext></math></body></html>
+CASE bytes=92 quirks=Quirks id=tests10.dat#50
+<html><head></head><body><math><mtext><malignmark></malignmark></mtext></math></body></html>
+CASE bytes=105 quirks=Quirks id=tests10.dat#51
+<html><head></head><body><math><annotation-xml><svg></svg></annotation-xml><mi></mi></math></body></html>
+CASE bytes=195 quirks=Quirks id=tests10.dat#52
+<html><head></head><body><math><annotation-xml><svg><foreignObject><div><math><mi></mi></math><span></span></div></foreignObject><path></path></svg></annotation-xml><mi></mi></math></body></html>
+CASE bytes=204 quirks=Quirks id=tests10.dat#53
+<html><head></head><body><math><annotation-xml><svg><foreignObject><math><mi><svg></svg></mi><mo></mo></math><span></span></foreignObject><path></path></svg></annotation-xml><mi></mi></math></body></html>

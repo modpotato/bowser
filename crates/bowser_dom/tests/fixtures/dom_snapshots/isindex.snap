@@ -1,0 +1,8 @@
+CASE bytes=58 quirks=Quirks id=isindex.dat#0
+<html><head></head><body><isindex></isindex></body></html>
+CASE bytes=97 quirks=Quirks id=isindex.dat#1
+<html><head></head><body><isindex name="A" action="B" prompt="C" foo="D"></isindex></body></html>
+CASE bytes=71 quirks=Quirks id=isindex.dat#2
+<html><head></head><body><form><isindex></isindex></form></body></html>
+CASE bytes=75 quirks=NoQuirks id=isindex.dat#3
+<!DOCTYPE html><html><head></head><body><isindex>x</isindex>x</body></html>

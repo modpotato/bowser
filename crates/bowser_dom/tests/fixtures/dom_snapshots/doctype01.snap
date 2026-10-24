@@ -1,0 +1,74 @@
+CASE bytes=59 quirks=NoQuirks id=doctype01.dat#0
+<!DOCTYPE html><html><head></head><body>Hello</body></html>
+CASE bytes=59 quirks=NoQuirks id=doctype01.dat#1
+<!DOCTYPE html><html><head></head><body>Hello</body></html>
+CASE bytes=59 quirks=NoQuirks id=doctype01.dat#2
+<!DOCTYPE html><html><head></head><body>Hello</body></html>
+CASE bytes=55 quirks=Quirks id=doctype01.dat#3
+<!DOCTYPE ><html><head></head><body>Hello</body></html>
+CASE bytes=55 quirks=Quirks id=doctype01.dat#4
+<!DOCTYPE ><html><head></head><body>Hello</body></html>
+CASE bytes=61 quirks=Quirks id=doctype01.dat#5
+<!DOCTYPE potato><html><head></head><body>Hello</body></html>
+CASE bytes=61 quirks=Quirks id=doctype01.dat#6
+<!DOCTYPE potato><html><head></head><body>Hello</body></html>
+CASE bytes=61 quirks=Quirks id=doctype01.dat#7
+<!DOCTYPE potato><html><head></head><body>Hello</body></html>
+CASE bytes=61 quirks=Quirks id=doctype01.dat#8
+<!DOCTYPE potato><html><head></head><body>Hello</body></html>
+CASE bytes=61 quirks=Quirks id=doctype01.dat#9
+<!DOCTYPE potato><html><head></head><body>Hello</body></html>
+CASE bytes=61 quirks=Quirks id=doctype01.dat#10
+<!DOCTYPE potato><html><head></head><body>Hello</body></html>
+CASE bytes=61 quirks=Quirks id=doctype01.dat#11
+<!DOCTYPE potato><html><head></head><body>Hello</body></html>
+CASE bytes=61 quirks=Quirks id=doctype01.dat#12
+<!DOCTYPE potato><html><head></head><body>Hello</body></html>
+CASE bytes=76 quirks=Quirks id=doctype01.dat#13
+<!DOCTYPE potato SYSTEM "taco""><html><head></head><body>Hello</body></html>
+CASE bytes=75 quirks=Quirks id=doctype01.dat#14
+<!DOCTYPE potato SYSTEM "taco"><html><head></head><body>Hello</body></html>
+CASE bytes=77 quirks=Quirks id=doctype01.dat#15
+<!DOCTYPE potato SYSTEM "tai'co"><html><head></head><body>Hello</body></html>
+CASE bytes=61 quirks=Quirks id=doctype01.dat#16
+<!DOCTYPE potato><html><head></head><body>Hello</body></html>
+CASE bytes=61 quirks=Quirks id=doctype01.dat#17
+<!DOCTYPE potato><html><head></head><body>Hello</body></html>
+CASE bytes=61 quirks=Quirks id=doctype01.dat#18
+<!DOCTYPE potato><html><head></head><body>Hello</body></html>
+CASE bytes=61 quirks=Quirks id=doctype01.dat#19
+<!DOCTYPE potato><html><head></head><body>Hello</body></html>
+CASE bytes=61 quirks=Quirks id=doctype01.dat#20
+<!DOCTYPE potato><html><head></head><body>Hello</body></html>
+CASE bytes=61 quirks=Quirks id=doctype01.dat#21
+<!DOCTYPE potato><html><head></head><body>Hello</body></html>
+CASE bytes=76 quirks=Quirks id=doctype01.dat#22
+<!DOCTYPE potato PUBLIC "go'of"><html><head></head><body>Hello</body></html>
+CASE bytes=73 quirks=Quirks id=doctype01.dat#23
+<!DOCTYPE potato PUBLIC "go"><html><head></head><body>Hello</body></html>
+CASE bytes=81 quirks=Quirks id=doctype01.dat#24
+<!DOCTYPE potato PUBLIC "go:hh   of"><html><head></head><body>Hello</body></html>
+CASE bytes=81 quirks=Quirks id=doctype01.dat#25
+<!DOCTYPE potato PUBLIC "W3C-//dfdf"><html><head></head><body>Hello</body></html>
+CASE bytes=134 quirks=NoQuirks id=doctype01.dat#26
+<!DOCTYPE html PUBLIC "-//W3C//DTD HTML 4.01//EN" "http://www.w3.org/TR/html4/strict.dtd"><html><head></head><body>Hello</body></html>
+CASE bytes=58 quirks=Quirks id=doctype01.dat#27
+<!DOCTYPE ...><html><head></head><body>Hello</body></html>
+CASE bytes=160 quirks=LimitedQuirks id=doctype01.dat#28
+<!DOCTYPE html PUBLIC "-//W3C//DTD XHTML 1.0 Transitional//EN" "http://www.w3.org/TR/xhtml1/DTD/xhtml1-transitional.dtd"><html><head></head><body></body></html>
+CASE bytes=152 quirks=LimitedQuirks id=doctype01.dat#29
+<!DOCTYPE html PUBLIC "-//W3C//DTD XHTML 1.0 Frameset//EN" "http://www.w3.org/TR/xhtml1/DTD/xhtml1-frameset.dtd"><html><head></head><body></body></html>
+CASE bytes=67 quirks=Quirks id=doctype01.dat#30
+<!DOCTYPE root-element><html><head></head><body>]&gt;</body></html>
+CASE bytes=150 quirks=NoQuirks id=doctype01.dat#31
+<!DOCTYPE html PUBLIC "-//WAPFORUM//DTD XHTML Mobile 1.0//EN" "http://www.wapforum.org/DTD/xhtml-mobile10.dtd"><html><head></head><body></body></html>
+CASE bytes=114 quirks=NoQuirks id=doctype01.dat#32
+<!DOCTYPE html SYSTEM "http://www.w3.org/DTD/HTML4-strict.dtd"><html><head></head><body><b>Mine!</b></body></html>
+CASE bytes=129 quirks=NoQuirks id=doctype01.dat#33
+<!DOCTYPE html PUBLIC "-//W3C//DTD HTML 4.01//EN" "http://www.w3.org/TR/html4/strict.dtd"><html><head></head><body></body></html>
+CASE bytes=129 quirks=NoQuirks id=doctype01.dat#34
+<!DOCTYPE html PUBLIC "-//W3C//DTD HTML 4.01//EN" "http://www.w3.org/TR/html4/strict.dtd"><html><head></head><body></body></html>
+CASE bytes=129 quirks=NoQuirks id=doctype01.dat#35
+<!DOCTYPE html PUBLIC "-//W3C//DTD HTML 4.01//EN" "http://www.w3.org/TR/html4/strict.dtd"><html><head></head><body></body></html>
+CASE bytes=129 quirks=NoQuirks id=doctype01.dat#36
+<!DOCTYPE html PUBLIC "-//W3C//DTD HTML 4.01//EN" "http://www.w3.org/TR/html4/strict.dtd"><html><head></head><body></body></html>

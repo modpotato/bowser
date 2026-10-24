@@ -1,0 +1,8 @@
+CASE bytes=174 quirks=LimitedQuirks id=quirks01.dat#0
+<!DOCTYPE html PUBLIC "-//W3C//DTD XHTML 1.0 Frameset//EN" "http://www.w3.org/TR/xhtml1/DTD/xhtml1-frameset.dtd"><html><head></head><body><p></p><table></table></body></html>
+CASE bytes=144 quirks=Quirks id=quirks01.dat#1
+<!DOCTYPE html SYSTEM "http://www.ibm.com/data/dtd/v11/ibmxhtml1-transitional.dtd"><html><head></head><body><p><table></table></p></body></html>
+CASE bytes=90 quirks=Quirks id=quirks01.dat#2
+<!DOCTYPE html PUBLIC "html"><html><head></head><body><p><table></table></p></body></html>
+CASE bytes=150 quirks=Quirks id=quirks01.dat#3
+<!DOCTYPE html PUBLIC "-//W3C//DTD HTML 3.2//EN" "http://www.w3.org/TR/html4/strict.dtd"><html><head></head><body><p><table></table></p></body></html>

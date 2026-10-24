@@ -1,0 +1,4 @@
+CASE bytes=286 quirks=NoQuirks id=tests12.dat#0
+<!DOCTYPE html><html><head></head><body><p>foo<math><mtext><i>baz</i></mtext><annotation-xml><svg><desc><b>eggs</b></desc><g><foreignObject><p>spam</p><table><tbody><tr><td><img></td></tr></tbody></table></foreignObject></g><g>quux</g></svg></annotation-xml></math>bar</p></body></html>
+CASE bytes=279 quirks=NoQuirks id=tests12.dat#1
+<!DOCTYPE html><html><head></head><body>foo<math><mtext><i>baz</i></mtext><annotation-xml><svg><desc><b>eggs</b></desc><g><foreignObject><p>spam</p><table><tbody><tr><td><img></td></tr></tbody></table></foreignObject></g><g>quux</g></svg></annotation-xml></math>bar</body></html>

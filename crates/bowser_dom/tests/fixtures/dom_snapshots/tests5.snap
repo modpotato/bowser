@@ -1,0 +1,32 @@
+CASE bytes=61 quirks=Quirks id=tests5.dat#0
+<html><head><style> <!-- </style></head><body>x</body></html>
+CASE bytes=69 quirks=Quirks id=tests5.dat#1
+<html><head><style> <!-- </style> </head><body>--&gt; x</body></html>
+CASE bytes=62 quirks=Quirks id=tests5.dat#2
+<html><head><style> <!--> </style></head><body>x</body></html>
+CASE bytes=63 quirks=Quirks id=tests5.dat#3
+<html><head><style> <!---> </style></head><body>x</body></html>
+CASE bytes=65 quirks=Quirks id=tests5.dat#4
+<html><head></head><body><iframe> <!---> </iframe>x</body></html>
+CASE bytes=78 quirks=Quirks id=tests5.dat#5
+<html><head></head><body><iframe> <!--- </iframe>-&gt;x --&gt; x</body></html>
+CASE bytes=71 quirks=Quirks id=tests5.dat#6
+<html><head><script> <!-- </script> </head><body>--&gt; x</body></html>
+CASE bytes=72 quirks=Quirks id=tests5.dat#7
+<html><head><title> &lt;!-- </title> </head><body>--&gt; x</body></html>
+CASE bytes=85 quirks=Quirks id=tests5.dat#8
+<html><head></head><body><textarea> &lt;!--- </textarea>-&gt;x --&gt; x</body></html>
+CASE bytes=63 quirks=Quirks id=tests5.dat#9
+<html><head><style> <!</-- </style></head><body>x</body></html>
+CASE bytes=57 quirks=Quirks id=tests5.dat#10
+<html><head></head><body><p></p><xmp></xmp></body></html>
+CASE bytes=62 quirks=Quirks id=tests5.dat#11
+<html><head></head><body><xmp> <!-- > --> </xmp></body></html>
+CASE bytes=59 quirks=Quirks id=tests5.dat#12
+<html><head><title>&amp;</title></head><body></body></html>
+CASE bytes=72 quirks=Quirks id=tests5.dat#13
+<html><head><title>&lt;!--&amp;--&gt;</title></head><body></body></html>
+CASE bytes=61 quirks=Quirks id=tests5.dat#14
+<html><head><title>&lt;!--</title></head><body></body></html>
+CASE bytes=78 quirks=Quirks id=tests5.dat#16
+<html><head><noscript><!--</noscript>--></noscript></head><body></body></html>

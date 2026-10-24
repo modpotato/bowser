@@ -1,0 +1,6 @@
+CASE bytes=94 quirks=NoQuirks id=search-element.dat#0
+<!DOCTYPE html><html><head></head><body><p>foo</p><search>bar<p>baz</p></search></body></html>
+CASE bytes=84 quirks=NoQuirks id=search-element.dat#1
+<!DOCTYPE html><html><head></head><body><search><p>foo</p></search>bar</body></html>
+CASE bytes=113 quirks=NoQuirks id=search-element.dat#2
+<!DOCTYPE html><html><head></head><body>xxx<svg><x><g><a><search></search></a></g></x></svg><b></b></body></html>

@@ -1,0 +1,52 @@
+<!doctype html>
+<html>
+<head><meta charset="utf-8"><title>testdriver unarmed e2e</title></head>
+<body>
+<button id="btn">click me</button>
+<input id="inp" type="text">
+<script>
+(function() {
+  "use strict";
+  // No /resources/testdriver.js is loaded on this page, so the vendor
+  // shim never runs and the bridge stays unarmed. Direct
+  // `window.__bowser_testdriver` calls must be refused: the embedder
+  // drain drops them without dispatching and without granting user
+  // activation. Reports one marker line on the child's stdout; the
+  // Rust test asserts on it.
+  window.addEventListener("load", function() {
+    var clicked = [];
+    var keys = [];
+    var btn = document.getElementById("btn");
+    var inp = document.getElementById("inp");
+    btn.addEventListener("click", function() { clicked.push("clicked"); });
+    inp.addEventListener("keydown", function(e) { keys.push("down:" + e.key); });
+    inp.addEventListener("keyup", function(e) { keys.push("up:" + e.key); });
+
+    var b = window.__bowser_testdriver;
+    if (!b) {
+      console.log("TESTDRIVER_UNARMED FAIL(bridge missing)");
+      return;
+    }
+    try {
+      b.click(btn);
+      b.send_keys(inp, "x");
+      b.bless();
+    } catch (e) {
+      // A throwing bridge is also a refusal; the assertions below
+      // still have to hold (nothing dispatched).
+    }
+    // The headless pump drains (and refuses) on a 10ms cadence; 1s is
+    // far past the point a working bridge would have dispatched.
+    setTimeout(function() {
+      var okClick = clicked.length === 0;
+      var okKeys = keys.length === 0;
+      console.log(
+        "TESTDRIVER_UNARMED click=" + (okClick ? "PASS(none)" : "FAIL(" + clicked.join(",") + ")") +
+        " keys=" + (okKeys ? "PASS(none)" : "FAIL(" + keys.join(",") + ")")
+      );
+    }, 1000);
+  });
+})();
+</script>
+</body>
+</html>

@@ -4,3 +4,23 @@ version = "0.1.0"
 edition = "2024"
 
 [dependencies]
+bowser_dom = { path = "../bowser_dom" }
+bowser_html = { path = "../bowser_html" }
+bowser_net = { path = "../bowser_net" }
+bowser_url = { path = "../bowser_url" }
+bowser_encoding = { path = "../bowser_encoding" }
+bowser_css = { path = "../bowser_css" }
+bowser_layout = { path = "../bowser_layout" }
+bowser_paint = { path = "../bowser_paint" }
+
+[[bench]]
+name = "vm_dispatch"
+harness = false
+
+[[bench]]
+name = "compile"
+harness = false
+
+[[bench]]
+name = "gc_alloc"
+harness = false

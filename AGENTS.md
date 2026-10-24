@@ -34,18 +34,24 @@ Read this before writing any code. It overrides general habits.
 - Release profile: `lto = true`, `codegen-units = 1`, `opt-level = 3`,
   `strip = true`.
 - One crate per subsystem under `crates/`. No dependency cycles between
-  crates. Dependency order: `url` -> `net` -> `html` -> `dom` -> `css` ->
-  `layout` -> `paint` -> `js` -> `app`.
+  crates. Dependency order: `url` -> `encoding` -> `net` -> `html` -> `dom`
+  -> `css` -> `layout` -> `paint` -> `js` -> `app` (`bowser_wpt` is a
+  standalone harness with no internal deps; `bowser_app` depends on it).
 - Public APIs are minimal and documented. Prefer concrete internals over
   clever abstraction.
 
-## Workflow
+## Workflow (local-first, hard rule)
 
-- Work on `feature/<subsystem>-<short-desc>` branches, one PR per coherent
-  subsystem. Open PRs early as drafts; reviewers are the authority.
-- Never push broken code to `develop`. If it does not compile and pass
-  `cargo test` for its crate, it does not merge.
+- All work happens locally. No pushes, no new branches, no PRs, no merges,
+  ever, until the user explicitly approves. Open GitHub PRs stay
+  untouched.
+- When a genuine completion checkpoint is reached, report it and stop
+  push-related work. If a push is ever approved, it goes to exactly one
+  work branch per project (`<name>/work-<task>`), never to master/default.
+- Never commit broken code. If it does not compile and pass `cargo test`
+  for its crate, it does not land.
 - Commit messages: imperative and scoped, e.g.
-  `html: handle foster parenting in table contexts`.
+  `html: handle foster parenting in table contexts`. Multi-crate wave
+  commits use `wave X: <summary>` (e.g. `wave E: perf/hardening pass`).
 - Test fixtures that are large or binary live under `tests/fixtures/`,
   never inline in source.

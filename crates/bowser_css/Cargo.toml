@@ -4,3 +4,12 @@ version = "0.1.0"
 edition = "2024"
 
 [dependencies]
+bowser_dom = { path = "../bowser_dom" }
+
+[[bench]]
+name = "match_bench"
+harness = false
+
+[[bench]]
+name = "nth_bench"
+harness = false

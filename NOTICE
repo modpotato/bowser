@@ -1,0 +1,38 @@
+Bowser — third-party attributions
+=================================
+
+This file records third-party material included in the Bowser repository,
+as required by the licenses under which that material is distributed.
+
+---
+
+wreq-util (https://github.com/0x676e67/wreq-util)
+Licensed under the Apache License, Version 2.0.
+
+The TLS fingerprint constants in `crates/bowser_net/src/tls.rs`
+(`FingerprintProfile`: cipher-suite order, extension order, and GREASE
+placement tables) were transcribed from the browser-emulation profile
+data in `wreq-util/src/emulate/`. The wire-format implementation
+(ClientHello / HTTP/2 / HTTP/1 control) is Bowser's own; only the
+profile constants carry wreq-util's attribution.
+
+The full text of the Apache License, Version 2.0, under which wreq-util
+is distributed, is available at:
+https://www.apache.org/licenses/LICENSE-2.0
+
+---
+
+RFC 7541 protocol data (HPACK) — no additional license obligation
+The HPACK Huffman code table (`HUFFMAN` in `crates/bowser_net/src/hpack.rs`)
+and the 61-entry static table (`STATIC_TABLE`) are normative wire-format
+data transcribed from RFC 7541, Appendices B and A (IETF). These numeric
+codes are facts required for HTTP/2 interoperability, not creative
+expression; every HPACK implementation must use exactly these values.
+
+The table values were cross-checked for transcription accuracy against the
+generated Huffman table in the `h2` crate (version 0.4.19, MIT licensed,
+Copyright (c) 2017 h2 authors, https://github.com/hyperium/h2). No `h2`
+source code is included in Bowser: the table layout, the runtime-built
+binary decode tree, and the encoder are Bowser's own implementation, and
+`h2` is not a dependency of this workspace. The MIT copyright notice above
+is recorded here for provenance only.

@@ -1,0 +1,16 @@
+CASE bytes=59 quirks=NoQuirks id=tests24.dat#0
+<!DOCTYPE html><html><head></head><body>≂̸</body></html>
+CASE bytes=60 quirks=NoQuirks id=tests24.dat#1
+<!DOCTYPE html><html><head></head><body>≂̸A</body></html>
+CASE bytes=60 quirks=NoQuirks id=tests24.dat#2
+<!DOCTYPE html><html><head></head><body>  </body></html>
+CASE bytes=61 quirks=NoQuirks id=tests24.dat#3
+<!DOCTYPE html><html><head></head><body>  A</body></html>
+CASE bytes=60 quirks=NoQuirks id=tests24.dat#4
+<!DOCTYPE html><html><head></head><body>⊂⃒</body></html>
+CASE bytes=61 quirks=NoQuirks id=tests24.dat#5
+<!DOCTYPE html><html><head></head><body>⊂⃒A</body></html>
+CASE bytes=58 quirks=NoQuirks id=tests24.dat#6
+<!DOCTYPE html><html><head></head><body>𝔾</body></html>
+CASE bytes=59 quirks=NoQuirks id=tests24.dat#7
+<!DOCTYPE html><html><head></head><body>𝔾A</body></html>

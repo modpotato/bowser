@@ -1,0 +1,2 @@
+CASE bytes=154 quirks=Quirks id=namespace-sensitivity.dat#0
+<html><head></head><body>Foo<table><tbody><tr><td><svg><td><foreignObject><span></span></foreignObject></td></svg></td></tr></tbody></table></body></html>

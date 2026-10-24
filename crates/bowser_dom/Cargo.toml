@@ -4,3 +4,14 @@ version = "0.1.0"
 edition = "2024"
 
 [dependencies]
+bowser_encoding = { path = "../bowser_encoding" }
+bowser_html = { path = "../bowser_html" }
+bowser_url = { path = "../bowser_url" }
+
+[[bench]]
+name = "parse_html"
+harness = false
+
+[[bench]]
+name = "dom_ops"
+harness = false

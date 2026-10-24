@@ -1,0 +1,42 @@
+CASE bytes=89 quirks=Quirks id=tricky01.dat#0
+<html><head></head><body><b></b><p><b>Bold </b> Not bold</p>
+Also not bold.</body></html>
+CASE bytes=427 quirks=Quirks id=tricky01.dat#1
+<html><head></head><body><font color="red"><i>Italic and Red</i></font><i><p><font color="red">Italic and Red </font> Just italic.</p> Italic only.</i> Plain
+<p>I should not be red. <font color="red">Red. <i>Italic and red.</i></font></p><font color="red"><i>
+</i></font><p><font color="red"><i>Italic and red. </i> Red.</font> I should not be red.</p>
+<b>Bold <i>Bold and italic</i></b><i> Only Italic </i> Plain</body></html>
+CASE bytes=190 quirks=Quirks id=tricky01.dat#2
+<html><head></head><body>
+<p><font size="7">First paragraph.</font></p><font size="7">
+<p>Second paragraph.</p></font>
+<b></b><p><b><i>Bold and Italic</i></b><i> Italic</i></p></body></html>
+CASE bytes=98 quirks=Quirks id=tricky01.dat#3
+<html><head></head><body><dl>
+<dt><b>Boo
+</b></dt><dd><b>Goo?
+</b></dd></dl><b>
+</b></body></html>
+CASE bytes=104 quirks=Quirks id=tricky01.dat#4
+<html><head></head><body>
+<label><a></a><div><a>Hello<div>World</div></a>  
+</div></label></body></html>
+CASE bytes=142 quirks=Quirks id=tricky01.dat#5
+<html><head></head><body><center> <font>a</font></center><font><img> </font><table> <tbody><tr><td> </td> </tr> </tbody></table></body></html>
+CASE bytes=131 quirks=Quirks id=tricky01.dat#6
+<html><head></head><body><p><a></a></p><p><a>You should see this text.</a></p><table><tbody><tr></tr></tbody></table></body></html>
+CASE bytes=306 quirks=Quirks id=tricky01.dat#7
+<html><head></head><body><center><center></center></center><font>
+</font><table>
+<tbody><tr>
+<td></td></tr><tr>
+</tr></tbody></table><table><tbody><tr></tr></tbody></table><font>
+<p></p>
+<a></a></font><a><font></font></a><font>
+This page contains an insanely badly-nested tag sequence.</font></body></html>
+CASE bytes=279 quirks=Quirks id=tricky01.dat#8
+<html><head></head><body>
+<b><nobr></nobr></b><div><b><nobr>This text is in a div inside a nobr</nobr>More text that should not be in the nobr, i.e., the
+nobr should have closed the div inside it implicitly. </b><pre>A pre tag outside everything else.</pre>
+
+</div></body></html>

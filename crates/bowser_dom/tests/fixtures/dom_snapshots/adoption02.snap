@@ -1,0 +1,6 @@
+CASE bytes=78 quirks=Quirks id=adoption02.dat#0
+<html><head></head><body><b>1<i>2</i></b><i><p><b>3</b>4</p></i></body></html>
+CASE bytes=112 quirks=Quirks id=adoption02.dat#1
+<html><head></head><body><a></a><div><a><style></style></a><address><a></a><a></a></address></div></body></html>
+CASE bytes=99 quirks=Quirks id=adoption02.dat#2
+<html><head></head><body><nobr><marquee></marquee><table></table></nobr><nobr></nobr></body></html>

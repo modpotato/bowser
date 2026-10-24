@@ -1,0 +1,556 @@
+//! Minimal JSON parser, standard library only.
+//!
+//! Exists because this crate is not allowed dependencies (no serde). It is
+//! deliberately small: it supports the full JSON grammar but optimizes for
+//! readability, not speed. The WPT manifest is tens of megabytes; if parsing
+//! ever shows up in a profile, replace the tree-building step with a
+//! streaming scanner over the `items` object.
+
+use std::fmt;
+
+/// Maximum nesting depth for arrays and objects. Mirrors serde_json's
+/// recursion limit (128). Without it, deeply nested but valid JSON
+/// (e.g. tens of thousands of nested `[`) overflows the call stack,
+/// which aborts the process (SIGABRT) and cannot be caught or recovered
+/// from. `Manifest::from_json` feeds untrusted MANIFEST.json through this
+/// parser, so the bound is load-bearing.
+const MAX_DEPTH: usize = 128;
+
+/// A parsed JSON value.
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) enum Json {
+    Null,
+    Bool(bool),
+    /// An integer literal that fits in an `i64`, stored losslessly.
+    Int(i64),
+    /// A number with a fraction or exponent part, or an integer literal
+    /// too large for `i64`. Literals that overflow `f64` are a parse
+    /// error rather than silently becoming infinity.
+    Float(f64),
+    Str(String),
+    Arr(Vec<Json>),
+    Obj(Vec<(String, Json)>),
+}
+
+impl Json {
+    /// Look up a key in an object value. When a key repeats, the last
+    /// value wins, matching serde_json and the WPT tooling.
+    pub(crate) fn get(&self, key: &str) -> Option<&Json> {
+        if let Json::Obj(pairs) = self {
+            pairs.iter().rev().find(|(k, _)| k == key).map(|(_, v)| v)
+        } else {
+            None
+        }
+    }
+
+    // Accessor API so callers do not hand-roll matches on `Json`; covered
+    // by the `accessors` test below (no non-test caller yet).
+    #[allow(dead_code)]
+    pub(crate) fn as_bool(&self) -> Option<bool> {
+        if let Json::Bool(b) = self {
+            Some(*b)
+        } else {
+            None
+        }
+    }
+
+    /// The number as an `i64`. Floats convert only when they are integral
+    /// and in range, mirroring serde_json's `as_i64`.
+    // Accessor API so callers do not hand-roll matches on `Json`; covered
+    // by the `accessors` test below (no non-test caller yet).
+    #[allow(dead_code)]
+    pub(crate) fn as_i64(&self) -> Option<i64> {
+        match self {
+            Json::Int(i) => Some(*i),
+            Json::Float(f)
+                if f.is_finite()
+                    && f.fract() == 0.0
+                    && (-9_223_372_036_854_775_808.0..9_223_372_036_854_775_808.0).contains(f) =>
+            {
+                Some(*f as i64)
+            }
+            _ => None,
+        }
+    }
+
+    /// The number as an `f64`. Integers convert exactly below 2^53;
+    /// larger ones round, as with any `i64 as f64` cast.
+    pub(crate) fn as_f64(&self) -> Option<f64> {
+        match self {
+            Json::Int(i) => Some(*i as f64),
+            Json::Float(f) => Some(*f),
+            _ => None,
+        }
+    }
+
+    pub(crate) fn as_str(&self) -> Option<&str> {
+        if let Json::Str(s) = self {
+            Some(s)
+        } else {
+            None
+        }
+    }
+
+    pub(crate) fn as_arr(&self) -> Option<&[Json]> {
+        if let Json::Arr(a) = self {
+            Some(a)
+        } else {
+            None
+        }
+    }
+
+    pub(crate) fn as_obj(&self) -> Option<&[(String, Json)]> {
+        if let Json::Obj(o) = self {
+            Some(o)
+        } else {
+            None
+        }
+    }
+}
+
+/// A JSON parse failure.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct ParseError {
+    /// Byte offset in the input where the failure was detected.
+    pub pos: usize,
+    pub msg: &'static str,
+}
+
+impl fmt::Display for ParseError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "JSON parse error at byte {}: {}", self.pos, self.msg)
+    }
+}
+
+impl std::error::Error for ParseError {}
+
+/// Parse a complete JSON document. Trailing garbage is an error.
+pub(crate) fn parse(text: &str) -> Result<Json, ParseError> {
+    let mut p = Parser {
+        text,
+        bytes: text.as_bytes(),
+        pos: 0,
+        depth: 0,
+    };
+    let v = p.parse_value()?;
+    p.skip_ws();
+    if p.pos != p.bytes.len() {
+        return Err(p.err("trailing data after JSON value"));
+    }
+    Ok(v)
+}
+
+struct Parser<'a> {
+    text: &'a str,
+    bytes: &'a [u8],
+    pos: usize,
+    /// Current array/object nesting depth. Bounded by [`MAX_DEPTH`].
+    depth: usize,
+}
+
+impl<'a> Parser<'a> {
+    fn err(&self, msg: &'static str) -> ParseError {
+        ParseError { pos: self.pos, msg }
+    }
+
+    fn peek(&self) -> Option<u8> {
+        self.bytes.get(self.pos).copied()
+    }
+
+    fn bump(&mut self) {
+        self.pos += 1;
+    }
+
+    fn skip_ws(&mut self) {
+        while matches!(self.peek(), Some(b' ' | b'\t' | b'\n' | b'\r')) {
+            self.bump();
+        }
+    }
+
+    fn parse_value(&mut self) -> Result<Json, ParseError> {
+        self.skip_ws();
+        match self.peek() {
+            Some(b'n') => self.parse_lit("null", Json::Null),
+            Some(b't') => self.parse_lit("true", Json::Bool(true)),
+            Some(b'f') => self.parse_lit("false", Json::Bool(false)),
+            Some(b'"') => Ok(Json::Str(self.parse_string()?)),
+            Some(b'[') => self.nested(Self::parse_array),
+            Some(b'{') => self.nested(Self::parse_object),
+            Some(c) if c == b'-' || c.is_ascii_digit() => self.parse_number(),
+            _ => Err(self.err("expected a JSON value")),
+        }
+    }
+
+    /// Parse one nested array/object level, enforcing [`MAX_DEPTH`].
+    fn nested(&mut self, f: fn(&mut Self) -> Result<Json, ParseError>) -> Result<Json, ParseError> {
+        if self.depth >= MAX_DEPTH {
+            return Err(self.err("maximum nesting depth exceeded"));
+        }
+        self.depth += 1;
+        let v = f(self);
+        self.depth -= 1;
+        v
+    }
+
+    fn parse_lit(&mut self, lit: &str, val: Json) -> Result<Json, ParseError> {
+        if self.bytes[self.pos..].starts_with(lit.as_bytes()) {
+            self.pos += lit.len();
+            Ok(val)
+        } else {
+            Err(self.err("invalid literal"))
+        }
+    }
+
+    fn parse_string(&mut self) -> Result<String, ParseError> {
+        debug_assert_eq!(self.peek(), Some(b'"'));
+        self.bump(); // opening quote
+        let mut out = String::new();
+        loop {
+            let b = self.peek().ok_or_else(|| self.err("unterminated string"))?;
+            match b {
+                b'"' => {
+                    self.bump();
+                    return Ok(out);
+                }
+                b'\\' => {
+                    self.bump();
+                    let e = self.peek().ok_or_else(|| self.err("unterminated escape"))?;
+                    self.bump();
+                    match e {
+                        b'"' => out.push('"'),
+                        b'\\' => out.push('\\'),
+                        b'/' => out.push('/'),
+                        b'b' => out.push('\x08'),
+                        b'f' => out.push('\x0C'),
+                        b'n' => out.push('\n'),
+                        b'r' => out.push('\r'),
+                        b't' => out.push('\t'),
+                        b'u' => out.push(self.parse_unicode_escape()?),
+                        _ => return Err(self.err("invalid escape")),
+                    }
+                }
+                0x00..=0x1F => return Err(self.err("unescaped control character")),
+                _ => {
+                    // Consume one full UTF-8 code point. The input is a &str,
+                    // so it is already valid UTF-8: decode the next char
+                    // directly instead of revalidating the rest of the input
+                    // for every character (that was quadratic in practice).
+                    let rest = &self.text[self.pos..];
+                    let ch = rest
+                        .chars()
+                        .next()
+                        .ok_or_else(|| self.err("unterminated string"))?;
+                    out.push(ch);
+                    self.pos += ch.len_utf8();
+                }
+            }
+        }
+    }
+
+    fn hex4(&mut self) -> Result<u32, ParseError> {
+        let mut v: u32 = 0;
+        for _ in 0..4 {
+            let b = self
+                .peek()
+                .ok_or_else(|| self.err("truncated unicode escape"))?;
+            let d = (b as char)
+                .to_digit(16)
+                .ok_or_else(|| self.err("bad hex digit"))?;
+            v = v * 16 + d;
+            self.bump();
+        }
+        Ok(v)
+    }
+
+    fn parse_unicode_escape(&mut self) -> Result<char, ParseError> {
+        let hi = self.hex4()?;
+        let cp = if (0xD800..0xDC00).contains(&hi) {
+            // Surrogate pair.
+            if self.peek() == Some(b'\\') {
+                self.bump();
+                if self.peek() == Some(b'u') {
+                    self.bump();
+                    let lo = self.hex4()?;
+                    if (0xDC00..0xE000).contains(&lo) {
+                        0x10000 + ((hi - 0xD800) << 10) + (lo - 0xDC00)
+                    } else {
+                        return Err(self.err("bad low surrogate"));
+                    }
+                } else {
+                    return Err(self.err("bad low surrogate"));
+                }
+            } else {
+                return Err(self.err("lone high surrogate"));
+            }
+        } else if (0xDC00..0xE000).contains(&hi) {
+            return Err(self.err("lone low surrogate"));
+        } else {
+            hi
+        };
+        char::from_u32(cp).ok_or_else(|| self.err("invalid code point"))
+    }
+
+    fn parse_number(&mut self) -> Result<Json, ParseError> {
+        let start = self.pos;
+        if self.peek() == Some(b'-') {
+            self.bump();
+        }
+        match self.peek() {
+            Some(b'0') => self.bump(),
+            Some(c) if c.is_ascii_digit() => {
+                while self.peek().is_some_and(|c| c.is_ascii_digit()) {
+                    self.bump();
+                }
+            }
+            _ => return Err(self.err("bad number")),
+        }
+        if self.peek() == Some(b'.') {
+            self.bump();
+            if !self.peek().is_some_and(|c| c.is_ascii_digit()) {
+                return Err(self.err("bad number"));
+            }
+            while self.peek().is_some_and(|c| c.is_ascii_digit()) {
+                self.bump();
+            }
+        }
+        if matches!(self.peek(), Some(b'e' | b'E')) {
+            self.bump();
+            if matches!(self.peek(), Some(b'+' | b'-')) {
+                self.bump();
+            }
+            if !self.peek().is_some_and(|c| c.is_ascii_digit()) {
+                return Err(self.err("bad number"));
+            }
+            while self.peek().is_some_and(|c| c.is_ascii_digit()) {
+                self.bump();
+            }
+        }
+        let text = std::str::from_utf8(&self.bytes[start..self.pos])
+            .map_err(|_| self.err("bad number"))?;
+        let is_float = text.bytes().any(|b| matches!(b, b'.' | b'e' | b'E'));
+        if !is_float {
+            // Plain integer literal: keep it lossless as i64. One that is
+            // too large for i64 falls through to f64, which still errors
+            // on overflow below.
+            if let Ok(i) = text.parse::<i64>() {
+                return Ok(Json::Int(i));
+            }
+        }
+        self.parse_float(text).map(Json::Float)
+    }
+
+    /// Parse a float literal, rejecting overflow to infinity and the
+    /// underflow of a nonzero literal to zero instead of going silent.
+    fn parse_float(&self, text: &str) -> Result<f64, ParseError> {
+        let f: f64 = text.parse().map_err(|_| self.err("bad number"))?;
+        if !f.is_finite() {
+            return Err(self.err("number out of range"));
+        }
+        if f == 0.0 && text.bytes().any(|b| matches!(b, b'1'..=b'9')) {
+            return Err(self.err("number out of range"));
+        }
+        Ok(f)
+    }
+
+    fn parse_array(&mut self) -> Result<Json, ParseError> {
+        debug_assert_eq!(self.peek(), Some(b'['));
+        self.bump();
+        let mut items = Vec::new();
+        self.skip_ws();
+        if self.peek() == Some(b']') {
+            self.bump();
+            return Ok(Json::Arr(items));
+        }
+        loop {
+            items.push(self.parse_value()?);
+            self.skip_ws();
+            match self.peek() {
+                Some(b',') => {
+                    self.bump();
+                }
+                Some(b']') => {
+                    self.bump();
+                    return Ok(Json::Arr(items));
+                }
+                _ => return Err(self.err("expected ',' or ']' in array")),
+            }
+        }
+    }
+
+    fn parse_object(&mut self) -> Result<Json, ParseError> {
+        debug_assert_eq!(self.peek(), Some(b'{'));
+        self.bump();
+        let mut pairs = Vec::new();
+        self.skip_ws();
+        if self.peek() == Some(b'}') {
+            self.bump();
+            return Ok(Json::Obj(pairs));
+        }
+        loop {
+            self.skip_ws();
+            if self.peek() != Some(b'"') {
+                return Err(self.err("expected string key in object"));
+            }
+            let key = self.parse_string()?;
+            self.skip_ws();
+            if self.peek() != Some(b':') {
+                return Err(self.err("expected ':' in object"));
+            }
+            self.bump();
+            let val = self.parse_value()?;
+            pairs.push((key, val));
+            self.skip_ws();
+            match self.peek() {
+                Some(b',') => {
+                    self.bump();
+                }
+                Some(b'}') => {
+                    self.bump();
+                    return Ok(Json::Obj(pairs));
+                }
+                _ => return Err(self.err("expected ',' or '}' in object")),
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn scalars() {
+        assert_eq!(parse("null").unwrap(), Json::Null);
+        assert_eq!(parse("true").unwrap(), Json::Bool(true));
+        assert_eq!(parse("false").unwrap(), Json::Bool(false));
+        assert_eq!(parse("42").unwrap(), Json::Int(42));
+        assert_eq!(parse("-1.5e3").unwrap(), Json::Float(-1500.0));
+        assert_eq!(parse("\"hi\"").unwrap(), Json::Str("hi".into()));
+    }
+
+    #[test]
+    fn escapes_and_unicode() {
+        assert_eq!(
+            parse(r#""a\nb\t\"q\"\\""#).unwrap(),
+            Json::Str("a\nb\t\"q\"\\".into())
+        );
+        assert_eq!(parse(r#""caf\u00e9""#).unwrap(), Json::Str("café".into()));
+        assert_eq!(parse(r#""\uD83D\uDE00""#).unwrap(), Json::Str("😀".into()));
+    }
+
+    #[test]
+    fn nested() {
+        let v = parse(r#"{"a":[1,{"b":null}],"c":"x"}"#).unwrap();
+        assert_eq!(v.get("c").and_then(Json::as_str), Some("x"));
+        let a = v.get("a").and_then(Json::as_arr).unwrap();
+        assert_eq!(a.len(), 2);
+        assert_eq!(a[0], Json::Int(1));
+    }
+
+    #[test]
+    fn rejects_garbage() {
+        assert!(parse("{").is_err());
+        assert!(parse("[1,]").is_err());
+        assert!(parse("nul").is_err());
+        assert!(parse("1 2").is_err());
+        assert!(parse("\"\\x\"").is_err());
+        assert!(parse("\"bad\ttab\"").is_err());
+    }
+
+    #[test]
+    fn duplicate_keys_last_wins() {
+        let v = parse(r#"{"a":1,"a":2}"#).unwrap();
+        assert_eq!(v.get("a"), Some(&Json::Int(2)));
+        // First occurrence is still visible in iteration order.
+        assert_eq!(
+            v.as_obj().unwrap(),
+            &[
+                ("a".to_owned(), Json::Int(1)),
+                ("a".to_owned(), Json::Int(2))
+            ]
+        );
+    }
+
+    #[test]
+    fn integers_are_lossless() {
+        // 2^53 + 1 is not representable as f64; it must survive as i64.
+        assert_eq!(
+            parse("9007199254740993").unwrap(),
+            Json::Int(9007199254740993)
+        );
+        assert_eq!(
+            parse("-9007199254740993").unwrap(),
+            Json::Int(-9007199254740993)
+        );
+        assert_eq!(parse("1.5").unwrap(), Json::Float(1.5));
+        // Integer literal too large for i64 falls back to f64, still
+        // finite, instead of erroring.
+        assert!(parse("99999999999999999999999").unwrap().as_f64().is_some());
+    }
+
+    #[test]
+    fn out_of_range_numbers_error() {
+        assert!(parse("1e999999").is_err());
+        assert!(parse("-1e999999").is_err());
+        assert!(parse("1e-999999").is_err());
+        // The largest finite f64 parses fine.
+        assert!(parse("1.7976931348623157e308").unwrap().as_f64().is_some());
+        assert!(parse("0.0").unwrap().as_f64().is_some());
+    }
+
+    #[test]
+    fn accessors() {
+        assert_eq!(parse("42").unwrap().as_i64(), Some(42));
+        assert_eq!(parse("42").unwrap().as_f64(), Some(42.0));
+        assert_eq!(parse("1.5").unwrap().as_i64(), None);
+        assert_eq!(parse("1.5").unwrap().as_f64(), Some(1.5));
+        assert_eq!(parse("true").unwrap().as_bool(), Some(true));
+        assert_eq!(parse("false").unwrap().as_bool(), Some(false));
+        assert_eq!(parse("null").unwrap().as_bool(), None);
+        assert_eq!(parse("1").unwrap().as_bool(), None);
+        assert_eq!(parse("\"x\"").unwrap().as_str(), Some("x"));
+        // Integral floats convert when in i64 range.
+        assert_eq!(parse("12.0").unwrap().as_i64(), Some(12));
+        assert_eq!(parse("1e3").unwrap().as_i64(), Some(1000));
+        assert_eq!(parse("1e30").unwrap().as_i64(), None);
+        assert_eq!(parse("-0.5").unwrap().as_i64(), None);
+    }
+
+    #[test]
+    fn nesting_within_limit_parses() {
+        // Well under MAX_DEPTH (128): parses fine.
+        let shallow = "[".repeat(100) + &"]".repeat(100);
+        assert!(parse(&shallow).is_ok());
+        let shallow_obj = r#"{"a":"#.repeat(60) + "1" + &"}".repeat(60);
+        assert!(parse(&shallow_obj).is_ok());
+    }
+
+    #[test]
+    fn nesting_beyond_limit_is_a_clean_error() {
+        // 10_000 nested arrays: must return Err, never abort the process.
+        let deep = "[".repeat(10_000) + &"]".repeat(10_000);
+        let err = parse(&deep).expect_err("excessively nested JSON must fail");
+        assert!(
+            err.to_string().contains("maximum nesting depth exceeded"),
+            "unexpected error: {err}"
+        );
+        // Mixed object/array nesting is bounded too.
+        let deep_obj = r#"{"a":"#.repeat(10_000) + "1" + &"}".repeat(10_000);
+        assert!(parse(&deep_obj).is_err());
+    }
+
+    #[test]
+    fn long_string_parses_in_linear_time() {
+        // Regression test: string scanning must not revalidate the rest of
+        // the input for every character; that was quadratic (a 200k-char
+        // string took ~1s). The assertion is on completion well inside a
+        // generous bound, not exact timing, so the test is not flaky.
+        let mut body = "x".repeat(200_000);
+        body.push_str("café😀");
+        let doc = format!("\"{body}\"");
+        let start = std::time::Instant::now();
+        let v = parse(&doc).unwrap();
+        assert!(start.elapsed() < std::time::Duration::from_secs(1));
+        assert_eq!(v, Json::Str(body));
+    }
+}

@@ -1,0 +1,38 @@
+CASE bytes=87 quirks=Quirks id=tables01.dat#0
+<html><head></head><body><table><tbody><tr><th></th></tr></tbody></table></body></html>
+CASE bytes=87 quirks=Quirks id=tables01.dat#1
+<html><head></head><body><table><tbody><tr><td></td></tr></tbody></table></body></html>
+CASE bytes=90 quirks=Quirks id=tables01.dat#2
+<html><head></head><body><table><colgroup><col foo="bar"></colgroup></table></body></html>
+CASE bytes=78 quirks=Quirks id=tables01.dat#3
+<html><head></head><body>foo<table><colgroup></colgroup></table></body></html>
+CASE bytes=64 quirks=Quirks id=tables01.dat#4
+<html><head></head><body><table></table><p>foo</p></body></html>
+CASE bytes=87 quirks=Quirks id=tables01.dat#5
+<html><head></head><body><table><tbody><tr><td></td></tr></tbody></table></body></html>
+CASE bytes=89 quirks=Quirks id=tables01.dat#6
+<html><head></head><body><select><option>3</option></select><table></table></body></html>
+CASE bytes=86 quirks=Quirks id=tables01.dat#7
+<html><head></head><body><select></select><table></table><table></table></body></html>
+CASE bytes=71 quirks=Quirks id=tables01.dat#8
+<html><head></head><body><select></select><table></table></body></html>
+CASE bytes=123 quirks=Quirks id=tables01.dat#9
+<html><head></head><body><select><option>A</option></select><table><tbody><tr><td>B</td></tr></tbody></table></body></html>
+CASE bytes=90 quirks=Quirks id=tables01.dat#10
+<html><head></head><body><table><tbody><tr><td>foo</td></tr></tbody></table></body></html>
+CASE bytes=89 quirks=Quirks id=tables01.dat#11
+<html><head></head><body><table><tbody><tr><td>A</td></tr></tbody></table>B</body></html>
+CASE bytes=97 quirks=Quirks id=tables01.dat#12
+<html><head></head><body><table><tbody><tr></tr></tbody><caption></caption></table></body></html>
+CASE bytes=90 quirks=Quirks id=tables01.dat#13
+<html><head></head><body><table><tbody><tr><td>foo</td></tr></tbody></table></body></html>
+CASE bytes=96 quirks=Quirks id=tables01.dat#14
+<html><head></head><body><table><tbody><tr><td></td></tr><tr></tr></tbody></table></body></html>
+CASE bytes=113 quirks=Quirks id=tables01.dat#15
+<html><head></head><body><table><tbody><tr><td><button></button></td><td></td></tr></tbody></table></body></html>
+CASE bytes=120 quirks=Quirks id=tables01.dat#16
+<html><head></head><body><table><tbody><tr><td><svg><desc></desc></svg></td><td></td></tr></tbody></table></body></html>
+CASE bytes=146 quirks=Quirks id=tables01.dat#17
+<html><head></head><body><div><svg><foreignObject><select></select></foreignObject></svg><table></table><s></s><table></table></div></body></html>
+CASE bytes=55 quirks=Quirks id=tables01.dat#18
+<html><head></head><body>a<table></table></body></html>

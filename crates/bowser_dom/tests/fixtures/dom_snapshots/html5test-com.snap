@@ -1,0 +1,48 @@
+CASE bytes=58 quirks=Quirks id=html5test-com.dat#0
+<html><head></head><body><div<div></div<div></body></html>
+CASE bytes=61 quirks=Quirks id=html5test-com.dat#1
+<html><head></head><body><div foo<bar=""></div></body></html>
+CASE bytes=62 quirks=Quirks id=html5test-com.dat#2
+<html><head></head><body><div foo="`bar`"></div></body></html>
+CASE bytes=59 quirks=Quirks id=html5test-com.dat#3
+<html><head></head><body><div \"foo=""></div></body></html>
+CASE bytes=59 quirks=Quirks id=html5test-com.dat#4
+<html><head></head><body><a href="\nbar"></a></body></html>
+CASE bytes=54 quirks=NoQuirks id=html5test-com.dat#5
+<!DOCTYPE html><html><head></head><body></body></html>
+CASE bytes=45 quirks=Quirks id=html5test-com.dat#6
+<html><head></head><body>⟨⟩</body></html>
+CASE bytes=40 quirks=Quirks id=html5test-com.dat#7
+<html><head></head><body>'</body></html>
+CASE bytes=42 quirks=Quirks id=html5test-com.dat#8
+<html><head></head><body>ⅈ</body></html>
+CASE bytes=43 quirks=Quirks id=html5test-com.dat#9
+<html><head></head><body>𝕂</body></html>
+CASE bytes=42 quirks=Quirks id=html5test-com.dat#10
+<html><head></head><body>∉</body></html>
+CASE bytes=87 quirks=Quirks id=html5test-com.dat#11
+<?import namespace="foo" implementation="#bar"?><html><head></head><body></body></html>
+CASE bytes=54 quirks=Quirks id=html5test-com.dat#12
+<!--foo--bar--><html><head></head><body></body></html>
+CASE bytes=56 quirks=Quirks id=html5test-com.dat#13
+<!--[CDATA[x]]--><html><head></head><body></body></html>
+CASE bytes=73 quirks=Quirks id=html5test-com.dat#14
+<html><head></head><body><textarea>&lt;!--</textarea>--&gt;</body></html>
+CASE bytes=73 quirks=Quirks id=html5test-com.dat#15
+<html><head></head><body><textarea>&lt;!--</textarea>--&gt;</body></html>
+CASE bytes=64 quirks=Quirks id=html5test-com.dat#16
+<html><head><style><!--</style></head><body>--&gt;</body></html>
+CASE bytes=64 quirks=Quirks id=html5test-com.dat#17
+<html><head><style><!--</style></head><body>--&gt;</body></html>
+CASE bytes=70 quirks=Quirks id=html5test-com.dat#18
+<html><head></head><body><ul><li>A </li> <li>B</li></ul></body></html>
+CASE bytes=106 quirks=Quirks id=html5test-com.dat#19
+<html><head></head><body><input><div></div><table><form></form><input type="hidden"></table></body></html>
+CASE bytes=85 quirks=Quirks id=html5test-com.dat#20
+<html><head></head><body><i>A<b>B</b></i><b></b><p><b><i></i>C</b>D</p></body></html>
+CASE bytes=50 quirks=Quirks id=html5test-com.dat#21
+<html><head></head><body><div></div></body></html>
+CASE bytes=50 quirks=Quirks id=html5test-com.dat#22
+<html><head></head><body><svg></svg></body></html>
+CASE bytes=52 quirks=Quirks id=html5test-com.dat#23
+<html><head></head><body><math></math></body></html>

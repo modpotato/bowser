@@ -1,0 +1,14 @@
+CASE bytes=73 quirks=NoQuirks id=tests14.dat#0
+<!DOCTYPE html><html><head></head><body><xyz:abc></xyz:abc></body></html>
+CASE bytes=86 quirks=NoQuirks id=tests14.dat#1
+<!DOCTYPE html><html><head></head><body><xyz:abc></xyz:abc><span></span></body></html>
+CASE bytes=86 quirks=NoQuirks id=tests14.dat#2
+<!DOCTYPE html><html abc:def="gh"><head></head><body><xyz:abc></xyz:abc></body></html>
+CASE bytes=69 quirks=NoQuirks id=tests14.dat#3
+<!DOCTYPE html><html xml:lang="bar"><head></head><body></body></html>
+CASE bytes=64 quirks=NoQuirks id=tests14.dat#4
+<!DOCTYPE html><html 123="456"><head></head><body></body></html>
+CASE bytes=74 quirks=NoQuirks id=tests14.dat#5
+<!DOCTYPE html><html 123="456" 789="012"><head></head><body></body></html>
+CASE bytes=64 quirks=NoQuirks id=tests14.dat#6
+<!DOCTYPE html><html><head></head><body 789="012"></body></html>

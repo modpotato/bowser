@@ -1,0 +1,222 @@
+CASE bytes=65 quirks=Quirks id=template.dat#0
+<html><head></head><body><template>Hello</template></body></html>
+CASE bytes=65 quirks=Quirks id=template.dat#1
+<html><head><template>Hello</template></head><body></body></html>
+CASE bytes=71 quirks=Quirks id=template.dat#2
+<html><head><template></template></head><body><div></div></body></html>
+CASE bytes=65 quirks=Quirks id=template.dat#3
+<html><head><template>Hello</template></head><body></body></html>
+CASE bytes=71 quirks=Quirks id=template.dat#4
+<html><head><template><div></div></template></head><body></body></html>
+CASE bytes=102 quirks=Quirks id=template.dat#5
+<html><head></head><body><div><template><div><span></span></div></template><b></b></div></body></html>
+CASE bytes=76 quirks=Quirks id=template.dat#6
+<html><head></head><body><div><template>Hello</template></div></body></html>
+CASE bytes=50 quirks=Quirks id=template.dat#7
+<html><head></head><body><div></div></body></html>
+CASE bytes=75 quirks=Quirks id=template.dat#8
+<html><head></head><body><table><template></template></table></body></html>
+CASE bytes=75 quirks=Quirks id=template.dat#9
+<html><head></head><body><table><template></template></table></body></html>
+CASE bytes=86 quirks=Quirks id=template.dat#10
+<html><head></head><body><div><template></template></div><table></table></body></html>
+CASE bytes=86 quirks=Quirks id=template.dat#11
+<html><head></head><body><div></div><table><template></template></table></body></html>
+CASE bytes=78 quirks=Quirks id=template.dat#12
+<html><head></head><body><table>   <template></template></table></body></html>
+CASE bytes=90 quirks=Quirks id=template.dat#13
+<html><head></head><body><table><tbody><template></template></tbody></table></body></html>
+CASE bytes=90 quirks=Quirks id=template.dat#14
+<html><head></head><body><table><tbody><template></template></tbody></table></body></html>
+CASE bytes=90 quirks=Quirks id=template.dat#15
+<html><head></head><body><table><tbody><template></template></tbody></table></body></html>
+CASE bytes=90 quirks=Quirks id=template.dat#16
+<html><head></head><body><table><thead><template></template></thead></table></body></html>
+CASE bytes=90 quirks=Quirks id=template.dat#17
+<html><head></head><body><table><tfoot><template></template></tfoot></table></body></html>
+CASE bytes=77 quirks=Quirks id=template.dat#18
+<html><head></head><body><select><template></template></select></body></html>
+CASE bytes=94 quirks=Quirks id=template.dat#19
+<html><head></head><body><select><template><option></option></template></select></body></html>
+CASE bytes=94 quirks=Quirks id=template.dat#20
+<html><head><template><option></option><option></option></template></head><body></body></html>
+CASE bytes=94 quirks=Quirks id=template.dat#21
+<html><head></head><body><select><template></template><option></option></select></body></html>
+CASE bytes=94 quirks=Quirks id=template.dat#22
+<html><head></head><body><select><option><template></template></option></select></body></html>
+CASE bytes=77 quirks=Quirks id=template.dat#23
+<html><head></head><body><select><template></template></select></body></html>
+CASE bytes=94 quirks=Quirks id=template.dat#24
+<html><head></head><body><select><option></option><template></template></select></body></html>
+CASE bytes=111 quirks=Quirks id=template.dat#25
+<html><head></head><body><select><option></option><template><option></option></template></select></body></html>
+CASE bytes=99 quirks=Quirks id=template.dat#26
+<html><head></head><body><table><thead><template><td></td></template></thead></table></body></html>
+CASE bytes=90 quirks=Quirks id=template.dat#27
+<html><head></head><body><table><template><thead></thead></template></table></body></html>
+CASE bytes=95 quirks=Quirks id=template.dat#28
+<html><head></head><body><table><template><td><div></div></td></template></table></body></html>
+CASE bytes=90 quirks=Quirks id=template.dat#29
+<html><head></head><body><table><template><thead></thead></template></table></body></html>
+CASE bytes=99 quirks=Quirks id=template.dat#30
+<html><head></head><body><table><thead><template><tr></tr></template></thead></table></body></html>
+CASE bytes=84 quirks=Quirks id=template.dat#31
+<html><head></head><body><table><template><tr></tr></template></table></body></html>
+CASE bytes=108 quirks=Quirks id=template.dat#32
+<html><head></head><body><table><tbody><tr><template><td></td></template></tr></tbody></table></body></html>
+CASE bytes=114 quirks=Quirks id=template.dat#33
+<html><head></head><body><table><template><tr><template><td></td></template></tr></template></table></body></html>
+CASE bytes=114 quirks=Quirks id=template.dat#34
+<html><head></head><body><table><template><tr><template><td></td></template></tr></template></table></body></html>
+CASE bytes=84 quirks=Quirks id=template.dat#35
+<html><head></head><body><table><template><td></td></template></table></body></html>
+CASE bytes=69 quirks=Quirks id=template.dat#36
+<html><head></head><body><template><td></td></template></body></html>
+CASE bytes=99 quirks=Quirks id=template.dat#37
+<html><head></head><body><template><template><tr></tr></template><td></td></template></body></html>
+CASE bytes=101 quirks=Quirks id=template.dat#38
+<html><head></head><body><table><colgroup><template><col></template></colgroup></table></body></html>
+CASE bytes=62 quirks=Quirks id=template.dat#39
+<html><head></head><frameset><frame></frame></frameset></html>
+CASE bytes=60 quirks=Quirks id=template.dat#40
+<html><head><template></template></head><body></body></html>
+CASE bytes=97 quirks=Quirks id=template.dat#41
+<html><head><template><div><span></span></div><span></span></template></head><body></body></html>
+CASE bytes=97 quirks=Quirks id=template.dat#42
+<html><head></head><body><template><div><span></span></div><span></span></template></body></html>
+CASE bytes=96 quirks=Quirks id=template.dat#43
+<html><head></head><body><template><script>var i = 1;</script><td></td></template></body></html>
+CASE bytes=80 quirks=Quirks id=template.dat#44
+<html><head></head><body><template><tr></tr><div></div></template></body></html>
+CASE bytes=87 quirks=Quirks id=template.dat#45
+<html><head></head><body><template><tr></tr><tr><td></td></tr></template></body></html>
+CASE bytes=78 quirks=Quirks id=template.dat#46
+<html><head></head><body><template><td></td><td></td></template></body></html>
+CASE bytes=78 quirks=Quirks id=template.dat#47
+<html><head></head><body><template><td></td><td></td></template></body></html>
+CASE bytes=78 quirks=Quirks id=template.dat#48
+<html><head></head><body><template><td></td><td></td></template></body></html>
+CASE bytes=78 quirks=Quirks id=template.dat#49
+<html><head></head><body><template><td></td><td></td></template></body></html>
+CASE bytes=78 quirks=Quirks id=template.dat#50
+<html><head></head><body><template><td></td><td></td></template></body></html>
+CASE bytes=78 quirks=Quirks id=template.dat#51
+<html><head></head><body><template><tr></tr><tr></tr></template></body></html>
+CASE bytes=78 quirks=Quirks id=template.dat#52
+<html><head></head><body><template><tr></tr><tr></tr></template></body></html>
+CASE bytes=78 quirks=Quirks id=template.dat#53
+<html><head></head><body><template><tr></tr><tr></tr></template></body></html>
+CASE bytes=109 quirks=Quirks id=template.dat#54
+<html><head></head><body><template><thead></thead><caption></caption><tbody></tbody></template></body></html>
+CASE bytes=90 quirks=Quirks id=template.dat#55
+<html><head></head><body><template><thead></thead><tbody></tbody></template></body></html>
+CASE bytes=71 quirks=Quirks id=template.dat#56
+<html><head></head><body><template><div></div></template></body></html>
+CASE bytes=74 quirks=Quirks id=template.dat#57
+<html><head></head><body><template><em>Hello</em></template></body></html>
+CASE bytes=74 quirks=Quirks id=template.dat#58
+<html><head></head><body><template><!--comment--></template></body></html>
+CASE bytes=84 quirks=Quirks id=template.dat#59
+<html><head></head><body><template><style></style><td></td></template></body></html>
+CASE bytes=75 quirks=Quirks id=template.dat#60
+<html><head></head><body><template><meta><td></td></template></body></html>
+CASE bytes=75 quirks=Quirks id=template.dat#61
+<html><head></head><body><template><link><td></td></template></body></html>
+CASE bytes=101 quirks=Quirks id=template.dat#62
+<html><head></head><body><table><colgroup><template><col></template></colgroup></table></body></html>
+CASE bytes=88 quirks=Quirks id=template.dat#63
+<html><head></head><body a="b"><template><div></div><div></div></template></body></html>
+CASE bytes=90 quirks=Quirks id=template.dat#64
+<html a="b"><head><template><div><span></span></div></template></head><body></body></html>
+CASE bytes=76 quirks=Quirks id=template.dat#65
+<html a="b"><head><template><col><col></template></head><body></body></html>
+CASE bytes=66 quirks=Quirks id=template.dat#66
+<html a="b"><head><template></template></head><body></body></html>
+CASE bytes=108 quirks=Quirks id=template.dat#67
+<html><head></head><body><template><tr></tr><template></template><tr><td></td></tr></template></body></html>
+CASE bytes=144 quirks=Quirks id=template.dat#68
+<html><head></head><body><template><thead></thead><template><tr></tr></template><tbody><tr></tr></tbody><tfoot></tfoot></template></body></html>
+CASE bytes=113 quirks=Quirks id=template.dat#69
+<html><head></head><body><template><template><b><template></template></b></template>text</template></body></html>
+CASE bytes=65 quirks=Quirks id=template.dat#70
+<html><head></head><body><template><col></template></body></html>
+CASE bytes=65 quirks=Quirks id=template.dat#71
+<html><head></head><body><template><col></template></body></html>
+CASE bytes=65 quirks=Quirks id=template.dat#72
+<html><head></head><body><template><col></template></body></html>
+CASE bytes=65 quirks=Quirks id=template.dat#73
+<html><head></head><body><template><col></template></body></html>
+CASE bytes=65 quirks=Quirks id=template.dat#74
+<html><head></head><body><template><col></template></body></html>
+CASE bytes=65 quirks=Quirks id=template.dat#75
+<html><head></head><body><template><col></template></body></html>
+CASE bytes=90 quirks=Quirks id=template.dat#76
+<html><head></head><body><template><i></i><menu><i>Foo</i></menu></template></body></html>
+CASE bytes=95 quirks=Quirks id=template.dat#77
+<html><head></head><body><template><div>Foo</div><template></template></template></body></html>
+CASE bytes=92 quirks=Quirks id=template.dat#78
+<html><head></head><body><div><template><tr><td>Foo</td></tr></template></div></body></html>
+CASE bytes=86 quirks=Quirks id=template.dat#79
+<html><head><template><sub><table></table></sub></template></head><body></body></html>
+CASE bytes=81 quirks=Quirks id=template.dat#80
+<html><head><template><template></template></template></head><body></body></html>
+CASE bytes=71 quirks=Quirks id=template.dat#81
+<html><head><template><div></div></template></head><body></body></html>
+CASE bytes=92 quirks=Quirks id=template.dat#82
+<html><head><template><template><div></div></template></template></head><body></body></html>
+CASE bytes=96 quirks=Quirks id=template.dat#83
+<html><head><template><template><table></table></template></template></head><body></body></html>
+CASE bytes=96 quirks=Quirks id=template.dat#84
+<html><head><template><template><tbody></tbody></template></template></head><body></body></html>
+CASE bytes=90 quirks=Quirks id=template.dat#85
+<html><head><template><template><tr></tr></template></template></head><body></body></html>
+CASE bytes=90 quirks=Quirks id=template.dat#86
+<html><head><template><template><td></td></template></template></head><body></body></html>
+CASE bytes=100 quirks=Quirks id=template.dat#87
+<html><head><template><template><caption></caption></template></template></head><body></body></html>
+CASE bytes=102 quirks=Quirks id=template.dat#88
+<html><head><template><template><colgroup></colgroup></template></template></head><body></body></html>
+CASE bytes=86 quirks=Quirks id=template.dat#89
+<html><head><template><template><col></template></template></head><body></body></html>
+CASE bytes=113 quirks=Quirks id=template.dat#90
+<html><head><template><template><tbody></tbody><select></select></template></template></head><body></body></html>
+CASE bytes=99 quirks=Quirks id=template.dat#91
+<html><head><template><template>Foo<table></table></template></template></head><body></body></html>
+CASE bytes=81 quirks=Quirks id=template.dat#92
+<html><head><template><template></template></template></head><body></body></html>
+CASE bytes=103 quirks=Quirks id=template.dat#93
+<html><head><template><template><script>var i</script></template></template></head><body></body></html>
+CASE bytes=101 quirks=Quirks id=template.dat#94
+<html><head><template><template><style>var i</style></template></template></head><body></body></html>
+CASE bytes=91 quirks=Quirks id=template.dat#95
+<html><head><template><table></table></template></head><body><span>Foo</span></body></html>
+CASE bytes=85 quirks=Quirks id=template.dat#96
+<html><head><template><td></td></template></head><body><span>Foo</span></body></html>
+CASE bytes=93 quirks=Quirks id=template.dat#97
+<html><head><template><object></object></template></head><body><span>Foo</span></body></html>
+CASE bytes=92 quirks=Quirks id=template.dat#98
+<html><head><template><svg><template></template></svg></template></head><body></body></html>
+CASE bytes=156 quirks=Quirks id=template.dat#99
+<html><head><template><svg><foo><template><foreignObject><div></div></foreignObject></template></foo></svg></template></head><body><div></div></body></html>
+CASE bytes=88 quirks=Quirks id=template.dat#100
+<html><head></head><body><dummy><template><span></span></template></dummy></body></html>
+CASE bytes=148 quirks=Quirks id=template.dat#101
+<html><head></head><body><table><tbody><tr><td><select><template>Foo</template></select></td></tr></tbody><caption>A</caption></table></body></html>
+CASE bytes=60 quirks=Quirks id=template.dat#102
+<html><head></head><body><template></template></body></html>
+CASE bytes=60 quirks=Quirks id=template.dat#103
+<html><head><template></template></head><body></body></html>
+CASE bytes=63 quirks=Quirks id=template.dat#104
+<html><head><template>Foo</template></head><body></body></html>
+CASE bytes=60 quirks=Quirks id=template.dat#105
+<html><head><template></template></head><body></body></html>
+CASE bytes=173 quirks=NoQuirks id=template.dat#106
+<!DOCTYPE html><html><head></head><body><dummy><table><template><table><template><table><script></script></table></template></table></template></table></dummy></body></html>
+CASE bytes=89 quirks=Quirks id=template.dat#107
+<html><head><template><a><a></a><table></table></a></template></head><body></body></html>
+CASE bytes=97 quirks=NoQuirks id=template.dat#109
+<!DOCTYPE html><html><head><template><tr><td>cell</td></tr></template></head><body></body></html>
+CASE bytes=101 quirks=NoQuirks id=template.dat#110
+<!DOCTYPE html><html><head><template> <tr> <td>cell</td> </tr> </template></head><body></body></html>
+CASE bytes=98 quirks=NoQuirks id=template.dat#111
+<!DOCTYPE html><html><head><template><tr><td>cell</td></tr>a</template></head><body></body></html>

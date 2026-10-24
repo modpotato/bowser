@@ -1,0 +1,34 @@
+CASE bytes=60 quirks=Quirks id=adoption01.dat#0
+<html><head></head><body><a></a><p><a></a></p></body></html>
+CASE bytes=63 quirks=Quirks id=adoption01.dat#1
+<html><head></head><body><a>1</a><p><a>2</a>3</p></body></html>
+CASE bytes=73 quirks=Quirks id=adoption01.dat#2
+<html><head></head><body><a>1</a><button><a>2</a>3</button></body></html>
+CASE bytes=63 quirks=Quirks id=adoption01.dat#3
+<html><head></head><body><a>1<b>2</b></a><b>3</b></body></html>
+CASE bytes=87 quirks=Quirks id=adoption01.dat#4
+<html><head></head><body><a>1</a><div><a>2</a><div><a>3</a>4</div>5</div></body></html>
+CASE bytes=78 quirks=Quirks id=adoption01.dat#5
+<html><head></head><body><a>1</a><p><a>2</a>3</p><table></table></body></html>
+CASE bytes=74 quirks=Quirks id=adoption01.dat#6
+<html><head></head><body><b><b><a></a><p><a></a></p></b></b></body></html>
+CASE bytes=81 quirks=Quirks id=adoption01.dat#7
+<html><head></head><body><b><a><b></b></a><b><p><a></a></p></b></b></body></html>
+CASE bytes=88 quirks=Quirks id=adoption01.dat#8
+<html><head></head><body><a><b><b></b></b></a><b><b><p><a></a></p></b></b></body></html>
+CASE bytes=121 quirks=Quirks id=adoption01.dat#9
+<html><head></head><body><p>1<s id="A">2<b id="B">3</b></s></p><s id="A"><b id="B">4</b></s><b id="B">5</b></body></html>
+CASE bytes=104 quirks=Quirks id=adoption01.dat#10
+<html><head></head><body><a>1</a><a>3</a><table><tbody><tr><td>2</td></tr></tbody></table></body></html>
+CASE bytes=90 quirks=Quirks id=adoption01.dat#11
+<html><head></head><body>AC<table><tbody><tr><td>B</td></tr></tbody></table></body></html>
+CASE bytes=81 quirks=Quirks id=adoption01.dat#12
+<html><head></head><body><a><svg><tr><input></input></tr></svg></a></body></html>
+CASE bytes=237 quirks=Quirks id=adoption01.dat#13
+<html><head></head><body><div><a><b></b></a><b><div><a></a><div><a></a><div><a></a><div><a></a><div><a></a><div><a></a><div><a></a><div><a><div><div></div></div></a></div></div></div></div></div></div></div></div></b></div></body></html>
+CASE bytes=136 quirks=Quirks id=adoption01.dat#14
+<html><head></head><body><div><a><b><u><i><code></code></i></u></b></a><u><i><code><div><a></a></div></code></i></u></div></body></html>
+CASE bytes=69 quirks=Quirks id=adoption01.dat#15
+<html><head></head><body><b><b><b><b>x</b></b></b></b>y</body></html>
+CASE bytes=103 quirks=Quirks id=adoption01.dat#16
+<html><head></head><body><p><b><b><b><b></b></b></b></b></p><p><b><b><b>x</b></b></b></p></body></html>

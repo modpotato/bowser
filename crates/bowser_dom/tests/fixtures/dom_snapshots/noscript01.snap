@@ -1,0 +1,36 @@
+CASE bytes=70 quirks=Quirks id=noscript01.dat#0
+<html><head><noscript><!--foo--></noscript></head><body></body></html>
+CASE bytes=82 quirks=Quirks id=noscript01.dat#1
+<html class="foo"><head><noscript><!--foo--></noscript></head><body></body></html>
+CASE bytes=60 quirks=Quirks id=noscript01.dat#2
+<html><head><noscript></noscript></head><body></body></html>
+CASE bytes=63 quirks=Quirks id=noscript01.dat#3
+<html><head><noscript>   </noscript></head><body></body></html>
+CASE bytes=70 quirks=Quirks id=noscript01.dat#4
+<html><head><noscript><!--foo--></noscript></head><body></body></html>
+CASE bytes=91 quirks=Quirks id=noscript01.dat#5
+<html><head><noscript><basefont></basefont><!--foo--></noscript></head><body></body></html>
+CASE bytes=89 quirks=Quirks id=noscript01.dat#6
+<html><head><noscript><bgsound></bgsound><!--foo--></noscript></head><body></body></html>
+CASE bytes=76 quirks=Quirks id=noscript01.dat#7
+<html><head><noscript><link><!--foo--></noscript></head><body></body></html>
+CASE bytes=76 quirks=Quirks id=noscript01.dat#8
+<html><head><noscript><meta><!--foo--></noscript></head><body></body></html>
+CASE bytes=95 quirks=Quirks id=noscript01.dat#9
+<html><head><noscript><noframes>XXX</noscript></noframes></noscript></head><body></body></html>
+CASE bytes=78 quirks=Quirks id=noscript01.dat#10
+<html><head><noscript><style>XXX</style></noscript></head><body></body></html>
+CASE bytes=74 quirks=Quirks id=noscript01.dat#11
+<html><head><noscript></noscript></head><body><br><!--foo--></body></html>
+CASE bytes=70 quirks=Quirks id=noscript01.dat#12
+<html><head><noscript><!--foo--></noscript></head><body></body></html>
+CASE bytes=70 quirks=Quirks id=noscript01.dat#13
+<html><head><noscript><!--foo--></noscript></head><body></body></html>
+CASE bytes=70 quirks=Quirks id=noscript01.dat#14
+<html><head><noscript><!--foo--></noscript></head><body></body></html>
+CASE bytes=77 quirks=Quirks id=noscript01.dat#15
+<html><head><noscript></noscript></head><body><p><!--foo--></p></body></html>
+CASE bytes=73 quirks=Quirks id=noscript01.dat#16
+<html><head><noscript></noscript></head><body>XXX<!--foo--></body></html>
+CASE bytes=60 quirks=Quirks id=noscript01.dat#17
+<html><head><noscript></noscript></head><body></body></html>

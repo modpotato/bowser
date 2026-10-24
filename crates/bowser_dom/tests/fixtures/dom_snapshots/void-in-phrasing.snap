@@ -1,0 +1,26 @@
+CASE bytes=65 quirks=NoQuirks id=void-in-phrasing.dat#0
+<!DOCTYPE html><html><head></head><body><p><br></p></body></html>
+CASE bytes=69 quirks=NoQuirks id=void-in-phrasing.dat#1
+<!DOCTYPE html><html><head></head><body><p><br>text</p></body></html>
+CASE bytes=76 quirks=NoQuirks id=void-in-phrasing.dat#2
+<!DOCTYPE html><html><head></head><body><p>before<br>after</p></body></html>
+CASE bytes=69 quirks=NoQuirks id=void-in-phrasing.dat#3
+<!DOCTYPE html><html><head></head><body><p><br><br></p></body></html>
+CASE bytes=72 quirks=NoQuirks id=void-in-phrasing.dat#4
+<!DOCTYPE html><html><head></head><body><p>a<br>b<br>c</p></body></html>
+CASE bytes=67 quirks=NoQuirks id=void-in-phrasing.dat#5
+<!DOCTYPE html><html><head></head><body><h1><br></h1></body></html>
+CASE bytes=68 quirks=NoQuirks id=void-in-phrasing.dat#6
+<!DOCTYPE html><html><head></head><body><p><input></p></body></html>
+CASE bytes=66 quirks=NoQuirks id=void-in-phrasing.dat#7
+<!DOCTYPE html><html><head></head><body><p><img></p></body></html>
+CASE bytes=66 quirks=NoQuirks id=void-in-phrasing.dat#8
+<!DOCTYPE html><html><head></head><body><p><wbr></p></body></html>
+CASE bytes=68 quirks=NoQuirks id=void-in-phrasing.dat#9
+<!DOCTYPE html><html><head></head><body><p><embed></p></body></html>
+CASE bytes=70 quirks=NoQuirks id=void-in-phrasing.dat#10
+<!DOCTYPE html><html><head></head><body><h2><input></h2></body></html>
+CASE bytes=67 quirks=NoQuirks id=void-in-phrasing.dat#11
+<!DOCTYPE html><html><head></head><body><em><br></em></body></html>
+CASE bytes=79 quirks=NoQuirks id=void-in-phrasing.dat#12
+<!DOCTYPE html><html><head></head><body><strong><br>text</strong></body></html>

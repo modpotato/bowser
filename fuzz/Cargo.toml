@@ -1,0 +1,56 @@
+# Fuzz harnesses for bowser's hand-rolled TLS 1.3 / X.509 parsers.
+#
+# This is a SEPARATE workspace (empty `[workspace]` below detaches it from the
+# parent `~/workspace/bowser` workspace), so the main build (`cargo check
+# --workspace` at the repo root) is completely unaffected: `cargo tree` there
+# stays dependency-free, and none of these targets are built by normal
+# `cargo build` / `cargo test` runs.
+#
+# Edition 2024 is required: the x509 harness compiles the real parser
+# sources in-tree via `#[path]` includes, and `include!`/`#[path]` sources
+# are parsed with the *including* crate's edition.
+#
+# libfuzzer-sys lives ONLY in this crate. Per AGENTS.md the main workspace
+# keeps zero dependencies; this exception is scoped to fuzzing
+# infrastructure, which never ships.
+
+[package]
+name = "bowser-fuzz"
+version = "0.0.0"
+publish = false
+edition = "2024"
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+libfuzzer-sys = "0.4"
+bowser_net = { path = "../crates/bowser_net" }
+bowser_html = { path = "../crates/bowser_html" }
+bowser_js = { path = "../crates/bowser_js" }
+
+[workspace]
+
+[[bin]]
+name = "fuzz_tls_handshake"
+path = "fuzz_targets/fuzz_tls_handshake.rs"
+test = false
+bench = false
+
+[[bin]]
+name = "fuzz_x509"
+path = "fuzz_targets/fuzz_x509.rs"
+test = false
+bench = false
+
+[[bin]]
+name = "fuzz_html"
+path = "fuzz_targets/fuzz_html.rs"
+test = false
+bench = false
+
+[[bin]]
+name = "fuzz_js"
+path = "fuzz_targets/fuzz_js.rs"
+test = false
+bench = false

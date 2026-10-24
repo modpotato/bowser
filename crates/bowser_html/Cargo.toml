@@ -3,4 +3,9 @@ name = "bowser_html"
 version = "0.1.0"
 edition = "2024"
 
+[[bench]]
+name = "parse_html"
+harness = false
+
 [dependencies]
+bowser_encoding = { path = "../bowser_encoding" }

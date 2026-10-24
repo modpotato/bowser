@@ -1,0 +1,115 @@
+CASE bytes=43 quirks=Quirks id=webkit01.dat#0
+<html><head></head><body>Test</body></html>
+CASE bytes=50 quirks=Quirks id=webkit01.dat#1
+<html><head></head><body><div></div></body></html>
+CASE bytes=54 quirks=Quirks id=webkit01.dat#2
+<html><head></head><body><div>Test</div></body></html>
+CASE bytes=39 quirks=Quirks id=webkit01.dat#3
+<html><head></head><body></body></html>
+CASE bytes=110 quirks=Quirks id=webkit01.dat#4
+<html><head></head><body><div>Hello</div>
+<script>
+console.log("PASS");
+</script>
+<div>Bye</div></body></html>
+CASE bytes=65 quirks=Quirks id=webkit01.dat#5
+<html><head></head><body><div foo="bar">Hello</div></body></html>
+CASE bytes=128 quirks=Quirks id=webkit01.dat#6
+<html><head></head><body><div>Hello</div>
+<script>
+console.log("FOO<span>BAR</span>BAZ");
+</script>
+<div>Bye</div></body></html>
+CASE bytes=90 quirks=Quirks id=webkit01.dat#7
+<html><head></head><body><foo bar="baz"></foo><potato quack="duck"></potato></body></html>
+CASE bytes=90 quirks=Quirks id=webkit01.dat#8
+<html><head></head><body><foo bar="baz"><potato quack="duck"></potato></foo></body></html>
+CASE bytes=67 quirks=Quirks id=webkit01.dat#9
+<html><head></head><body><foo></foo><potato></potato></body></html>
+CASE bytes=51 quirks=Quirks id=webkit01.dat#10
+<!-- tttt--><html><head></head><body></body></html>
+CASE bytes=67 quirks=Quirks id=webkit01.dat#11
+<html><head></head><body><div foo=""><img><img></div></body></html>
+CASE bytes=55 quirks=Quirks id=webkit01.dat#12
+<html><head></head><body><p>TestTest2</p></body></html>
+CASE bytes=76 quirks=Quirks id=webkit01.dat#13
+<html><head></head><body><rdar: problem="" 6869687=""></rdar:></body></html>
+CASE bytes=61 quirks=Quirks id=webkit01.dat#14
+<html><head></head><body><a>test&lt; /A&gt;</a></body></html>
+CASE bytes=43 quirks=Quirks id=webkit01.dat#15
+<html><head></head><body>&lt;</body></html>
+CASE bytes=59 quirks=Quirks id=webkit01.dat#16
+<html><head></head><body foo="bar" yo="mama"></body></html>
+CASE bytes=43 quirks=Quirks id=webkit01.dat#17
+<html><head></head><body><br></body></html>
+CASE bytes=64 quirks=Quirks id=webkit01.dat#18
+<html><head></head><body><bdy><br foo="bar"></bdy></body></html>
+CASE bytes=43 quirks=Quirks id=webkit01.dat#19
+<html><head></head><body><br></body></html>
+CASE bytes=64 quirks=Quirks id=webkit01.dat#20
+<html><head></head><body><bdy><br foo="bar"></bdy></body></html>
+CASE bytes=56 quirks=Quirks id=webkit01.dat#21
+<html><head></head><body></body></html><!-- Hi there -->
+CASE bytes=129 quirks=Quirks id=webkit01.dat#22
+<html><head></head><body></body></html><!-- Comment A --><!-- Comment B --><!-- Comment C --><!-- Comment D --><!-- Comment E -->
+CASE bytes=57 quirks=Quirks id=webkit01.dat#23
+<html><head></head><body>x<!-- Hi there --></body></html>
+CASE bytes=71 quirks=Quirks id=webkit01.dat#24
+<html><head></head><body>x<!-- Hi there --></body></html><!-- Again -->
+CASE bytes=71 quirks=Quirks id=webkit01.dat#25
+<html><head></head><body>x<!-- Hi there --></body></html><!-- Again -->
+CASE bytes=60 quirks=Quirks id=webkit01.dat#26
+<html><head></head><body>
+   </body><!-- Hi there --></html>
+CASE bytes=60 quirks=Quirks id=webkit01.dat#27
+<html><head></head><body>
+   </body></html><!-- Hi there -->
+CASE bytes=74 quirks=Quirks id=webkit01.dat#28
+<html><head></head><body><ruby><div><rp>xx</rp></div></ruby></body></html>
+CASE bytes=74 quirks=Quirks id=webkit01.dat#29
+<html><head></head><body><ruby><div><rt>xx</rt></div></ruby></body></html>
+CASE bytes=161 quirks=Quirks id=webkit01.dat#30
+<html><head></head><frameset><!--1--><noframes>A</noframes><!--2--></frameset><!--3--><noframes>B</noframes><!--4--><noframes>C</noframes></html><!--5--><!--6-->
+CASE bytes=233 quirks=Quirks id=webkit01.dat#31
+<html><head></head><body><select><option>A</option></select><option>B<select><option>C</option></select></option><option>D<select><option>E</option></select></option><option>F<select><option>G</option></select></option></body></html>
+CASE bytes=102 quirks=Quirks id=webkit01.dat#32
+<html><head></head><body><dd></dd><dd></dd><dt></dt><dt></dt><dd><li></li><li></li></dd></body></html>
+CASE bytes=102 quirks=Quirks id=webkit01.dat#33
+<html><head></head><body><div><b></b></div><div><b><nobr>a</nobr><nobr></nobr></b></div></body></html>
+CASE bytes=40 quirks=Quirks id=webkit01.dat#34
+<html><head></head>
+<body></body></html>
+CASE bytes=58 quirks=Quirks id=webkit01.dat#35
+<html><head><style></style></head> <body>ddd</body></html>
+CASE bytes=132 quirks=Quirks id=webkit01.dat#36
+<html><head></head><body><kbd><select></select><table><colgroup><col></colgroup><tbody><tr></tr></tbody></table></kbd></body></html>
+CASE bytes=143 quirks=Quirks id=webkit01.dat#37
+<html><head></head><body><kbd><select></select><table><colgroup><col></colgroup><tbody><tr></tr></tbody></table><div></div></kbd></body></html>
+CASE bytes=92 quirks=Quirks id=webkit01.dat#38
+<html><head></head><body><a></a><li><a><style></style><title></title></a></li></body></html>
+CASE bytes=100 quirks=Quirks id=webkit01.dat#39
+<html><head></head><body><font><p></p></font><p><font><meta><title></title></font></p></body></html>
+CASE bytes=92 quirks=Quirks id=webkit01.dat#40
+<html><head></head><body><a></a><center><a><title></title></a><a></a></center></body></html>
+CASE bytes=76 quirks=Quirks id=webkit01.dat#41
+<html><head></head><body><svg><title><div></div></title></svg></body></html>
+CASE bytes=89 quirks=Quirks id=webkit01.dat#42
+<html><head></head><body><svg><title><rect><div></div></rect></title></svg></body></html>
+CASE bytes=87 quirks=Quirks id=webkit01.dat#43
+<html><head></head><body><svg><title><svg></svg><div></div></title></svg></body></html>
+CASE bytes=57 quirks=Quirks id=webkit01.dat#44
+<html><head></head><body><img <="" fail=""></body></html>
+CASE bytes=100 quirks=Quirks id=webkit01.dat#45
+<html><head></head><body><ul><li><div id="foo">A</div></li><li>B<div>C</div></li></ul></body></html>
+CASE bytes=72 quirks=Quirks id=webkit01.dat#46
+<html><head></head><body><svg></svg><em><desc></desc></em></body></html>
+CASE bytes=137 quirks=Quirks id=webkit01.dat#47
+<html><head></head><body><table><tbody><tr><td><svg><desc></desc></svg></td><td><circle></circle></td></tr></tbody></table></body></html>
+CASE bytes=74 quirks=Quirks id=webkit01.dat#48
+<html><head></head><body><svg><tfoot><td></td></tfoot></svg></body></html>
+CASE bytes=98 quirks=Quirks id=webkit01.dat#49
+<html><head></head><body><math><mrow><mrow><mn>1</mn></mrow><mi>a</mi></mrow></math></body></html>
+CASE bytes=62 quirks=NoQuirks id=webkit01.dat#50
+<!DOCTYPE html><html><head></head><frameset></frameset></html>
+CASE bytes=75 quirks=NoQuirks id=webkit01.dat#51
+<!DOCTYPE html><html><head></head><body><input type="button"></body></html>

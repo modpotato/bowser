@@ -4,3 +4,21 @@ version = "0.1.0"
 edition = "2024"
 
 [dependencies]
+bowser_url = { path = "../bowser_url" }
+bowser_encoding = { path = "../bowser_encoding" }
+
+[[bench]]
+name = "fetch_bench"
+harness = false
+
+[[bench]]
+name = "aes_bench"
+harness = false
+
+[[bench]]
+name = "pool_bench"
+harness = false
+
+[[bench]]
+name = "hpack_bench"
+harness = false

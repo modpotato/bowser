@@ -1,0 +1,52 @@
+CASE bytes=62 quirks=Quirks id=entities02.dat#0
+<html><head></head><body><div bar="ZZ>YY"></div></body></html>
+CASE bytes=64 quirks=Quirks id=entities02.dat#1
+<html><head></head><body><div bar="ZZ&amp;"></div></body></html>
+CASE bytes=64 quirks=Quirks id=entities02.dat#2
+<html><head></head><body><div bar="ZZ&amp;"></div></body></html>
+CASE bytes=64 quirks=Quirks id=entities02.dat#3
+<html><head></head><body><div bar="ZZ&amp;"></div></body></html>
+CASE bytes=69 quirks=Quirks id=entities02.dat#4
+<html><head></head><body><div bar="ZZ&amp;gt=YY"></div></body></html>
+CASE bytes=69 quirks=Quirks id=entities02.dat#5
+<html><head></head><body><div bar="ZZ&amp;gt0YY"></div></body></html>
+CASE bytes=69 quirks=Quirks id=entities02.dat#6
+<html><head></head><body><div bar="ZZ&amp;gt9YY"></div></body></html>
+CASE bytes=69 quirks=Quirks id=entities02.dat#7
+<html><head></head><body><div bar="ZZ&amp;gtaYY"></div></body></html>
+CASE bytes=69 quirks=Quirks id=entities02.dat#8
+<html><head></head><body><div bar="ZZ&amp;gtZYY"></div></body></html>
+CASE bytes=63 quirks=Quirks id=entities02.dat#9
+<html><head></head><body><div bar="ZZ> YY"></div></body></html>
+CASE bytes=60 quirks=Quirks id=entities02.dat#10
+<html><head></head><body><div bar="ZZ>"></div></body></html>
+CASE bytes=60 quirks=Quirks id=entities02.dat#11
+<html><head></head><body><div bar="ZZ>"></div></body></html>
+CASE bytes=60 quirks=Quirks id=entities02.dat#12
+<html><head></head><body><div bar="ZZ>"></div></body></html>
+CASE bytes=67 quirks=Quirks id=entities02.dat#13
+<html><head></head><body><div bar="ZZ£_id=23"></div></body></html>
+CASE bytes=74 quirks=Quirks id=entities02.dat#14
+<html><head></head><body><div bar="ZZ&amp;prod_id=23"></div></body></html>
+CASE bytes=67 quirks=Quirks id=entities02.dat#15
+<html><head></head><body><div bar="ZZ£_id=23"></div></body></html>
+CASE bytes=68 quirks=Quirks id=entities02.dat#16
+<html><head></head><body><div bar="ZZ∏_id=23"></div></body></html>
+CASE bytes=72 quirks=Quirks id=entities02.dat#17
+<html><head></head><body><div bar="ZZ&amp;pound=23"></div></body></html>
+CASE bytes=71 quirks=Quirks id=entities02.dat#18
+<html><head></head><body><div bar="ZZ&amp;prod=23"></div></body></html>
+CASE bytes=60 quirks=Quirks id=entities02.dat#19
+<html><head></head><body><div>ZZ£_id=23</div></body></html>
+CASE bytes=67 quirks=Quirks id=entities02.dat#20
+<html><head></head><body><div>ZZ&amp;prod_id=23</div></body></html>
+CASE bytes=60 quirks=Quirks id=entities02.dat#21
+<html><head></head><body><div>ZZ£_id=23</div></body></html>
+CASE bytes=61 quirks=Quirks id=entities02.dat#22
+<html><head></head><body><div>ZZ∏_id=23</div></body></html>
+CASE bytes=57 quirks=Quirks id=entities02.dat#23
+<html><head></head><body><div>ZZ£=23</div></body></html>
+CASE bytes=64 quirks=Quirks id=entities02.dat#24
+<html><head></head><body><div>ZZ&amp;prod=23</div></body></html>
+CASE bytes=55 quirks=Quirks id=entities02.dat#25
+<html><head></head><body><div>ZZÆ=</div></body></html>

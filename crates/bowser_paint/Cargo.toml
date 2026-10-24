@@ -4,3 +4,28 @@ version = "0.1.0"
 edition = "2024"
 
 [dependencies]
+bowser_layout = { path = "../bowser_layout" }
+bowser_css = { path = "../bowser_css" }
+bowser_dom = { path = "../bowser_dom" }
+# Linux-first v1: Vulkan only. Metal (macOS), DX12 (Windows), and GL
+# fallbacks are deferred until after the first release; the feature list
+# above intentionally omits them.
+wgpu = { version = "=30.0.1", default-features = false, features = ["wgsl", "vulkan"] }
+swash = "0.2"
+# Direct use of read-fonts for font discovery (SFNT name/OS/2/head
+# parsing). Pinned to the exact version already in the tree via
+# swash -> skrifa -> read-fonts, so no new crate enters the tree.
+read-fonts = "=0.41.0"
+# WOFF1 decoding needs zlib inflation, which std cannot do (flate2 is
+# the smallest pure-Rust option). Pinned to the exact version already
+# in the tree via png, so no new crate enters the tree; default
+# features (miniz_oxide backend) only.
+flate2 = "=1.1.10"
+png = "0.17"
+zune-jpeg = "0.4"
+tiny-skia = { version = "0.11", default-features = false, features = ["std", "simd"] }
+pollster = "1"
+
+[[bench]]
+name = "wgpu_be_lower"
+harness = false

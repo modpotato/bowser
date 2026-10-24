@@ -1,0 +1,72 @@
+CASE bytes=80 quirks=Quirks id=tests18.dat#0
+<html><head></head><body><plaintext>&lt;/plaintext&gt;</plaintext></body></html>
+CASE bytes=95 quirks=NoQuirks id=tests18.dat#1
+<!DOCTYPE html><html><head></head><body><plaintext>&lt;/plaintext&gt;</plaintext></body></html>
+CASE bytes=95 quirks=NoQuirks id=tests18.dat#2
+<!DOCTYPE html><html><head></head><body><plaintext>&lt;/plaintext&gt;</plaintext></body></html>
+CASE bytes=95 quirks=NoQuirks id=tests18.dat#3
+<!DOCTYPE html><html><head></head><body><plaintext>&lt;/plaintext&gt;</plaintext></body></html>
+CASE bytes=116 quirks=NoQuirks id=tests18.dat#4
+<!DOCTYPE html><html><head><noscript></noscript></head><body><plaintext>&lt;/plaintext&gt;</plaintext></body></html>
+CASE bytes=95 quirks=NoQuirks id=tests18.dat#5
+<!DOCTYPE html><html><head></head><body><plaintext>&lt;/plaintext&gt;</plaintext></body></html>
+CASE bytes=95 quirks=NoQuirks id=tests18.dat#6
+<!DOCTYPE html><html><head></head><body><plaintext>&lt;/plaintext&gt;</plaintext></body></html>
+CASE bytes=110 quirks=NoQuirks id=tests18.dat#7
+<!DOCTYPE html><html><head></head><body><plaintext>&lt;/plaintext&gt;</plaintext><table></table></body></html>
+CASE bytes=125 quirks=NoQuirks id=tests18.dat#8
+<!DOCTYPE html><html><head></head><body><plaintext>&lt;/plaintext&gt;</plaintext><table><tbody></tbody></table></body></html>
+CASE bytes=134 quirks=NoQuirks id=tests18.dat#9
+<!DOCTYPE html><html><head></head><body><plaintext>&lt;/plaintext&gt;</plaintext><table><tbody><tr></tr></tbody></table></body></html>
+CASE bytes=143 quirks=NoQuirks id=tests18.dat#10
+<!DOCTYPE html><html><head></head><body><table><tbody><tr><td><plaintext>&lt;/plaintext&gt;</plaintext></td></tr></tbody></table></body></html>
+CASE bytes=129 quirks=NoQuirks id=tests18.dat#11
+<!DOCTYPE html><html><head></head><body><table><caption><plaintext>&lt;/plaintext&gt;</plaintext></caption></table></body></html>
+CASE bytes=131 quirks=NoQuirks id=tests18.dat#12
+<!DOCTYPE html><html><head></head><body><plaintext>&lt;/plaintext&gt;</plaintext><table><colgroup></colgroup></table></body></html>
+CASE bytes=113 quirks=NoQuirks id=tests18.dat#13
+<!DOCTYPE html><html><head></head><body><select><plaintext>&lt;/plaintext&gt;X</plaintext></select></body></html>
+CASE bytes=126 quirks=NoQuirks id=tests18.dat#14
+<!DOCTYPE html><html><head></head><body><select><plaintext>a&lt;caption&gt;b</plaintext></select><table></table></body></html>
+CASE bytes=117 quirks=NoQuirks id=tests18.dat#15
+<!DOCTYPE html><html><head><template><plaintext>a&lt;/template&gt;b</plaintext></template></head><body></body></html>
+CASE bytes=95 quirks=NoQuirks id=tests18.dat#16
+<!DOCTYPE html><html><head></head><body><plaintext>&lt;/plaintext&gt;</plaintext></body></html>
+CASE bytes=62 quirks=NoQuirks id=tests18.dat#17
+<!DOCTYPE html><html><head></head><frameset></frameset></html>
+CASE bytes=62 quirks=NoQuirks id=tests18.dat#18
+<!DOCTYPE html><html><head></head><frameset></frameset></html>
+CASE bytes=95 quirks=NoQuirks id=tests18.dat#19
+<!DOCTYPE html><html><head></head><body><plaintext>&lt;/plaintext&gt;</plaintext></body></html>
+CASE bytes=62 quirks=NoQuirks id=tests18.dat#20
+<!DOCTYPE html><html><head></head><frameset></frameset></html>
+CASE bytes=90 quirks=NoQuirks id=tests18.dat#21
+<!DOCTYPE html><html><head></head><body><svg><plaintext>a</plaintext>b</svg></body></html>
+CASE bytes=123 quirks=NoQuirks id=tests18.dat#22
+<!DOCTYPE html><html><head></head><body><svg><title><plaintext>a&lt;/plaintext&gt;b</plaintext></title></svg></body></html>
+CASE bytes=120 quirks=NoQuirks id=tests18.dat#23
+<!DOCTYPE html><html><head></head><body>abc<table><tbody><tr><style></script></style></tr></tbody></table></body></html>
+CASE bytes=121 quirks=NoQuirks id=tests18.dat#24
+<!DOCTYPE html><html><head></head><body>abc<table><tbody><tr><script></style></script></tr></tbody></table></body></html>
+CASE bytes=115 quirks=NoQuirks id=tests18.dat#25
+<!DOCTYPE html><html><head></head><body><table><caption><style></script></style>abc</caption></table></body></html>
+CASE bytes=129 quirks=NoQuirks id=tests18.dat#26
+<!DOCTYPE html><html><head></head><body><table><tbody><tr><td><style></script></style>abc</td></tr></tbody></table></body></html>
+CASE bytes=99 quirks=NoQuirks id=tests18.dat#27
+<!DOCTYPE html><html><head></head><body><select><script></style></script>abc</select></body></html>
+CASE bytes=114 quirks=NoQuirks id=tests18.dat#28
+<!DOCTYPE html><html><head></head><body><select><script></style></script>abc</select><table></table></body></html>
+CASE bytes=138 quirks=NoQuirks id=tests18.dat#29
+<!DOCTYPE html><html><head></head><body><select><script></style></script>abc</select><table><tbody><tr></tr></tbody></table></body></html>
+CASE bytes=86 quirks=NoQuirks id=tests18.dat#30
+<!DOCTYPE html><html><head></head><frameset></frameset><noframes>abc</noframes></html>
+CASE bytes=96 quirks=NoQuirks id=tests18.dat#31
+<!DOCTYPE html><html><head></head><frameset></frameset><noframes>abc</noframes><!--abc--></html>
+CASE bytes=86 quirks=NoQuirks id=tests18.dat#32
+<!DOCTYPE html><html><head></head><frameset></frameset><noframes>abc</noframes></html>
+CASE bytes=96 quirks=NoQuirks id=tests18.dat#33
+<!DOCTYPE html><html><head></head><frameset></frameset><noframes>abc</noframes></html><!--abc-->
+CASE bytes=108 quirks=NoQuirks id=tests18.dat#34
+<!DOCTYPE html><html><head></head><body><table><tbody><tr></tr></tbody><tfoot></tfoot></table></body></html>
+CASE bytes=125 quirks=NoQuirks id=tests18.dat#35
+<!DOCTYPE html><html><head></head><body><table><tbody><tr><td><svg></svg>abc</td><td></td></tr></tbody></table></body></html>

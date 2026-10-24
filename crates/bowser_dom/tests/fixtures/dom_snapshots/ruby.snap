@@ -1,0 +1,42 @@
+CASE bytes=72 quirks=Quirks id=ruby.dat#0
+<html><head></head><body><ruby>a<rb>b</rb><rb></rb></ruby></body></html>
+CASE bytes=72 quirks=Quirks id=ruby.dat#1
+<html><head></head><body><ruby>a<rb>b</rb><rt></rt></ruby></body></html>
+CASE bytes=74 quirks=Quirks id=ruby.dat#2
+<html><head></head><body><ruby>a<rb>b</rb><rtc></rtc></ruby></body></html>
+CASE bytes=72 quirks=Quirks id=ruby.dat#3
+<html><head></head><body><ruby>a<rb>b</rb><rp></rp></ruby></body></html>
+CASE bytes=76 quirks=Quirks id=ruby.dat#4
+<html><head></head><body><ruby>a<rb>b<span></span></rb></ruby></body></html>
+CASE bytes=72 quirks=Quirks id=ruby.dat#5
+<html><head></head><body><ruby>a<rt>b</rt><rb></rb></ruby></body></html>
+CASE bytes=72 quirks=Quirks id=ruby.dat#6
+<html><head></head><body><ruby>a<rt>b</rt><rt></rt></ruby></body></html>
+CASE bytes=74 quirks=Quirks id=ruby.dat#7
+<html><head></head><body><ruby>a<rt>b</rt><rtc></rtc></ruby></body></html>
+CASE bytes=72 quirks=Quirks id=ruby.dat#8
+<html><head></head><body><ruby>a<rt>b</rt><rp></rp></ruby></body></html>
+CASE bytes=76 quirks=Quirks id=ruby.dat#9
+<html><head></head><body><ruby>a<rt>b<span></span></rt></ruby></body></html>
+CASE bytes=74 quirks=Quirks id=ruby.dat#10
+<html><head></head><body><ruby>a<rtc>b</rtc><rb></rb></ruby></body></html>
+CASE bytes=85 quirks=Quirks id=ruby.dat#11
+<html><head></head><body><ruby>a<rtc>b<rt>c</rt><rt>d</rt></rtc></ruby></body></html>
+CASE bytes=76 quirks=Quirks id=ruby.dat#12
+<html><head></head><body><ruby>a<rtc>b</rtc><rtc></rtc></ruby></body></html>
+CASE bytes=74 quirks=Quirks id=ruby.dat#13
+<html><head></head><body><ruby>a<rtc>b<rp></rp></rtc></ruby></body></html>
+CASE bytes=78 quirks=Quirks id=ruby.dat#14
+<html><head></head><body><ruby>a<rtc>b<span></span></rtc></ruby></body></html>
+CASE bytes=72 quirks=Quirks id=ruby.dat#15
+<html><head></head><body><ruby>a<rp>b</rp><rb></rb></ruby></body></html>
+CASE bytes=72 quirks=Quirks id=ruby.dat#16
+<html><head></head><body><ruby>a<rp>b</rp><rt></rt></ruby></body></html>
+CASE bytes=74 quirks=Quirks id=ruby.dat#17
+<html><head></head><body><ruby>a<rp>b</rp><rtc></rtc></ruby></body></html>
+CASE bytes=72 quirks=Quirks id=ruby.dat#18
+<html><head></head><body><ruby>a<rp>b</rp><rp></rp></ruby></body></html>
+CASE bytes=76 quirks=Quirks id=ruby.dat#19
+<html><head></head><body><ruby>a<rp>b<span></span></rp></ruby></body></html>
+CASE bytes=96 quirks=Quirks id=ruby.dat#20
+<html><head></head><body><ruby><rtc><ruby>a<rb>b</rb><rt></rt></ruby></rtc></ruby></body></html>

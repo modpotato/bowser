@@ -1,0 +1,54 @@
+CASE bytes=67 quirks=NoQuirks id=tests9.dat#0
+<!DOCTYPE html><html><head></head><body><math></math></body></html>
+CASE bytes=67 quirks=NoQuirks id=tests9.dat#1
+<!DOCTYPE html><html><head></head><body><math></math></body></html>
+CASE bytes=76 quirks=NoQuirks id=tests9.dat#2
+<!DOCTYPE html><html><head></head><body><math><mi></mi></math></body></html>
+CASE bytes=118 quirks=NoQuirks id=tests9.dat#3
+<!DOCTYPE html><html><head></head><body><math><annotation-xml><svg></svg></annotation-xml></math><u></u></body></html>
+CASE bytes=84 quirks=NoQuirks id=tests9.dat#4
+<!DOCTYPE html><html><head></head><body><select><math></math></select></body></html>
+CASE bytes=101 quirks=NoQuirks id=tests9.dat#5
+<!DOCTYPE html><html><head></head><body><select><option><math></math></option></select></body></html>
+CASE bytes=82 quirks=NoQuirks id=tests9.dat#6
+<!DOCTYPE html><html><head></head><body><math></math><table></table></body></html>
+CASE bytes=94 quirks=NoQuirks id=tests9.dat#7
+<!DOCTYPE html><html><head></head><body><math><mi>foo</mi></math><table></table></body></html>
+CASE bytes=106 quirks=NoQuirks id=tests9.dat#8
+<!DOCTYPE html><html><head></head><body><math><mi>foo</mi><mi>bar</mi></math><table></table></body></html>
+CASE bytes=121 quirks=NoQuirks id=tests9.dat#9
+<!DOCTYPE html><html><head></head><body><math><mi>foo</mi><mi>bar</mi></math><table><tbody></tbody></table></body></html>
+CASE bytes=130 quirks=NoQuirks id=tests9.dat#10
+<!DOCTYPE html><html><head></head><body><math><mi>foo</mi><mi>bar</mi></math><table><tbody><tr></tr></tbody></table></body></html>
+CASE bytes=139 quirks=NoQuirks id=tests9.dat#11
+<!DOCTYPE html><html><head></head><body><table><tbody><tr><td><math><mi>foo</mi><mi>bar</mi></math></td></tr></tbody></table></body></html>
+CASE bytes=149 quirks=NoQuirks id=tests9.dat#12
+<!DOCTYPE html><html><head></head><body><table><tbody><tr><td><math><mi>foo</mi><mi>bar</mi></math><p>baz</p></td></tr></tbody></table></body></html>
+CASE bytes=135 quirks=NoQuirks id=tests9.dat#13
+<!DOCTYPE html><html><head></head><body><table><caption><math><mi>foo</mi><mi>bar</mi></math><p>baz</p></caption></table></body></html>
+CASE bytes=146 quirks=NoQuirks id=tests9.dat#14
+<!DOCTYPE html><html><head></head><body><table><caption><math><mi>foo</mi><mi>bar</mi></math><p>baz</p></caption></table><p>quux</p></body></html>
+CASE bytes=139 quirks=NoQuirks id=tests9.dat#15
+<!DOCTYPE html><html><head></head><body><table><caption><math><mi>foo</mi><mi>bar</mi>baz</math></caption></table><p>quux</p></body></html>
+CASE bytes=148 quirks=NoQuirks id=tests9.dat#16
+<!DOCTYPE html><html><head></head><body><math><mi>foo</mi><mi>bar</mi></math><p>baz</p><table><colgroup></colgroup></table><p>quux</p></body></html>
+CASE bytes=177 quirks=NoQuirks id=tests9.dat#17
+<!DOCTYPE html><html><head></head><body><table><tbody><tr><td><select><math><mi>foo</mi><mi>bar</mi></math><p>baz</p></select></td></tr></tbody></table><p>quux</p></body></html>
+CASE bytes=144 quirks=NoQuirks id=tests9.dat#18
+<!DOCTYPE html><html><head></head><body><select><math><mi>foo</mi><mi>bar</mi></math><p>baz</p></select><table></table><p>quux</p></body></html>
+CASE bytes=101 quirks=NoQuirks id=tests9.dat#19
+<!DOCTYPE html><html><head></head><body><math><mi>foo</mi><mi>bar</mi></math><p>baz</p></body></html>
+CASE bytes=101 quirks=NoQuirks id=tests9.dat#20
+<!DOCTYPE html><html><head></head><body><math><mi>foo</mi><mi>bar</mi></math><p>baz</p></body></html>
+CASE bytes=62 quirks=NoQuirks id=tests9.dat#21
+<!DOCTYPE html><html><head></head><frameset></frameset></html>
+CASE bytes=62 quirks=NoQuirks id=tests9.dat#22
+<!DOCTYPE html><html><head></head><frameset></frameset></html>
+CASE bytes=101 quirks=NoQuirks id=tests9.dat#23
+<!DOCTYPE html><html><head></head><body xlink:href="foo"><math xlink:href="foo"></math></body></html>
+CASE bytes=138 quirks=NoQuirks id=tests9.dat#24
+<!DOCTYPE html><html><head></head><body xlink:href="foo" xml:lang="en"><math><mi xml:lang="en" xlink:href="foo"></mi></math></body></html>
+CASE bytes=138 quirks=NoQuirks id=tests9.dat#25
+<!DOCTYPE html><html><head></head><body xlink:href="foo" xml:lang="en"><math><mi xml:lang="en" xlink:href="foo"></mi></math></body></html>
+CASE bytes=141 quirks=NoQuirks id=tests9.dat#26
+<!DOCTYPE html><html><head></head><body xlink:href="foo" xml:lang="en"><math><mi xml:lang="en" xlink:href="foo"></mi>bar</math></body></html>

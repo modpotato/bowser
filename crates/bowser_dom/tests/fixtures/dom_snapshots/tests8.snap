@@ -1,0 +1,23 @@
+CASE bytes=64 quirks=Quirks id=tests8.dat#0
+<html><head></head><body><div>
+<div></div>
+x</div></body></html>
+CASE bytes=64 quirks=Quirks id=tests8.dat#1
+<html><head></head><body><div>x<div></div>
+x</div></body></html>
+CASE bytes=64 quirks=Quirks id=tests8.dat#2
+<html><head></head><body><div>x<div></div>xx</div></body></html>
+CASE bytes=64 quirks=Quirks id=tests8.dat#3
+<html><head></head><body><div>x<div></div>yz</div></body></html>
+CASE bytes=79 quirks=Quirks id=tests8.dat#4
+<html><head></head><body><div>x<div></div>xx</div><table></table></body></html>
+CASE bytes=72 quirks=Quirks id=tests8.dat#5
+<html><head></head><body><li></li><li></li><table></table></body></html>
+CASE bytes=56 quirks=Quirks id=tests8.dat#6
+<html><head></head><body>xx<table></table></body></html>
+CASE bytes=71 quirks=Quirks id=tests8.dat#7
+<html><head></head><body>x<table></table>x<table></table></body></html>
+CASE bytes=77 quirks=Quirks id=tests8.dat#8
+<html><head></head><body><b>a<div></div></b><div><b></b>y</div></body></html>
+CASE bytes=78 quirks=Quirks id=tests8.dat#9
+<html><head></head><body><a></a><div><a></a><p><a></a></p></div></body></html>

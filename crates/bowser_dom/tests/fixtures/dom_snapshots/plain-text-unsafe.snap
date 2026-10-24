@@ -1,0 +1,68 @@
+CASE bytes=46 quirks=Quirks id=plain-text-unsafe.dat#0
+<html><head></head><body>FOOZOO</body></html>
+CASE bytes=47 quirks=Quirks id=plain-text-unsafe.dat#1
+<html><head></head><frameset></frameset></html>
+CASE bytes=47 quirks=Quirks id=plain-text-unsafe.dat#2
+<html><head></head><frameset></frameset></html>
+CASE bytes=41 quirks=Quirks id=plain-text-unsafe.dat#3
+<html><head></head><body>aa</body></html>
+CASE bytes=47 quirks=Quirks id=plain-text-unsafe.dat#4
+<html><head></head><frameset></frameset></html>
+CASE bytes=47 quirks=Quirks id=plain-text-unsafe.dat#5
+<html><head></head><frameset></frameset></html>
+CASE bytes=56 quirks=Quirks id=plain-text-unsafe.dat#6
+<html><head></head><body><select></select></body></html>
+CASE bytes=39 quirks=Quirks id=plain-text-unsafe.dat#7
+<html><head></head><body></body></html>
+CASE bytes=39 quirks=Quirks id=plain-text-unsafe.dat#8
+<html><head></head><body></body></html>
+CASE bytes=81 quirks=Quirks id=plain-text-unsafe.dat#9
+<html><head></head><body><plaintext>�filler�text�</plaintext></body></html>
+CASE bytes=69 quirks=Quirks id=plain-text-unsafe.dat#10
+<html><head></head><body><svg>�filler�text�</svg></body></html>
+CASE bytes=49 quirks=Quirks id=plain-text-unsafe.dat#11
+<html><head></head><body><!--�--></body></html>
+CASE bytes=62 quirks=Quirks id=plain-text-unsafe.dat#12
+<html><head></head><body><!--�filler�text--></body></html>
+CASE bytes=91 quirks=Quirks id=plain-text-unsafe.dat#13
+<html><head></head><body><svg><foreignObject>fillertext</foreignObject></svg></body></html>
+CASE bytes=66 quirks=Quirks id=plain-text-unsafe.dat#14
+<html><head></head><body><svg>�filler�text</svg></body></html>
+CASE bytes=74 quirks=Quirks id=plain-text-unsafe.dat#15
+<html><head></head><body><svg>�<frameset></frameset></svg></body></html>
+CASE bytes=75 quirks=Quirks id=plain-text-unsafe.dat#16
+<html><head></head><body><svg>� <frameset></frameset></svg></body></html>
+CASE bytes=75 quirks=Quirks id=plain-text-unsafe.dat#17
+<html><head></head><body><svg>�a<frameset></frameset></svg></body></html>
+CASE bytes=47 quirks=Quirks id=plain-text-unsafe.dat#18
+<html><head></head><frameset></frameset></html>
+CASE bytes=47 quirks=Quirks id=plain-text-unsafe.dat#19
+<html><head></head><frameset></frameset></html>
+CASE bytes=54 quirks=Quirks id=plain-text-unsafe.dat#20
+<html><head></head><body><svg>�a</svg></body></html>
+CASE bytes=47 quirks=Quirks id=plain-text-unsafe.dat#21
+<html><head></head><frameset></frameset></html>
+CASE bytes=47 quirks=Quirks id=plain-text-unsafe.dat#22
+<html><head></head><frameset></frameset></html>
+CASE bytes=67 quirks=NoQuirks id=plain-text-unsafe.dat#23
+<!DOCTYPE html><html><head></head><body><pre>
+A</pre></body></html>
+CASE bytes=67 quirks=NoQuirks id=plain-text-unsafe.dat#24
+<!DOCTYPE html><html><head></head><body><pre>
+A</pre></body></html>
+CASE bytes=66 quirks=NoQuirks id=plain-text-unsafe.dat#25
+<!DOCTYPE html><html><head></head><body><pre>A</pre></body></html>
+CASE bytes=131 quirks=NoQuirks id=plain-text-unsafe.dat#26
+<!DOCTYPE html><html><head></head><body><table><tbody><tr><td><math><mtext>a</mtext></math></td></tr></tbody></table></body></html>
+CASE bytes=145 quirks=NoQuirks id=plain-text-unsafe.dat#27
+<!DOCTYPE html><html><head></head><body><table><tbody><tr><td><svg><foreignObject>a</foreignObject></svg></td></tr></tbody></table></body></html>
+CASE bytes=78 quirks=NoQuirks id=plain-text-unsafe.dat#28
+<!DOCTYPE html><html><head></head><body><math><mi>ab</mi></math></body></html>
+CASE bytes=78 quirks=NoQuirks id=plain-text-unsafe.dat#29
+<!DOCTYPE html><html><head></head><body><math><mo>ab</mo></math></body></html>
+CASE bytes=78 quirks=NoQuirks id=plain-text-unsafe.dat#30
+<!DOCTYPE html><html><head></head><body><math><mn>ab</mn></math></body></html>
+CASE bytes=78 quirks=NoQuirks id=plain-text-unsafe.dat#31
+<!DOCTYPE html><html><head></head><body><math><ms>ab</ms></math></body></html>
+CASE bytes=84 quirks=NoQuirks id=plain-text-unsafe.dat#32
+<!DOCTYPE html><html><head></head><body><math><mtext>ab</mtext></math></body></html>

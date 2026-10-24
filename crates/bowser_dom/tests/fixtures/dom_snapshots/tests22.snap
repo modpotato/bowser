@@ -1,0 +1,10 @@
+CASE bytes=146 quirks=Quirks id=tests22.dat#0
+<html><head></head><body><a><b><big><em><strong></strong></em></big></b></a><big><em><strong><div><a>X</a></div></strong></em></big></body></html>
+CASE bytes=261 quirks=Quirks id=tests22.dat#1
+<html><head></head><body><a><b></b></a><b><div id="1"><a></a><div id="2"><a></a><div id="3"><a></a><div id="4"><a></a><div id="5"><a></a><div id="6"><a></a><div id="7"><a></a><div id="8"><a>A</a></div></div></div></div></div></div></div></div></b></body></html>
+CASE bytes=279 quirks=Quirks id=tests22.dat#2
+<html><head></head><body><a><b></b></a><b><div id="1"><a></a><div id="2"><a></a><div id="3"><a></a><div id="4"><a></a><div id="5"><a></a><div id="6"><a></a><div id="7"><a></a><div id="8"><a><div id="9">A</div></a></div></div></div></div></div></div></div></div></b></body></html>
+CASE bytes=298 quirks=Quirks id=tests22.dat#3
+<html><head></head><body><a><b></b></a><b><div id="1"><a></a><div id="2"><a></a><div id="3"><a></a><div id="4"><a></a><div id="5"><a></a><div id="6"><a></a><div id="7"><a></a><div id="8"><a><div id="9"><div id="10">A</div></div></a></div></div></div></div></div></div></div></div></b></body></html>
+CASE bytes=156 quirks=Quirks id=tests22.dat#4
+<html><head></head><body><cite><b><cite><i><cite><i><cite><i></i></cite></i></cite></i></cite></b><i><i><div><b>X</b>TEST</div></i></i></cite></body></html>

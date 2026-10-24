@@ -1,0 +1,77 @@
+<!doctype html>
+<html>
+<head><meta charset="utf-8"><title>testdriver phase-1 e2e</title></head>
+<body>
+<button id="btn">click me</button>
+<input id="inp" type="text">
+<script src="/resources/testdriver.js"></script>
+<script>
+(function() {
+  "use strict";
+  // Exercises the real upstream testdriver.js (vendored under
+  // tests/fixtures/wpt/resources/) against the Bowser vendor shim
+  // (appended by the fixture server) and the native
+  // `window.__bowser_testdriver` bridge. The bridge is installed by the
+  // post-parse production install, and layout runs in the headless
+  // pump before the testdriver drain, so we wait for both (load event
+  // for the bridge, non-empty getClientRects for layout) before
+  // running. Reports one marker line on the child's stdout; the Rust
+  // test asserts on it.
+  window.addEventListener("load", function() {
+    var btn = document.getElementById("btn");
+    var tries = 0;
+    function waitForLayout() {
+      tries++;
+      if (btn.getClientRects().length === 0 && tries < 50) {
+        setTimeout(waitForLayout, 100);
+        return;
+      }
+      runTests();
+    }
+    function runTests() {
+      var results = [];
+      function report(name, ok, detail) {
+        results.push(name + "=" + (ok ? "PASS" : "FAIL") + (detail ? "(" + detail + ")" : ""));
+        if (results.length === 4) console.log("TESTDRIVER_E2E " + results.join(" "));
+      }
+
+      var clicked = [];
+      btn.addEventListener("click", function() { clicked.push("clicked"); });
+
+      var keys = [];
+      var inp = document.getElementById("inp");
+      inp.addEventListener("keydown", function(e) { keys.push("down:" + e.key); });
+      inp.addEventListener("keyup", function(e) { keys.push("up:" + e.key); });
+
+      var blessRan = false;
+
+      test_driver.click(btn).then(function() {
+        report("click", clicked.join(",") === "clicked", clicked.join(","));
+        return test_driver.send_keys(inp, "a\uE004");
+      }, function(e) {
+        report("click", false, "rejected:" + (e && e.message));
+        return test_driver.send_keys(inp, "a\uE004");
+      }).then(function() {
+        report("send_keys", keys.join(",") === "down:a,up:a,down:Tab,up:Tab", keys.join(","));
+        return test_driver.bless("e2e", function() { blessRan = true; });
+      }, function(e) {
+        report("send_keys", false, "rejected:" + (e && e.message));
+        return test_driver.bless("e2e", function() { blessRan = true; });
+      }).then(function() {
+        report("bless", blessRan === true, String(blessRan));
+        report("in_automation",
+               window.test_driver_internal.in_automation === true,
+               String(window.test_driver_internal.in_automation));
+      }, function(e) {
+        report("bless", false, "rejected:" + (e && e.message));
+        report("in_automation",
+               window.test_driver_internal.in_automation === true,
+               String(window.test_driver_internal.in_automation));
+      });
+    }
+    waitForLayout();
+  });
+})();
+</script>
+</body>
+</html>

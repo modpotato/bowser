@@ -1,0 +1,101 @@
+CASE bytes=57 quirks=Quirks id=domjs-unsafe.dat#0
+<html><head></head><body><svg>foo
+bar</svg></body></html>
+CASE bytes=57 quirks=Quirks id=domjs-unsafe.dat#1
+<html><head></head><body><svg>foo
+bar</svg></body></html>
+CASE bytes=57 quirks=Quirks id=domjs-unsafe.dat#2
+<html><head></head><body><svg>foo
+bar</svg></body></html>
+CASE bytes=63 quirks=Quirks id=domjs-unsafe.dat#3
+<html><head><script>a='�'</script></head><body></body></html>
+CASE bytes=75 quirks=Quirks id=domjs-unsafe.dat#4
+<html><head><script type="data"><!--�</script></head><body></body></html>
+CASE bytes=78 quirks=Quirks id=domjs-unsafe.dat#5
+<html><head><script type="data"><!--foo�</script></head><body></body></html>
+CASE bytes=80 quirks=Quirks id=domjs-unsafe.dat#6
+<html><head><script type="data"><!-- foo-�</script></head><body></body></html>
+CASE bytes=81 quirks=Quirks id=domjs-unsafe.dat#7
+<html><head><script type="data"><!-- foo--�</script></head><body></body></html>
+CASE bytes=77 quirks=Quirks id=domjs-unsafe.dat#8
+<html><head><script type="data"><!-- foo-</script></head><body></body></html>
+CASE bytes=78 quirks=Quirks id=domjs-unsafe.dat#9
+<html><head><script type="data"><!-- foo-<</script></head><body></body></html>
+CASE bytes=79 quirks=Quirks id=domjs-unsafe.dat#10
+<html><head><script type="data"><!-- foo-<S</script></head><body></body></html>
+CASE bytes=77 quirks=Quirks id=domjs-unsafe.dat#11
+<html><head><script type="data"><!-- foo-</script></head><body></body></html>
+CASE bytes=75 quirks=Quirks id=domjs-unsafe.dat#12
+<html><head><script type="data"><!--<p></script></head><body></body></html>
+CASE bytes=89 quirks=Quirks id=domjs-unsafe.dat#13
+<html><head><script type="data"><!--<script></script></script></head><body></body></html>
+CASE bytes=92 quirks=Quirks id=domjs-unsafe.dat#14
+<html><head><script type="data"><!--<script>�</script></script></head><body></body></html>
+CASE bytes=93 quirks=Quirks id=domjs-unsafe.dat#15
+<html><head><script type="data"><!--<script>-�</script></script></head><body></body></html>
+CASE bytes=94 quirks=Quirks id=domjs-unsafe.dat#16
+<html><head><script type="data"><!--<script>--�</script></script></head><body></body></html>
+CASE bytes=92 quirks=Quirks id=domjs-unsafe.dat#17
+<html><head><script type="data"><!--<script>---</script></script></head><body></body></html>
+CASE bytes=97 quirks=Quirks id=domjs-unsafe.dat#18
+<html><head><script type="data"><!--<script></scrip></SCRIPT></script></head><body></body></html>
+CASE bytes=97 quirks=Quirks id=domjs-unsafe.dat#19
+<html><head><script type="data"><!--<script></scrip </SCRIPT></script></head><body></body></html>
+CASE bytes=97 quirks=Quirks id=domjs-unsafe.dat#20
+<html><head><script type="data"><!--<script></scrip/</SCRIPT></script></head><body></body></html>
+CASE bytes=77 quirks=Quirks id=domjs-unsafe.dat#21
+<html><head><script type="data"></scrip/></script></head><body></body></html>
+CASE bytes=77 quirks=Quirks id=domjs-unsafe.dat#22
+<html><head><script type="data"></scrip ></script></head><body></body></html>
+CASE bytes=80 quirks=Quirks id=domjs-unsafe.dat#23
+<html><head><script type="data"><!--</scrip></script></head><body></body></html>
+CASE bytes=80 quirks=Quirks id=domjs-unsafe.dat#24
+<html><head><script type="data"><!--</scrip </script></head><body></body></html>
+CASE bytes=80 quirks=Quirks id=domjs-unsafe.dat#25
+<html><head><script type="data"><!--</scrip/</script></head><body></body></html>
+CASE bytes=54 quirks=NoQuirks id=domjs-unsafe.dat#26
+<!DOCTYPE html><html><head></head><body></body></html>
+CASE bytes=39 quirks=Quirks id=domjs-unsafe.dat#27
+<html><head></head><body></body></html>
+CASE bytes=39 quirks=Quirks id=domjs-unsafe.dat#28
+<html><head></head><body></body></html>
+CASE bytes=39 quirks=Quirks id=domjs-unsafe.dat#29
+<html><head></head><body></body></html>
+CASE bytes=39 quirks=Quirks id=domjs-unsafe.dat#30
+<html><head></head><body></body></html>
+CASE bytes=54 quirks=Quirks id=domjs-unsafe.dat#31
+<html><head></head><body><table></table></body></html>
+CASE bytes=56 quirks=Quirks id=domjs-unsafe.dat#32
+<html><head></head><body><select></select></body></html>
+CASE bytes=75 quirks=Quirks id=domjs-unsafe.dat#33
+<html><head></head><body><table><colgroup></colgroup></table></body></html>
+CASE bytes=86 quirks=Quirks id=domjs-unsafe.dat#34
+<html><head></head><body><table><colgroup><!--test--></colgroup></table></body></html>
+CASE bytes=75 quirks=Quirks id=domjs-unsafe.dat#35
+<html><head></head><body><table><colgroup></colgroup></table></body></html>
+CASE bytes=79 quirks=Quirks id=domjs-unsafe.dat#36
+<html><head></head><body>foo<table><colgroup> </colgroup></table></body></html>
+CASE bytes=67 quirks=Quirks id=domjs-unsafe.dat#37
+<html><head></head><body><select><!--test--></select></body></html>
+CASE bytes=56 quirks=Quirks id=domjs-unsafe.dat#38
+<html><head></head><body><select></select></body></html>
+CASE bytes=47 quirks=Quirks id=domjs-unsafe.dat#39
+<html><head></head><frameset></frameset></html>
+CASE bytes=47 quirks=Quirks id=domjs-unsafe.dat#40
+<html><head></head><frameset></frameset></html>
+CASE bytes=47 quirks=Quirks id=domjs-unsafe.dat#41
+<html><head></head><frameset></frameset></html>
+CASE bytes=39 quirks=Quirks id=domjs-unsafe.dat#42
+<html><head></head><body></body></html>
+CASE bytes=50 quirks=Quirks id=domjs-unsafe.dat#43
+<html><head></head><body><svg></svg></body></html>
+CASE bytes=63 quirks=Quirks id=domjs-unsafe.dat#44
+<html><head></head><body><svg><font></font></svg></body></html>
+CASE bytes=72 quirks=Quirks id=domjs-unsafe.dat#45
+<html><head></head><body><svg><font id="foo"></font></svg></body></html>
+CASE bytes=72 quirks=Quirks id=domjs-unsafe.dat#46
+<html><head></head><body><svg></svg><font size="4"></font></body></html>
+CASE bytes=75 quirks=Quirks id=domjs-unsafe.dat#47
+<html><head></head><body><svg></svg><font color="red"></font></body></html>
+CASE bytes=75 quirks=Quirks id=domjs-unsafe.dat#48
+<html><head></head><body><svg><font font="sans"></font></svg></body></html>

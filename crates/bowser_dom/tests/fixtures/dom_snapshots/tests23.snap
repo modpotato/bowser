@@ -1,0 +1,10 @@
+CASE bytes=352 quirks=Quirks id=tests23.dat#0
+<html><head></head><body><p><font size="4"><font color="red"><font size="4"><font size="4"><font size="4"><font size="4"><font size="4"><font color="red"></font></font></font></font></font></font></font></font></p><p><font color="red"><font size="4"><font size="4"><font size="4"><font color="red">X</font></font></font></font></font></p></body></html>
+CASE bytes=208 quirks=Quirks id=tests23.dat#1
+<html><head></head><body><p><font size="4"><font size="4"><font size="4"><font size="4"></font></font></font></font></p><p><font size="4"><font size="4"><font size="4">X</font></font></font></p></body></html>
+CASE bytes=252 quirks=Quirks id=tests23.dat#2
+<html><head></head><body><p><font size="4"><font size="4"><font size="4"><font size="5"><font size="4"></font></font></font></font></font></p><p><font size="4"><font size="4"><font size="5"><font size="4">X</font></font></font></font></p></body></html>
+CASE bytes=258 quirks=Quirks id=tests23.dat#3
+<html><head></head><body><p><font size="4" id="a"><font size="4" id="b"><font size="4"><font size="4"></font></font></font></font></p><p><font size="4" id="a"><font size="4" id="b"><font size="4"><font size="4">X</font></font></font></font></p></body></html>
+CASE bytes=198 quirks=Quirks id=tests23.dat#4
+<html><head></head><body><p><b id="a"><b id="a"><b id="a"><b><object><b id="a"><b id="a">X</b></b></object></b></b></b></b></p><p><b id="a"><b id="a"><b id="a"><b>Y</b></b></b></b></p></body></html>
