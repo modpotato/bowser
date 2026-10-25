@@ -1,3 +1,0 @@
-resolved 137 profiles
-25 TLS configs, 14 HTTP/2 configs, 25 list strings, 542 compressed UA strings
-wrote /home/hatch/workspace/scratch/fix-minors/regen_data.rs
