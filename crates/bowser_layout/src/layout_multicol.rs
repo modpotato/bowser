@@ -1387,6 +1387,8 @@ fn clone_node(forest: &Forest, o: usize) -> crate::boxes::Node {
         phantom_h: n.phantom_h,
         from_table_element: n.from_table_element,
         is_br: n.is_br,
+        is_img: n.is_img,
+        nowrap_attr: n.nowrap_attr,
         natural_content_h: n.natural_content_h,
     }
 }

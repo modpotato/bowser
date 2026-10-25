@@ -1066,13 +1066,21 @@ fn parse_layout_hook_baseline_td_full_page_pct_tail() {
     // w76fix M5-probe: the whole WPT `baseline-td` page (scripts
     // and `<link>` sheets stripped; their rules inlined) read the
     // way `checkLayout` reads it — renamed for what it actually
-    // pins: the %ge tail plus shim plumbing, NOT document-order
-    // QSA. The shim `querySelectorAll` returns selector-GROUP order
-    // (every `table` match, then every `.display-table` match),
-    // which is shim behavior, not the spec: document order on this
-    // page is TABLE, DIV, TABLE, TABLE, TABLE. Do not "fix" the
-    // group order here — changing shim QSA to document order would
-    // renumber WPT subtests and is a separate, riskier change.
+    // pins: the %ge tail plus shim plumbing. w77fix: the QSA pin
+    // below was updated from selector-GROUP order to document
+    // order. w77 commit 36744d4 deliberately made shim
+    // `querySelectorAll` return the union of comma groups in
+    // document order, deduped — the DOM spec order, and the order
+    // the production DOM (`bowser_dom`) already returns — so the
+    // old group-order expectation (every `table`, then the
+    // `.display-table` div) is no longer correct shim behavior,
+    // even though it passed at the w76 base: that pass pinned a
+    // documented non-spec shim quirk ("shim behavior, not the
+    // spec"), not WPT geometry. Document order on this page is
+    // TABLE, DIV, TABLE, TABLE, TABLE. The %ge tail pin is
+    // unchanged, and no geometry in this probe indexes into the
+    // QSA order (the tops come from a separate single-group
+    // `.m` query, whose order is unaffected).
     // Subtest 1's table-1 offsets are collected only as the reads
     // that populate the whole-document cache entry before the %ge
     // reads, and are deliberately NOT asserted: they ride on Ahem
@@ -1126,12 +1134,11 @@ fn parse_layout_hook_baseline_td_full_page_pct_tail() {
          <tr><td style=\"vertical-align:baseline;height:100px\">Xp</td></tr></table></main>",
         "var nodes = document.querySelectorAll('table, .display-table');\n         var names = [];\n         for (var i = 0; i < nodes.length; i++) names.push(nodes[i].tagName);\n         var ms = document.querySelectorAll('.m');\n         var t1tops = [];\n         for (var i = 0; i < 12 && i < ms.length; i++) t1tops.push(ms[i].offsetTop);\n         var d50 = document.getElementById('d50');\n         var d80 = document.getElementById('d80');\n         globalThis.__result = [names.join(','), t1tops.join(','), d50.offsetParent.tagName, d50.offsetTop, d50.offsetHeight, d80.offsetTop, d80.offsetHeight].join('|');",
     );
-    // Only the shim QSA group order (shim behavior, explicitly NOT
-    // document order — see the test doc) and the %ge tail are
-    // asserted here.
+    // Only the shim QSA document order (see the test doc) and the
+    // %ge tail are asserted here.
     assert!(
-        r.starts_with("TABLE,TABLE,TABLE,TABLE,DIV|"),
-        "shim QSA must list tables first (selector-group order, not document order), got: {r}"
+        r.starts_with("TABLE,DIV,TABLE,TABLE,TABLE|"),
+        "shim QSA must list matches in document order, got: {r}"
     );
     assert!(
         r.ends_with("|TD|30|50|0|80"),

@@ -23,12 +23,35 @@ const VP: Size = Size { w: 800.0, h: 600.0 };
 /// match the real WPT files (which all carry `<!doctype html>`).
 /// A caller-supplied doctype is left alone, so quirks fixtures keep
 /// their mode.
+///
+/// Mode split, documented (w77fix finding 11): only the helpers in
+/// this file that take an HTML string inject a doctype
+/// (`layout_html`, `layout_html_markers`). The table helpers in
+/// `layout_table.rs` (`layout_table_html`, `layout_table_doc`,
+/// `layout_table_html_with`, and the module-local `layout_html`
+/// helpers) and `layout_doc_with_intrinsics` /
+/// `layout_html_with_moved_node` below do NOT inject: doctype-less
+/// input there parses as full quirks mode, so the same fixture
+/// gets standards mode in one helper and quirks in another.
+/// Pass an explicit doctype in those helpers when the fixture's
+/// mode matters; do not "fix" the split by injecting everywhere
+/// without re-baselining the table fixtures, which were written
+/// against quirks mode.
+///
+/// Comment-before-doctype edge: leading comments are skipped when
+/// looking for a caller doctype. Without that, a fixture starting
+/// with a comment followed by a quirks doctype would get a second,
+/// prepended doctype shadowing it (the first doctype token wins)
+/// and silently re-mode to standards.
 fn standards_html(html: &str) -> String {
-    if html
-        .trim_start()
-        .to_ascii_lowercase()
-        .starts_with("<!doctype")
-    {
+    let mut rest = html.trim_start();
+    while let Some(after) = rest.strip_prefix("<!--") {
+        match after.find("-->") {
+            Some(end) => rest = after[end + 3..].trim_start(),
+            None => break,
+        }
+    }
+    if rest.to_ascii_lowercase().starts_with("<!doctype") {
         html.to_string()
     } else {
         format!("<!DOCTYPE html>{html}")
@@ -59,6 +82,11 @@ fn layout_html_markers(html: &str, css: &str) -> (LayoutBox, Vec<MarkerBox>) {
     )
 }
 
+/// Mode split (see `standards_html` above): the document is
+/// already parsed, so no doctype can be injected here — a doc
+/// parsed from doctype-less input is full quirks mode. Callers
+/// that need standards mode must include the doctype in the
+/// input they parse.
 fn layout_doc_with_intrinsics(
     doc: &bowser_dom::Document,
     css: &str,
@@ -67,6 +95,27 @@ fn layout_doc_with_intrinsics(
 ) -> LayoutBox {
     let ss = bowser_css::parse_stylesheet(&[TABLE_TEST_RESET_CSS, css].concat());
     layout_with_intrinsics(doc, &[&ss], VP, fonts, intrinsics)
+}
+
+#[test]
+fn standards_html_keeps_doctype_after_leading_comment() {
+    // w77fix finding 11, comment-before-doctype edge: a quirks
+    // doctype after a leading comment must survive untouched —
+    // the old whitespace-only check prepended a second doctype,
+    // shadowing it (first doctype token wins) and silently
+    // re-moding the fixture to standards. Fail-before: the
+    // quirks input below came back with a prepended doctype.
+    let quirks = "<!-- note --><!DOCTYPE HTML PUBLIC \"-//W3C//DTD HTML 4.0 Transitional//EN\"><table></table>";
+    assert_eq!(standards_html(quirks), quirks);
+    let quirks_ws = "  <!-- a --><!-- b --><!doctype html><table></table>";
+    assert_eq!(standards_html(quirks_ws), quirks_ws);
+    let plain = "<!-- note --><table></table>";
+    assert_eq!(standards_html(plain), format!("<!DOCTYPE html>{plain}"));
+    let plain_ws = "  <table></table>";
+    assert_eq!(
+        standards_html(plain_ws),
+        format!("<!DOCTYPE html>{plain_ws}")
+    );
 }
 
 /// Metrics where uppercase letters are twice as wide as lowercase, so a
@@ -1596,6 +1645,10 @@ fn wpt_absolute_tables_004() {
 
 /// Parse `html`, move the element with `id=child_id` from inside
 /// `id=outer_id` into the table, and lay out the document.
+/// Mode split (see `standards_html` above): this helper parses
+/// directly without injecting a doctype, so doctype-less input is
+/// full quirks mode. Pass an explicit doctype in `html` when the
+/// fixture's mode matters.
 fn layout_html_with_moved_node(html: &str, css: &str, outer_id: &str, child_id: &str) -> LayoutBox {
     let (mut doc, _) = bowser_dom::Document::parse_html(html.as_bytes());
     let outer = doc.get_element_by_id(outer_id).expect("outer");
@@ -4315,6 +4368,59 @@ fn w77g_flex_inline_block_item_still_wrapped() {
     let i = &w.children[0];
     assert_eq!(i.box_type, BoxType::InlineBlock);
     assert!(approx(i.rect.w, 60.0), "inline-block w={} != 60", i.rect.w);
+}
+
+#[test]
+fn w77fix_inline_table_blockifies_through_both_triggers() {
+    // w77fix finding 12, joint pin: inline-table blockification
+    // runs through two triggers that must agree. Container A has
+    // a block-level sibling, so the `needs_wrap` branch in
+    // `boxes.rs` pass 3 promotes the table at box-build time;
+    // container B has only a text run beside the table, so pass 3
+    // does not fire (no block-level child) and
+    // `wrap_flex_text_runs` promotes it at flex-layout time.
+    // Both tables carry the same `flex: 0 0 200px` and 10px side
+    // margins, so both items must land identically: a `Table`
+    // box, 200px wide, 10px off the container's start edge, with
+    // the sibling after the margin box. A regression in either
+    // trigger breaks this one test.
+    let table = r#"<table class="t"><tr><td><div style="width:40px"></div></td><td><div style="width:40px"></div></td></tr></table>"#;
+    let css = "body { margin: 0; } .c { display: flex; width: 600px; font-size: 10px; } \
+         .t { display: inline-table; flex: 0 0 200px; margin: 0 10px; } \
+         .s { width: 50px; height: 20px; }";
+    // Trigger one (boxes pass 3): block sibling present.
+    let l = layout_html(
+        &format!(r#"<div class="c">{table}<div class="s"></div></div>"#),
+        css,
+    );
+    let c = &body(&l).children[0];
+    assert_eq!(c.children.len(), 2, "A: want table item + sibling");
+    let t = &c.children[0];
+    assert_eq!(t.box_type, BoxType::Table, "A: table must promote");
+    assert!(approx(t.rect.w, 200.0), "A: table w={} != 200", t.rect.w);
+    assert!(
+        approx(t.rect.x, c.rect.x + 10.0),
+        "A: table x={} != container + 10",
+        t.rect.x
+    );
+    assert!(
+        approx(c.children[1].rect.x, c.rect.x + 220.0),
+        "A: sibling x={} != container + 220",
+        c.children[1].rect.x
+    );
+    // Trigger two (wrap_flex_text_runs): text run, no block child.
+    let l = layout_html(&format!(r#"<div class="c">hi{table}</div>"#), css);
+    let c = &body(&l).children[0];
+    assert_eq!(c.children.len(), 2, "B: want text item + table item");
+    assert_eq!(c.children[0].box_type, BoxType::AnonymousBlock);
+    let t = &c.children[1];
+    assert_eq!(t.box_type, BoxType::Table, "B: table must promote");
+    assert!(approx(t.rect.w, 200.0), "B: table w={} != 200", t.rect.w);
+    assert!(
+        approx(t.rect.x, c.rect.x + 22.0),
+        "B: table x={} != container + 22 (12 text + 10 margin)",
+        t.rect.x
+    );
 }
 
 #[test]
@@ -10796,6 +10902,76 @@ fn w77_intrinsic_width_pre_seam_spaces_are_preserved() {
     );
     let a = &body(&l).children[0];
     assert!(approx(a.rect.w, 24.0), "pre seam {w} != 24", w = a.rect.w);
+}
+
+#[test]
+fn w77fix_seam_tab_edge_collapses_like_space() {
+    // w77fix finding 13: `seam_space_drop` only checks U+0020
+    // edges, but a tab edge reaches it already normalized:
+    // `boxes::collapse_ws` turns a trailing tab into U+0020 for
+    // normal white-space at box-build time, so the seam drop
+    // fires exactly as for a space. A shrink-to-fit inline-block
+    // over <span>a\t</span> + " b" must measure 18, not 24.
+    let l = layout_html(
+        "<div class=\"a\"><span>a\t</span> b</div>",
+        ".a { display: inline-block; font-size: 10px; }",
+    );
+    let a = &body(&l).children[0];
+    assert!(approx(a.rect.w, 18.0), "tab seam {w} != 18", w = a.rect.w);
+}
+
+#[test]
+fn w77fix_seam_newline_edge_collapses_like_space() {
+    // Same as the tab case for a newline edge: normal
+    // white-space collapses it to U+0020 at box-build time, so
+    // the seam drop fires and the inline-block measures 18.
+    let l = layout_html(
+        "<div class=\"a\"><span>a\n</span> b</div>",
+        ".a { display: inline-block; font-size: 10px; }",
+    );
+    let a = &body(&l).children[0];
+    assert!(
+        approx(a.rect.w, 18.0),
+        "newline seam {w} != 18",
+        w = a.rect.w
+    );
+}
+
+#[test]
+fn w77fix_seam_tab_edge_collapses_under_pre_line() {
+    // Pre-line also normalizes tabs to U+0020 (`collapse_ws`
+    // pre-line arm), so the tab seam still drops: 18, not 24.
+    let l = layout_html(
+        "<div class=\"a\"><span>a\t</span> b</div>",
+        ".a { display: inline-block; font-size: 10px; white-space: pre-line; }",
+    );
+    let a = &body(&l).children[0];
+    assert!(
+        approx(a.rect.w, 18.0),
+        "pre-line tab seam {w} != 18",
+        w = a.rect.w
+    );
+}
+
+#[test]
+fn w77fix_seam_newline_edge_preserved_under_pre_line() {
+    // Pre-line is the exception that proves the rule: a newline
+    // is a preserved segment break there, NOT a collapsible
+    // space, so `seam_space_drop`'s U+0020 check correctly does
+    // not fire (line layout's `collapse_adjacent_spaces` never
+    // sees an `is_space` fragment for it either). Both sides
+    // count: advance("a\n") + advance(" b") = 24 at 10px Fixed
+    // metrics. Treating \n as a droppable space would give 18.
+    let l = layout_html(
+        "<div class=\"a\"><span>a\n</span> b</div>",
+        ".a { display: inline-block; font-size: 10px; white-space: pre-line; }",
+    );
+    let a = &body(&l).children[0];
+    assert!(
+        approx(a.rect.w, 24.0),
+        "pre-line newline seam {w} != 24",
+        w = a.rect.w
+    );
 }
 
 #[test]

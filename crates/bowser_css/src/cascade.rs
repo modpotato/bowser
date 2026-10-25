@@ -530,49 +530,39 @@ fn table_rules(value: &str) -> Option<TableRules> {
 }
 
 /// An HTML dimension value (`width`/`height` attributes): the
-/// WHATWG HTML §2.3.4.4 dimension grammar in strict full-consumption
-/// form — ASCII whitespace trimmed from both ends, then one or more
-/// ASCII digits, an optional single fraction (`.` followed by one or
-/// more digits), and an optional single `%` suffix; anything else
-/// maps to nothing. That shape is what §2.3.4.4 itself requires of
-/// the number (a leading digit, no sign, no exponent, a fraction
-/// only with digits after the dot), tightened here to full
-/// consumption because the result becomes a CSS declaration: the
-/// lenient prefix form of the parsing algorithm would silently turn
-/// `100abc` into `100px` and `100 px` into `100px`, which are not
-/// dimensions at all. A trailing `%` makes a percentage, anything
-/// else a px length.
+/// WHATWG HTML §2.3.4.4 rules for parsing dimension values, which
+/// are prefix-lenient by design: ASCII whitespace is skipped, one
+/// or more ASCII digits are collected, an optional `.` plus any
+/// further digits follows, and a `%` immediately after the number
+/// makes a percentage — anything after that point is ignored, so
+/// `100px`, `100abc`, `100 px`, `10.5.2`, `100.`, `1e3`, and `100%%`
+/// all parse to a number (the last to a percentage). No sign and no
+/// exponent are recognized: a value that does not start with a
+/// digit (`.5`, `+100`, `-100`, `abc`, empty) maps to nothing. The
+/// strict full-consumption form this replaced (w77g) contradicted
+/// the algorithm it cited and regressed `width="100px"` table/cell
+/// attributes (previously mapped, then mapped to nothing); the
+/// number itself is what §2.3.4.4 requires of the grammar, and the
+/// trailing junk is simply not part of it. A trailing `%` makes a
+/// percentage, anything else a px length.
 fn html_dimension(value: &str) -> Option<String> {
     let s = value.trim_matches(|c| matches!(c, '\t' | '\n' | '\x0C' | '\r' | ' '));
     let b = s.as_bytes();
     let mut i = 0;
-    let int_start = i;
     while i < b.len() && b[i].is_ascii_digit() {
         i += 1;
     }
-    if i == int_start {
+    if i == 0 {
         return None;
     }
     if i < b.len() && b[i] == b'.' {
         i += 1;
-        let frac_start = i;
         while i < b.len() && b[i].is_ascii_digit() {
             i += 1;
         }
-        if i == frac_start {
-            return None;
-        }
     }
     let num_end = i;
-    let is_pct = if i < b.len() && b[i] == b'%' {
-        i += 1;
-        true
-    } else {
-        false
-    };
-    if i != b.len() {
-        return None;
-    }
+    let is_pct = i < b.len() && b[i] == b'%';
     let num: f32 = s[..num_end].parse().ok()?;
     if is_pct {
         Some(format!("{num}%"))
@@ -9364,24 +9354,36 @@ impl<'a> Styler<'a> {
             },
             // Unspecified, or invalid at computed-value time: inherit,
             // else leave unset (the document's initial value).
-            // WHATWG Quirks §3.11 (text decoration must not propagate
-            // into tables) as probed by WPT `table-quirks.html`: the
-            // test wraps a table in `font-style: italic` and asserts
-            // the cell computes `normal`. `text-decoration` itself is
-            // not an inherited property in this engine (and paint
-            // reads it from the text box's own style, never from an
-            // ancestor), so the §3.11 half is already satisfied; the
-            // observable half is the inherited `font-style`, which
-            // stops at the `<table>` boundary in full quirks mode
-            // only — the historical non-inheritance of font properties
-            // into tables. Limited-quirks documents propagate (the
-            // limited-quirks twin asserts `italic`), and an explicit
-            // `inherit`/`unset` keyword still climbs (handled in
+            // HTML rendering UA stylesheet §15.3.8 (tables in quirks
+            // mode) as probed by WPT `table-quirks.html`: in full
+            // quirks mode the table boundary resets `font-weight`,
+            // `font-style`, `font-variant`, `font-size`,
+            // `line-height`, `white-space`, and `text-align` to
+            // their initial values — the historical non-inheritance
+            // of font properties into tables — so the test's wrapper
+            // `font-style: italic` computes `normal` in the cell.
+            // This is NOT WHATWG Quirks §3.11 (that quirk is
+            // text-decoration only, and it is already satisfied
+            // separately: `text-decoration` is not an inherited
+            // property in this engine, and paint reads it from the
+            // text box's own style, never from an ancestor).
+            // Limited-quirks documents propagate (the limited-quirks
+            // twin asserts `italic`), and an explicit `inherit` /
+            // `unset` keyword still climbs (handled in
             // `apply_css_wide`, not here): this gate covers only the
             // unspecified-inheritance arm.
             None if is_inherited(prop) => {
                 if self.quirks_mode == QuirksMode::Quirks
-                    && prop == "font-style"
+                    && matches!(
+                        prop,
+                        "font-weight"
+                            | "font-style"
+                            | "font-variant"
+                            | "font-size"
+                            | "line-height"
+                            | "white-space"
+                            | "text-align"
+                    )
                     && matches!(
                         self.doc.kind(node),
                         NodeKind::Element(d) if d.tag_name == "table"
@@ -10700,11 +10702,10 @@ mod tests {
         let table = doc.create_element("table");
         doc.append_child(root, table);
         let colgroup = doc.create_element("colgroup");
-        // w77g: `100px` is not a dimension under the strict
-        // full-consumption grammar (`html_dimension`), so this
-        // mapping case uses the bare number, which maps to the same
-        // 100px hint as before.
-        doc.set_attribute(colgroup, "width", "100");
+        // Restored w77fix: `100px` is a dimension under the
+        // spec-lenient §2.3.4.4 prefix parser (`html_dimension`),
+        // mapping to the same 100px hint as the bare number.
+        doc.set_attribute(colgroup, "width", "100px");
         doc.append_child(table, colgroup);
         let col = doc.create_element("col");
         doc.set_attribute(col, "width", "50%");
@@ -10888,27 +10889,27 @@ mod tests {
     }
 
     #[test]
-    fn w77g_html_dimension_rejects_partial_and_junk_values() {
-        // WHATWG HTML §2.3.4.4 dimension grammar in its strict
-        // full-consumption form: ASCII digits, one optional fraction
-        // (`.` followed by digits), one optional `%` suffix, with
-        // ASCII whitespace trimmed from both ends — anything else
-        // maps to nothing. Fail-before: the lenient prefix parser
-        // mapped every rejected case below to a length (it stopped
-        // at the first non-digit/dot character and ignored the rest).
-        // `td` uses the nonzero mapping, so a rejected value leaves
-        // `width` at its `auto` initial.
-        for v in [
-            "100abc", "100 px", "10.5.2", "100px", ".5", "+100", "-100", "1e3", "100%%", "100.",
-            "", "abc", "10.5.2%",
-        ] {
-            let (mut doc, _table, td) = table_doc(&[]);
-            doc.set_attribute(td, "width", v);
-            let s = style(&doc, td, "", &vp());
-            assert_eq!(s.get("width"), Some(&kw("auto")), "{v:?} must not map");
-        }
-        // Valid forms still map through the same nonzero path.
+    fn w77fix_html_dimension_parses_spec_lenient_prefix() {
+        // WHATWG HTML §2.3.4.4 rules for parsing dimension values
+        // are prefix-lenient: the number is collected and anything
+        // after it (a unit suffix, junk, a second dot, an exponent
+        // marker, a second `%`) is ignored, so every case below
+        // maps to the parsed number. The w77g strict form rejected
+        // all of these and regressed `width="100px"` attributes.
+        // `td` uses the nonzero mapping, so a value that does not
+        // start with a digit still leaves `width` at `auto`.
         for (v, want) in [
+            ("100px", CssValue::Length(100.0, LengthUnit::Px)),
+            ("100abc", CssValue::Length(100.0, LengthUnit::Px)),
+            ("100 px", CssValue::Length(100.0, LengthUnit::Px)),
+            ("10.5.2", CssValue::Length(10.5, LengthUnit::Px)),
+            ("100.", CssValue::Length(100.0, LengthUnit::Px)),
+            ("1e3", CssValue::Length(1.0, LengthUnit::Px)),
+            ("100%%", CssValue::Percentage(100.0)),
+            // The `%` must immediately follow the number: after
+            // `10.5` comes `.`, so this is a px length, not a
+            // percentage, and the trailing `2%` is ignored.
+            ("10.5.2%", CssValue::Length(10.5, LengthUnit::Px)),
             ("100", CssValue::Length(100.0, LengthUnit::Px)),
             ("100%", CssValue::Percentage(100.0)),
             ("10.5", CssValue::Length(10.5, LengthUnit::Px)),
@@ -10922,8 +10923,14 @@ mod tests {
             let s = style(&doc, td, "", &vp());
             assert_eq!(s.get("width"), Some(&want), "{v:?} must map to {want:?}");
         }
-        // The plain mapping (`col`) rejects junk the same way and
-        // still maps valid forms, including zero (plain, not nonzero).
+        // No leading digit, a sign, or no digits at all: nothing.
+        for v in [".5", "+100", "-100", "", "abc", "px100"] {
+            let (mut doc, _table, td) = table_doc(&[]);
+            doc.set_attribute(td, "width", v);
+            let s = style(&doc, td, "", &vp());
+            assert_eq!(s.get("width"), Some(&kw("auto")), "{v:?} must not map");
+        }
+        // The plain mapping (`col`) is lenient the same way.
         let mut doc = Document::new();
         let root = doc.root();
         let table = doc.create_element("table");
@@ -10932,7 +10939,11 @@ mod tests {
         doc.set_attribute(col, "width", "100abc");
         doc.append_child(table, col);
         let s = style(&doc, col, "", &vp());
-        assert_eq!(s.get("width"), Some(&kw("auto")), "col 100abc must not map");
+        assert_eq!(
+            s.get("width"),
+            Some(&CssValue::Length(100.0, LengthUnit::Px)),
+            "col 100abc must map to 100px"
+        );
         let mut doc = Document::new();
         let root = doc.root();
         let table = doc.create_element("table");
@@ -11793,16 +11804,29 @@ mod tests {
 
     #[test]
     fn quirks_font_style_stops_at_table_boundary() {
-        // WHATWG Quirks §3.11 as probed by WPT `table-quirks.html`:
-        // a table wrapped in `font-style: italic` computes `normal`
-        // for its cells in full quirks mode only; limited-quirks and
-        // no-quirks documents propagate `italic` (the limited-quirks
-        // twin asserts `italic`). Other inherited properties are
-        // untouched: `color` still propagates into the table in all
-        // modes, and an explicit `font-style` on the table itself
-        // still wins in quirks mode.
-        let body =
-            "<div style=\"font-style:italic;color:red\"><table><tr><td>x</td></tr></table></div>";
+        // HTML rendering UA stylesheet §15.3.8 (tables in quirks
+        // mode) as probed by WPT `table-quirks.html`: all seven
+        // properties — `font-weight`, `font-style`, `font-variant`,
+        // `font-size`, `line-height`, `white-space`, `text-align` —
+        // reset to initial at the table boundary in full quirks
+        // mode only; limited-quirks and no-quirks documents
+        // propagate them. Other inherited properties are untouched:
+        // `color` still propagates into the table in all modes, and
+        // an explicit `font-style` on the table itself still wins in
+        // quirks mode. The quirks assertions compare against a bare
+        // `td` (no wrapper) so they pin the initial values whatever
+        // their representation; the standards assertions pin the
+        // propagated wrapper values directly.
+        let body = "<div style=\"font-weight:bold;font-style:italic;font-variant:small-caps;font-size:30px;line-height:40px;white-space:pre;text-align:right;color:red\"><table><tr><td>x</td></tr></table></div>";
+        let props = [
+            "font-weight",
+            "font-style",
+            "font-variant",
+            "font-size",
+            "line-height",
+            "white-space",
+            "text-align",
+        ];
         for (html, expected) in [
             (
                 format!(
@@ -11826,6 +11850,36 @@ mod tests {
             let s = compute_style(&doc, td, &[], &ua(), &vp());
             assert_eq!(s.get_str("font-style"), Some(expected));
             assert_eq!(s.get("color"), Some(&red()));
+            if expected == "normal" {
+                // Quirks: every one of the seven equals a bare td's.
+                let (bare, _) = Document::parse_html(
+                    b"<!DOCTYPE HTML PUBLIC \"-//W3C//DTD HTML 4.0 Transitional//EN\"><html><body><table><tr><td>x</td></tr></table></body></html>",
+                );
+                let bare_td = bare.query_selector("td").unwrap().expect("td");
+                let bare_s = compute_style(&bare, bare_td, &[], &ua(), &vp());
+                for prop in props {
+                    assert_eq!(
+                        s.get(prop),
+                        bare_s.get(prop),
+                        "quirks: {prop} must reset to initial"
+                    );
+                }
+            } else {
+                // Standards / limited-quirks: all seven propagate.
+                assert_eq!(s.get("font-weight"), Some(&kw("bold")));
+                assert_eq!(s.get("font-style"), Some(&kw("italic")));
+                assert_eq!(s.get("font-variant"), Some(&kw("small-caps")));
+                assert_eq!(
+                    s.get("font-size"),
+                    Some(&CssValue::Length(30.0, LengthUnit::Px))
+                );
+                assert_eq!(
+                    s.get("line-height"),
+                    Some(&CssValue::Length(40.0, LengthUnit::Px))
+                );
+                assert_eq!(s.get("white-space"), Some(&kw("pre")));
+                assert_eq!(s.get("text-align"), Some(&kw("right")));
+            }
         }
         // Explicit style on the table wins even in quirks mode.
         let (doc, _) = Document::parse_html(

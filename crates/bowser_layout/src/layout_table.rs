@@ -160,6 +160,7 @@ use crate::{
     position_of, resolve_font_size,
 };
 use bowser_css::{Color, CssValue, props};
+use bowser_dom::QuirksMode;
 
 /// One cell placed in the grid: its arena node plus grid coordinates.
 #[derive(Clone, Copy, Debug)]
@@ -3529,6 +3530,72 @@ pub(crate) fn auto_column_maxima(
 }
 
 #[allow(clippy::too_many_arguments)]
+/// WHATWG Quirks Mode Standard §3.9 (w77fix finding 8): in a
+/// full-quirks document, a `td`/`th` with a `nowrap` attribute whose
+/// computed `width` is a non-zero `<length>` acts as if its outer
+/// min-content width in the automatic table layout algorithm were
+/// `max(computed width, outer min-content width)`. Returns `None`
+/// when the quirk does not apply (not full quirks, no `nowrap`
+/// attribute, no nonzero length width, fixed layout, vertical
+/// table — the quirk is defined for the automatic layout
+/// algorithm's horizontal inline axis).
+///
+/// A bare floor on the §3.8.3 minimum is not enough: the WPT
+/// `table-quirks` case measures the full unwrapped line (580 =
+/// full line + padding, not max(50, 160)), so the cell's
+/// min-content for this computation is its nowrap measure — its
+/// max-content width, exactly what the missing presentational hint
+/// (`td[nowrap], th[nowrap] { white-space: nowrap }` from the
+/// HTML rendering UA stylesheet) would have produced. The floor
+/// is on the *outer* width: a border-box length floors it
+/// directly, a content-box length floors it after padding/border
+/// (`pad`).
+///
+/// LIMITATION: the layout-level route cannot distinguish an
+/// author `white-space: normal` rule (which should beat the hint)
+/// from the missing hint — both yield computed `Normal` — so the
+/// arm applies whenever the attribute is present. Percentages are
+/// not lengths: no quirk.
+fn quirks_nowrap_min_floor(
+    forest: &mut Forest,
+    node: usize,
+    fonts: &dyn FontMetrics,
+    mcw_scratch: &mut Vec<f32>,
+    int_bufs: &mut WalkBufs,
+    pad: f32,
+) -> Option<f32> {
+    if forest.quirks_mode != QuirksMode::Quirks || !forest.nodes[node].nowrap_attr {
+        return None;
+    }
+    let spec = table_col_spec(forest.nodes[node].data.width);
+    let SpecLen::Px(p) = spec else {
+        return None;
+    };
+    if p <= 0.0 {
+        return None;
+    }
+    let width_outer = match forest.nodes[node].data.box_sizing {
+        BoxSizing::BorderBox => p,
+        BoxSizing::ContentBox => p + pad,
+    };
+    // Fresh cache and inner buffers: `auto_column_minima` owns no
+    // `PrefWidthCache`, and sharing the caller's `int_bufs` as the
+    // inner buffers would corrupt the min-content walk's state.
+    let mut pw_cache = PrefWidthCache::new(forest.nodes.len());
+    let mut inner = WalkBufs::new();
+    let mcw = preferred_width_mcw(
+        forest,
+        node,
+        fonts,
+        &mut pw_cache,
+        mcw_scratch,
+        int_bufs,
+        &mut inner,
+    );
+    Some(width_outer.max(mcw + pad))
+}
+
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn auto_column_minima(
     forest: &mut Forest,
     grid: &TableGrid,
@@ -3618,7 +3685,23 @@ pub(crate) fn auto_column_minima(
         };
         let pad = cell.intrinsic_pad;
         let min_bb = cell_min_width_bb(forest, cell.node, table_w, grid.vertical);
-        let need_min = (mcw.max(specified) + pad).max(min_bb);
+        let mut need_min = (mcw.max(specified) + pad).max(min_bb);
+        // WHATWG Quirks §3.9 (see `quirks_nowrap_min_floor`): a
+        // nowrap cell's outer min-content is floored by its
+        // nowrap measure.
+        if !grid.fixed
+            && !grid.vertical
+            && let Some(floor) = quirks_nowrap_min_floor(
+                forest,
+                cell.node,
+                fonts,
+                &mut mcw_scratch,
+                &mut int_bufs,
+                pad,
+            )
+        {
+            need_min = need_min.max(floor);
+        }
         if need_min > col_min[cell.col] {
             col_min[cell.col] = need_min;
         }
@@ -3718,7 +3801,23 @@ pub(crate) fn auto_column_minima(
                 (specified, cell.intrinsic_pad, cell_pct)
             };
             let min_bb = cell_min_width_bb(forest, cell.node, table_w, grid.vertical);
-            let need_min = (mcw.max(specified) + pad).max(min_bb);
+            let mut need_min = (mcw.max(specified) + pad).max(min_bb);
+            // WHATWG Quirks §3.9 (see `quirks_nowrap_min_floor`):
+            // same floor as the single-column loop, distributed
+            // over the spanned columns below.
+            if !grid.fixed
+                && !grid.vertical
+                && let Some(floor) = quirks_nowrap_min_floor(
+                    forest,
+                    cell.node,
+                    fonts,
+                    &mut mcw_scratch,
+                    &mut int_bufs,
+                    pad,
+                )
+            {
+                need_min = need_min.max(floor);
+            }
             distribute_spanning_min(
                 forest,
                 grid,
@@ -4647,10 +4746,30 @@ pub(crate) struct TableResume {
     /// already in (inline, block) space from the measurement resume and
     /// must not be transposed twice.
     pub phase2_cells: Vec<usize>,
-    /// Deferred orthogonal captions (w77-d task 1): horizontal captions
-    /// in a vertical table with an auto block size, held out of the
-    /// first task push and of `captions_top`/`captions_bottom` until
-    /// the table's block size is finalized by placement; split by
+    /// Stacked block extent from `place_table_rows` (rows plus
+    /// non-deferred captions, in algorithm space): the deferred
+    /// caption phase's grid base. Unlike the finalized content
+    /// size, it excludes the specified-size floor, which
+    /// `place_deferred_captions` must not double-count (w77fix
+    /// finding 7). Set by `resume_table` before
+    /// [`push_deferred_caption_tasks`]; 0.0 until then.
+    pub stacked_block: f32,
+    /// Cursor after rows plus non-deferred captions but BEFORE
+    /// the float-containment max in `place_table_rows` (w77fix
+    /// finding 14): the rows' true block-end edge. The finalized
+    /// content size and `stacked_block` both carry any float
+    /// extension past the rows, but floats do not push normal
+    /// flow — bottom deferred captions sit after the rows, not
+    /// after the floats. Set alongside `stacked_block` before
+    /// [`push_deferred_caption_tasks`]; 0.0 until then (and
+    /// legitimately 0.0 for a rowless table whose cursor never
+    /// advanced before the floats).
+    pub pre_float_block: f32,
+    /// Deferred orthogonal captions (w77-d task 1, extended by
+    /// w77fix finding 7 to definite block sizes): horizontal
+    /// captions in a vertical table, held out of the first task
+    /// push and of `captions_top`/`captions_bottom` until the
+    /// table's block size is finalized by placement; split by
     /// `caption-side` like those lists. [`place_deferred_captions`]
     /// positions them (and extends the table) after they re-lay.
     pub deferred_top: Vec<usize>,
@@ -4779,81 +4898,24 @@ fn vertical_caption_inline_size(
     Some(v.max(0.0))
 }
 
-/// Definite-spec fast path for an orthogonal caption's containing-block
-/// width (wave 75, B2). A horizontal caption in a vertical table lays
-/// out with its inline axis physical-horizontal, i.e. along the table's
-/// block axis — so its [`Task::Block`] `cb_w` must be the table's block
-/// content width (physical horizontal), not the table's inline
-/// `content_w` (physical vertical in a vertical table). At caption
-/// task-push time the table's rect is not yet finalized (the block size
-/// is only settled in `resume_table` via `finish_content_height`), but
-/// when the block spec is definite the already-computed `hspec` — the
-/// table's specified block size via `table_block_spec` /
-/// [`specified_height`], already in content-box terms (a `border-box`
-/// spec has its horizontal border/padding stripped there) — is that
-/// width, so it can be reused directly.
-///
-/// Returns `None` when the fast path does not apply: a horizontal
-/// table, a caption that is not horizontal, or an `auto` block size
-/// (`hspec` is `None`). The caller then keeps the historical
-/// `content_w`.
-///
-/// Remaining general path, now implemented (w77-d task 1): an `auto`
-/// block size defers the caption (see
-/// [`is_deferred_orthogonal_caption`]) and re-lays it after
-/// `place_table_rows` finalizes the table's block size; this fast path
-/// only serves the definite case, and does not distribute auto block
-/// margins — those ride along with the deferred path.
-///
-/// Min/max, however, ARE applied here (w75f3, item 2): the returned
-/// width is `hspec` clamped by the table's block-axis min/max specs
-/// ([`super::clamp_height`], whose vertical-table arm reads the
-/// physical `min-width`/`max-width` against the table's `cb_w`, the
-/// same base `place_table_rows`' finalization uses), so the caption's
-/// `cb_w` matches the table's final block size whenever the specified
-/// size is the final size.
-///
-/// Exactness limit, stated plainly: the fast path is exact only when
-/// the specified block size is >= the table's natural block size.
-/// When content forces the table to grow past its specified size
-/// (`finish_content_height` raises `hspec` to the natural size), the
-/// caption still lays out against the (smaller) specified size and
-/// the general deferred path is what would re-lay it — not done here.
-fn orthogonal_caption_cb_w(
-    grid_vertical: bool,
-    caption_writing_mode: WritingMode,
-    hspec: Option<f32>,
-    forest: &Forest,
-    idx: usize,
-    cb_w: f32,
-) -> Option<f32> {
-    if !grid_vertical {
-        return None;
-    }
-    if !matches!(caption_writing_mode, WritingMode::HorizontalTb) {
-        return None;
-    }
-    hspec.map(|h| super::clamp_height(forest, idx, Some(cb_w), h))
-}
-
 /// Whether a caption is held out of the first task push for the
-/// deferred orthogonal-caption path (w77-d task 1): a horizontal
-/// caption in a vertical table whose block size is `auto` (`hspec` is
-/// `None`). Its containing-block width is the table's finalized block
-/// size, which does not exist until `place_table_rows` /
-/// `finish_content_height` run, so it lays out after placement (see
-/// [`push_deferred_caption_tasks`] / [`place_deferred_captions`]).
-/// Definite-spec captions keep the fast path above and are never
-/// deferred; same-writing-mode captions keep the historical
-/// inline-`content_w` base and are never deferred.
-fn is_deferred_orthogonal_caption(
-    forest: &Forest,
-    cap: usize,
-    grid_vertical: bool,
-    hspec: Option<f32>,
-) -> bool {
+/// deferred orthogonal-caption path (w77-d task 1, extended by
+/// w77fix finding 7 to definite block sizes): a horizontal caption
+/// in a vertical table. Its containing-block width is the table's
+/// finalized block size, which does not exist until
+/// `place_table_rows` / `finish_content_height` run, so it lays
+/// out after placement (see [`push_deferred_caption_tasks`] /
+/// [`place_deferred_captions`]). Definite-spec captions used to
+/// keep a fast path against the specified size, but that base is
+/// wrong when the rows grow past it: the caption's base is
+/// max(specified, grid), and the grid is only known after
+/// placement — so definite captions defer too, with their base
+/// floored by the clamped specified size (see
+/// [`push_deferred_caption_tasks`]). Same-writing-mode captions
+/// keep the historical inline-`content_w` base and are never
+/// deferred.
+fn is_deferred_orthogonal_caption(forest: &Forest, cap: usize, grid_vertical: bool) -> bool {
     grid_vertical
-        && hspec.is_none()
         && matches!(
             forest.nodes[cap].data.writing_mode,
             WritingMode::HorizontalTb
@@ -5904,7 +5966,7 @@ pub(crate) fn layout_table(
         } else {
             top_all.push(cap);
         }
-        if is_deferred_orthogonal_caption(forest, cap, grid.vertical, hspec) {
+        if is_deferred_orthogonal_caption(forest, cap, grid.vertical) {
             if bottom {
                 deferred_bottom.push(cap);
             } else {
@@ -5967,6 +6029,8 @@ pub(crate) fn layout_table(
         phase_bshift: Vec::new(),
         phase_group_target: Vec::new(),
         phase2_cells: Vec::new(),
+        stacked_block: 0.0,
+        pre_float_block: 0.0,
     })));
 
     // Re-resolve each cell's padding/border against the finalized table
@@ -6075,7 +6139,7 @@ pub(crate) fn layout_table(
     // orthogonal captions (w77-d task 1) are held out here entirely:
     // they re-lay after placement against the finalized block size.
     for &cap in grid.captions.iter().rev() {
-        if is_deferred_orthogonal_caption(forest, cap, grid.vertical, hspec) {
+        if is_deferred_orthogonal_caption(forest, cap, grid.vertical) {
             continue;
         }
         let child_floats = if establishes_bfc(forest, cap) {
@@ -6089,26 +6153,45 @@ pub(crate) fn layout_table(
         // the vertical intrinsic size instead of the horizontal line
         // stack (WPT `caption.html` table 13).
         let vwm_inline = vertical_caption_inline_size(forest, cap, fonts, pw_cache, grid.vertical);
-        // B2 definite-spec fast path: a horizontal caption in a
-        // vertical table lays out against the table's block content
-        // width (see `orthogonal_caption_cb_w`); otherwise it keeps
-        // the table's inline `content_w` as before.
-        let fast_path = orthogonal_caption_cb_w(
-            grid.vertical,
-            forest.nodes[cap].data.writing_mode,
-            hspec,
-            forest,
-            idx,
-            input.cb_w,
-        );
-        let caption_cb_w = fast_path.unwrap_or(content_w);
+        // Orthogonal (horizontal) captions in a vertical table never
+        // reach this loop: they are all deferred (see
+        // `is_deferred_orthogonal_caption`) and lay out in
+        // `push_deferred_caption_tasks` against the finalized block
+        // size. Only same-mode captions take a definite base here.
+        // w77fix finding 2, same-mode definite base: a vertical
+        // caption in a vertical table lays out against the definite
+        // block content width (clamped by the table's block-axis
+        // min/max specs, exactly as the orthogonal deferred base
+        // clamps), so its fill-minus-margins border box is
+        // definite-block-minus-margins. Without it the caption
+        // filled the table's inline `content_w` instead, and the
+        // override below (an auto-regime fix) then handed it that
+        // inline width outright.
+        let same_mode_fast_path = if grid.vertical
+            && hspec.is_some()
+            && matches!(
+                forest.nodes[cap].data.writing_mode,
+                WritingMode::VerticalLr | WritingMode::VerticalRl
+            ) {
+            hspec.map(|h| super::clamp_height(forest, idx, Some(input.cb_w), h))
+        } else {
+            None
+        };
+        let caption_cb_w = same_mode_fast_path.unwrap_or(content_w);
         // w77-d task 2: in a vertical table the caption's block-axis
         // extent must not shrink under its physical-horizontal margins
         // (those margins are added again by `place_table_rows`) — but
         // only in the auto regime; a definite-spec fast-path caption
         // keeps its margin box constrained to the specified block size
-        // (see `caption_block_axis_width_override`).
-        let caption_width_override = if grid.vertical && fast_path.is_none() {
+        // (see `caption_block_axis_width_override`). w77fix: the
+        // same gate applies to same-mode captions (orthogonal
+        // captions never reach this loop — they are deferred):
+        // without the `hspec.is_none()` check the override fired
+        // for definite same-mode captions too, handing them the
+        // table's inline content width instead of
+        // definite-block-minus-margins and growing the table past
+        // its definite block size.
+        let caption_width_override = if grid.vertical && hspec.is_none() {
             caption_block_axis_width_override(forest, cap, caption_cb_w)
         } else {
             None
@@ -6757,13 +6840,16 @@ pub(crate) fn resume_table(forest: &mut Forest, tasks: &mut Vec<Task>, fr: Table
         // moved. Recompute the shifts from the current baselines;
         // rows without a re-laid cell recompute to the same values.
         let bshift = recompute_baseline_shifts(forest, &fr);
-        place_table_rows(
+        let (stacked, pre_float) = place_table_rows(
             forest,
             &fr,
             &fr.phase_row_h,
             &bshift,
             &fr.phase_group_target,
         );
+        let mut fr = fr;
+        fr.stacked_block = stacked;
+        fr.pre_float_block = pre_float;
         push_deferred_caption_tasks(forest, tasks, fr);
         return;
     }
@@ -7104,12 +7190,31 @@ pub(crate) fn resume_table(forest: &mut Forest, tasks: &mut Vec<Task>, fr: Table
     // second-pass gate below.
     let row_h_before_table_excess = row_h.clone();
     if let Some(hspec) = fr.hspec {
-        let caps: f32 = fr
+        let mut caps: f32 = fr
             .captions_top
             .iter()
             .chain(fr.captions_bottom.iter())
             .map(|c| forest.nodes[*c].rect.h)
             .sum();
+        // w77fix finding 7: deferred captions are absent from
+        // `captions_top`/`captions_bottom`, but definite ones
+        // still occupy their specified base in the stacked total
+        // — without this reserve the specified excess
+        // distributes to the rows, and the deferred caption then
+        // stacks on top of the stretched rows, double-counting
+        // the specified size (300 spec + 100 rows laid out as
+        // 300 rows + 300 caption = 600, not 400). The reserve is
+        // the clamped specified size per deferred caption: a
+        // lower bound on its eventual extent (its base is
+        // max(specified, stacked)), and it always suffices to
+        // zero the excess, since the reserve alone meets the
+        // specified size. Auto tables never reach this block
+        // (`hspec` is `None`), so auto deferred captions are
+        // unaffected.
+        let ndef = (fr.deferred_top.len() + fr.deferred_bottom.len()) as f32;
+        if ndef > 0.0 {
+            caps += ndef * super::clamp_height(forest, fr.idx, Some(fr.cb_w), hspec);
+        }
         let bare: Vec<usize> = (0..fr.nrows)
             .filter(|&r| fr.row_group.get(r).copied().flatten().is_none() && vis_row(r))
             .collect();
@@ -7354,7 +7459,10 @@ pub(crate) fn resume_table(forest: &mut Forest, tasks: &mut Vec<Task>, fr: Table
         .map(|(i, _)| i)
         .collect();
     if pass2.is_empty() {
-        place_table_rows(forest, &fr, &row_h, &bshift, &group_target);
+        let (stacked, pre_float) = place_table_rows(forest, &fr, &row_h, &bshift, &group_target);
+        let mut fr = fr;
+        fr.stacked_block = stacked;
+        fr.pre_float_block = pre_float;
         push_deferred_caption_tasks(forest, tasks, fr);
         return;
     }
@@ -7708,6 +7816,24 @@ fn push_deferred_caption_tasks(forest: &mut Forest, tasks: &mut Vec<Task>, fr: T
         .chain(fr.deferred_bottom.iter())
         .copied()
         .collect();
+    // w77fix finding 7: definite-spec captions defer too, so
+    // their base is max(clamped specified size, stacked grid
+    // extent) — the specified size when the grid is smaller
+    // (the old fast path's base, exactly), the grid when it
+    // grows past it. The stacked extent (`fr.stacked_block`:
+    // rows plus non-deferred captions) is the right comparator,
+    // not the finalized content size, which already carries the
+    // specified floor and would double-count it. The auto-regime
+    // width override does NOT apply to them: it would hand the
+    // caption the base outright, breaking the definite
+    // margin-box constraint (300 base + 40 margins = 260 border
+    // box, pinned by the w75/w76 tests); without it the caption
+    // fills the base minus its margins, as the fast path did.
+    let definite = fr.hspec.is_some();
+    let deferred_cb_w = match fr.hspec {
+        Some(spec) => super::clamp_height(forest, idx, Some(fr.cb_w), spec).max(fr.stacked_block),
+        None => block_content,
+    };
     let (content_x, content_top, cb_h) = (fr.content_x, fr.content_top, fr.cb_h);
     let mut final_fr = fr;
     final_fr.phase_caption = true;
@@ -7718,12 +7844,17 @@ fn push_deferred_caption_tasks(forest: &mut Forest, tasks: &mut Vec<Task>, fr: T
         // Auto-regime width override (w77-d task 2): the caption's
         // block-axis extent must not shrink under its horizontal
         // margins; here the fill base is the finalized block size.
-        let width_override = caption_block_axis_width_override(forest, cap, block_content);
+        // Definite captions skip it (see above).
+        let width_override = if definite {
+            None
+        } else {
+            caption_block_axis_width_override(forest, cap, deferred_cb_w)
+        };
         tasks.push(Task::Block(BlockInput {
             abs_pct_height_base: None,
             idx: cap,
             cb_x: content_x,
-            cb_w: block_content,
+            cb_w: deferred_cb_w,
             cb_h,
             shrink: false,
             width_override,
@@ -7753,9 +7884,10 @@ fn push_deferred_caption_tasks(forest: &mut Forest, tasks: &mut Vec<Task>, fr: T
 /// `top_all`/`bottom_all`), with non-deferred captions re-placed to
 /// their merged positions; the already placed rows/cells/floats shift
 /// toward the block-end by the top deferred captions' extent only.
-/// The table's border box extends toward the block-end by the total
-/// deferred extent (its block-start edge is anchored), and its block
-/// content size grows by the same amount.
+/// The table's border box extends rightward by the extension (its
+/// left edge is parent-anchored in both directions; for vertical-rl
+/// the block-start edge is the post-extension right content edge),
+/// and its block content size grows by the same amount.
 ///
 /// Inline positions come from the caption's block margins along the
 /// table's inline axis (physical vertical): the same distribution
@@ -7764,13 +7896,19 @@ fn push_deferred_caption_tasks(forest: &mut Forest, tasks: &mut Vec<Task>, fr: T
 /// auto block margin re-center when re-wrapping changed the height
 /// (task 1b).
 ///
-/// Approximation, stated plainly: the rows' block-end edge is derived
-/// as the finalized block content size minus the non-deferred bottom
-/// captions' extents. If a float extended the table's block size past
-/// the bottom captions, that extension is attributed to the rows, so
-/// bottom deferred captions sit that far too far toward the block-end.
-/// Floats plus deferred captions in one auto-block vertical table is
-/// the only affected combination.
+/// w77fix finding 14: the rows' block-end edge excludes float
+/// extension. `place_table_rows` maxes its cursor with float
+/// bottoms (the table's BFC contains its floats), so the
+/// finalized block content size and `stacked_block` both carry
+/// any float extension past the rows — but floats do not push
+/// normal flow, so bottom deferred captions sit after the rows
+/// (`pre_float_block`), not after the floats: the anchor
+/// subtracts the float excess (`stacked_block` minus
+/// `pre_float_block`), and the extension covers only the part
+/// of the deferred extents the float-extended size does not
+/// already contain (plus the top shift, which moves the floats
+/// themselves). With no floats the excess is zero and both
+/// formulas reduce to the historical ones.
 fn place_deferred_captions(forest: &mut Forest, fr: &TableResume) {
     let idx = fr.idx;
     let table_wm = forest.nodes[idx].data.writing_mode;
@@ -7782,6 +7920,20 @@ fn place_deferred_captions(forest: &mut Forest, fr: &TableResume) {
     // the content origin; for vertical-rl it is the right content
     // edge, mirroring `place_table_rows`' cursor anchor (right border
     // + padding + scrollbar-gutter reservation).
+    //
+    // w77fix finding 7: the table's position in its parent is
+    // anchored at its left edge (the parent's writing mode
+    // governs the table box's own position, not the table's
+    // internal direction), so the table's `x` never moves here:
+    // the border box extends rightward by the extension and the
+    // block-start edge for vertical-rl is the POST-extension
+    // right content edge. The old code anchored the rl edge at
+    // its pre-extension value and shifted `x` left by the
+    // extension, translating the whole table left by the rows'
+    // extent whenever a definite caption deferred (w76 rl
+    // anchor test: table at -38.4 instead of 0). The deferred
+    // extents and the extension are computable up front (the
+    // captions already laid out), so the edge uses them.
     let (old_x, old_w) = {
         let n = &forest.nodes[idx];
         (n.rect.x, n.rect.w)
@@ -7799,14 +7951,38 @@ fn place_deferred_captions(forest: &mut Forest, fr: &TableResume) {
     } else {
         0.0
     };
-    let block_start_edge = if rl {
-        old_x + old_w - br - pr - gr
-    } else {
-        fr.content_x
-    };
     // State A (swapped back by `push_deferred_caption_tasks`):
     // `content_h` is the finalized block content size.
     let block_content_first = forest.nodes[idx].content_h;
+    let deferred_extent_of = |forest: &Forest, caps: &[usize]| -> f32 {
+        caps.iter()
+            .map(|&cap| {
+                let (mbs, mbe, w) = caption_block_extent(forest, cap, rl);
+                mbs + w + mbe
+            })
+            .sum()
+    };
+    let e_top_pre = deferred_extent_of(forest, &fr.deferred_top);
+    let e_bottom_pre = deferred_extent_of(forest, &fr.deferred_bottom);
+    let e_total_pre = e_top_pre + e_bottom_pre;
+    // Float excess over the rows' true block-end edge (w77fix
+    // finding 14): zero when no float extends past the rows.
+    let float_excess = (fr.stacked_block - fr.pre_float_block).max(0.0);
+    // Extension, as applied below (definite tables: only the part
+    // the specified floor does not already cover — see below;
+    // auto tables: only the part the float-extended size does
+    // not already cover, but at least the top shift, which moves
+    // the floats themselves toward the block-end).
+    let extension_pre = if fr.hspec.is_some() {
+        (fr.stacked_block + e_total_pre - block_content_first).max(0.0)
+    } else {
+        e_top_pre.max(e_total_pre - float_excess)
+    };
+    let block_start_edge = if rl {
+        old_x + old_w + extension_pre - br - pr - gr
+    } else {
+        fr.content_x
+    };
     let bottom_nondeferred: f32 = fr
         .captions_bottom
         .iter()
@@ -7815,7 +7991,25 @@ fn place_deferred_captions(forest: &mut Forest, fr: &TableResume) {
             mbs + w + mbe
         })
         .sum();
-    let rows_end_offset = block_content_first - bottom_nondeferred;
+    // w77fix finding 7: for definite tables the finalized content
+    // size already carries the specified floor, which is NOT part
+    // of the stacked rows — bottom captions stack after the
+    // stacked extent (rows plus non-deferred captions), and the
+    // table extends only by the part of the deferred extents the
+    // floor does not already cover. Auto tables keep the
+    // historical math (there the finalized size IS the stacked
+    // extent, modulo min/max clamping).
+    let rows_end_offset = if fr.hspec.is_some() {
+        fr.stacked_block - bottom_nondeferred
+    } else {
+        // w77fix finding 14: the finalized size carries float
+        // extension; subtract it so bottom captions anchor after
+        // the rows, not after the floats. A min-height clamp
+        // still belongs to the rows (it grows them, §17.5.3
+        // excess distribution), so it stays in the anchor via
+        // `block_content_first`; only the float part is removed.
+        block_content_first - bottom_nondeferred - float_excess
+    };
     // Stack the merged DOM-order lists: every caption on a side is
     // (re-)placed by record_shift — deferred captions for the first
     // time, non-deferred ones overwritten to their merged position
@@ -7837,16 +8031,34 @@ fn place_deferred_captions(forest: &mut Forest, fr: &TableResume) {
                 } else {
                     block_start_edge + border_offset
                 };
-                let inline = orthogonal_caption_inline_shift_for_extent(
-                    forest,
-                    cap,
-                    table_wm,
-                    fr.content_w,
-                    forest.nodes[cap].rect.h,
-                );
+                // Same-mode captions (w77fix finding 9): their
+                // inline position is fixed by first placement
+                // (`orthogonal_caption_inline_shift` returns 0.0
+                // for them, so their inline shift is zero and
+                // their provisional position IS the placed one) —
+                // re-placement here moves them only along the
+                // block axis (merged order), so preserve the
+                // provisional inline position (zero shift) instead
+                // of forcing `content_top`, which would discard
+                // any inline-start offset first placement gave
+                // them.
                 let (prov_x, prov_y) = {
                     let n = &forest.nodes[cap];
                     (n.rect.x, n.rect.y)
+                };
+                let inline = if matches!(
+                    forest.nodes[cap].data.writing_mode,
+                    WritingMode::HorizontalTb
+                ) {
+                    orthogonal_caption_inline_shift_for_extent(
+                        forest,
+                        cap,
+                        table_wm,
+                        fr.content_w,
+                        forest.nodes[cap].rect.h,
+                    )
+                } else {
+                    prov_y - fr.content_top
                 };
                 record_shift(
                     forest,
@@ -7872,8 +8084,13 @@ fn place_deferred_captions(forest: &mut Forest, fr: &TableResume) {
     // the top deferred captions' extent: pending-shift nodes
     // accumulate, direct rects (rows, groups, columns) move outright.
     // Captions are not shifted here — they were (re-)placed above.
-    if e_top != 0.0 {
-        let dx = if rl { -e_top } else { e_top };
+    // For vertical-rl the table's left edge is parent-anchored (see
+    // above), so the shift is the top deferred extent minus the
+    // rightward growth: rows were placed against the pre-extension
+    // right edge and must land after the top captions against the
+    // post-extension one.
+    if e_top != 0.0 || (rl && extension_pre != 0.0) {
+        let dx = if rl { extension_pre - e_top } else { e_top };
         for cell in fr.cells.iter() {
             if cell_laid_out(&fr.collapsed_rows, &fr.collapsed_cols, cell) {
                 add_shift(forest, cell.node, dx, 0.0);
@@ -7895,16 +8112,28 @@ fn place_deferred_captions(forest: &mut Forest, fr: &TableResume) {
         }
     }
     // Extend the table toward the block-end and swap the metrics back
-    // to physical state (block content in `metrics.content_w`).
+    // to physical state (block content in `metrics.content_w`). For
+    // definite tables the extension is only the uncovered part (see
+    // above): the floor already reserves up to the specified size.
+    // The table's `x` never moves (see above): the border box grows
+    // rightward in both directions.
     let e_total = e_top + e_bottom;
+    let extension = extension_pre;
     {
         let n = &mut forest.nodes[idx];
-        n.rect.w += e_total;
-        if rl {
-            n.rect.x -= e_total;
+        n.rect.w += extension;
+        n.content_h += extension;
+        // The natural total is the stacked extent plus all deferred
+        // extents; for definite tables the floor-covered part must
+        // not inflate it a second time (see above). For auto
+        // tables the extension already excludes the
+        // float-covered part (w77fix finding 14), so it applies
+        // to the natural total as well.
+        if fr.hspec.is_some() {
+            n.natural_content_h = fr.stacked_block + e_total;
+        } else {
+            n.natural_content_h += extension;
         }
-        n.content_h += e_total;
-        n.natural_content_h += e_total;
         std::mem::swap(&mut n.content_h, &mut n.metrics.content_w);
     }
 }
@@ -7920,7 +8149,7 @@ fn place_table_rows(
     row_h: &[f32],
     bshift: &[f32],
     group_target: &[f32],
-) {
+) -> (f32, f32) {
     let idx = fr.idx;
     // Place rows top to bottom. Cells were laid out provisionally at the
     // content top; the deferred shift moves each cell subtree once (the
@@ -7981,11 +8210,11 @@ fn place_table_rows(
         // ordering problem (the caption is measured before the table's
         // inline size is known).
         //
-        // Orthogonal captions with an auto block size do not reach
-        // this loop with a wrong `cb_w`: they are deferred (w77-d
-        // task 1) and placed by `place_deferred_captions` after they
-        // re-lay against the finalized block size. A definite block
-        // spec still uses the fast path in `orthogonal_caption_cb_w`.
+        // Orthogonal captions do not reach this loop with a
+        // wrong `cb_w`: they are deferred (w77-d task 1, extended
+        // by w77fix finding 7 to definite block specs) and placed
+        // by `place_deferred_captions` after they re-lay against
+        // the finalized block size.
         let (mbs, mbe, h) = {
             let n = &forest.nodes[cap];
             match forest.nodes[idx].data.writing_mode {
@@ -8159,6 +8388,11 @@ fn place_table_rows(
     // DOM order inside the table's block formatting context without
     // advancing the flow cursor. A deferred shift moves each float
     // subtree from its provisional position at the content top.
+    // w77fix finding 14: capture the cursor here, before the
+    // float-containment max below — this is the rows' true
+    // block-end edge (rows plus non-deferred captions), which
+    // the deferred-caption phase needs unpolluted by floats.
+    let pre_float_h = (y - cursor_start).max(0.0);
     let mut table_floats = FloatCtx::new();
     // The reserved content width from the resume: re-deriving from the
     // node's metrics would give the unreserved width and let floats
@@ -8279,6 +8513,13 @@ fn place_table_rows(
     }
 
     let natural_h = (y - cursor_start).max(0.0);
+    // Return the stacked extent (rows plus non-deferred captions)
+    // plus the pre-float cursor (w77fix finding 14): the
+    // deferred-caption phase needs the pre-float edge as the
+    // rows' true block-end (floats extend the stacked extent
+    // above, but must not push bottom deferred captions), distinct
+    // from the specified-floored content size
+    // `finish_content_height` stamps below.
     // CSS 2.1 §17.5.3: a specified table height is a *minimum* — the
     // table grows past it when its rows (or row-group minimums) need
     // more room, instead of clamping the content down to it. In the
@@ -8356,6 +8597,7 @@ fn place_table_rows(
     let (phantom_w, phantom_h) = table_sized_by_phantom(forest, idx, fr.spacing_h, fr.spacing_v);
     forest.nodes[idx].phantom_w = phantom_w;
     forest.nodes[idx].phantom_h = phantom_h;
+    (natural_h, pre_float_h)
 }
 
 /// The percentage fraction of a `SpecLen`, if it carries a percentage
@@ -10244,6 +10486,10 @@ mod table_tests {
         (a - b).abs() < 0.01
     }
 
+    /// Mode split (see `standards_html` in `tests.rs`): this helper
+    /// does NOT inject a doctype, so doctype-less input parses as
+    /// full quirks mode. Pass an explicit doctype when the fixture's
+    /// mode matters.
     fn layout_table_html(html: &str, css: &str) -> crate::LayoutBox {
         let (doc, _) = bowser_dom::Document::parse_html(html.as_bytes());
         let ss = bowser_css::parse_stylesheet(&[TABLE_TEST_RESET_CSS, css].concat());
@@ -10253,6 +10499,11 @@ mod table_tests {
     /// Like [`layout_table_html`], but also returning the parsed document
     /// so geometry tests can build tag-name predicates for
     /// [`table_offset_parent`] / [`table_box_geometry`].
+    ///
+    /// Mode split (see `standards_html` in `tests.rs`): no doctype
+    /// is injected, so doctype-less input parses as full quirks
+    /// mode. Pass an explicit doctype when the fixture's mode
+    /// matters.
     fn layout_table_doc(html: &str, css: &str) -> (bowser_dom::Document, crate::LayoutBox) {
         let (doc, _) = bowser_dom::Document::parse_html(html.as_bytes());
         let ss = bowser_css::parse_stylesheet(&[TABLE_TEST_RESET_CSS, css].concat());
@@ -11930,8 +12181,23 @@ mod table_tests {
         // table sits on a text line; with the text baseline as the
         // table baseline it needs no shift, so its top meets the
         // line's top. Fail-before: the table sits one baseline lower.
+        // Standards-mode fixture (w77fix): `layout_table_html`
+        // injects no doctype, so a bare fixture parses as full
+        // quirks mode, where HTML rendering §15.3.8 resets
+        // `font-size` at the table boundary — the 10px on `.line`
+        // would NOT reach the cell, the cell's 16px line would
+        // baseline at 15.36 against the outer 9.6, and the outer
+        // text would legitimately shift down 5.76. That shift is
+        // correct quirks behavior (bisect: 3592883, the quirks
+        // font reset; not the dcdb290/81696e3 blockification,
+        // which is flex-gated and passes this test), not a
+        // baseline bug — so this baseline test runs in standards
+        // mode, where the 10px does inherit, per the helper's own
+        // "pass an explicit doctype when the mode matters" rule
+        // and the 06a104c `layout_html` precedent. Assertions
+        // unchanged.
         let l = layout_table_html(
-            "<div class=\"line\">x<table class=\"it\"><tr>\
+            "<!DOCTYPE html><div class=\"line\">x<table class=\"it\"><tr>\
              <td><div>yy</div></td></tr></table></div>",
             ".line { font-size: 10px; } \
              table.it { display: inline-table; } \
@@ -12499,6 +12765,10 @@ mod table_tests {
 
     /// Lay out a document with the given [`FontMetrics`] and return the
     /// public tree (800x600 viewport).
+    /// Mode split (see `standards_html` in `tests.rs`): no doctype
+    /// is injected, so doctype-less input parses as full quirks
+    /// mode. Pass an explicit doctype when the fixture's mode
+    /// matters.
     fn layout_table_html_with(
         html: &str,
         css: &str,
@@ -15030,6 +15300,450 @@ mod table_tests {
             css,
         );
         assert!(approx(cell_at(&limited, 0, 0).rect.w, 184.0));
+    }
+
+    #[test]
+    fn w77fix_quirks_cell_width_run_rules_floated_nested_nonimg() {
+        // WHATWG Quirks §3.8, w77fix corrections (fail-before
+        // probes; all in full quirks mode, table width 50px so
+        // the table grows to the column minimum — the existing
+        // §3.8 test's pattern — 8px border-spacing, 20px cell
+        // padding, 50px replaced widths):
+        // (a) a floated `img` breaks the run instead of joining
+        // it: float 50 + two in-flow 50s give min-content
+        // max(50, 100) + 40 = 140, not the joined 190.
+        // (b) an inline container is transparent: text inside a
+        // span still breaks the run, so `<span><img>hello<img>
+        // </span>` (50 + 30-word + 50 at 10px) contributes the
+        // largest single run inside the span (50), not the span's
+        // summed 130 — cell 90, not 170. And a run continues
+        // across a span boundary: `<img><span><img></span><img>`
+        // sums all three (190), since all three are consecutive
+        // `img`s in one formatting context.
+        // (c) only `img` joins a run: two `object`s (50 each)
+        // contribute max(50, 50) + 40 = 90, not the summed 140;
+        // an `img` followed by an `object` likewise gives 90.
+        // Controls: three in-flow `img`s still sum to 190, and
+        // two plain inline-blocks (never replaced) still give 90.
+        let css = "table { width: 50px; border-spacing: 8px; } td { padding: 20px; font-size: 10px; } img, object { width: 50px; height: 20px; } .ib { display: inline-block; width: 50px; height: 20px; }";
+        let quirks = |inner: &str| {
+            layout_table_html(
+                &format!(
+                    "<!DOCTYPE HTML PUBLIC \"-//W3C//DTD HTML 4.0 Transitional//EN\"><table><tr><td>{inner}</td></tr></table>"
+                ),
+                css,
+            )
+        };
+        let cell_w = |inner: &str| cell_at(&quirks(inner), 0, 0).rect.w;
+        // (a) floated img breaks the run.
+        assert!(
+            approx(cell_w("<img style=\"float:left\"><img><img>"), 140.0),
+            "floated img cell w {}, want 140 (max(50, 100) + 40)",
+            cell_w("<img style=\"float:left\"><img><img>")
+        );
+        // (b) nested span: largest single run, not the sum.
+        assert!(
+            approx(cell_w("<span><img>hello<img></span>"), 90.0),
+            "nested span cell w {}, want 90 (50 + 40)",
+            cell_w("<span><img>hello<img></span>")
+        );
+        // (b) run continues across a span boundary.
+        assert!(
+            approx(cell_w("<img><span><img></span><img>"), 190.0),
+            "cross-span run cell w {}, want 190 (150 + 40)",
+            cell_w("<img><span><img></span><img>")
+        );
+        // (c) non-img replaced elements break runs.
+        assert!(
+            approx(cell_w("<object></object><object></object>"), 90.0),
+            "object run cell w {}, want 90 (50 + 40)",
+            cell_w("<object></object><object></object>")
+        );
+        assert!(
+            approx(cell_w("<img><object></object>"), 90.0),
+            "img+object cell w {}, want 90 (50 + 40)",
+            cell_w("<img><object></object>")
+        );
+        // Controls (unchanged behavior).
+        assert!(
+            approx(cell_w("<img><img><img>"), 190.0),
+            "img run cell w {}, want 190",
+            cell_w("<img><img><img>")
+        );
+        assert!(
+            approx(
+                cell_w("<div class=\"ib\"></div><div class=\"ib\"></div>"),
+                90.0
+            ),
+            "inline-block cell w {}, want 90",
+            cell_w("<div class=\"ib\"></div><div class=\"ib\"></div>")
+        );
+    }
+
+    #[test]
+    fn w77fix_quirks_vertical_cell_width_sums_consecutive_imgs() {
+        // WHATWG Quirks §3.8, vertical twin (w77fix finding 5):
+        // in a vertical-writing-mode table in full quirks mode,
+        // consecutive `img`s in a cell sum along the vertical
+        // inline axis instead of maxing. Two 50px-tall imgs plus
+        // 20px top/bottom cell padding give a 140px inline
+        // minimum; the table's 50px specified inline size (its
+        // `height`) grows to it, exactly as the horizontal arm
+        // grows past a narrow specified width. Without the arm
+        // the cell measured max(50, 50) + 40 = 90. The
+        // standards-mode twin keeps the max fold (90). The imgs
+        // carry intrinsic 20x50 sizes (a missing `img` has a 0x0
+        // intrinsic, which the vertical atomic arm reads before
+        // any CSS height — so CSS sizing alone cannot drive
+        // this measurement).
+        let css = "table { writing-mode: vertical-lr; height: 50px; border-spacing: 0; } td { padding: 20px 0; } img { width: 20px; height: 50px; }";
+        let inner = "<img><img>";
+        let lay = |doctype: &str| {
+            let html = format!("{doctype}<table><tr><td>{inner}</td></tr></table>");
+            let (doc, _) = bowser_dom::Document::parse_html(html.as_bytes());
+            let ss = bowser_css::parse_stylesheet(&[TABLE_TEST_RESET_CSS, css].concat());
+            let imgs = doc.get_elements_by_tag_name("img");
+            let mut map = std::collections::HashMap::new();
+            for i in 0..imgs.len() {
+                if let Some(n) = imgs.item(i) {
+                    map.insert(n, crate::IntrinsicDims::from_size(20.0, 50.0));
+                }
+            }
+            crate::layout_with_intrinsics(
+                &doc,
+                &[&ss],
+                Size { w: 800.0, h: 600.0 },
+                &FixedFontMetrics,
+                &map,
+            )
+        };
+        let quirks = lay("<!DOCTYPE HTML PUBLIC \"-//W3C//DTD HTML 4.0 Transitional//EN\">");
+        let cell = cell_at(&quirks, 0, 0);
+        assert!(
+            approx(cell.rect.h, 140.0),
+            "quirks vertical cell h {}, want 140 (100 imgs + 40 padding)",
+            cell.rect.h
+        );
+        let standards = lay("<!DOCTYPE html>");
+        let cell = cell_at(&standards, 0, 0);
+        assert!(
+            approx(cell.rect.h, 90.0),
+            "standards vertical cell h {}, want 90 (max fold, no quirk)",
+            cell.rect.h
+        );
+    }
+
+    #[test]
+    fn w77fix_deferred_replacement_preserves_samemode_inline() {
+        // w77fix finding 9: re-placement in
+        // `place_deferred_captions` must preserve a same-mode
+        // caption's inline position instead of forcing it to the
+        // content top. Vertical-lr table with a 10px content top
+        // (7px border-top + 3px padding-top): the same-mode
+        // caption's inline position is y = 10, with or without a
+        // deferred orthogonal caption triggering the re-placement
+        // pass; its block position still follows merged order
+        // (first caption, so x = 0 at the block-start edge).
+        // Probed shapes (lr/rl, fixed/auto inline margins,
+        // asymmetric borders) all show the same-mode inline shift
+        // as zero with provisional y = content_top by
+        // construction, so the preserve is a no-op there — this
+        // test pins the invariant so a future inline distribution
+        // for same-mode captions cannot be silently clobbered.
+        let css = "table { writing-mode: vertical-lr; border-top: 7px solid black; padding-top: 3px; border-spacing: 0; } caption.v { writing-mode: vertical-lr; } caption.h { writing-mode: horizontal-tb; } td { width: 50px; height: 30px; padding: 0; }";
+        let same_y = |html: &str| {
+            let l = layout_table_html(html, css);
+            let table = &l.children[0].children[0];
+            let same = table
+                .children
+                .iter()
+                .filter(|c| c.box_type == crate::BoxType::Block)
+                .min_by(|a, b| a.rect.x.partial_cmp(&b.rect.x).unwrap())
+                .expect("same-mode caption");
+            (same.rect.x, same.rect.y)
+        };
+        let (x_with, y_with) = same_y(
+            "<table><caption class=\"v\">same</caption><caption class=\"h\">orth</caption><tr><td>x</td></tr></table>",
+        );
+        let (_x_without, y_without) =
+            same_y("<table><caption class=\"v\">same</caption><tr><td>x</td></tr></table>");
+        assert!(
+            approx(y_with, 10.0),
+            "same-mode y with deferred trigger {y_with}, want 10 (content top)"
+        );
+        assert!(
+            approx(y_with, y_without),
+            "same-mode y with deferred trigger {y_with} != without {y_without}"
+        );
+        assert!(
+            approx(x_with, 0.0),
+            "same-mode x {x_with}, want 0 (first in merged order)"
+        );
+    }
+
+    #[test]
+    fn w77fix_deferred_bottom_caption_ignores_float_extension() {
+        // w77fix finding 14: a float extending an auto-block
+        // vertical table past its rows must not push a bottom
+        // deferred caption toward the block-end. Div-table
+        // fixture (real <table> children would foster-parent
+        // the float out): vertical-lr table, horizontal bottom
+        // caption, one 100px row, one 300px float. Fail-before:
+        // the finalized block size (300, float-extended) anchored
+        // the caption at x 300 with table 600. Fixed: the
+        // caption anchors after the rows (x 100) and the table
+        // extends only by the uncovered part (400 = max(300,
+        // 100 + caption)). The caption's width stays the
+        // finalized-size fill base (300) — the auto-regime
+        // override hands it the base outright; only its
+        // placement (and the table total) change.
+        let l = layout_table_html(
+            r#"<div class="t"><div class="cap">caption</div><div class="f"></div><div class="r"><div class="c">x</div></div></div>"#,
+            ".t { display: table; writing-mode: vertical-lr; border-spacing: 0; } .cap { display: table-caption; caption-side: bottom; writing-mode: horizontal-tb; } .f { float: left; width: 300px; height: 20px; } .r { display: table-row; } .c { display: table-cell; width: 100px; height: 30px; padding: 0; }",
+        );
+        let t = &l.children[0].children[0];
+        assert!(approx(t.rect.w, 400.0), "table w {} != 400", t.rect.w);
+        let cap = t
+            .children
+            .iter()
+            .find(|c| c.box_type == crate::BoxType::Block && c.rect.h == 19.2)
+            .expect("caption");
+        assert!(approx(cap.rect.x, 100.0), "caption x {} != 100", cap.rect.x);
+        assert!(approx(cap.rect.w, 300.0), "caption w {} != 300", cap.rect.w);
+        let fl = t
+            .children
+            .iter()
+            .find(|c| c.box_type == crate::BoxType::Block && c.rect.h == 20.0)
+            .expect("float");
+        assert!(approx(fl.rect.x, 0.0), "float x {} != 0", fl.rect.x);
+        assert!(approx(fl.rect.w, 300.0), "float w {} != 300", fl.rect.w);
+        let row = t
+            .children
+            .iter()
+            .find(|c| c.box_type == crate::BoxType::TableRow)
+            .expect("row");
+        assert!(approx(row.rect.w, 100.0), "row w {} != 100", row.rect.w);
+    }
+
+    #[test]
+    fn w77fix_row_stray_group_lays_out_end_to_end() {
+        // w77fix finding 10: row-stray grouping (CSS Tables 3
+        // §2.2.1 rule 2.3) end to end, not just grid-only. A
+        // `colspan="2"` real cell, a stray `<span>`, and a real
+        // cell share one row: the stray sequence forms one
+        // anonymous cell (node-less) in the third column, and
+        // the spanning cell's width covers its two columns.
+        // FixedFontMetrics at 10px (6px/char): "real" = 24 over
+        // two columns, "stray" = 30, "after" = 30; the narrow
+        // 50px table grows to the column minima, 84 total.
+        // (Divs with table display bypass HTML foster parenting,
+        // which would move row strays out of a real `<tr>`.)
+        let l = layout_table_html(
+            "<div class=\"t\"><div class=\"r\"><div class=\"c\" colspan=\"2\">real</div><span>stray</span><div class=\"c\">after</div></div></div>",
+            ".t { display: table; width: 50px; border-spacing: 0; } .r { display: table-row; } .c { display: table-cell; font-size: 10px; padding: 0; } span { font-size: 10px; }",
+        );
+        let table = &l.children[0].children[0];
+        assert_eq!(table.box_type, crate::BoxType::Table);
+        assert!(
+            approx(table.rect.w, 84.0),
+            "table w {}, want 84 (24 + 30 + 30)",
+            table.rect.w
+        );
+        let row = &table.children[0];
+        assert_eq!(row.box_type, crate::BoxType::TableRow);
+        assert_eq!(row.children.len(), 3, "three cells in the row");
+        let (real, anon, after) = (&row.children[0], &row.children[1], &row.children[2]);
+        assert!(real.node.is_some(), "first cell is a real cell");
+        assert!(
+            approx(real.rect.w, 24.0),
+            "spanning cell w {}, want 24 (its two columns)",
+            real.rect.w
+        );
+        assert!(anon.node.is_none(), "second cell is anonymous");
+        assert!(
+            approx(anon.rect.x, 24.0) && approx(anon.rect.w, 30.0),
+            "anonymous cell at x {} w {}, want x 24 w 30 (\"stray\")",
+            anon.rect.x,
+            anon.rect.w
+        );
+        assert!(after.node.is_some(), "third cell is a real cell");
+        assert!(
+            approx(after.rect.x, 54.0) && approx(after.rect.w, 30.0),
+            "after cell at x {} w {}, want x 54 w 30",
+            after.rect.x,
+            after.rect.w
+        );
+    }
+
+    #[test]
+    fn w77fix_definite_orthogonal_caption_rebases_on_grown_grid() {
+        // w77fix finding 7: a definite-spec orthogonal caption
+        // must re-base on the finalized grid block size when the
+        // rows grow past the specified size. Table vertical-lr,
+        // `width: 300px` (block spec), `height: 200px` (inline);
+        // caption horizontal, no margins unless noted. The
+        // caption's base is max(specified, grid): the specified
+        // size when the grid is smaller, the grid when it grows
+        // past it — the deferred path's base, which the old
+        // definite fast path could not see (it laid out against
+        // the specified size before the rows were measured).
+        let lay = |row_w: f32, cap_css: &str| {
+            let css = format!(
+                "table {{ writing-mode: vertical-lr; width: 300px; height: 200px; border-spacing: 0; }} caption {{ writing-mode: horizontal-tb; {cap_css} }} td {{ width: {row_w}px; height: 30px; padding: 0; }}"
+            );
+            layout_table_html(
+                "<table><caption>caption</caption><tr><td>x</td></tr></table>",
+                &css,
+            )
+        };
+        let geom = |l: &crate::LayoutBox| {
+            let table = &l.children[0].children[0];
+            let cap = table
+                .children
+                .iter()
+                .find(|c| c.box_type == crate::BoxType::Block)
+                .expect("caption");
+            (table.rect.w, cap.rect.w, cap.rect.x)
+        };
+        // No growth: grid 100 < specified 300 — caption keeps
+        // the specified base, table stacks caption + rows.
+        let (tw, cw, cx) = geom(&lay(100.0, ""));
+        assert!(approx(tw, 400.0), "no-growth table w {tw}, want 400");
+        assert!(approx(cw, 300.0), "no-growth caption w {cw}, want 300");
+        assert!(approx(cx, 0.0), "no-growth caption x {cx}, want 0");
+        // Growth: grid 400 > specified 300 — caption re-bases
+        // on the grid, table stacks caption + rows.
+        let (tw, cw, _cx) = geom(&lay(400.0, ""));
+        assert!(approx(tw, 800.0), "grown table w {tw}, want 800");
+        assert!(approx(cw, 400.0), "grown caption w {cw}, want 400");
+        // Margins control: no growth, 40px of caption margins —
+        // the definite margin-box constraint survives deferral
+        // (border 260, not the 300 the auto-regime override
+        // would hand it).
+        let (tw, cw, cx) = geom(&lay(100.0, "margin-left: 20px; margin-right: 20px;"));
+        assert!(approx(tw, 400.0), "margins table w {tw}, want 400");
+        assert!(approx(cw, 260.0), "margins caption w {cw}, want 260");
+        assert!(approx(cx, 20.0), "margins caption x {cx}, want 20");
+        // Bottom side: the caption stacks after the rows, not
+        // after the specified floor — no-growth (rows 100) puts
+        // it at x 100 with table 400; grown (rows 400) puts it
+        // at x 400 with table 800.
+        let lay_side = |row_w: f32| {
+            let css = format!(
+                "table {{ writing-mode: vertical-lr; width: 300px; height: 200px; border-spacing: 0; }} caption {{ writing-mode: horizontal-tb; caption-side: bottom; }} td {{ width: {row_w}px; height: 30px; padding: 0; }}"
+            );
+            layout_table_html(
+                "<table><caption>caption</caption><tr><td>x</td></tr></table>",
+                &css,
+            )
+        };
+        let (tw, cw, cx) = geom(&lay_side(100.0));
+        assert!(approx(tw, 400.0), "bottom no-growth table w {tw}, want 400");
+        assert!(
+            approx(cw, 300.0),
+            "bottom no-growth caption w {cw}, want 300"
+        );
+        assert!(
+            approx(cx, 100.0),
+            "bottom no-growth caption x {cx}, want 100"
+        );
+        let (tw, cw, cx) = geom(&lay_side(400.0));
+        assert!(approx(tw, 800.0), "bottom grown table w {tw}, want 800");
+        assert!(approx(cw, 400.0), "bottom grown caption w {cw}, want 400");
+        assert!(approx(cx, 400.0), "bottom grown caption x {cx}, want 400");
+    }
+
+    #[test]
+    fn w77fix_quirks_nowrap_width_floors_min_content() {
+        // WHATWG Quirks §3.9 (w77fix finding 8): a `td` with a
+        // `nowrap` attribute and a nonzero length width measures
+        // its outer min-content as the max of that width and its
+        // nowrap (max-content) measure. FixedFontMetrics at
+        // 20px: 0.6em advances, so "nowrap nowrap nowrap
+        // nowrap" (27 chars) unwraps to 324px; with 20px cell
+        // padding the nowrap outer measure is 364. The wrapping
+        // min-content would be only the longest word (72) +
+        // padding = 112, and a bare width floor would give
+        // max(50, 112) = 112 — the WPT `table-quirks` case (580
+        // under Ahem) shows the full-line measure is what counts.
+        // The table's 50px specified width grows to the column
+        // minimum in every case, as in the §3.8 tests.
+        let css =
+            "table { width: 50px; border-spacing: 0; } td { padding: 20px; font-size: 20px; }";
+        let quirks_doctype = "<!DOCTYPE HTML PUBLIC \"-//W3C//DTD HTML 4.0 Transitional//EN\">";
+        let lay = |doctype: &str, inner: &str| {
+            layout_table_html(&format!("{doctype}<table><tr>{inner}</tr></table>"), css)
+        };
+        // Main case: nowrap + 50px width + multi-word text.
+        let l = lay(
+            quirks_doctype,
+            "<td nowrap style=\"width: 50px\">nowrap nowrap nowrap nowrap</td>",
+        );
+        let table = &l.children[0].children[0];
+        assert!(
+            approx(table.rect.w, 364.0),
+            "quirks nowrap table w {}, want 364 (full line 324 + 40 padding)",
+            table.rect.w
+        );
+        // Width floor case: nowrap + 200px content-box width +
+        // short text (nowrap measure 24 + 40 = 64) floors at the
+        // width's outer measure (200 + 40 padding = 240).
+        let l = lay(quirks_doctype, "<td nowrap style=\"width: 200px\">hi</td>");
+        let table = &l.children[0].children[0];
+        assert!(
+            approx(table.rect.w, 240.0),
+            "quirks nowrap floor table w {}, want 240",
+            table.rect.w
+        );
+        // Standards control: same fixture, no quirk — wrapping
+        // min-content (longest word 72 + 40 = 112).
+        let l = lay(
+            "<!DOCTYPE html>",
+            "<td nowrap style=\"width: 50px\">nowrap nowrap nowrap nowrap</td>",
+        );
+        let table = &l.children[0].children[0];
+        assert!(
+            approx(table.rect.w, 112.0),
+            "standards nowrap table w {}, want 112 (no quirk)",
+            table.rect.w
+        );
+        // Percentage width is not a length: no quirk.
+        let l = lay(
+            quirks_doctype,
+            "<td nowrap style=\"width: 50%\">nowrap nowrap nowrap nowrap</td>",
+        );
+        let table = &l.children[0].children[0];
+        assert!(
+            approx(table.rect.w, 112.0),
+            "quirks nowrap % width table w {}, want 112 (no quirk)",
+            table.rect.w
+        );
+        // Zero width is not nonzero: no quirk.
+        let l = lay(
+            quirks_doctype,
+            "<td nowrap style=\"width: 0\">nowrap nowrap nowrap nowrap</td>",
+        );
+        let table = &l.children[0].children[0];
+        assert!(
+            approx(table.rect.w, 112.0),
+            "quirks nowrap 0 width table w {}, want 112 (no quirk)",
+            table.rect.w
+        );
+        // Spanning arm: the nowrap floor distributes over the
+        // spanned columns (row 2 pins each column at 52; the
+        // spanning cell's 364 floor lifts the total to 364).
+        let l = layout_table_html(
+            &format!(
+                "{quirks_doctype}<table><tr><td colspan=\"2\" nowrap style=\"width: 50px\">nowrap nowrap nowrap nowrap</td></tr><tr><td>a</td><td>b</td></tr></table>"
+            ),
+            css,
+        );
+        let table = &l.children[0].children[0];
+        assert!(
+            approx(table.rect.w, 364.0),
+            "quirks nowrap spanning table w {}, want 364",
+            table.rect.w
+        );
     }
 
     #[test]
@@ -18427,6 +19141,10 @@ mod w65_b_spanmin_tests {
         (a - b).abs() < 0.01
     }
 
+    /// Mode split (see `standards_html` in `tests.rs`): no doctype
+    /// is injected, so doctype-less input parses as full quirks
+    /// mode. Pass an explicit doctype when the fixture's mode
+    /// matters.
     fn layout_html(html: &str, css: &str) -> LayoutBox {
         let (doc, _) = bowser_dom::Document::parse_html(html.as_bytes());
         let ss = bowser_css::parse_stylesheet(&[TABLE_TEST_RESET_CSS, css].concat());
@@ -18773,6 +19491,10 @@ mod w65_a_floor_tests {
         (a - b).abs() < 0.01
     }
 
+    /// Mode split (see `standards_html` in `tests.rs`): no doctype
+    /// is injected, so doctype-less input parses as full quirks
+    /// mode. Pass an explicit doctype when the fixture's mode
+    /// matters.
     fn layout_html(html: &str, css: &str) -> crate::LayoutBox {
         let (doc, _) = bowser_dom::Document::parse_html(html.as_bytes());
         let ss = bowser_css::parse_stylesheet(&[TABLE_TEST_RESET_CSS, css].concat());
@@ -18978,6 +19700,10 @@ mod w65_c_caption_tests {
         (a - b).abs() < 0.01
     }
 
+    /// Mode split (see `standards_html` in `tests.rs`): no doctype
+    /// is injected, so doctype-less input parses as full quirks
+    /// mode. Pass an explicit doctype when the fixture's mode
+    /// matters.
     fn layout_html(html: &str, css: &str) -> crate::LayoutBox {
         let (doc, _) = bowser_dom::Document::parse_html(html.as_bytes());
         let ss = bowser_css::parse_stylesheet(&[TABLE_TEST_RESET_CSS, css].concat());
@@ -19117,6 +19843,10 @@ mod w66_vwm_caption_tests {
         (a - b).abs() < 0.01
     }
 
+    /// Mode split (see `standards_html` in `tests.rs`): no doctype
+    /// is injected, so doctype-less input parses as full quirks
+    /// mode. Pass an explicit doctype when the fixture's mode
+    /// matters.
     fn layout_html(html: &str, css: &str) -> crate::LayoutBox {
         let (doc, _) = bowser_dom::Document::parse_html(html.as_bytes());
         let ss = bowser_css::parse_stylesheet(&[TABLE_TEST_RESET_CSS, css].concat());
@@ -19831,6 +20561,80 @@ mod w66_vwm_caption_tests {
             approx(caption.rect.y, 20.0),
             "pct-fixed caption y {}, want 20 (10% of 200 inline)",
             caption.rect.y
+        );
+    }
+
+    /// w77fix finding 2 (fail-before probe): a definite-spec
+    /// vertical table with a same-writing-mode caption and
+    /// horizontal margins must keep the caption's margin box
+    /// constrained to the definite block size — border box =
+    /// definite block minus margins (300 - 20 - 20 = 260), with
+    /// the block-start margin counted once (x = 20). Before the
+    /// fix the caption measured 200 (the table's inline content
+    /// width, via the auto-regime override) with the gate alone,
+    /// or 160 (inline minus margins) with the override gated but
+    /// no same-mode fast path; the fix adds the same-mode twin of
+    /// the definite fast path so the caption fills the definite
+    /// block width minus its margins. The no-row twin pins the
+    /// table total: caption margin box 300 = definite block size.
+    /// (With a row present the table legitimately grows past the
+    /// definite size — a specified table block size is a minimum,
+    //  CSS 2.1 §17.5.3 — so the row case pins caption geometry
+    /// only, not the table total.) The auto-table twin (no
+    /// definite block size) keeps the override: there the caption's
+    /// border box is the inline content width.
+    #[test]
+    fn w77fix_definite_same_mode_caption_margins_constrained() {
+        let l = layout_html(
+            "<table style=\"writing-mode:vertical-lr;width:300px;height:200px\">\
+             <caption style=\"height:50px;margin-left:20px;margin-right:20px\">caption</caption>\
+             <tbody><tr><td>cell</td></tr></tbody></table>",
+            "",
+        );
+        let table = table_box(&l);
+        let caption = caption_box(table);
+        assert!(
+            approx(caption.rect.w, 260.0),
+            "definite same-mode caption w {}, want 260 (300 - 20 - 20)",
+            caption.rect.w
+        );
+        assert!(
+            approx(caption.rect.x, 20.0),
+            "definite same-mode caption x {}, want 20 (block-start margin once)",
+            caption.rect.x
+        );
+        // No-row twin: table total is exactly the definite size.
+        let l = layout_html(
+            "<table style=\"writing-mode:vertical-lr;width:300px;height:200px\">\
+             <caption style=\"height:50px;margin-left:20px;margin-right:20px\">caption</caption></table>",
+            "",
+        );
+        let table = table_box(&l);
+        let caption = caption_box(table);
+        assert!(
+            approx(caption.rect.w, 260.0),
+            "no-row definite caption w {}, want 260",
+            caption.rect.w
+        );
+        assert!(
+            approx(table.rect.w, 300.0),
+            "no-row definite table w {}, want 300 (caption margin box = block size)",
+            table.rect.w
+        );
+        // Auto twin: no definite block size, so the override still
+        // applies and the caption fills the inline content width.
+        let l = layout_html(
+            "<table style=\"writing-mode:vertical-lr;height:200px\">\
+             <caption style=\"height:50px;margin-left:20px;margin-right:20px\">caption</caption>\
+             <tbody><tr><td>cell</td></tr></tbody></table>",
+            "",
+        );
+        let table = table_box(&l);
+        let caption = caption_box(table);
+        assert!(
+            approx(caption.rect.w, 200.0),
+            "auto same-mode caption w {}, want 200 (inline content width)",
+            caption.rect.w
         );
     }
 }

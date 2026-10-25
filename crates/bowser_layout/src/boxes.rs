@@ -417,6 +417,17 @@ pub(crate) struct Node {
     /// [`BoxType::Inline`] boxes — a `<br>` restyled to `display: block`
     /// lays out as an ordinary empty block.
     pub is_br: bool,
+    /// Whether this box came from an HTML `<img>` element. Stamped
+    /// at box construction while the tag name is in scope (same
+    /// reason as [`Node::is_br`]); read by the quirks §3.8
+    /// run-summing pass, which names `img` elements specifically —
+    /// other replaced elements must not join a run.
+    pub is_img: bool,
+    /// Whether this box came from a `td`/`th` element carrying a
+    /// `nowrap` attribute. Stamped at box construction while the
+    /// document is in scope (same reason as [`Node::is_br`]); read
+    /// by the quirks §3.9 minimum-width pass in table layout.
+    pub nowrap_attr: bool,
 }
 
 /// An `list-style-position: outside` marker attached to a list-item
@@ -486,6 +497,8 @@ impl Node {
             phantom_h: false,
             from_table_element: false,
             is_br: false,
+            is_img: false,
+            nowrap_attr: false,
         }
     }
 }
@@ -1980,6 +1993,17 @@ fn build_box_tree_rooted(
                 // `<br>` forces a line break in inline layout (see
                 // [`Node::is_br`]); stamped here for the same reason.
                 forest.nodes[idx].is_br = tag == "br";
+                // `<img>` identity for the quirks §3.8 run pass (see
+                // [`Node::is_img`]): only `img` elements join a run.
+                forest.nodes[idx].is_img = tag.eq_ignore_ascii_case("img");
+                // `nowrap` on `td`/`th` for the quirks §3.9 pass
+                // (see [`Node::nowrap_attr`]): presence of the
+                // attribute, whatever its value.
+                if box_type == BoxType::TableCell
+                    && (tag.eq_ignore_ascii_case("td") || tag.eq_ignore_ascii_case("th"))
+                {
+                    forest.nodes[idx].nowrap_attr = doc.get_attribute(item.dom, "nowrap").is_some();
+                }
                 // `display: list-item` generates a marker box alongside
                 // the principal (block) box (see `marker`).
                 {
@@ -2249,7 +2273,9 @@ fn build_box_tree_rooted(
             // (css-flexbox-1 §4) instead of being swept into the
             // anonymous wrapper below: the wrapper is style-less, so
             // the table's `flex-basis`/margins would never reach the
-            // item. The gate is the parent's raw `display` (the
+            // item. This is trigger one of two (see the joint note
+            // on `wrap_flex_text_runs` in `layout.rs` for trigger
+            // two and for why only inline-table promotes). The gate is the parent's raw `display` (the
             // bucketed `Display` collapses `flex` to `Block`, so the
             // raw keyword is what identifies a flex container here,
             // as in `layout::flex_kind`). Non-flex parents keep the

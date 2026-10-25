@@ -7945,7 +7945,17 @@ fn flex_basis_keyword_size(
     // value is already track-based) — only the definite-width
     // hole changes behavior. Ordinary layout is untouched:
     // `grid_pref_width` keeps its fast path.
-    if definite_specified_content_width(forest, idx).is_some()
+    // w77fix: a `width: min-content` grid needs the arm too.
+    // `definite_specified_content_width` returns `None` for
+    // `MinContent` (`SpecLen::resolve` never resolves it), so the
+    // gate above never fired for this shape — and the dispatched
+    // `grid_pref_width` MinContent fast path returns the min walk
+    // (120), not the track max (252) the max-content basis needs.
+    // The ignoring variant skips that fast path as well, so the
+    // gate is extended to the min-content-width case for
+    // max-content bases only.
+    if (definite_specified_content_width(forest, idx).is_some()
+        || matches!(forest.nodes[idx].data.width, SpecLen::MinContent))
         && matches!(spec, SpecLen::MaxContent)
         && (forest.nodes[idx].box_type == BoxType::Grid
             || forest.nodes[idx].data.display == Display::InlineGrid)
@@ -9855,7 +9865,7 @@ fn vertical_atomic_inline(
         return Some(vertical_child_margin_box(forest, idx, h));
     }
     if n.box_type == BoxType::InlineBlock {
-        let content = vertical_flow_content(forest, idx, fonts, mode, None, depth + 1)?;
+        let content = vertical_flow_content(forest, idx, fonts, mode, None, depth + 1, false)?;
         return Some(vertical_child_margin_box(forest, idx, content));
     }
     None
@@ -9882,6 +9892,7 @@ fn vertical_block_child(
     mode: VerticalIntrinsicMode,
     ancestor_h: Option<f32>,
     depth: u32,
+    quirks: bool,
 ) -> Option<f32> {
     if depth > VERTICAL_INTRINSIC_DEPTH_CAP {
         return None;
@@ -9909,7 +9920,7 @@ fn vertical_block_child(
             (p * base / 100.0).max(0.0),
         ));
     }
-    let content = vertical_flow_content(forest, idx, fonts, mode, None, depth + 1)?;
+    let content = vertical_flow_content(forest, idx, fonts, mode, None, depth + 1, quirks)?;
     Some(vertical_child_margin_box(forest, idx, content))
 }
 
@@ -9930,6 +9941,17 @@ fn vertical_block_child(
 ///
 /// `depth` is the [`VERTICAL_INTRINSIC_DEPTH_CAP`] counter (see
 /// [`vertical_inline_min`]).
+///
+/// `quirks` is the vertical twin of the horizontal §3.8 gate (see
+/// [`quirks_cell_inline_min_content`]): in full quirks mode, when
+/// the container being measured is a table cell (or the anonymous
+/// block wrapping its inline run), consecutive `img` children in
+/// Min mode have no soft wrap opportunity between them along the
+/// vertical inline axis, so they sum instead of maxing. It
+/// propagates only into anonymous-block children (the wrapper is
+/// part of the cell's own formatting context); real block children
+/// and nested inline-blocks are separate formatting contexts and
+/// always measure with `false`. Max mode is unaffected.
 fn vertical_flow_content(
     forest: &Forest,
     idx: usize,
@@ -9937,6 +9959,7 @@ fn vertical_flow_content(
     mode: VerticalIntrinsicMode,
     ancestor_h: Option<f32>,
     depth: u32,
+    quirks: bool,
 ) -> Option<f32> {
     if depth > VERTICAL_INTRINSIC_DEPTH_CAP {
         return None;
@@ -9945,6 +9968,9 @@ fn vertical_flow_content(
     let mut block_max = 0.0f32;
     // Min mode: largest unbreakable run over all inline children.
     let mut inline_min_acc = 0.0f32;
+    // Min mode with the quirks arm: the open run of consecutive
+    // `img` extents, closed (into `inline_min_acc`) by any breaker.
+    let mut inline_min_run = 0.0f32;
     // Max mode: largest inline run; the current run closes at each
     // block child.
     let mut inline_max = 0.0f32;
@@ -9964,6 +9990,10 @@ fn vertical_flow_content(
             }
             run = 0.0;
             run_has_inline = false;
+            // A block child ends any open quirks run: it is not
+            // part of the cell's inline run.
+            inline_min_acc = inline_min_acc.max(inline_min_run);
+            inline_min_run = 0.0;
             block_max = block_max.max(vertical_block_child(
                 forest,
                 c,
@@ -9971,13 +10001,25 @@ fn vertical_flow_content(
                 mode,
                 ancestor_h,
                 depth + 1,
+                quirks && forest.nodes[c].box_type == BoxType::AnonymousBlock,
             )?);
         } else {
             has_inline = true;
             match mode {
                 VerticalIntrinsicMode::Min => {
-                    inline_min_acc =
-                        inline_min_acc.max(vertical_inline_min(forest, c, fonts, depth + 1)?);
+                    if quirks {
+                        vertical_quirks_run_step(
+                            forest,
+                            c,
+                            fonts,
+                            depth + 1,
+                            &mut inline_min_acc,
+                            &mut inline_min_run,
+                        )?;
+                    } else {
+                        inline_min_acc =
+                            inline_min_acc.max(vertical_inline_min(forest, c, fonts, depth + 1)?);
+                    }
                 }
                 VerticalIntrinsicMode::Max => {
                     run_has_inline = true;
@@ -9991,7 +10033,7 @@ fn vertical_flow_content(
     let inline_total = match mode {
         VerticalIntrinsicMode::Min => {
             if has_inline {
-                inline_min_acc.max(strut)
+                inline_min_acc.max(inline_min_run).max(strut)
             } else {
                 0.0
             }
@@ -10006,10 +10048,61 @@ fn vertical_flow_content(
     Some(block_max.max(inline_total))
 }
 
+/// One inline child's step in the vertical quirks run walk (see
+/// [`vertical_flow_content`]): a floated child or any non-`img`
+/// child closes the open run and contributes its own vertical
+/// extent; an `img` extends the run; an `Inline` container (other
+/// than `<br>`) recurses transparently, sharing both accumulators —
+/// the horizontal [`quirks_run_walk`] with vertical measures.
+/// Returns `None` when a child has no vertical model, declining
+/// the whole cell exactly as the non-quirks path does.
+fn vertical_quirks_run_step(
+    forest: &Forest,
+    idx: usize,
+    fonts: &dyn FontMetrics,
+    depth: u32,
+    acc: &mut f32,
+    run: &mut f32,
+) -> Option<()> {
+    if depth > VERTICAL_INTRINSIC_DEPTH_CAP {
+        return None;
+    }
+    let n = &forest.nodes[idx];
+    if is_float(forest, idx) {
+        *acc = acc.max(*run);
+        *run = 0.0;
+        *acc = acc.max(vertical_inline_min(forest, idx, fonts, depth)?);
+    } else if n.box_type == BoxType::InlineBlock && n.is_img && n.intrinsic.is_some() {
+        *run += vertical_inline_min(forest, idx, fonts, depth)?;
+    } else if n.box_type == BoxType::Inline && !n.is_br {
+        for &c in &n.children {
+            if layout_position::is_out_of_flow(forest, c) {
+                continue;
+            }
+            if is_ignorable_whitespace(forest, c) {
+                continue;
+            }
+            vertical_quirks_run_step(forest, c, fonts, depth + 1, acc, run)?;
+        }
+    } else {
+        *acc = acc.max(*run);
+        *run = 0.0;
+        *acc = acc.max(vertical_inline_min(forest, idx, fonts, depth)?);
+    }
+    Some(())
+}
+
 /// Vertical min-content size of a table cell: the min-content measure
 /// along a vertical table's inline axis (the physical vertical axis).
 /// Used by the column machinery ([`layout_table::auto_column_minima`])
 /// when `TableGrid::vertical` is set.
+///
+/// In full quirks mode the §3.8 run-summing arm applies here too
+/// (see [`vertical_flow_content`]'s `quirks` parameter): consecutive
+/// `img` children of the cell sum along the vertical inline axis
+/// instead of maxing. The definite-height fast path above runs
+/// first, so a definite inline size still short-circuits before
+/// any run summing.
 ///
 /// The definite-height fast path ([`vertical_definite_content`]) runs
 /// first; otherwise [`vertical_flow_content`] measures the cell
@@ -10030,6 +10123,16 @@ pub(crate) fn vertical_cell_min_content(
     mcw_scratch: &mut Vec<f32>,
     int_bufs: &mut WalkBufs,
 ) -> f32 {
+    // §3.8 arm (see `vertical_flow_content`): the cell itself, or
+    // the anonymous block wrapping its inline run, in a full-quirks
+    // document. A definite inline size short-circuits above, so no
+    // separate spec check is needed here.
+    let quirks = forest.quirks_mode == QuirksMode::Quirks
+        && (forest.nodes[idx].box_type == BoxType::TableCell
+            || forest.nodes[idx].box_type == BoxType::AnonymousBlock
+                && forest.nodes[idx]
+                    .parent
+                    .is_some_and(|p| forest.nodes[p].box_type == BoxType::TableCell));
     match vertical_definite_content(forest, idx).or_else(|| {
         vertical_flow_content(
             forest,
@@ -10038,6 +10141,7 @@ pub(crate) fn vertical_cell_min_content(
             VerticalIntrinsicMode::Min,
             definite_content_box_height(forest, idx),
             0,
+            quirks,
         )
     }) {
         Some(v) => v,
@@ -10080,6 +10184,7 @@ pub(crate) fn vertical_cell_max_content(
             VerticalIntrinsicMode::Max,
             definite_content_box_height(forest, idx),
             0,
+            false,
         )
     }) {
         Some(v) => v,
@@ -11667,35 +11772,62 @@ fn min_content_width_pooled_raw(
 
 /// Min-content width of a table cell's inline formatting context in
 /// full quirks mode (WHATWG Quirks §3.8, the table cell width
-/// calculation quirk): consecutive inline-level replaced elements
-/// have no soft wrap opportunity before or after them, so a run of
-/// them contributes its summed width instead of the widest single
-/// element. Any other child breaks the run and contributes its own
-/// min-content, exactly as the normal max fold does. Applies to the
-/// cell node itself and to an anonymous block wrapping its inline
-/// run alike — both iterate the same direct children. Replaced boxes
-/// are the `InlineBlock` boxes carrying an intrinsic size (box
-/// construction stamps `intrinsic = Some` on every replaced element,
-/// even a missing `<img>`); a run only ever forms between such boxes,
-/// never across text or inline containers (an `Inline` container
-/// already sums its children in the `Inline` arm).
+/// calculation quirk): `img` elements that are inline-level replaced
+/// elements in that context have no soft wrap opportunity before or
+/// after them, so a run of them contributes its summed width
+/// instead of the widest single element. Applies to the cell node
+/// itself and to an anonymous block wrapping its inline run alike —
+/// both iterate the same direct children.
+///
+/// Three w77fix corrections to the original form:
+/// - A float interrupts inline flow, so a floated replaced element
+///   breaks the run (and contributes its own width, like any other
+///   breaker) instead of joining it — floated non-replaced children
+///   already broke runs, and the two cases must agree.
+/// - An `Inline` container is transparent to the run: its children
+///   are walked in place, sharing the run state, so a run continues
+///   across a span boundary (`<img><span><img></span><img>` sums
+///   all three — they are consecutive `img`s in one formatting
+///   context) while text inside the span still breaks it
+///   (`<span><img>hello<img></span>` contributes the largest
+///   single run inside the span, not the span's summed width).
+/// - Only `img` elements join a run (§3.8 names `img`, not
+///   replaced elements generally): any other replaced element
+///   (`object`, `video`, `input`, …) breaks the run and contributes
+///   its own width. `is_img` is stamped at box construction (see
+///   [`Node::is_img`]); the forest carries no tag names.
 fn quirks_cell_inline_min_content(forest: &Forest, idx: usize, out: &[f32]) -> f32 {
     let mut best = 0.0f32;
     let mut run = 0.0f32;
+    quirks_run_walk(forest, idx, out, &mut best, &mut run);
+    best.max(run)
+}
+
+/// One level of the §3.8 walk (see
+/// [`quirks_cell_inline_min_content`]): `best` is the widest
+/// closed run or breaker so far, `run` the open run. `Inline`
+/// containers (other than `<br>`, which breaks the run) recurse
+/// transparently, sharing both accumulators.
+fn quirks_run_walk(forest: &Forest, idx: usize, out: &[f32], best: &mut f32, run: &mut f32) {
     for &c in forest.nodes[idx].children.iter() {
         if layout_position::is_out_of_flow(forest, c) {
             continue;
         }
         let n = &forest.nodes[c];
-        if n.box_type == BoxType::InlineBlock && n.intrinsic.is_some() {
-            run += out[c] + intrinsic_h_extras(forest, c);
+        if is_float(forest, c) {
+            *best = best.max(*run);
+            *run = 0.0;
+            *best = best.max(out[c] + intrinsic_h_extras(forest, c));
+        } else if n.box_type == BoxType::InlineBlock && n.is_img && n.intrinsic.is_some() {
+            *run += out[c] + intrinsic_h_extras(forest, c);
+        } else if n.box_type == BoxType::Inline && !n.is_br {
+            quirks_run_walk(forest, c, out, best, run);
         } else {
-            best = best.max(run);
-            run = 0.0;
-            best = best.max(out[c] + intrinsic_h_extras(forest, c));
+            *best = best.max(*run);
+            *run = 0.0;
+            *best = best.max(out[c] + intrinsic_h_extras(forest, c));
         }
     }
-    best.max(run)
 }
 
 fn min_content_width_pooled_impl(
@@ -11893,10 +12025,13 @@ fn min_content_width_pooled_impl(
                 // direct children when no block-level sibling forces
                 // an anonymous wrapper) or the anonymous block
                 // wrapping the cell's inline run. Limited-quirks and
-                // no-quirks documents, cells with a definite width,
-                // and vertical-writing-mode cells (whose inline axis
-                // is physical vertical, measured by the vertical
-                // intrinsic passes instead) keep the normal max fold.
+                // no-quirks documents and cells with a definite width
+                // keep the normal max fold. Vertical-writing-mode
+                // cells measure through the vertical passes instead
+                // ([`vertical_cell_min_content`], which carries its
+                // own §3.8 run-summing arm) — the gate here is
+                // horizontal-only because the vertical axis is
+                // measured there, not because the quirk is absent.
                 let quirks_cell_run = forest.quirks_mode == QuirksMode::Quirks
                     && forest.nodes[i].data.writing_mode == WritingMode::HorizontalTb
                     && (forest.nodes[i].box_type == BoxType::TableCell
@@ -11991,6 +12126,30 @@ fn min_content_width_pooled_impl(
 /// Out-of-flow inline-tables are not flex items at all, so they are
 /// left as `InlineBlock` boxes for the absolute-positioning path.
 fn wrap_flex_text_runs(forest: &mut Forest, idx: usize) {
+    // Inline-table blockification, joint note (w77fix finding 12):
+    // this is the SECOND of two promotion triggers for
+    // `display: inline-table` flex items — the first is the
+    // `needs_wrap` branch in `boxes.rs` pass 3, which fires when
+    // the flex container has a block-level child. This one fires
+    // when it does not (a text run or a lone inline-table means
+    // not all children are block-level). Both promote the table
+    // to a direct `Table` item carrying its own style, so
+    // `flex-basis`/margins survive; the w77fix joint test pins
+    // both paths to identical item geometry.
+    //
+    // Only inline-table promotes. `inline-block`, `inline-grid`,
+    // and `inline-flex` still take the wrapper path, deliberately
+    // but incompletely: promoting them needs `BoxType` changes
+    // (`Block`/`Grid`/flex) whose interaction with the
+    // display-keyed inner layout in `layout_block` is unverified,
+    // and the inline-block wrapper shape is pinned by
+    // `w77g_flex_inline_block_item_still_wrapped`. The cost is
+    // real and known: the style-less wrapper swallows their
+    // flex-item properties (probed: an inline-block with
+    // `flex: 0 0 200px` and 10px side margins lays out as a 20px
+    // wrapper holding a 0px inner box — basis lost entirely).
+    // Extending promotion to them is follow-up work, not a
+    // spec stance: css-flexbox-1 §4 blockifies all of them.
     // Index iteration instead of `children.clone()`: nothing in the loop
     // below mutates `nodes[idx].children` itself (the anonymous wrappers
     // are appended as fresh nodes and wired in by the final assignment),
@@ -16269,6 +16428,45 @@ mod flex_tests {
         let a = &first(&l).children[0];
         assert!(a.rect.w.is_finite());
         assert!(approx(a.rect.w, 100.0), "fit-content item w={}", a.rect.w);
+    }
+
+    #[test]
+    fn w77fix_min_content_width_grid_basis_max_content_uses_track_max() {
+        // w77fix finding 6 (fail-before probe): a grid whose own
+        // `width` is `min-content`, used as a flex item with
+        // `flex-basis: max-content`, must base at its track
+        // max-content (two `auto` tracks over 126px lines = 252),
+        // not at its min-content (two 60px longest words = 120).
+        // `SpecLen::resolve` returns `None` for `MinContent`, so
+        // the definite-width gate in `flex_basis_keyword_size`
+        // never fired for this shape and the dispatched
+        // `grid_pref_width` MinContent fast path returned the min
+        // walk instead of the track max.
+        let html = r#"<div class="c"><div class="g"><div class="i">aaaaaaaaaa bbbbbbbbbb</div><div class="i">aaaaaaaaaa bbbbbbbbbb</div></div></div>"#;
+        let css = "body { margin: 0; } .c { display: flex; width: 600px; } \
+             .g { display: grid; grid-template-columns: auto auto; width: min-content; \
+                  font-size: 10px; flex-basis: max-content; flex-grow: 0; flex-shrink: 0; }";
+        let l = layout_html(html, css);
+        let g = &first(&l).children[0];
+        assert!(
+            approx(g.rect.w, 252.0),
+            "min-content-width grid basis-max item w {}, want 252 (track max, not min 120)",
+            g.rect.w
+        );
+        // The intrinsic arm agrees: with an auto-width flex
+        // container, its max-content is the item's max-content
+        // basis (a definite container width would floor the
+        // measurement at 600 instead).
+        let (_, pc) = measure_flex_intrinsic(
+            html,
+            "body { margin: 0; } .c { display: flex; } \
+             .g { display: grid; grid-template-columns: auto auto; width: min-content; \
+                  font-size: 10px; flex-basis: max-content; flex-grow: 0; flex-shrink: 0; }",
+        );
+        assert!(
+            approx(pc, 252.0),
+            "flex max-content {pc}, want 252 (not the 120 min-content floor)"
+        );
     }
 
     #[test]

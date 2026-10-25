@@ -3024,6 +3024,28 @@ window.__r = results.join(' | ');
                 .pump_bounded(1000);
             std::thread::sleep(Duration::from_millis(20));
         }
+        // The loop above only proves the fetch was sent; the load
+        // outcome settles asynchronously, so pump until the
+        // promise resolves (or the deadline fires) before asserting
+        // on it — otherwise a slow completion would still read
+        // `__loaded` as undefined and flake.
+        let loaded_deadline = std::time::Instant::now() + Duration::from_secs(10);
+        let mut loaded = false;
+        while std::time::Instant::now() < loaded_deadline {
+            loaded = matches!(
+                tab.page_vm_mut()
+                    .expect("page VM installed")
+                    .eval("window.__loaded === true"),
+                Ok(Value::Bool(true))
+            );
+            if loaded {
+                break;
+            }
+            tab.page_vm_mut()
+                .expect("page VM installed")
+                .pump_bounded(1000);
+            std::thread::sleep(Duration::from_millis(20));
+        }
         let headers = seen.lock().expect("seen").clone();
         let status = tab
             .page_vm_mut()
@@ -3033,6 +3055,14 @@ window.__r = results.join(' | ');
         assert!(
             headers.iter().any(|h| h.contains("session=abc123")),
             "same-origin FontFace.load() must send the profile cookie; got headers {headers:?}, status {status:?}"
+        );
+        // The load outcome itself, not just the cookie: a CORS
+        // rejection or install failure that still sent the cookie
+        // used to pass silently, because `status` was only ever
+        // read into the failure message above.
+        assert!(
+            loaded,
+            "same-origin FontFace.load() must resolve; got status {status:?}"
         );
     }
 }

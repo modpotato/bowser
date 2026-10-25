@@ -1240,6 +1240,25 @@ pub fn share_completed_image_loads(ctx: u32, set: Rc<RefCell<HashSet<NodeId>>>) 
     }
 }
 
+/// Share the embedder's profile cookie jar with the web APIs
+/// installed as `ctx`: from then on same-origin `FontFace.load()`
+/// URL fetches send profile cookies (see [`font_fetch_jar_for`]).
+/// Unknown ids are ignored. Production embedders call this once per
+/// document, next to [`share_font_cache`], passing the profile jar
+/// (the same handle the loader's subresource fetches lock). This
+/// is re-exported from `lib.rs`, and production calls it at
+/// document install (`install_loaded_document` in
+/// `bowser_app::navigation`), so production JS font loads are
+/// credentialed for same-origin URLs — the earlier "not yet
+/// re-exported, stays credentialless until wiring lands" note was
+/// true when the mechanism landed and is now stale.
+#[allow(dead_code)]
+pub fn share_cookie_jar(ctx: u32, jar: Arc<Mutex<CookieJar>>) {
+    if let Some(apis) = web_apis(ContextId(ctx)) {
+        apis.borrow_mut().set_cookie_jar(jar);
+    }
+}
+
 /// Share the embedder's font cache with the web APIs installed as
 /// `ctx`: from then on `document.fonts.check()` resolves against it
 /// and `FontFace.load()` installs fetched bytes into it. Unknown ids
@@ -1250,27 +1269,9 @@ pub fn share_completed_image_loads(ctx: u32, set: Rc<RefCell<HashSet<NodeId>>>) 
 /// production install already adopts the parse shim's cache when one
 /// exists, so a WPT-style load that never calls this still sees the
 /// test fonts; calling this replaces that adopted cache with the
-/// window's. NOTE: this is not yet re-exported from `lib.rs` (see the
-/// FontFace/FontFaceSet section): embedders reach it once the
-/// orchestrator adds the one-line re-export.
-/// Share the embedder's profile cookie jar with the web APIs
-/// installed as `ctx`: from then on same-origin `FontFace.load()`
-/// URL fetches send profile cookies (see [`font_fetch_jar_for`]).
-/// Unknown ids are ignored. Production embedders call this once per
-/// document, next to [`share_font_cache`], passing the profile jar
-/// (the same handle the loader's subresource fetches lock). NOTE:
-/// like `share_font_cache`, this is not yet re-exported from
-/// `lib.rs`: embedders reach it once the orchestrator adds the
-/// one-line re-export, so production JS font loads stay
-/// credentialless until that wiring lands — the bindings-side
-/// mechanism (and its tests) are complete here.
-#[allow(dead_code)]
-pub fn share_cookie_jar(ctx: u32, jar: Arc<Mutex<CookieJar>>) {
-    if let Some(apis) = web_apis(ContextId(ctx)) {
-        apis.borrow_mut().set_cookie_jar(jar);
-    }
-}
-
+/// window's. This is re-exported from `lib.rs` (the earlier
+/// "not yet re-exported" note was true when the mechanism landed
+/// and is now stale).
 #[allow(dead_code)]
 pub fn share_font_cache(ctx: u32, cache: SharedFontCache) {
     if let Some(apis) = web_apis(ContextId(ctx)) {
@@ -2191,10 +2192,10 @@ pub struct WebApis {
     /// attached a jar, in which case JS font loads stay
     /// credentialless exactly as before. The jar is `Arc`-shared
     /// and `Mutex`-guarded because pool workers run on other
-    /// threads; a worker locks it only for the duration of its own
-    /// fetch (mirroring the loader's `SubresourceFetch`, which
-    /// locks once per request), never across requests and never on
-    /// the JS thread.
+    /// threads; a worker locks it only to snapshot and to merge
+    /// back, never across network I/O (see [`net_fetch_impl`]),
+    /// so a slow font fetch cannot stall navigation initiation
+    /// or serialize concurrent font fetches.
     cookie_jar: Option<Arc<Mutex<CookieJar>>>,
     /// Font-load job id -> flag the pool worker sets to the actual
     /// per-hop credentials-sent value for that fetch (see
@@ -6419,11 +6420,23 @@ fn used_auto_margins(bx: &LayoutBox, ancestors: &[&LayoutBox]) -> Option<(f32, f
 /// `content_w`, i.e. the physical-height content box of a vertical
 /// table) and the span of the auto-block-margin distribution below.
 /// `None` unless the box is a horizontal `table-caption` whose
-/// direct parent is a vertical table (or inline-table). The
-/// float/position gate of the auto-margin distribution does NOT
-/// apply here: layout resolves a floated/abspos orthogonal
-/// caption's percentage margins against this base too, it just
-/// never distributes its auto margins.
+/// direct parent is a vertical table (or inline-table). The span
+/// itself is defined for floated captions too — layout's float
+/// machinery lays a floated caption out with the table's `content_w`
+/// as its percentage base (probe: a floated caption's `margin-left:
+/// 20%` shifts its offsetTop by 40px on a 200px-inline table, the
+/// span value, not the 60px a 300px block-size base would give) —
+/// but NOT for abspos captions: an absolute/fixed caption's
+/// containing block is its nearest positioned ancestor (or the
+/// viewport), and layout resolves its percentage margins against
+/// that block's width instead (probe: the same 20% shifts offsetLeft
+/// by 160px against the 800px viewport, 80px inside a 400px
+/// relative wrapper, while the span would give 40px). Callers
+/// resolving percentage margins must therefore branch on
+/// positioning (see [`abspos_caption_cb_width`]); the span alone
+/// is not the answer for out-of-flow captions. The auto-margin
+/// distribution below already excludes floated and abspos captions
+/// via its own gate, so it is unaffected by this distinction.
 fn orthogonal_caption_table_span(bx: &LayoutBox, ancestors: &[&LayoutBox]) -> Option<f32> {
     let style = bx.style.as_deref()?;
     let kw_is = |s: &bowser_css::ComputedStyle, prop: &str, kw: &str| match s.get(prop) {
@@ -6502,6 +6515,96 @@ fn orthogonal_caption_table_span(bx: &LayoutBox, ancestors: &[&LayoutBox]) -> Op
     Some((cb_bottom - cb_top).max(0.0))
 }
 
+/// Whether `bx` is an out-of-flow (absolute/fixed) horizontal
+/// caption under a vertical table — the shape whose percentage
+/// margins resolve against its own containing block, not the table
+/// span (see [`orthogonal_caption_table_span`]'s doc for the probe
+/// evidence). Floated, relative, sticky, and static captions are
+/// not out-of-flow here: floated captions keep the span base.
+fn is_abspos_orthogonal_caption(bx: &LayoutBox, ancestors: &[&LayoutBox]) -> bool {
+    let style = match bx.style.as_deref() {
+        Some(s) => s,
+        None => return false,
+    };
+    let kw_is = |s: &bowser_css::ComputedStyle, prop: &str, kw: &str| match s.get(prop) {
+        Some(CssValue::Keyword(k)) => k.eq_ignore_ascii_case(kw),
+        _ => false,
+    };
+    let wm_is = |s: &bowser_css::ComputedStyle, wm: &str| matches!(s.get("writing-mode"), Some(CssValue::Keyword(k)) if k.eq_ignore_ascii_case(wm));
+    if !wm_is(style, "horizontal-tb") || !kw_is(style, "display", "table-caption") {
+        return false;
+    }
+    if !(kw_is(style, "position", "absolute") || kw_is(style, "position", "fixed")) {
+        return false;
+    }
+    let parent = match ancestors.last() {
+        Some(p) => p,
+        None => return false,
+    };
+    let pstyle = match parent.style.as_deref() {
+        Some(s) => s,
+        None => return false,
+    };
+    let parent_is_table = matches!(parent.box_type, BoxType::Table)
+        || (matches!(parent.box_type, BoxType::InlineBlock)
+            && kw_is(pstyle, "display", "inline-table"));
+    parent_is_table && (wm_is(pstyle, "vertical-lr") || wm_is(pstyle, "vertical-rl"))
+}
+
+/// Containing-block width for an abspos orthogonal caption's
+/// percentage margins: the nearest positioned ancestor's content
+/// width (its percentage padding against its padding-box width,
+/// the `used_auto_margins` approximation), or the viewport width
+/// when there is no positioned ancestor — or when the caption is
+/// fixed, whose containing block is the viewport (a transformed
+/// ancestor would change that; the published tree carries no
+/// transform, so this reads the viewport and the limitation stands
+/// documented, not silent). `None` unless
+/// [`is_abspos_orthogonal_caption`] holds.
+fn abspos_caption_cb_width(
+    bx: &LayoutBox,
+    ancestors: &[&LayoutBox],
+    viewport_w: f32,
+) -> Option<f32> {
+    if !is_abspos_orthogonal_caption(bx, ancestors) {
+        return None;
+    }
+    let kw_is = |s: &bowser_css::ComputedStyle, prop: &str, kw: &str| match s.get(prop) {
+        Some(CssValue::Keyword(k)) => k.eq_ignore_ascii_case(kw),
+        _ => false,
+    };
+    // Ancestors are outermost-first: search from the nearest out.
+    for (i, anc) in ancestors.iter().enumerate().rev() {
+        let astyle = match anc.style.as_deref() {
+            Some(s) => s,
+            None => continue,
+        };
+        if kw_is(astyle, "position", "static") {
+            continue;
+        }
+        if kw_is(astyle, "position", "fixed") {
+            return Some(viewport_w);
+        }
+        // Relative, absolute, or sticky: the padding box of this
+        // ancestor is the containing block.
+        let [_, br, _, bl] = box_used_borders(anc, &ancestors[..i]);
+        let pad_base = (anc.rect.w - bl - br).max(0.0);
+        let pad = |prop: u8| match astyle.get_by_index(prop) {
+            Some(CssValue::Percentage(p)) => p / 100.0 * pad_base,
+            v => parse_abs_len_px(v),
+        };
+        return Some(
+            (anc.rect.w
+                - bl
+                - br
+                - pad(bowser_css::props::PADDING_LEFT)
+                - pad(bowser_css::props::PADDING_RIGHT))
+            .max(0.0),
+        );
+    }
+    Some(viewport_w)
+}
+
 fn used_auto_block_margins_orthogonal_caption(
     bx: &LayoutBox,
     ancestors: &[&LayoutBox],
@@ -6565,6 +6668,7 @@ fn used_auto_block_margins_orthogonal_caption(
     let extent = bx.rect.h;
     let margin_px = |prop: &str| match style.get(prop) {
         Some(CssValue::Percentage(p)) => p / 100.0 * span,
+        Some(CssValue::MathDeferred { pct, px, .. }) => pct / 100.0 * span + px,
         v => parse_abs_len_px(v),
     };
     let mt_auto = kw_is(style, "margin-top", "auto");
@@ -13929,9 +14033,10 @@ struct FetchTask {
     /// one, and only when [`font_fetch_jar_for`] allowed it at
     /// submit time (same-origin initial URL); generic `fetch()`
     /// tasks and cross-origin font tasks carry `None` and fetch
-    /// with a scratch jar. The worker locks it for its own fetch
-    /// only (see `WebApis::cookie_jar`); it is never shared
-    /// lock-free across pool threads.
+    /// with a scratch jar. The worker never holds the live lock
+    /// across I/O: it snapshots the jar under a brief lock, fetches
+    /// against the private clone, and merges back under a brief
+    /// lock (see [`net_fetch_impl`]).
     jar: Option<Arc<Mutex<CookieJar>>>,
     /// `SameSite` context for this fetch. Font tasks carry the
     /// document-host subresource context; generic `fetch()` tasks
@@ -13998,10 +14103,12 @@ enum FetchSubmitError {
 /// the pool lives for the process lifetime, so context teardown never
 /// has to join threads (which could block on in-flight network I/O).
 /// Cancellation is cooperative instead: each task carries its
-/// context's `fetch_cancel` flag, set by `Drop for WebApis`; workers
-/// skip the network call for tasks whose context is already gone, and
-/// outcomes addressed to a dropped context fail to send and are
-/// discarded.
+/// context's `fetch_cancel` flag, set by `Drop for WebApis`;
+/// workers skip the network call for tasks whose context is
+/// already gone but still deliver a cancellation outcome (so a
+/// retained context's font-load maps drain and its promises
+/// settle), and outcomes addressed to a dropped context fail to
+/// send and are discarded.
 struct FetchPool {
     /// `None` after shutdown; dropping the sender closes the queue so
     /// workers blocked in `recv` wake and exit.
@@ -14073,8 +14180,9 @@ impl Drop for FetchPool {
     }
 }
 
-/// Worker run loop: take tasks FIFO, skip cancelled ones, run the
-/// blocking fetch, deliver the outcome to the owning context.
+/// Worker run loop: take tasks FIFO, deliver a cancellation
+/// outcome for cancelled ones, run the blocking fetch for the
+/// rest, deliver the outcome to the owning context.
 fn fetch_worker(rx: &Arc<Mutex<Receiver<FetchTask>>>, fetch: FetchImpl, live: &Arc<AtomicUsize>) {
     live.fetch_add(1, Ordering::Relaxed);
     loop {
@@ -14085,9 +14193,22 @@ fn fetch_worker(rx: &Arc<Mutex<Receiver<FetchTask>>>, fetch: FetchImpl, live: &A
             rx.recv()
         };
         let Ok(task) = task else { break };
-        // The owning context was torn down while this task was queued:
-        // skip the network I/O entirely.
+        // The owning context was torn down while this task was
+        // queued: skip the network I/O entirely, but still deliver
+        // a cancellation outcome. Dropping the task silently leaked
+        // the owning context's font-load job and credentials-flag
+        // entries (and left the face's promise hanging) whenever
+        // the context was retained past teardown, because only a
+        // delivered outcome reaches `complete_font_load` /
+        // `complete_fetch`, which are what remove those entries and
+        // settle the promise as an error. A dropped context's
+        // receiver is gone, so the send fails silently exactly as
+        // before.
         if task.cancel.load(Ordering::Acquire) {
+            let _ = task.tx.send((
+                task.job,
+                Err("fetch cancelled: owning context torn down".to_string()),
+            ));
             continue;
         }
         let outcome = fetch(&task);
@@ -14103,22 +14224,79 @@ fn fetch_worker(rx: &Arc<Mutex<Receiver<FetchTask>>>, fetch: FetchImpl, live: &A
 /// becomes the plain string [`FetchOutcome`] carries across threads,
 /// and the fetch's actual per-hop credentials-sent value is
 /// recorded into the task's flag (font tasks only) for the CORS gate
-/// in [`BindingRunner::complete_font_load`]. When the task carries
-/// a jar it is locked for the duration of this fetch only — never
-/// across fetches, never on the JS thread — mirroring the loader;
-/// a poisoned lock is recovered rather than panicking the worker.
+/// in [`BindingRunner::complete_font_load`].
+/// Snapshot-and-merge jar discipline: the worker locks the shared
+/// jar only long enough to clone it, runs the whole fetch (all
+/// redirect hops, network I/O) against the private clone, then
+/// re-locks briefly to merge back. Holding the live lock across
+/// I/O serialized concurrent JS font fetches and stalled
+/// navigation initiation — whose jar swap takes the same lock on
+/// the event thread — behind a slow or hung fetch. Redirect-hop
+/// cookies land in the clone exactly as they did in the live jar
+/// (fetch re-evaluates the jar per hop), so the merge preserves
+/// them: when the live jar is unchanged since the snapshot it is
+/// replaced wholesale by the clone (hop cookies, expiry purges,
+/// LRU touches included); when it changed meanwhile (a concurrent
+/// fetch or a navigation swap landed first), the clone is
+/// discarded except for the final response's `Set-Cookie` headers,
+/// which are replayed into the live jar — the common single-hop
+/// case still lands, and no concurrent update is ever clobbered.
+/// `CookieJar` exposes no equality or version counter, so
+/// "unchanged" is judged by `Debug` comparison of the snapshot
+/// against the live jar under the lock: a false negative only
+/// costs a hop-cookie replay, never a leak or a clobber. A
+/// poisoned lock is recovered rather than panicking the worker.
+/// The credentials-sent value comes from the snapshot clone, so a
+/// cookie that lands in the live jar mid-fetch is not seen by
+/// this fetch — snapshot semantics, the standard cost of not
+/// holding the lock.
 fn net_fetch_impl(task: &FetchTask) -> FetchOutcome {
-    let result = match &task.jar {
+    // Snapshot under a brief lock: no I/O while holding it.
+    let (snapshot, snapshot_dbg) = match &task.jar {
         Some(jar) => {
-            let mut guard = jar.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
-            net_fetch::fetch_with_trace_credentials_in_context(
-                &task.request,
-                Some(&mut guard),
-                &task.nav,
-            )
+            let guard = jar.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+            (Some(guard.clone()), Some(format!("{:?}", *guard)))
         }
-        None => net_fetch::fetch_with_trace_credentials_in_context(&task.request, None, &task.nav),
+        None => (None, None),
     };
+    let mut local = snapshot;
+    let result = net_fetch::fetch_with_trace_credentials_in_context(
+        &task.request,
+        local.as_mut(),
+        &task.nav,
+    );
+    // Merge back under a brief lock.
+    if let (Some(jar), Some(local_jar), Some(snapshot_dbg)) = (&task.jar, local, snapshot_dbg) {
+        let mut guard = jar.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+        if format!("{:?}", *guard) == snapshot_dbg {
+            *guard = local_jar;
+        } else if let Ok((response, _, _)) = &result {
+            // Best effort: the final hop's `Set-Cookie` headers land
+            // even when a concurrent update changed the live jar.
+            // Intermediate-hop cookies in this racing case are
+            // dropped rather than clobbering the concurrent update
+            // — the same discard navigation already applies to an
+            // abandoned worker's jar.
+            let now = SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .map(|d| d.as_secs())
+                .unwrap_or(0);
+            let ctx = bowser_net::cookies::RequestContext {
+                host: response.url.host().unwrap_or(""),
+                path: response.url.path(),
+                secure: response.url.scheme() == "https",
+                http_api: true,
+                top_host: task.nav.top_host.as_deref(),
+                top_secure: task.nav.top_secure,
+                top_level_safe_navigation: task.nav.top_level_safe_navigation,
+            };
+            for (name, value) in &response.headers {
+                if name.eq_ignore_ascii_case("set-cookie") {
+                    guard.set_cookie(value, &ctx, now);
+                }
+            }
+        }
+    }
     match result {
         Ok((response, _trace, credentials_sent)) => {
             if let Some(flag) = &task.credentials_sent {
@@ -17254,6 +17432,73 @@ fn serialized_length_px(s: &str, ctx: &ComputedAdjustCtx) -> Option<f32> {
     Some(n * factor)
 }
 
+/// Resolve a serialized computed `margin-*` value against `base`:
+/// plain percentages (whitespace-padded, e.g. `"20 %"`), and affine
+/// `calc()` sums of percentage and length terms
+/// (`"calc(50% + 60px)"`, `"calc(50% - 10px)"`) — the forms the
+/// cascade serializes (`MathDeferred` and `Math` values). Relative
+/// length terms resolve through `ctx` (`em`/`rem`/`vw`/`vh`).
+/// Anything else (`auto`, keywords, plain lengths, nested
+/// `min()`/`max()`/`clamp()`, `*`/`/` terms, unspaced operators)
+/// returns `None` and the caller leaves the value untouched rather
+/// than guessing.
+fn resolve_serialized_margin_px(s: &str, base: f32, ctx: &ComputedAdjustCtx) -> Option<f32> {
+    let s = s.trim();
+    if let Some(pct) = s.strip_suffix('%') {
+        return pct.trim().parse::<f32>().ok().map(|p| p / 100.0 * base);
+    }
+    let inner = s.strip_prefix("calc(")?.strip_suffix(')')?;
+    let mut total = 0.0f32;
+    let mut rest = inner.trim();
+    let mut sign = 1.0f32;
+    loop {
+        // Next top-level spaced operator (`" + "` / `" - "` as the
+        // cascade serializes them). The `i > 0` guard keeps a
+        // leading sign on the first term, and the space requirement
+        // keeps exponent minus signs (`1e-3px`) out of the split.
+        let bytes = rest.as_bytes();
+        let mut depth = 0i32;
+        let mut split: Option<(usize, f32)> = None;
+        let mut i = 0;
+        while i < bytes.len() {
+            match bytes[i] {
+                b'(' => depth += 1,
+                b')' => depth -= 1,
+                b'+' | b'-'
+                    if depth == 0
+                        && i > 0
+                        && bytes[i - 1] == b' '
+                        && (i + 1 >= bytes.len() || bytes[i + 1] == b' ') =>
+                {
+                    split = Some((i, if bytes[i] == b'+' { 1.0 } else { -1.0 }));
+                    break;
+                }
+                _ => {}
+            }
+            i += 1;
+        }
+        let (term, next) = match split {
+            Some((idx, op)) => (&rest[..idx], Some((idx, op))),
+            None => (rest, None),
+        };
+        let term = term.trim();
+        let val = if let Some(pct) = term.strip_suffix('%') {
+            pct.trim().parse::<f32>().ok()? / 100.0 * base
+        } else {
+            serialized_length_px(term, ctx)?
+        };
+        total += sign * val;
+        match next {
+            Some((idx, op)) => {
+                sign = op;
+                rest = rest[idx + 1..].trim();
+            }
+            None => break,
+        }
+    }
+    Some(total)
+}
+
 /// Serialize an absolute px length the way `css_value_to_string`
 /// serializes a `Length` (`10px`, `1.5px`).
 fn fmt_px(n: f32) -> String {
@@ -17828,9 +18073,14 @@ fn n_get_computed_style(
         // or no parent box, keep their serialized value.
         let has_pct_margin = ["margin-top", "margin-right", "margin-bottom", "margin-left"]
             .iter()
-            .any(|p| props.get(*p).is_some_and(|v| v.trim_end().ends_with('%')));
+            .any(|p| {
+                props.get(*p).is_some_and(|v| {
+                    v.trim_end().ends_with('%') || v.trim_start().starts_with("calc(")
+                })
+            });
         if has_pct_margin {
             let index = g.layout_box_index.borrow();
+            let viewport_w = g.viewport.w;
             let base = g
                 .layout_tree
                 .borrow()
@@ -17843,6 +18093,13 @@ fn n_get_computed_style(
                         .or_else(|| find_layout_box(root, node))
                 })
                 .and_then(|(bx, ancestors)| {
+                    // Abspos orthogonal captions resolve against
+                    // their own containing block, not the table span
+                    // (see `orthogonal_caption_table_span`); floated
+                    // and in-flow captions take the span below.
+                    if is_abspos_orthogonal_caption(bx, &ancestors) {
+                        return abspos_caption_cb_width(bx, &ancestors, viewport_w);
+                    }
                     orthogonal_caption_table_span(bx, &ancestors).or_else(|| {
                         let parent = ancestors.last()?;
                         let pstyle = parent.style.as_deref()?;
@@ -17866,12 +18123,9 @@ fn n_get_computed_style(
             if let Some(base) = base {
                 for side in ["margin-top", "margin-right", "margin-bottom", "margin-left"] {
                     if let Some(v) = props.get(side).cloned()
-                        && let Some(pct) = v
-                            .trim()
-                            .strip_suffix('%')
-                            .and_then(|p| p.trim().parse::<f32>().ok())
+                        && let Some(px) = resolve_serialized_margin_px(&v, base, &adjust_ctx)
                     {
-                        props.insert(side.to_string(), format!("{}px", pct / 100.0 * base));
+                        props.insert(side.to_string(), format!("{px}px"));
                     }
                 }
             }
@@ -23658,6 +23912,45 @@ fn parse_snap_apply(
     clamp(out)
 }
 
+/// Resolve one computed padding side against `pct_base`:
+/// percentages against the base, `em` against the element's own
+/// computed font size, `rem`/viewport units against `ctx`, absolute
+/// lengths directly, deferred calc as `pct * base + px`, unitless
+/// zero as zero. Anything else (keywords, `ex` beyond the 0.5em
+/// fallback, unknown units) is 0 — the same fail-closed shape as
+/// [`parse_abs_len_px`], but with the relative units resolved
+/// instead of dropped.
+fn resolve_pad_css_value(
+    value: Option<&CssValue>,
+    pct_base: f32,
+    font_px: f32,
+    ctx: &ComputedAdjustCtx,
+) -> f32 {
+    use bowser_css::LengthUnit;
+    match value {
+        Some(CssValue::Percentage(p)) => p / 100.0 * pct_base,
+        Some(CssValue::MathDeferred { pct, px, .. }) => pct / 100.0 * pct_base + px,
+        Some(CssValue::Length(n, unit)) => match unit {
+            LengthUnit::Px => *n,
+            LengthUnit::Cm => *n * 96.0 / 2.54,
+            LengthUnit::Mm => *n * 96.0 / 25.4,
+            LengthUnit::In => *n * 96.0,
+            LengthUnit::Pt => *n * 96.0 / 72.0,
+            LengthUnit::Pc => *n * 16.0,
+            LengthUnit::Q => *n * 96.0 / 101.6,
+            LengthUnit::Em => *n * font_px,
+            LengthUnit::Rem => *n * ctx.root_px,
+            LengthUnit::Vw => *n * ctx.vw / 100.0,
+            LengthUnit::Vh => *n * ctx.vh / 100.0,
+            LengthUnit::Vmin => *n * ctx.vw.min(ctx.vh) / 100.0,
+            LengthUnit::Vmax => *n * ctx.vw.max(ctx.vh) / 100.0,
+            LengthUnit::Ex => *n * font_px * 0.5,
+        },
+        Some(CssValue::Number(n)) if *n == 0.0 => 0.0,
+        _ => 0.0,
+    }
+}
+
 /// An absolute CSS length in px (mirror of the production
 /// `abs_len_px`): absolute units convert, everything else (relative
 /// units, keywords, missing) is 0 — the mid-parse resolver has no
@@ -25115,21 +25408,29 @@ impl ParseLayoutHook {
         // orthogonal caption (the table content box along physical
         // y, mirroring layout's `pct_base`), the containing-block
         // width for an ordinary box (the parent content width).
-        // Parent padding resolves absolute lengths only, like the
-        // shim's other ancestor-relative units (a percentage parent
-        // padding reads as 0 here, overstating the base by that
-        // padding — the same approximation the height/width block
-        // makes). Ordinary `auto` margins are left alone: their
-        // production resolution needs the parent content-box
-        // offsets, which the partial pass's per-subtree frames do
-        // not share. Any missing piece (no parent, no parent
-        // computed style, no geometry) fails closed, leaving the
-        // serialized `auto`/`%` value in place.
+        // Parent padding resolves fully here (see the block below):
+        // percentages against the parent's containing-block width
+        // (the grandparent content width when it is computable, the
+        // parent padding-box width otherwise), `em` against the
+        // parent's computed font size, `rem`/viewport units against
+        // `ctx` — so a non-px parent padding no longer reads as 0
+        // and overstates the base. The one approximation left: when
+        // the grandparent itself carries percentage padding, its
+        // content width uses its padding-box width as the base
+        // (production's approximation), so the error in this base is
+        // at most the parent's percentage times the grandparent's
+        // percentage-padding error; with no percentage padding
+        // anywhere above, the base is exact. Ordinary `auto`
+        // margins are left alone: their production resolution needs
+        // the parent content-box offsets, which the partial pass's
+        // per-subtree frames do not share. Any missing piece (no
+        // parent, no parent computed style, no geometry) fails
+        // closed, leaving the serialized `auto`/`%` value in place.
         let margin_sides = ["margin-top", "margin-right", "margin-bottom", "margin-left"];
         let margin_needs = margin_sides.iter().any(|p| {
-            props
-                .get(*p)
-                .is_some_and(|v| v == "auto" || v.trim_end().ends_with('%'))
+            props.get(*p).is_some_and(|v| {
+                v == "auto" || v.trim_end().ends_with('%') || v.trim_start().starts_with("calc(")
+            })
         });
         if margin_needs
             && let Some(chain) = ancestor_chain(host, el)
@@ -25154,8 +25455,122 @@ impl ParseLayoutHook {
                 self.ensure_layout(&mut *host, el),
                 self.ensure_layout(&mut *host, parent_el),
             ) {
-                let parent_pad = |prop: &str| parse_abs_len_px(parent_computed.get(prop));
-                let base = if is_orth {
+                // Parent padding, resolved (see the margin comment
+                // above): percentages against the parent's
+                // containing-block width — the grandparent content
+                // width when the grandparent's geometry and style
+                // are available, else the parent padding-box width
+                // (production's approximation). An abspos parent's
+                // true containing block may sit further up the
+                // tree; that case keeps the padding-box fallback
+                // and its bounded error rather than a silent zero.
+                let parent_pad_box =
+                    (parent_geom.rect.w - parent_geom.borders[1] - parent_geom.borders[3]).max(0.0);
+                let parent_font_px = computed_font_px_of(&parent_computed);
+                let parent_pct_base = chain
+                    .get(2)
+                    .and_then(|&gp_el| {
+                        let gp_node = data.arena_node.get(&gp_el.arena_index()).copied()?;
+                        let gp_computed = compute_style(
+                            &data.doc,
+                            gp_node,
+                            &sheet_refs,
+                            parse_ua_stylesheet(),
+                            &viewport,
+                        );
+                        let gp_geom = self.ensure_layout(&mut *host, gp_el)?;
+                        let gp_pad_box =
+                            (gp_geom.rect.w - gp_geom.borders[1] - gp_geom.borders[3]).max(0.0);
+                        let gp_font_px = computed_font_px_of(&gp_computed);
+                        let gp_pad = |prop: &str| {
+                            resolve_pad_css_value(
+                                gp_computed.get(prop),
+                                gp_pad_box,
+                                gp_font_px,
+                                &ctx,
+                            )
+                        };
+                        Some(
+                            (gp_geom.rect.w
+                                - gp_geom.borders[1]
+                                - gp_geom.borders[3]
+                                - gp_pad("padding-left")
+                                - gp_pad("padding-right"))
+                            .max(0.0),
+                        )
+                    })
+                    .unwrap_or(parent_pad_box);
+                let parent_pad = |prop: &str| {
+                    resolve_pad_css_value(
+                        parent_computed.get(prop),
+                        parent_pct_base,
+                        parent_font_px,
+                        &ctx,
+                    )
+                };
+                // Abspos orthogonal captions resolve against their
+                // own containing block, not the table span — the
+                // production `abspos_caption_cb_width` rule, adapted
+                // to the shim's ancestor chain: the nearest positioned
+                // ancestor's content width, else the shim viewport
+                // width (a fixed caption's block is the viewport).
+                // An ancestor without geometry is skipped outward:
+                // the pass that produced this element's geometry
+                // normally covers its ancestors too.
+                let is_abspos =
+                    kw(&computed, "position", "absolute") || kw(&computed, "position", "fixed");
+                let abspos_base = if is_orth && is_abspos {
+                    let mut found: Option<f32> = None;
+                    for &anc_el in chain.iter().skip(1) {
+                        let Some(anc_node) = data.arena_node.get(&anc_el.arena_index()).copied()
+                        else {
+                            continue;
+                        };
+                        let anc_computed = compute_style(
+                            &data.doc,
+                            anc_node,
+                            &sheet_refs,
+                            parse_ua_stylesheet(),
+                            &viewport,
+                        );
+                        if kw(&anc_computed, "position", "static") {
+                            continue;
+                        }
+                        if kw(&anc_computed, "position", "fixed") {
+                            found = Some(self.viewport.0 as f32);
+                            break;
+                        }
+                        if let Some(anc_geom) = self.ensure_layout(&mut *host, anc_el) {
+                            let pad_base =
+                                (anc_geom.rect.w - anc_geom.borders[1] - anc_geom.borders[3])
+                                    .max(0.0);
+                            let anc_font_px = computed_font_px_of(&anc_computed);
+                            let pad = |prop: &str| {
+                                resolve_pad_css_value(
+                                    anc_computed.get(prop),
+                                    pad_base,
+                                    anc_font_px,
+                                    &ctx,
+                                )
+                            };
+                            found = Some(
+                                (anc_geom.rect.w
+                                    - anc_geom.borders[1]
+                                    - anc_geom.borders[3]
+                                    - pad("padding-left")
+                                    - pad("padding-right"))
+                                .max(0.0),
+                            );
+                            break;
+                        }
+                    }
+                    Some(found.unwrap_or(self.viewport.0 as f32))
+                } else {
+                    None
+                };
+                let base = if let Some(b) = abspos_base {
+                    b
+                } else if is_orth {
                     (parent_geom.rect.h
                         - parent_geom.borders[0]
                         - parent_geom.borders[2]
@@ -25174,12 +25589,9 @@ impl ParseLayoutHook {
                 // reads the fixed side in px.
                 for side in margin_sides {
                     if let Some(v) = props.get(side).cloned()
-                        && let Some(pct) = v
-                            .trim()
-                            .strip_suffix('%')
-                            .and_then(|p| p.trim().parse::<f32>().ok())
+                        && let Some(px) = resolve_serialized_margin_px(&v, base, &ctx)
                     {
-                        props.insert(side.to_string(), format!("{}px", pct / 100.0 * base));
+                        props.insert(side.to_string(), format!("{px}px"));
                     }
                 }
                 // Orthogonal-caption auto block margins: the
@@ -30477,6 +30889,79 @@ mod tests {
     }
 
     #[test]
+    fn computed_style_orthogonal_caption_pct_margin_floated_and_abspos() {
+        // w77fix: floated vs abspos orthogonal captions resolve
+        // their percentage margins against DIFFERENT bases — the
+        // old code gave both the table span (40px). A floated
+        // caption keeps the span: layout's float machinery lays it
+        // out with the table's inline content width as its
+        // percentage base (its 20% margin shifts its offsetTop by
+        // 40px on a 200px-inline table). An abspos caption resolves
+        // against its own containing block instead: the 800px
+        // viewport here (its offsetLeft shifts by 160px), or the
+        // 400px relative wrapper below (80px). The in-flow shape
+        // stays 40px (see
+        // `computed_style_orthogonal_caption_pct_margin`).
+        let read = |html: &[u8]| -> String {
+            let (mut vm, _doc, ctx) = geometry_vm(html, "");
+            let r = node_list_str(
+                &mut vm,
+                "getComputedStyle(document.getElementById(\"c\")).marginLeft;",
+            );
+            remove_context(ContextId(ctx));
+            r
+        };
+        assert_eq!(
+            read(b"<html><head></head><body style=\"margin:0\"><table style=\"writing-mode:vertical-lr;width:300px;height:200px\"><caption id=\"c\" style=\"writing-mode:horizontal-tb;height:50px;width:120px;float:left;margin-left:20%\">caption</caption></table></body></html>"),
+            "40px",
+            "floated caption keeps the table span"
+        );
+        assert_eq!(
+            read(b"<html><head></head><body style=\"margin:0\"><table style=\"writing-mode:vertical-lr;width:300px;height:200px\"><caption id=\"c\" style=\"writing-mode:horizontal-tb;height:50px;width:120px;position:absolute;left:0;top:0;margin-left:20%\">caption</caption></table></body></html>"),
+            "160px",
+            "abspos caption resolves against the viewport CB"
+        );
+        assert_eq!(
+            read(b"<html><head></head><body style=\"margin:0\"><div style=\"position:relative;width:400px\"><table style=\"writing-mode:vertical-lr;width:300px;height:200px\"><caption id=\"c\" style=\"writing-mode:horizontal-tb;height:50px;width:120px;position:absolute;left:0;top:0;margin-left:20%\">caption</caption></table></div></body></html>"),
+            "80px",
+            "abspos caption resolves against the positioned ancestor CB"
+        );
+    }
+
+    #[test]
+    fn parse_gcs_orthogonal_caption_pct_margin_floated_and_abspos() {
+        // Shim mirror of the production test above, mid-parse:
+        // floated keeps the span (40px), abspos resolves against
+        // its containing block (the 800px shim viewport, 160px;
+        // the 400px relative wrapper, 80px).
+        let read = |html: &[u8]| -> String { shim_result(html) };
+        assert_eq!(
+            read(b"<html><body style=\"margin:0\">\
+              <table style=\"writing-mode:vertical-lr;width:300px;height:200px\"><caption id=c style=\"writing-mode:horizontal-tb;height:50px;width:120px;float:left;margin-left:20%\">caption</caption></table>\
+              <script>globalThis.__result = getComputedStyle(document.getElementById('c')).marginLeft;</script>\
+              </body></html>"),
+            "40px",
+            "shim floated caption keeps the table span"
+        );
+        assert_eq!(
+            read(b"<html><body style=\"margin:0\">\
+              <table style=\"writing-mode:vertical-lr;width:300px;height:200px\"><caption id=c style=\"writing-mode:horizontal-tb;height:50px;width:120px;position:absolute;left:0;top:0;margin-left:20%\">caption</caption></table>\
+              <script>globalThis.__result = getComputedStyle(document.getElementById('c')).marginLeft;</script>\
+              </body></html>"),
+            "160px",
+            "shim abspos caption resolves against the viewport CB"
+        );
+        assert_eq!(
+            read(b"<html><body style=\"margin:0\">\
+              <div style=\"position:relative;width:400px\"><table style=\"writing-mode:vertical-lr;width:300px;height:200px\"><caption id=c style=\"writing-mode:horizontal-tb;height:50px;width:120px;position:absolute;left:0;top:0;margin-left:20%\">caption</caption></table></div>\
+              <script>globalThis.__result = getComputedStyle(document.getElementById('c')).marginLeft;</script>\
+              </body></html>"),
+            "80px",
+            "shim abspos caption resolves against the positioned ancestor CB"
+        );
+    }
+
+    #[test]
     fn computed_style_pct_margin_ordinary_box_cb_width() {
         // Ordinary percentage margins resolve against the
         // containing-block width on the production path: 20% of the
@@ -30493,6 +30978,74 @@ mod tests {
             "100px"
         );
         remove_context(ContextId(ctx));
+    }
+
+    #[test]
+    fn computed_style_calc_pct_margins_resolve() {
+        // w77fix: `calc()` percentage margins resolve on the
+        // production path. Before the fix the percentage gate
+        // (`ends_with('%')`) never fired for a value ending in
+        // `')'`, so the serialized `calc()` string was served
+        // verbatim instead of a px value.
+        let read = |style: &str| -> String {
+            let html = format!(
+                "<html><head></head><body><div style=\"width:500px\"><div id=\"c\" style=\"{style}\">x</div></div></body></html>"
+            );
+            let (mut vm, _doc, ctx) = geometry_vm(html.as_bytes(), "");
+            let r = node_list_str(
+                &mut vm,
+                "getComputedStyle(document.getElementById(\"c\")).marginLeft;",
+            );
+            remove_context(ContextId(ctx));
+            r
+        };
+        assert_eq!(read("margin-left:calc(50% + 60px)"), "310px");
+        assert_eq!(read("margin-left:calc(50% - 60px)"), "190px");
+        assert_eq!(read("margin-left:calc(20%)"), "100px");
+    }
+
+    #[test]
+    fn resolve_serialized_margin_px_forms() {
+        // Unit coverage for the resolver's forms, including the
+        // whitespace-padded percentage (`"20 %"`) the old
+        // `strip_suffix` + parse chain could not be trusted on for
+        // every serialization, and the fail-closed forms.
+        let ctx = ComputedAdjustCtx {
+            font_px: 20.0,
+            root_px: 16.0,
+            vw: 800.0,
+            vh: 600.0,
+        };
+        assert_eq!(
+            resolve_serialized_margin_px("20%", 500.0, &ctx),
+            Some(100.0)
+        );
+        assert_eq!(
+            resolve_serialized_margin_px("20 %", 500.0, &ctx),
+            Some(100.0)
+        );
+        assert_eq!(
+            resolve_serialized_margin_px("calc(50% + 60px)", 500.0, &ctx),
+            Some(310.0)
+        );
+        assert_eq!(
+            resolve_serialized_margin_px("calc(50% - 60px)", 500.0, &ctx),
+            Some(190.0)
+        );
+        assert_eq!(
+            resolve_serialized_margin_px("calc(20%)", 500.0, &ctx),
+            Some(100.0)
+        );
+        assert_eq!(
+            resolve_serialized_margin_px("calc(10% + 1em)", 500.0, &ctx),
+            Some(70.0)
+        );
+        assert_eq!(resolve_serialized_margin_px("auto", 500.0, &ctx), None);
+        assert_eq!(resolve_serialized_margin_px("10px", 500.0, &ctx), None);
+        assert_eq!(
+            resolve_serialized_margin_px("calc(50% * 2)", 500.0, &ctx),
+            None
+        );
     }
 
     #[test]
@@ -32438,13 +32991,21 @@ mod tests {
         // unshifted flow footprint (bottom ~704) must not fold in —
         // only the shifted content (bottom ~404) counts.
         // The WPT point is the EQUALITY (nested contributes the same
-        // overflow as sibling), so assert that, not the absolute
-        // value: the absolute is font-dependent (system serif
-        // varies; the spec value with real metrics would be 405,
-        // and the current 403 is the wrong-strut artifact). The
+        // overflow as sibling), so that is asserted — but not
+        // vacuously: both extents must also land in a sane range.
+        // The numbers around this test have drifted apart and are
+        // reconciled here rather than collapsed: the measured value
+        // today is 403|403; the assertion this replaced was 404|404
+        // (already stale by 1px when it was weakened); the spec
+        // value with real font metrics would be 405; the ~404 in
+        // the comment above is the shifted content's geometric
+        // bottom, not a scroll extent. The 390..=420 band covers
+        // all three extent values (403 measured, 404 old, 405
+        // spec) while failing symmetric breakage: both 0, or both
+        // ~704 from the unshifted footprint folding back in. The
         // normal->font-metrics fix is deferred to its own wave, so
         // neither 403|403 (enshrines the wrong descent) nor 405|405
-        // (fails until the metrics fix lands) is asserted here.
+        // (fails until the metrics fix lands) is asserted exactly.
         let r = shim_result(
             b"<html><head><style>\
               .container { width: 10px; height: 10px; }\
@@ -32461,6 +33022,14 @@ mod tests {
         );
         let (nested, sibling) = r.split_once('|').expect("nested|sibling extents");
         assert_eq!(nested, sibling);
+        let nested_px: f32 = nested.parse().expect("nested extent parses");
+        let sibling_px: f32 = sibling.parse().expect("sibling extent parses");
+        for (label, px) in [("nested", nested_px), ("sibling", sibling_px)] {
+            assert!(
+                (390.0..=420.0).contains(&px),
+                "{label} scroll extent must be non-zero and near the 403 measured / 405 spec values, got {px} (0 or ~704 would mean symmetric breakage)"
+            );
+        }
     }
 
     #[test]
@@ -32481,6 +33050,57 @@ mod tests {
               </body></html>",
         );
         assert_eq!(r, "40px");
+    }
+
+    #[test]
+    fn parse_gcs_calc_pct_margins_resolve() {
+        // Shim mirror of `computed_style_calc_pct_margins_resolve`,
+        // mid-parse: calc() percentage margins resolve against the
+        // parent content width on the parse-shim path too.
+        let read = |style: &str| -> String {
+            let html = format!(
+                "<html><body style=\"margin:0\">\
+                 <div style=\"width:500px\"><div id=c style=\"{style}\">x</div></div>\
+                 <script>globalThis.__result = getComputedStyle(document.getElementById('c')).marginLeft;</script>\
+                 </body></html>"
+            );
+            shim_result(html.as_bytes())
+        };
+        assert_eq!(read("margin-left:calc(50% + 60px)"), "310px");
+        assert_eq!(read("margin-left:calc(50% - 60px)"), "190px");
+        assert_eq!(read("margin-left:calc(20%)"), "100px");
+    }
+
+    #[test]
+    fn parse_gcs_parent_padding_non_px_resolves() {
+        // w77fix: non-px parent padding resolves instead of
+        // reading as 0 and overstating the percentage-margin base.
+        // Percentage parent padding resolves against the parent's
+        // containing-block width (the 800px shim viewport through
+        // the margin-0 body): a 500px parent with `padding-left:
+        // 10%` has an 80px padding and a 500px content width, so
+        // the child's 20% margin is 100px — the old code read the
+        // padding as 0 and reported 116px (20% of the 580px border
+        // box). `em` parent padding resolves against the parent's
+        // font size: 1em at 20px is 20px, so the same 100px (the
+        // old code reported 104px).
+        let read = |html: &[u8]| -> String { shim_result(html) };
+        assert_eq!(
+            read(b"<html><body style=\"margin:0\">\
+              <div style=\"width:500px;padding-left:10%\"><div id=c style=\"margin-left:20%\">x</div></div>\
+              <script>globalThis.__result = getComputedStyle(document.getElementById('c')).marginLeft;</script>\
+              </body></html>"),
+            "100px",
+            "percentage parent padding"
+        );
+        assert_eq!(
+            read(b"<html><body style=\"margin:0\">\
+              <div style=\"width:500px;font-size:20px;padding-left:1em\"><div id=c style=\"margin-left:20%\">x</div></div>\
+              <script>globalThis.__result = getComputedStyle(document.getElementById('c')).marginLeft;</script>\
+              </body></html>"),
+            "100px",
+            "em parent padding"
+        );
     }
 
     #[test]
@@ -36127,6 +36747,205 @@ mod tests {
     }
 
     #[test]
+    fn net_fetch_impl_does_not_hold_jar_lock_across_io() {
+        // w77fix: the shared profile jar must not be locked across
+        // network I/O. A slow font fetch held the lock for its whole
+        // duration, so navigation initiation (whose jar swap takes
+        // the same lock on the event thread) stalled behind it and
+        // concurrent JS font fetches serialized. The server delays
+        // its response 500ms; once it has read the request the
+        // fetch is in flight, and the jar lock must already be
+        // free — while the seeded profile cookie must still have
+        // been sent (snapshot semantics) and the server's
+        // `Set-Cookie` must land in the live jar afterwards.
+        use std::io::{Read, Write};
+        use std::net::TcpListener;
+        use std::sync::atomic::AtomicBool;
+
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind slow server");
+        let addr = listener.local_addr().expect("slow server addr");
+        let seen_req = Arc::new(AtomicBool::new(false));
+        let seen_req_server = Arc::clone(&seen_req);
+        let seen_cookie: Arc<std::sync::Mutex<Vec<String>>> =
+            Arc::new(std::sync::Mutex::new(Vec::new()));
+        let seen_cookie_server = Arc::clone(&seen_cookie);
+        std::thread::spawn(move || {
+            for stream in listener.incoming() {
+                let Ok(mut stream) = stream else { continue };
+                let _ = stream.set_read_timeout(Some(Duration::from_secs(5)));
+                let mut buf = Vec::new();
+                let mut chunk = [0u8; 4096];
+                loop {
+                    match stream.read(&mut chunk) {
+                        Ok(0) => break,
+                        Ok(n) => {
+                            buf.extend_from_slice(&chunk[..n]);
+                            if buf.windows(4).any(|w| w == b"\r\n\r\n") || buf.len() > 65_536 {
+                                break;
+                            }
+                        }
+                        Err(_) => break,
+                    }
+                }
+                let head = String::from_utf8_lossy(&buf);
+                let cookie = head
+                    .lines()
+                    .find_map(|line| line.strip_prefix("Cookie:"))
+                    .map(str::trim)
+                    .unwrap_or("(none)")
+                    .to_string();
+                seen_cookie_server.lock().expect("seen").push(cookie);
+                seen_req_server.store(true, Ordering::SeqCst);
+                std::thread::sleep(Duration::from_millis(500));
+                let response = "HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\nContent-Length: 2\r\nSet-Cookie: srv=1; Path=/\r\nConnection: close\r\n\r\nhi";
+                let _ = stream.write_all(response.as_bytes());
+            }
+        });
+
+        let jar: Arc<std::sync::Mutex<CookieJar>> =
+            Arc::new(std::sync::Mutex::new(CookieJar::new()));
+        jar.lock().expect("test jar").set_cookie(
+            "session=abc123; Path=/",
+            &bowser_net::cookies::RequestContext {
+                host: "127.0.0.1",
+                path: "/",
+                secure: false,
+                http_api: true,
+                top_host: None,
+                top_secure: None,
+                top_level_safe_navigation: false,
+            },
+            0,
+        );
+        let (tx, _rx) = mpsc::channel::<(u32, FetchOutcome)>();
+        let task = FetchTask {
+            tx,
+            job: 1,
+            request: net_fetch::Request {
+                method: "GET".to_string(),
+                url: bowser_url::parse(&format!("http://{addr}/slow"), None).unwrap(),
+                headers: Vec::new(),
+                body: None,
+            },
+            cancel: Arc::new(AtomicBool::new(false)),
+            jar: Some(Arc::clone(&jar)),
+            nav: net_fetch::NavigationContext::default(),
+            credentials_sent: None,
+        };
+        let handle = std::thread::spawn(move || net_fetch_impl(&task));
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        while !seen_req.load(Ordering::SeqCst) && std::time::Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        assert!(
+            seen_req.load(Ordering::SeqCst),
+            "server must see the request"
+        );
+        assert!(
+            jar.try_lock().is_ok(),
+            "jar lock must be free while the fetch is in flight"
+        );
+        let outcome = handle.join().expect("fetch thread");
+        let resp = outcome.expect("slow fetch must succeed");
+        assert_eq!(resp.body, b"hi");
+        let cookies = seen_cookie.lock().expect("seen").clone();
+        assert!(
+            cookies.iter().any(|c| c.contains("session=abc123")),
+            "snapshot must still send the seeded profile cookie; saw {cookies:?}"
+        );
+        assert_eq!(
+            jar.lock().expect("test jar").len(),
+            2,
+            "seeded cookie plus the server's Set-Cookie must both be in the live jar"
+        );
+    }
+
+    #[test]
+    fn net_fetch_impl_redirect_hop_cookies_merge_back() {
+        // w77fix: redirect-hop `Set-Cookie` headers must survive
+        // the snapshot discipline — the fetch runs against a
+        // private clone, so a hop cookie that only the clone saw
+        // has to merge back into the live jar, not just the final
+        // hop's. `/redir` sets `hop=1` and redirects to `/final`,
+        // which sets `fin=1`: the live jar must hold both.
+        use std::io::{Read, Write};
+        use std::net::TcpListener;
+
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind redir server");
+        let addr = listener.local_addr().expect("redir server addr");
+        std::thread::spawn(move || {
+            for stream in listener.incoming() {
+                let Ok(mut stream) = stream else { continue };
+                let _ = stream.set_read_timeout(Some(Duration::from_secs(5)));
+                let mut buf = Vec::new();
+                let mut chunk = [0u8; 4096];
+                loop {
+                    match stream.read(&mut chunk) {
+                        Ok(0) => break,
+                        Ok(n) => {
+                            buf.extend_from_slice(&chunk[..n]);
+                            if buf.windows(4).any(|w| w == b"\r\n\r\n") || buf.len() > 65_536 {
+                                break;
+                            }
+                        }
+                        Err(_) => break,
+                    }
+                }
+                let head = String::from_utf8_lossy(&buf);
+                let raw_path = head
+                    .lines()
+                    .next()
+                    .and_then(|l| l.split_whitespace().nth(1))
+                    .unwrap_or("/")
+                    .to_string();
+                // The client sends absolute-form targets
+                // (`GET http://host/redir ...`): strip the
+                // scheme+authority to get the path.
+                let path = if let Some(rest) = raw_path.strip_prefix("http://") {
+                    match rest.find('/') {
+                        Some(i) => rest[i..].to_string(),
+                        None => "/".to_string(),
+                    }
+                } else {
+                    raw_path
+                };
+                let response = if path == "/redir" {
+                    "HTTP/1.1 302 Found\r\nLocation: /final\r\nSet-Cookie: hop=1; Path=/\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+                } else {
+                    "HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\nContent-Length: 2\r\nSet-Cookie: fin=1; Path=/\r\nConnection: close\r\n\r\nok"
+                };
+                let _ = stream.write_all(response.as_bytes());
+            }
+        });
+
+        let jar: Arc<std::sync::Mutex<CookieJar>> =
+            Arc::new(std::sync::Mutex::new(CookieJar::new()));
+        let (tx, _rx) = mpsc::channel::<(u32, FetchOutcome)>();
+        let task = FetchTask {
+            tx,
+            job: 1,
+            request: net_fetch::Request {
+                method: "GET".to_string(),
+                url: bowser_url::parse(&format!("http://{addr}/redir"), None).unwrap(),
+                headers: Vec::new(),
+                body: None,
+            },
+            cancel: Arc::new(AtomicBool::new(false)),
+            jar: Some(Arc::clone(&jar)),
+            nav: net_fetch::NavigationContext::default(),
+            credentials_sent: None,
+        };
+        let outcome = net_fetch_impl(&task);
+        let resp = outcome.expect("redirect fetch must succeed");
+        assert_eq!(resp.body, b"ok");
+        assert_eq!(
+            jar.lock().expect("test jar").len(),
+            2,
+            "both the redirect hop's and the final hop's cookies must merge back"
+        );
+    }
+
+    #[test]
     fn fetch_pool_skips_tasks_of_dropped_contexts() {
         let runs = CANCELLED_RUNS.get_or_init(|| AtomicUsize::new(0));
         runs.store(0, Ordering::SeqCst);
@@ -36136,24 +36955,138 @@ mod tests {
         let dead = Arc::new(AtomicBool::new(true));
         let live = Arc::new(AtomicBool::new(false));
         // The cancelled task is queued first; FIFO order means the
-        // worker must skip it (no fetch call, no completion) and still
-        // deliver the live task behind it.
+        // worker must skip its network call — but it still delivers
+        // a cancellation outcome (w77fix: dropping it silently
+        // leaked the retained context's font-load maps and left its
+        // promise hanging), and the live task behind it still runs.
+        // Order between the two workers is not guaranteed, so both
+        // completions are collected before asserting.
         pool.submit(test_fetch_task(&ctx_tx, &dead, 7)).unwrap();
         pool.submit(test_fetch_task(&ctx_tx, &live, 8)).unwrap();
 
-        let (job, _) = ctx_rx
-            .recv_timeout(Duration::from_secs(10))
-            .expect("live fetch completion");
-        assert_eq!(job, 8);
+        let mut got: HashMap<u32, FetchOutcome> = HashMap::new();
+        for _ in 0..2 {
+            let (job, outcome) = ctx_rx
+                .recv_timeout(Duration::from_secs(10))
+                .expect("fetch completion");
+            got.insert(job, outcome);
+        }
         assert!(
-            ctx_rx.try_recv().is_err(),
-            "cancelled task must not deliver a completion"
+            matches!(got.get(&7), Some(Err(_))),
+            "cancelled task must deliver a cancellation outcome, got {got:?}"
+        );
+        assert!(
+            got.contains_key(&8),
+            "live task must still deliver its completion"
         );
         assert_eq!(
             runs.load(Ordering::SeqCst),
             1,
             "fetch must run exactly once: the cancelled task is skipped"
         );
+    }
+
+    /// Test fetch impl for the cancellation test: a cancelled task
+    /// must never reach the fetch implementation at all. Panicking
+    /// here (rather than returning an error) keeps the test
+    /// sensitive: an error outcome would drain the maps through
+    /// `complete_font_load` anyway and mask a missed cancel check.
+    fn cancelled_must_not_run_fetch(_task: &FetchTask) -> FetchOutcome {
+        panic!("cancelled task must not run its fetch")
+    }
+
+    #[test]
+    fn cancelled_font_load_drains_job_and_credentials_maps() {
+        // w77fix: a cancelled font-load job leaked both its
+        // `font_load_jobs` entry and its `font_load_credentials`
+        // flag entry, because the worker dropped the cancelled
+        // task without an outcome and nothing ever removed them
+        // (and the face's promise hung). The worker now delivers
+        // a cancellation outcome, so `poll_fetch_completions` +
+        // the page pump run it through `complete_font_load`,
+        // which removes both entries and settles the face as an
+        // error. The cancel flag is set directly (what
+        // `remove_context` does) while the context stays
+        // registered, so the pump can still run.
+        let mut vm = Vm::new();
+        let (doc, _) = Document::parse_html(b"<html><head></head><body></body></html>");
+        let doc = Rc::new(RefCell::new(doc));
+        let base = bowser_url::parse("http://example.com/", None).unwrap();
+        let ctx = vm
+            .install_page_web_apis(doc, base, "BowserTest/1.0")
+            .expect("production install");
+        node_list_str(
+            &mut vm,
+            "globalThis.__face = new FontFace('CancelFam', 'url(http://example.com/cancel.ttf)'); \
+             document.fonts.add(globalThis.__face); \
+             'setup';",
+        );
+        let apis = web_apis(ContextId(ctx)).expect("context registered");
+        let face = {
+            let g = apis.borrow();
+            g.gc_roots
+                .borrow()
+                .font_faces
+                .iter()
+                .find(|(_, rec)| rec.family == "CancelFam")
+                .map(|(h, _)| *h)
+                .expect("CancelFam face record")
+        };
+        let job = 0xC0FF_EE03u32;
+        let (tx, cancel) = {
+            let mut g = apis.borrow_mut();
+            g.font_load_jobs.insert(job, face);
+            let flag = Arc::new(AtomicBool::new(false));
+            g.font_load_credentials.insert(job, flag);
+            (g.fetch_tx.clone(), g.fetch_cancel.clone())
+        };
+        assert!(
+            apis.borrow().font_load_jobs.contains_key(&job)
+                && apis.borrow().font_load_credentials.contains_key(&job),
+            "job and credentials entries must be present before the cancel"
+        );
+        cancel.store(true, Ordering::SeqCst);
+        let pool = FetchPool::new(2, 8, cancelled_must_not_run_fetch);
+        pool.submit(FetchTask {
+            tx,
+            job,
+            request: test_fetch_request(),
+            cancel,
+            jar: None,
+            nav: net_fetch::NavigationContext::default(),
+            credentials_sent: None,
+        })
+        .expect("submit cancelled font task");
+        // The worker delivers the cancellation outcome promptly;
+        // poll it into the outcome table (bounded: a missing
+        // outcome fails instead of hanging the test).
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        loop {
+            poll_fetch_completions(&apis);
+            if apis.borrow().font_load_outcomes.contains_key(&job) {
+                break;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "cancelled font task must deliver its outcome"
+            );
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        let _errors = pump_page_event_loop(&mut vm, ctx);
+        assert!(
+            !apis.borrow().font_load_jobs.contains_key(&job),
+            "cancelled font load must remove its job entry"
+        );
+        assert!(
+            !apis.borrow().font_load_credentials.contains_key(&job),
+            "cancelled font load must remove its credentials-flag entry"
+        );
+        assert_eq!(
+            node_list_str(&mut vm, "globalThis.__face.status;"),
+            "error",
+            "cancelled load must settle the face as an error, not hang"
+        );
+        remove_context(ContextId(ctx));
     }
 
     #[test]
