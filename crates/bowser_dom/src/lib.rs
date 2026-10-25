@@ -605,6 +605,15 @@ pub struct Document {
     /// default. Drives the URL Standard's encoding override for query
     /// percent-encoding (see [`crate::anchor`]).
     encoding: bowser_encoding::Encoding,
+    /// The document's quirks mode (WHATWG HTML 13.2.6.4.1), computed
+    /// from the doctype at parse time and stored here so layout and
+    /// style can branch on it without re-deriving it from the doctype
+    /// (w77 quirks plumbing). `Document::new` documents — built by
+    /// script, not parsed — default to [`QuirksMode::NoQuirks`];
+    /// [`Document::parse_html`] and
+    /// [`Document::parse_html_with_executor`] stamp the mode they
+    /// return, so the returned mode and this field always agree.
+    quirks_mode: QuirksMode,
 }
 
 /// Longest text payload eligible for [`Document::intern_text`] sharing.
@@ -677,6 +686,7 @@ impl Document {
             clone_stack: Vec::new(),
             text_cache: HashSet::new(),
             encoding: bowser_encoding::Encoding::Utf8,
+            quirks_mode: QuirksMode::NoQuirks,
         };
         let root = doc.alloc(NodeKind::Document);
         // The root is trivially reachable from itself; everything the
@@ -701,6 +711,7 @@ impl Document {
             bowser_html::parse_into(html, &mut sink)
         };
         doc.set_encoding(bowser_html::detect_encoding(html));
+        doc.set_quirks_mode(quirks);
         (doc, quirks)
     }
 
@@ -724,6 +735,7 @@ impl Document {
             )
         };
         doc.set_encoding(bowser_html::detect_encoding(html));
+        doc.set_quirks_mode(quirks);
         (doc, quirks)
     }
 
@@ -742,6 +754,25 @@ impl Document {
     /// here.
     pub fn set_encoding(&mut self, encoding: bowser_encoding::Encoding) {
         self.encoding = encoding;
+    }
+
+    /// The document's quirks mode (see the [`Document::quirks_mode`]
+    /// field): stamped by [`Self::parse_html`] /
+    /// [`Self::parse_html_with_executor`] from the doctype, `NoQuirks`
+    /// for script-built documents. Layout and style read this instead
+    /// of re-deriving the mode, so the mode survives from parse to
+    /// layout input through every [`Document`] carrier (loader,
+    /// navigation, script executor) with no per-site threading.
+    pub fn quirks_mode(&self) -> QuirksMode {
+        self.quirks_mode
+    }
+
+    /// Set the document's quirks mode (see [`Self::quirks_mode`]).
+    /// Parse entry points call this; embedders that build a document
+    /// by other means (e.g. a re-parse that reuses a document) use it
+    /// to keep the field in sync with the doctype they installed.
+    pub fn set_quirks_mode(&mut self, quirks_mode: QuirksMode) {
+        self.quirks_mode = quirks_mode;
     }
 
     /// The `Document` node itself (always arena index 0).
@@ -4677,6 +4708,28 @@ mod w65_p_dom_tests {
         let (doc, _) = Document::parse_html(b"<div id=\"d\"></div><p id=\"d\"></p>");
         let first = doc.get_elements_by_tag_name("div").item(0).unwrap();
         assert_eq!(doc.get_element_by_id("d"), Some(first));
+    }
+
+    #[test]
+    fn quirks_mode_field_matches_parse_return() {
+        // w77 quirks plumbing: the mode returned by `parse_html` must
+        // also be the mode the document carries, for all three modes,
+        // so downstream layout/style need no separate threading.
+        assert_eq!(Document::new().quirks_mode(), QuirksMode::NoQuirks);
+        let (doc, q) = Document::parse_html(b"<!DOCTYPE html><html></html>");
+        assert_eq!(q, QuirksMode::NoQuirks);
+        assert_eq!(doc.quirks_mode(), QuirksMode::NoQuirks);
+        let (doc, q) = Document::parse_html(
+            b"<!DOCTYPE html PUBLIC \"-//W3C//DTD HTML 4.01 Transitional//EN\" \"http://www.w3.org/TR/html4/loose.dtd\"><html></html>",
+        );
+        assert_eq!(q, QuirksMode::LimitedQuirks);
+        assert_eq!(doc.quirks_mode(), QuirksMode::LimitedQuirks);
+        let (doc, q) = Document::parse_html(b"<html></html>");
+        assert_eq!(q, QuirksMode::Quirks);
+        assert_eq!(doc.quirks_mode(), QuirksMode::Quirks);
+        let mut doc = Document::new();
+        doc.set_quirks_mode(QuirksMode::Quirks);
+        assert_eq!(doc.quirks_mode(), QuirksMode::Quirks);
     }
 
     #[test]

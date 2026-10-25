@@ -47,7 +47,7 @@ use super::style::{
 };
 use super::{BoxType, FontFamilyId, FontMetrics, Rect};
 use bowser_css::{ComputedStyle, CssValue, props};
-use bowser_dom::NodeId;
+use bowser_dom::{NodeId, QuirksMode};
 use std::cell::RefCell;
 use std::ops::Range;
 use std::rc::Rc;
@@ -2259,6 +2259,23 @@ fn resolve_metrics(
     };
 }
 
+/// Box-sizing used for `height` / `min-height` / `max-height`
+/// resolution on a node: WHATWG Quirks §3.13 (the table cell height
+/// box sizing quirk) — in full quirks mode only, elements with a
+/// computed `display` of `table-cell` act as `border-box` for the
+/// height properties. Width resolution keeps the specified
+/// box-sizing, and limited-quirks / no-quirks documents use the
+/// specified value for height too.
+fn height_box_sizing(forest: &Forest, idx: usize) -> BoxSizing {
+    if forest.quirks_mode == QuirksMode::Quirks
+        && forest.nodes[idx].data.display == Display::TableCell
+    {
+        BoxSizing::BorderBox
+    } else {
+        forest.nodes[idx].data.box_sizing
+    }
+}
+
 /// The specified content height, if any. Percentage heights resolve against
 /// the containing-block height; `auto` (or a percentage — or a `calc()`
 /// containing a percentage — of an `auto` height) is `None`. Under
@@ -2295,7 +2312,7 @@ fn specified_height(forest: &Forest, idx: usize, cb_h: Option<f32>) -> Option<f3
         SpecLen::Stretch => {
             let base = cb_h?;
             let v = base.max(0.0);
-            Some(match d.box_sizing {
+            Some(match height_box_sizing(forest, idx) {
                 BoxSizing::BorderBox => {
                     let m = &forest.nodes[idx].metrics;
                     let bp = if is_vertical_table(forest, idx) {
@@ -2319,7 +2336,7 @@ fn specified_height(forest: &Forest, idx: usize, cb_h: Option<f32>) -> Option<f3
             )
             .map(|v| {
                 let v = v.max(0.0);
-                match d.box_sizing {
+                match height_box_sizing(forest, idx) {
                     BoxSizing::BorderBox => {
                         let m = &forest.nodes[idx].metrics;
                         // A vertical table's block axis is horizontal:
@@ -2389,7 +2406,7 @@ fn clamp_height(forest: &Forest, idx: usize, cb_h: Option<f32>, content_h: f32) 
         let m = &forest.nodes[idx].metrics;
         m.bt + m.pt + m.pb + m.bb
     };
-    match d.box_sizing {
+    match height_box_sizing(forest, idx) {
         BoxSizing::BorderBox => {
             let border_h = (content_h + extras).min(max_h).max(min_h);
             (border_h - extras).max(0.0)
@@ -7726,23 +7743,32 @@ pub(crate) fn content_based_width(
 ///   keep the dispatched value (no column-based size exists for
 ///   them here). Auto-width tables never reach the column arm —
 ///   their dispatched value is already column-based.
-/// - Grids and inline-grids keep the dispatched value, which floors
-///   a definite-width grid at its width (`grid_pref_width`'s fast
-///   path): a definite-ignoring grid measurement would need a
-///   variant of the grid track computation in `layout_grid.rs`,
-///   which this file does not own, so the floor stands as a known
-///   gap (usually masked at used-width time because grid layout
-///   grows the container to its tracks). Inline-tables as flex
-///   items are blockified through an anonymous wrapper, so the
-///   table node itself is never the item and its own `flex-basis`
-///   never applies; the wrapper measures the table's preferred
-///   width through the generic walk.
+/// - Grids and inline-grids with a definite width measure their
+///   tracks directly (w77, via
+///   [`layout_grid::grid_pref_width_ignoring_definite`]): the
+///   dispatched value floors such a grid at its width
+///   (`grid_pref_width`'s fast path), so keeping it would defeat
+///   the basis, exactly as for tables above. Ordinary layout keeps
+///   the fast path — only this basis arm uses the
+///   definite-ignoring variant. A grid's min-content basis needs
+///   no arm: `grid_min_width` has no definite fast path, so the
+///   dispatched min-content value is already track-based.
+///   Inline-tables as flex items are blockified (w77g,
+///   css-flexbox-1 §4): an in-flow inline-table child of a flex
+///   container is promoted to a `Table` box carrying its own style,
+///   so it IS the item, its own `flex-basis` applies, and it reaches
+///   the table column arm above like a block-level table.
+///   (Inline-grids still take the anonymous-wrapper path as flex
+///   items, so an end-to-end inline-grid basis is still masked by
+///   the wrapper; the inline-grid arm is pinned by a direct variant
+///   call in `layout_grid.rs`, like the table direct pins below.)
 ///
-/// Known limitation (w76fix L7): a replaced box (an intrinsic size
-/// is present) keeps the dispatched definite-width floor — an `<img>`
-/// with `width:100px` + `flex-basis:max-content` over a 300px natural
-/// size still measures 100. Replaced-intrinsic handling is out of
-/// this bypass's scope.
+/// Known limitation (w76fix L7), fixed in w77: a replaced box (an
+/// intrinsic size is present) used to keep the dispatched
+/// definite-width floor — an `<img>` with `width:100px` +
+/// `flex-basis:max-content` over a 300px natural size measured 100.
+/// [`flex_basis_keyword_size`] now has a replaced arm returning the
+/// intrinsic natural size (box-sizing-adjusted) instead.
 /// The returned value is content-box, like [`content_based_width`];
 /// it is never border-box-stripped (the keyword measures content,
 /// unlike a definite length basis, which resolves in box-sizing
@@ -7846,6 +7872,21 @@ fn flex_basis_keyword_size(
             }
         };
     }
+    // w77 (replaced): a replaced box with a definite width and an
+    // intrinsic size measures its intrinsic natural size for a
+    // content-keyword basis, not the dispatched definite-width
+    // floor — `<img width:100px>` + `flex-basis:max-content` over
+    // a 300px natural size bases at 300. `intrinsic_content_width`
+    // is already content-box (border-box strips border/padding)
+    // and min/max-clamped, matching the other arms' return terms.
+    // Gated on a definite width so the auto-width path — whose
+    // dispatched value is already intrinsic — is untouched.
+    if definite_specified_content_width(forest, idx).is_some()
+        && forest.nodes[idx].intrinsic.is_some()
+        && let Some(intrinsic) = intrinsic_content_width(forest, idx)
+    {
+        return intrinsic;
+    }
     if flex_kind(forest, idx).is_some() {
         return flex_basis_flex_size(forest, idx, spec, fonts, pw_cache, mcw, bufs, inner);
     }
@@ -7864,10 +7905,11 @@ fn flex_basis_keyword_size(
     // the dispatched value, as before. Auto-width tables never reach
     // this arm — their dispatched value is already column-based —
     // so only the definite-width hole changes behavior. (An
-    // `inline-table` item never arrives here: flex items are
-    // blockified through an anonymous wrapper, so the table node
-    // itself is not the item; the display arm is kept for symmetry
-    // with the dispatched arms.)
+    // in-flow `inline-table` flex item DOES arrive here since w77g
+    // blockification: it is promoted to a `Table` box carrying its
+    // own style, so it is the item (not a style-less wrapper) and
+    // its own basis reaches this column arm; the `display` arm
+    // additionally covers nodes measured before promotion.)
     if definite_specified_content_width(forest, idx).is_some()
         && (forest.nodes[idx].box_type == BoxType::Table
             || forest.nodes[idx].data.display == Display::InlineTable)
@@ -7887,6 +7929,28 @@ fn flex_basis_keyword_size(
             }
             _ => {}
         }
+    }
+    // w77 (grids, mirroring the table arm above): the dispatched
+    // value floors a definite-width grid at its width
+    // (`grid_pref_width`'s fast path), so a max-content basis over
+    // a definite width must measure the tracks directly instead,
+    // via the definite-ignoring variant in `layout_grid.rs` (same
+    // track computation, fast path skipped, min/max-width clamp
+    // kept). Only max-content needs the arm: the min-content
+    // dispatch (`grid_min_width`) has no definite fast path, so a
+    // min-content basis is already track-based, and fit-content
+    // reaches this arm through its max-content half. Replaced
+    // grids never reach here (the replaced arm above returns
+    // first), and auto-width grids never need it (their dispatched
+    // value is already track-based) — only the definite-width
+    // hole changes behavior. Ordinary layout is untouched:
+    // `grid_pref_width` keeps its fast path.
+    if definite_specified_content_width(forest, idx).is_some()
+        && matches!(spec, SpecLen::MaxContent)
+        && (forest.nodes[idx].box_type == BoxType::Grid
+            || forest.nodes[idx].data.display == Display::InlineGrid)
+    {
+        return layout_grid::grid_pref_width_ignoring_definite(forest, idx, fonts, pw_cache);
     }
     content_based_width(forest, idx, spec, fonts, pw_cache, mcw, bufs, inner, avail)
 }
@@ -8729,7 +8793,16 @@ fn flex_intrinsic_width(
             continue;
         }
         let w = child_w(forest, c);
-        if is_block_level(forest.nodes[c].box_type) {
+        // w77g: mirror `wrap_flex_text_runs`' blockification — an
+        // in-flow inline-table is a single styled item, not part of a
+        // coalesced run, so its contribution goes through
+        // `flex_item_intrinsic_contribution` (basis/margins) instead
+        // of the run's unstyled sum/max. (This runs before layout
+        // promotes the node, so the `display` check, not the
+        // post-promotion `box_type`, is what identifies it here.)
+        let is_inline_table_item = forest.nodes[c].box_type == BoxType::InlineBlock
+            && forest.nodes[c].data.display == Display::InlineTable;
+        if is_block_level(forest.nodes[c].box_type) || is_inline_table_item {
             run_open = false;
             items.push(RawItem {
                 rep: c,
@@ -10181,6 +10254,114 @@ fn intrinsic_scrollbar_reservation(forest: &Forest, i: usize) -> f32 {
     reservation
 }
 
+/// Whether a text node's `white-space` lets its edge spaces collapse
+/// against a neighbour's (the same set
+/// [`collapse_adjacent_spaces`] treats as collapsible): `pre`-family
+/// modes preserve spaces, so their seams never collapse.
+fn seam_collapsible_ws(ws: WhiteSpace) -> bool {
+    matches!(
+        ws,
+        WhiteSpace::Normal | WhiteSpace::NoWrap | WhiteSpace::PreLine
+    )
+}
+
+/// Last text descendant of an inline box in document order, skipping
+/// out-of-flow and floated children (they produce no line fragments,
+/// so they never break a seam). Returns `(Some(t), false)` for a
+/// text node, `(None, false)` for an inline with no in-flow
+/// children at all (transparent to the seam), and `(None, true)`
+/// when the inline ends in a breaking box (a block-level child, a
+/// replaced box, a `<br>`).
+fn last_text_descendant(forest: &Forest, mut idx: usize) -> (Option<usize>, bool) {
+    loop {
+        let kids = &forest.nodes[idx].children;
+        let mut found = None;
+        for &c in kids.iter().rev() {
+            if layout_position::is_out_of_flow(forest, c) || is_float(forest, c) {
+                continue;
+            }
+            found = Some(c);
+            break;
+        }
+        let Some(c) = found else {
+            return (None, false);
+        };
+        if forest.nodes[c].box_type == BoxType::Text {
+            return (Some(c), false);
+        }
+        if forest.nodes[c].box_type == BoxType::Inline {
+            idx = c;
+            continue;
+        }
+        return (None, true);
+    }
+}
+
+/// Previous text node in the same inline run as `idx` (w77): walk
+/// left through siblings, descending into trailing inlines, and up
+/// through enclosing inlines; a block-level, replaced, or `<br>`
+/// sibling, a non-inline parent, or the walk root itself ends the
+/// run. Mirrors the fragment adjacency
+/// [`collapse_adjacent_spaces`] sees in line layout, where inline
+/// wrappers contribute no fragments of their own.
+fn prev_text_in_run(forest: &Forest, idx: usize, root: usize) -> Option<usize> {
+    let mut cur = idx;
+    loop {
+        if cur == root {
+            return None;
+        }
+        let parent = forest.nodes[cur].parent?;
+        let kids = &forest.nodes[parent].children;
+        let pos = kids.iter().position(|&c| c == cur)?;
+        for &c in kids[..pos].iter().rev() {
+            if layout_position::is_out_of_flow(forest, c) || is_float(forest, c) {
+                continue;
+            }
+            if forest.nodes[c].box_type == BoxType::Text {
+                return Some(c);
+            }
+            if forest.nodes[c].box_type == BoxType::Inline {
+                match last_text_descendant(forest, c) {
+                    (Some(t), _) => return Some(t),
+                    (None, true) => return None,
+                    (None, false) => continue,
+                }
+            }
+            return None;
+        }
+        if forest.nodes[parent].box_type == BoxType::Inline {
+            cur = parent;
+            continue;
+        }
+        return None;
+    }
+}
+
+/// Whether the max-content walk must drop one space advance from
+/// text node `idx`: its own text starts with a collapsible space
+/// and the previous text node in its inline run ends with one.
+/// This is the intrinsic-width twin of
+/// [`collapse_adjacent_spaces`]; line layout itself is untouched,
+/// so there is no double correction (fragments are computed from
+/// the text, never from `pref_w`). The search stops at the walk
+/// root, so a subtree measurement never inherits a seam from
+/// outside the measured subtree.
+fn seam_space_drop(forest: &Forest, idx: usize, root: usize) -> bool {
+    let n = &forest.nodes[idx];
+    if !seam_collapsible_ws(n.data.white_space) {
+        return false;
+    }
+    let text = n.text.as_deref().unwrap_or("");
+    if !text.starts_with(' ') {
+        return false;
+    }
+    let Some(prev) = prev_text_in_run(forest, idx, root) else {
+        return false;
+    };
+    let p = &forest.nodes[prev];
+    seam_collapsible_ws(p.data.white_space) && p.text.as_deref().unwrap_or("").ends_with(' ')
+}
+
 fn preferred_width_mcw(
     forest: &mut Forest,
     idx: usize,
@@ -10237,11 +10418,16 @@ fn preferred_width_mcw(
                 // whole-run product). `pre`-family modes keep the
                 // whole-run advance alone: their fragments are
                 // pre-fit pieces, not this split.
-                // Per-node, not cross-node: `collapse_adjacent_spaces`
-                // zeroes one space at a text-node seam in line layout,
-                // but this per-node walk counts both seam spaces, so
-                // the guarantee above holds within each node only.
-                if matches!(n.data.white_space, WhiteSpace::Normal | WhiteSpace::NoWrap) {
+                // Cross-node seam (w77): `collapse_adjacent_spaces`
+                // zeroes one space at a text-node seam in line layout;
+                // this walk used to count both seam spaces, overcounting
+                // max-content by one space advance whenever text is
+                // split across nodes. Drop the leading space here when
+                // the previous text node in the run ends with a
+                // collapsible space (see [`seam_space_drop`]); the
+                // per-node guarantee above then holds across nodes too.
+                let base = if matches!(n.data.white_space, WhiteSpace::Normal | WhiteSpace::NoWrap)
+                {
                     let mut w = 0.0f32;
                     for (k, part) in text.split(' ').enumerate() {
                         if k > 0 {
@@ -10256,6 +10442,11 @@ fn preferred_width_mcw(
                     w.max(fonts.advance(text, fs, family))
                 } else {
                     fonts.advance(text, fs, family)
+                };
+                if seam_space_drop(forest, i, idx) {
+                    (base - fonts.advance(" ", fs, family)).max(0.0)
+                } else {
+                    base
                 }
             }
             // `<br>` forces a line break even at max-content (no soft wraps
@@ -11474,6 +11665,39 @@ fn min_content_width_pooled_raw(
     min_content_width_pooled_impl(forest, idx, fonts, scratch, bufs, false)
 }
 
+/// Min-content width of a table cell's inline formatting context in
+/// full quirks mode (WHATWG Quirks §3.8, the table cell width
+/// calculation quirk): consecutive inline-level replaced elements
+/// have no soft wrap opportunity before or after them, so a run of
+/// them contributes its summed width instead of the widest single
+/// element. Any other child breaks the run and contributes its own
+/// min-content, exactly as the normal max fold does. Applies to the
+/// cell node itself and to an anonymous block wrapping its inline
+/// run alike — both iterate the same direct children. Replaced boxes
+/// are the `InlineBlock` boxes carrying an intrinsic size (box
+/// construction stamps `intrinsic = Some` on every replaced element,
+/// even a missing `<img>`); a run only ever forms between such boxes,
+/// never across text or inline containers (an `Inline` container
+/// already sums its children in the `Inline` arm).
+fn quirks_cell_inline_min_content(forest: &Forest, idx: usize, out: &[f32]) -> f32 {
+    let mut best = 0.0f32;
+    let mut run = 0.0f32;
+    for &c in forest.nodes[idx].children.iter() {
+        if layout_position::is_out_of_flow(forest, c) {
+            continue;
+        }
+        let n = &forest.nodes[c];
+        if n.box_type == BoxType::InlineBlock && n.intrinsic.is_some() {
+            run += out[c] + intrinsic_h_extras(forest, c);
+        } else {
+            best = best.max(run);
+            run = 0.0;
+            best = best.max(out[c] + intrinsic_h_extras(forest, c));
+        }
+    }
+    best.max(run)
+}
+
 fn min_content_width_pooled_impl(
     forest: &mut Forest,
     idx: usize,
@@ -11659,12 +11883,39 @@ fn min_content_width_pooled_impl(
             // never resolves, so F7 (the box sizes to its min-content)
             // is preserved by the kids fallback.
             _ => {
-                let kids = forest.nodes[i]
-                    .children
-                    .iter()
-                    .filter(|&&c| !layout_position::is_out_of_flow(forest, c))
-                    .map(|&c| out[c] + intrinsic_h_extras(forest, c))
-                    .fold(0.0, f32::max);
+                // WHATWG Quirks §3.8: the min-content of a table
+                // cell's inline formatting context, in a full-quirks
+                // document whose cell has an `auto` width, measures
+                // with no soft wrap opportunities between consecutive
+                // inline replaced elements (see
+                // `quirks_cell_inline_min_content`). The context is
+                // either the cell itself (its inline children stay
+                // direct children when no block-level sibling forces
+                // an anonymous wrapper) or the anonymous block
+                // wrapping the cell's inline run. Limited-quirks and
+                // no-quirks documents, cells with a definite width,
+                // and vertical-writing-mode cells (whose inline axis
+                // is physical vertical, measured by the vertical
+                // intrinsic passes instead) keep the normal max fold.
+                let quirks_cell_run = forest.quirks_mode == QuirksMode::Quirks
+                    && forest.nodes[i].data.writing_mode == WritingMode::HorizontalTb
+                    && (forest.nodes[i].box_type == BoxType::TableCell
+                        && matches!(forest.nodes[i].data.width, SpecLen::Auto)
+                        || forest.nodes[i].box_type == BoxType::AnonymousBlock
+                            && forest.nodes[i].parent.is_some_and(|p| {
+                                forest.nodes[p].box_type == BoxType::TableCell
+                                    && matches!(forest.nodes[p].data.width, SpecLen::Auto)
+                            }));
+                let kids = if quirks_cell_run {
+                    quirks_cell_inline_min_content(forest, i, out)
+                } else {
+                    forest.nodes[i]
+                        .children
+                        .iter()
+                        .filter(|&&c| !layout_position::is_out_of_flow(forest, c))
+                        .map(|&c| out[c] + intrinsic_h_extras(forest, c))
+                        .fold(0.0, f32::max)
+                };
                 match forest.nodes[i].box_type {
                     BoxType::Block | BoxType::AnonymousBlock => {
                         definite_specified_content_width(forest, i)
@@ -11724,6 +11975,21 @@ fn min_content_width_pooled_impl(
 /// container `idx` in an anonymous block box (flexbox §4), rewriting the
 /// container's child list. Each contiguous run of text and inline boxes
 /// becomes one anonymous flex item instead of N separate items.
+///
+/// Exception (w77g, css-flexbox-1 §4 blockification): an in-flow
+/// `display: inline-table` child is NOT wrapped — it blockifies to a
+/// real `Table` box carrying its own style, so its `flex-basis`,
+/// `flex-grow`/`flex-shrink`, and margins reach the item instead of
+/// being lost on a style-less wrapper (the wrapper's basis is `auto`,
+/// its grow 0). The promotion is idempotent: a promoted node is
+/// block-level, so a second pass (e.g. the inline-flex shrink-to-fit
+/// estimate running before the real pass) takes the early return or
+/// the block-level arm and leaves it alone. Other inline-level
+/// children (text runs, inline-block, inline-flex, inline-grid) keep
+/// the wrapper path, which they rely on: text has no style of its own
+/// to carry, and the wrapper is the item those shapes lay out through.
+/// Out-of-flow inline-tables are not flex items at all, so they are
+/// left as `InlineBlock` boxes for the absolute-positioning path.
 fn wrap_flex_text_runs(forest: &mut Forest, idx: usize) {
     // Index iteration instead of `children.clone()`: nothing in the loop
     // below mutates `nodes[idx].children` itself (the anonymous wrappers
@@ -11753,6 +12019,25 @@ fn wrap_flex_text_runs(forest: &mut Forest, idx: usize) {
                     true,
                 ));
             }
+            roots.push(c);
+        } else if forest.nodes[c].box_type == BoxType::InlineBlock
+            && forest.nodes[c].data.display == Display::InlineTable
+        {
+            // w77g blockification (see the fn docs): flush any pending
+            // run, then promote this node to a table item of its own.
+            // Its style is untouched, so `flex-basis` etc. survive;
+            // the table dispatch arms key off `display` as well as
+            // `box_type`, so the promoted node still sizes as an
+            // inline-table (caption floor, column sizing).
+            if !run.is_empty() {
+                roots.push(forest.make_anonymous(
+                    &parent_data,
+                    std::mem::take(&mut run),
+                    idx,
+                    true,
+                ));
+            }
+            forest.nodes[c].box_type = BoxType::Table;
             roots.push(c);
         } else {
             run.push(c);
@@ -16248,14 +16533,14 @@ mod flex_tests {
     // dispatched definite floor the max base was 100 and table
     // layout grew the item only to the min-plus-spacing 140, so
     // 404 discriminates the column arm from the floor.
-    // NOTE on the task's inline-table shape: an inline-table flex
-    // item is blockified through a style-less anonymous wrapper in
-    // this engine, so `flex-basis` on the table never reaches the
-    // item — the shape cannot test the basis at all (verified by
-    // probe: the item is the wrapper with basis Auto). The
-    // block-level table below is the testable form of the same
-    // column-sum claim; the wrapper behavior itself is a
-    // boxes.rs blockification gap, out of this task's scope.
+    // NOTE on the task's inline-table shape: since w77g
+    // blockification, an inline-table flex item is promoted to a
+    // `Table` box carrying its own style, so `flex-basis` on the
+    // table DOES reach the item — the shape is now testable (see
+    // the inline-table blockification tests in `tests.rs`). The
+    // block-level table below is kept as the form of the same
+    // column-sum claim that was testable before that promotion
+    // landed, when the item really was a style-less wrapper.
     #[test]
     fn w76fix_table_basis_max_content_uses_column_sum() {
         let l = layout_html(

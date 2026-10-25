@@ -148,19 +148,25 @@ pub struct Profile {
     /// The profile's cookie jar, shared across all tabs and all loader
     /// threads.
     ///
-    /// `Mutex`, not `RefCell`: loads run on worker threads, and
-    /// [`crate::loader::load_document_with_user_agent`] requires `&Mutex<CookieJar>` so
-    /// the jar can cross into those threads. The lock is held for the
-    /// whole load in v1 (see the loader docs); keep critical sections
-    /// short everywhere else.
-    pub cookie_jar: Mutex<CookieJar>,
+    /// `Arc<Mutex<_>>`, not a plain `Mutex`: the loader takes
+    /// `&Mutex<CookieJar>` (through deref coercion) so the jar can
+    /// cross into loader threads, and the install path shares this
+    /// same `Arc` with each page's JS context
+    /// ([`bowser_js::share_cookie_jar`]) so a same-origin
+    /// `FontFace.load()` sends the profile's cookies. A snapshot copy
+    /// would diverge from the profile jar in both directions and is
+    /// not wiring, so the profile itself owns the shared handle: one
+    /// jar, one `Arc`, every consumer clones it. The lock is held for
+    /// the whole load in v1 (see the loader docs); keep critical
+    /// sections short everywhere else.
+    pub cookie_jar: Arc<Mutex<CookieJar>>,
 }
 
 impl Profile {
     /// A fresh profile with an empty cookie jar.
     pub fn new() -> Self {
         Self {
-            cookie_jar: Mutex::new(CookieJar::new()),
+            cookie_jar: Arc::new(Mutex::new(CookieJar::new())),
         }
     }
 }
@@ -202,12 +208,13 @@ impl Browser {
         &self.config
     }
 
-    /// The profile's shared cookie jar.
+    /// The profile's shared cookie jar handle.
     ///
-    /// `&Mutex<_>` is what [`crate::loader::load_document_with_user_agent`] and
-    /// [`crate::navigation`] require; this is the reference to hand them.
+    /// The `Arc` itself (not a `&Mutex` view of it): [`crate::navigation`]
+    /// takes this handle and shares it with each page's JS context, so
+    /// JS font loads and loader fetches lock the same jar.
     /// [`Browser::navigate`] and friends already plumb it in.
-    pub fn cookie_jar(&self) -> &Mutex<CookieJar> {
+    pub fn cookie_jar(&self) -> &Arc<Mutex<CookieJar>> {
         &self.profile.cookie_jar
     }
 

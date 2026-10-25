@@ -1568,6 +1568,16 @@ impl<'a, 'x, 'h> ScriptHost<'a, 'x, 'h> {
         self.tb.mutation_count()
     }
 
+    /// The document's quirks mode as computed from its doctype
+    /// (WHATWG 13.2.6.4.1). Live during script execution: the mode
+    /// is set when the doctype token processes, before any body
+    /// script runs, so a mid-parse measurement can read it even
+    /// though no `Document` exists yet — the parse shim stamps it
+    /// onto the documents it rebuilds from the snapshot.
+    pub fn quirks_mode(&self) -> QuirksMode {
+        self.tb.quirks_mode()
+    }
+
     /// Snapshot the tree built so far into `sink`, borrowing the arena:
     /// string payloads are cloned and the parse continues afterwards,
     /// undisturbed. Buffered text runs, table text, and foster-parented
@@ -1611,97 +1621,70 @@ impl<'a, 'x, 'h> ScriptHost<'a, 'x, 'h> {
     /// `:nth-of-type()`, `:nth-last-of-type()`, `:empty`, `:root`, and
     /// `:not()`, combined with the descendant (` `), child (`>`),
     /// adjacent-sibling (`+`), and general-sibling (`~`) combinators.
-    /// Comma-separated groups return the first match across all groups.
-    /// Anything else (other pseudo-classes/elements, namespaces, `:has()`,
-    /// ...) is unsupported and yields `None`.
+    /// Comma-separated groups are unioned: the earliest element in
+    /// document order matching any group wins. Anything else (other
+    /// pseudo-classes/elements, namespaces, `:has()`, ...) is
+    /// unsupported and yields `None`.
     pub fn query_selector(&self, sel: &str) -> Option<ScriptElement> {
-        let generation = self.tb.generation;
-        // Handle comma-separated groups (respecting brackets/parens):
-        // return first match across groups.
-        for group in split_selector_groups(sel) {
-            if group.is_empty() {
-                continue;
-            }
-            if let Some(el) = self.query_single(&group, generation) {
-                return Some(el);
-            }
-        }
-        None
+        self.query_selector_all(sel).into_iter().next()
     }
 
     /// `document.querySelectorAll(sel)`: all elements in document order
     /// matching the selector. Same selector support as
-    /// [`query_selector`](Self::query_selector).
+    /// [`query_selector`](Self::query_selector). Comma-separated groups
+    /// are unioned: an element matching two groups appears once, and
+    /// interleaved groups come out in document order, not group order
+    /// — mirroring the production DOM's matched-set + preorder walk.
+    /// Arena order is creation order, NOT document order: moves
+    /// (`appendChild` / `insertBefore`) and foster parenting reorder
+    /// the tree without touching arena slots, so order is taken from
+    /// the preorder walk from the document root (the same walk
+    /// `getElementById` / `getElementsByTagName` use). That walk only
+    /// reaches connected nodes, so detached nodes — e.g. an element
+    /// removed by `removeChild` / `replaceChild`, or created by
+    /// `createElement` but never inserted — never match (a setup loop
+    /// like `while (xtd = querySelector('x-td[rowspan]')) {
+    /// ...replaceChild(td, xtd); }` would otherwise keep finding the
+    /// just-detached node forever). Template contents are likewise
+    /// never walked, per DOM.
     pub fn query_selector_all(&self, sel: &str) -> Vec<ScriptElement> {
         let generation = self.tb.generation;
-        let mut result = Vec::new();
-        for group in split_selector_groups(sel) {
-            if group.is_empty() {
-                continue;
-            }
-            self.query_all_single(&group, generation, &mut result);
+        let complexes: Vec<_> = split_selector_groups(sel)
+            .into_iter()
+            .filter(|group| !group.is_empty())
+            .filter_map(|group| parse_complex_selector(&group))
+            .collect();
+        if complexes.is_empty() {
+            return Vec::new();
         }
-        result
+        let order = self.document_order_elements();
+        let mut matched = vec![false; self.tb.arena.len()];
+        for complex in &complexes {
+            for &idx in &order {
+                if self.complex_matches(complex, idx) {
+                    matched[idx] = true;
+                }
+            }
+        }
+        order
+            .into_iter()
+            .filter(|idx| matched[*idx])
+            .map(|idx| ScriptElement::from_el(idx, generation))
+            .collect()
     }
 
-    /// Whether the arena element is connected to the document:
-    /// following parent links reaches the document root.
-    /// `document.querySelector` / `querySelectorAll` must not match
-    /// detached nodes — e.g. an element removed by `removeChild` /
-    /// `replaceChild`, or created by `createElement` but never
-    /// inserted. (The sibling `getElementById` / `getElementsByTagName`
-    /// already walk from the document root, so they never saw detached
-    /// nodes.) Without this, a setup loop like `while (xtd =
-    /// querySelector('x-td[rowspan]')) { ...replaceChild(td, xtd); }`
-    /// would keep finding the just-detached node forever.
-    fn is_connected(&self, idx: El) -> bool {
-        let mut cur = idx;
-        // Bound the walk by the arena length: parent links form a tree,
-        // so a longer walk means a cycle (unreachable in a correct
-        // run) — fail closed instead of hanging.
-        for _ in 0..self.tb.arena.len() {
-            match self.tb.arena.get(cur).and_then(|n| n.parent) {
-                Some(Parent::Elem(p)) => cur = p,
-                Some(Parent::Doc) => return true,
-                None => return false,
-            }
-        }
-        false
-    }
-
-    /// Match a single (non-comma) selector group, returning the first
-    /// match in document order.
-    fn query_single(&self, sel: &str, generation: u64) -> Option<ScriptElement> {
-        let complex = parse_complex_selector(sel)?;
-        // Walk the arena in order (document order).
-        for (idx, node) in self.tb.arena.iter().enumerate() {
-            if !is_element_node(node) {
-                continue;
-            }
-            // Check connectedness only for selector matches: the
-            // parent walk is O(depth) and most nodes never match.
-            if self.complex_matches(&complex, idx) && self.is_connected(idx) {
-                return Some(ScriptElement::from_el(idx, generation));
-            }
-        }
-        None
-    }
-
-    /// Match a single selector group, appending all matches in document
-    /// order to `out`.
-    fn query_all_single(&self, sel: &str, generation: u64, out: &mut Vec<ScriptElement>) {
-        let Some(complex) = parse_complex_selector(sel) else {
-            return;
-        };
-        for (idx, node) in self.tb.arena.iter().enumerate() {
-            if !is_element_node(node) {
-                continue;
-            }
-            // See `query_single`: only connected nodes match.
-            if self.complex_matches(&complex, idx) && self.is_connected(idx) {
-                out.push(ScriptElement::from_el(idx, generation));
-            }
-        }
+    /// Element indices in document order: the preorder walk from the
+    /// document root, following `children` lists. This — not arena
+    /// index order — is document order after moves and foster
+    /// parenting, and it excludes detached nodes and template
+    /// contents by construction.
+    fn document_order_elements(&self) -> Vec<El> {
+        let mut out = Vec::new();
+        self.tb.each_element(|el| {
+            out.push(el);
+            true
+        });
+        out
     }
 
     /// Right-to-left match of a complex selector against arena element
@@ -2069,56 +2052,48 @@ impl<'a, 'x, 'h> ScriptHost<'a, 'x, 'h> {
     }
 
     /// `el.querySelector(sel)`: first descendant of `el` (not `el`
-    /// itself) matching the selector, in document order.
+    /// itself) matching the selector, in document order — the earliest
+    /// descendant in document order matching any comma-separated group,
+    /// not the first group's first match.
     pub fn query_selector_in(&self, el: ScriptElement, sel: &str) -> Option<ScriptElement> {
-        let idx = self.check_el(el)?;
-        let generation = el.generation;
-        for group in split_selector_groups(sel) {
-            if group.is_empty() {
-                continue;
-            }
-            let Some(complex) = parse_complex_selector(&group) else {
-                continue;
-            };
-            for desc in self.descendant_elements(idx) {
-                if self.complex_matches(&complex, desc) {
-                    return Some(ScriptElement::from_el(desc, generation));
-                }
-            }
-        }
-        None
+        self.query_selector_all_in(el, sel).into_iter().next()
     }
 
     /// `el.querySelectorAll(sel)`: all descendants of `el` matching the
-    /// selector, in document order.
+    /// selector, in document order. Comma-separated groups are unioned
+    /// like [`query_selector_all`](Self::query_selector_all): each
+    /// descendant appears once, in document order, not group order.
+    /// (`descendant_elements` already walks `children` lists, so it is
+    /// document order even after moves; no dedup scan is needed because
+    /// each descendant is visited exactly once.)
     pub fn query_selector_all_in(&self, el: ScriptElement, sel: &str) -> Vec<ScriptElement> {
         let Some(idx) = self.check_el(el) else {
             return Vec::new();
         };
         let generation = el.generation;
-        let mut out = Vec::new();
-        for group in split_selector_groups(sel) {
-            if group.is_empty() {
-                continue;
-            }
-            let Some(complex) = parse_complex_selector(&group) else {
-                continue;
-            };
-            for desc in self.descendant_elements(idx) {
-                if self.complex_matches(&complex, desc)
-                    && !out.iter().any(|e: &ScriptElement| e.to_el() == desc)
-                {
-                    out.push(ScriptElement::from_el(desc, generation));
-                }
-            }
+        let complexes: Vec<_> = split_selector_groups(sel)
+            .into_iter()
+            .filter(|group| !group.is_empty())
+            .filter_map(|group| parse_complex_selector(&group))
+            .collect();
+        if complexes.is_empty() {
+            return Vec::new();
         }
-        out
+        self.descendant_elements(idx)
+            .into_iter()
+            .filter(|desc| {
+                complexes
+                    .iter()
+                    .any(|complex| self.complex_matches(complex, *desc))
+            })
+            .map(|desc| ScriptElement::from_el(desc, generation))
+            .collect()
     }
 
     /// Whether `anc` is an ancestor of (or equal to) `idx`.
     fn is_ancestor_or_self(&self, anc: El, idx: El) -> bool {
         let mut cur = idx;
-        // Bound the walk by the arena length, mirroring `is_connected`:
+        // Bound the walk by the arena length:
         // parent links form a tree, so a longer walk means a cycle
         // (unreachable through the guarded mutation APIs) — fail closed
         // instead of hanging.
@@ -2612,14 +2587,6 @@ fn is_void_element(tag: &str) -> bool {
             | "track"
             | "wbr"
     )
-}
-
-/// Check if an arena node is an element (not text/comment/etc).
-fn is_element_node(node: &ArenaNode) -> bool {
-    // ArenaNode is always an element in this tree builder; text nodes
-    // are stored separately. All arena entries are elements.
-    let _ = node;
-    true
 }
 
 // ---------------------------------------------------------------------------
@@ -9664,6 +9631,209 @@ mod tests {
             "mutators that did not bump mutation_count: {:?}",
             probe.failures
         );
+    }
+
+    // -- shim querySelector / querySelectorAll document order --------
+
+    /// `id` attribute of a shim element, for QSA probe assertions.
+    fn shim_id(host: &ScriptHost, el: ScriptElement) -> String {
+        host.get_attributes(el)
+            .into_iter()
+            .find(|(k, _)| k == "id")
+            .map(|(_, v)| v)
+            .unwrap_or_default()
+    }
+
+    /// [`ScriptExecutor`] asserting multi-group shim QSA is deduped and
+    /// in document order, and shim QS returns the earliest element in
+    /// document order across groups (not the first group's first match).
+    struct QsaOrderProbe {
+        ran: bool,
+        all: Vec<String>,
+        one: String,
+        single: Vec<String>,
+    }
+
+    impl ScriptExecutor for QsaOrderProbe {
+        fn execute_script(
+            &mut self,
+            host: &mut ScriptHost<'_, '_, '_>,
+            _el: ScriptElement,
+            _attrs: &[(String, String)],
+            _script: &str,
+        ) {
+            // `.y` matches b, c, d; `.x` matches a, c. Group order with
+            // no dedup would be [b, c, d, a, c]; document order deduped
+            // is [a, b, c, d].
+            self.all = host
+                .query_selector_all(".y, .x")
+                .into_iter()
+                .map(|el| shim_id(host, el))
+                .collect();
+            self.one = host
+                .query_selector(".y, .x")
+                .map(|el| shim_id(host, el))
+                .unwrap_or_default();
+            self.single = host
+                .query_selector_all(".x")
+                .into_iter()
+                .map(|el| shim_id(host, el))
+                .collect();
+            self.ran = true;
+        }
+    }
+
+    #[test]
+    fn shim_qsa_multi_group_deduped_in_document_order() {
+        let html = "<div id=\"a\" class=\"x\"></div><span id=\"b\" class=\"y\"></span>\
+                    <div id=\"c\" class=\"x y\"></div><p id=\"d\" class=\"y\"></p><script>1</script>";
+        let mut probe = QsaOrderProbe {
+            ran: false,
+            all: Vec::new(),
+            one: String::new(),
+            single: Vec::new(),
+        };
+        parse_with_scripting_and_executor(html.as_bytes(), true, &mut probe);
+        assert!(probe.ran, "script executor never ran");
+        assert_eq!(probe.all, vec!["a", "b", "c", "d"]);
+        assert_eq!(probe.one, "a");
+        assert_eq!(probe.single, vec!["a", "c"]);
+    }
+
+    /// [`ScriptExecutor`] asserting a moved element is reported in its
+    /// new document position, not its (unchanged) arena slot: arena
+    /// order is creation order, so it diverges from document order
+    /// after `appendChild` moves a node.
+    struct QsaMoveProbe {
+        ran: bool,
+        all: Vec<String>,
+        one: String,
+    }
+
+    impl ScriptExecutor for QsaMoveProbe {
+        fn execute_script(
+            &mut self,
+            host: &mut ScriptHost<'_, '_, '_>,
+            _el: ScriptElement,
+            _attrs: &[(String, String)],
+            _script: &str,
+        ) {
+            let a = host.get_element_by_id("a").expect("a");
+            let parent = host.parent_element(a).expect("a has a parent");
+            assert!(host.append_child(parent, a), "move a to the end");
+            // A detached element must not match, even though it sits in
+            // the arena with a matching class.
+            let detached = host.create_element("div");
+            host.set_attribute(detached, "class", "x");
+            self.all = host
+                .query_selector_all("#c, .x")
+                .into_iter()
+                .map(|el| shim_id(host, el))
+                .collect();
+            self.one = host
+                .query_selector(".x")
+                .map(|el| shim_id(host, el))
+                .unwrap_or_default();
+            self.ran = true;
+        }
+    }
+
+    #[test]
+    fn shim_qsa_follows_moves_not_arena_order() {
+        let html = "<div id=\"a\" class=\"x\"></div><div id=\"b\" class=\"x\"></div>\
+                    <div id=\"c\" class=\"x\"></div><script>1</script>";
+        let mut probe = QsaMoveProbe {
+            ran: false,
+            all: Vec::new(),
+            one: String::new(),
+        };
+        parse_with_scripting_and_executor(html.as_bytes(), true, &mut probe);
+        assert!(probe.ran, "script executor never ran");
+        assert_eq!(probe.all, vec!["b", "c", "a"]);
+        assert_eq!(probe.one, "b");
+    }
+
+    /// [`ScriptExecutor`] asserting a foster-parented element is
+    /// reported before the table it was foster-parented in front of,
+    /// even though the table was created (and sits in the arena)
+    /// first.
+    struct QsaFosterProbe {
+        ran: bool,
+        tags: Vec<String>,
+    }
+
+    impl ScriptExecutor for QsaFosterProbe {
+        fn execute_script(
+            &mut self,
+            host: &mut ScriptHost<'_, '_, '_>,
+            _el: ScriptElement,
+            _attrs: &[(String, String)],
+            _script: &str,
+        ) {
+            self.tags = host
+                .query_selector_all("table, div")
+                .into_iter()
+                .map(|el| host.tag_name(el).unwrap_or_default())
+                .collect();
+            self.ran = true;
+        }
+    }
+
+    #[test]
+    fn shim_qsa_foster_parented_element_precedes_table() {
+        let html = "<table><div id=\"f\"></div><tr><td>cell</td></tr></table><script>1</script>";
+        let mut probe = QsaFosterProbe {
+            ran: false,
+            tags: Vec::new(),
+        };
+        parse_with_scripting_and_executor(html.as_bytes(), true, &mut probe);
+        assert!(probe.ran, "script executor never ran");
+        assert_eq!(probe.tags, vec!["div", "table"]);
+    }
+
+    /// [`ScriptExecutor`] asserting the element-scoped shim QSA/QS have
+    /// the same document-order, deduped behaviour as the document ones.
+    struct QsaScopedProbe {
+        ran: bool,
+        all: Vec<String>,
+        one: String,
+    }
+
+    impl ScriptExecutor for QsaScopedProbe {
+        fn execute_script(
+            &mut self,
+            host: &mut ScriptHost<'_, '_, '_>,
+            _el: ScriptElement,
+            _attrs: &[(String, String)],
+            _script: &str,
+        ) {
+            let scope = host.get_element_by_id("scope").expect("scope");
+            self.all = host
+                .query_selector_all_in(scope, ".y, .x")
+                .into_iter()
+                .map(|el| shim_id(host, el))
+                .collect();
+            self.one = host
+                .query_selector_in(scope, ".y, .x")
+                .map(|el| shim_id(host, el))
+                .unwrap_or_default();
+            self.ran = true;
+        }
+    }
+
+    #[test]
+    fn shim_qsa_scoped_multi_group_deduped_in_document_order() {
+        let html = "<div id=\"scope\"><span id=\"s1\" class=\"x\"></span>\
+                    <b id=\"s2\" class=\"y\"></b><i id=\"s3\" class=\"x y\"></i></div><script>1</script>";
+        let mut probe = QsaScopedProbe {
+            ran: false,
+            all: Vec::new(),
+            one: String::new(),
+        };
+        parse_with_scripting_and_executor(html.as_bytes(), true, &mut probe);
+        assert!(probe.ran, "script executor never ran");
+        assert_eq!(probe.all, vec!["s1", "s2", "s3"]);
+        assert_eq!(probe.one, "s1");
     }
 
     #[test]

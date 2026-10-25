@@ -340,6 +340,7 @@ pub(crate) fn install_loaded_document(
     loaded: LoadedDocument,
     user_agent: &str,
     fonts: &Arc<Mutex<FontCache>>,
+    cookie_jar: &Arc<Mutex<CookieJar>>,
 ) {
     // @font-face install, before first layout and before the
     // scripted parse: the loader fetched these synchronously (no
@@ -424,8 +425,11 @@ pub(crate) fn install_loaded_document(
             &loaded.script_sources,
             Some((tab.viewport.w as u32, tab.viewport.h as u32)),
         );
-        let (document, _quirks) =
+        let (document, quirks) =
             Document::parse_html_with_executor(&loaded.body, true, &mut executor);
+        // w77 quirks plumbing: the mode travels on the document itself
+        // (`Document::quirks_mode`); layout/style read it from there.
+        debug_assert_eq!(document.quirks_mode(), quirks);
         let outcome = executor.outcome();
         (document, outcome)
     };
@@ -478,6 +482,12 @@ pub(crate) fn install_loaded_document(
         // it, a JS-loaded face lands in a lazily created orphan cache
         // and layout never sees it.
         bowser_js::share_font_cache(ctx, SharedFontCache::from_arc(Arc::clone(fonts)));
+        // Share the profile's LIVE jar (not a copy): a same-origin
+        // `FontFace.load()` in this realm sends the profile's cookies
+        // and stores its `Set-Cookie` back into the profile jar, like
+        // the loader's `@font-face` path. Sharing a snapshot copy
+        // would diverge in both directions and is not wiring.
+        bowser_js::share_cookie_jar(ctx, Arc::clone(cookie_jar));
     }
     // The post-parse scripts below run with the production web APIs
     // installed but before any pump: install the forced-sync-layout
@@ -611,11 +621,12 @@ pub(crate) fn complete_navigation(
     push_history: bool,
     user_agent: &str,
     fonts: &Arc<Mutex<FontCache>>,
+    cookie_jar: &Arc<Mutex<CookieJar>>,
 ) {
     if push_history {
         tab.history.push(loaded.url.clone());
     }
-    install_loaded_document(tab, loaded, user_agent, fonts);
+    install_loaded_document(tab, loaded, user_agent, fonts, cookie_jar);
 }
 
 /// Same-document (fragment-only) fast path, shared by [`navigate`] and the
@@ -654,7 +665,7 @@ pub(crate) fn navigate_fragment(tab: &mut Tab, url: &Url) -> Option<Vec<Option<N
 /// can leave the profile with the empty swap jar.
 fn load_document_blocking(
     url: &Url,
-    jar: &Mutex<CookieJar>,
+    jar: &Arc<Mutex<CookieJar>>,
     timeout: Duration,
     user_agent: &str,
 ) -> Result<LoadedDocument, NavError> {
@@ -693,8 +704,11 @@ fn load_document_blocking(
 /// Runs the loader on a worker thread and blocks the caller on its report
 /// channel (v1: navigation is synchronous from the caller's perspective;
 /// the window worker must call this off the UI thread). `jar` is the
-/// profile's shared cookie jar; `&Mutex<_>` (not `RefCell`) is what the
-/// loader requires so the jar can be shared across loader threads.
+/// profile's shared cookie jar, as an `Arc` handle: the loader takes
+/// `&Mutex<_>` (not `RefCell`) through deref coercion so the jar can
+/// be shared across loader threads, and the install path shares this
+/// same `Arc` with the page's JS context (see
+/// [`install_loaded_document`]).
 ///
 /// The load is bounded by `timeout`: if the report has not arrived by the
 /// deadline, the worker is detached and abandoned (a thread stuck in
@@ -710,16 +724,19 @@ fn load_document_blocking(
 /// successful load).
 fn load_url(
     tab: &mut Tab,
-    jar: &Mutex<CookieJar>,
+    jar: &Arc<Mutex<CookieJar>>,
     url: &Url,
     timeout: Duration,
     push_history: bool,
     user_agent: &str,
     fonts: &Arc<Mutex<FontCache>>,
 ) -> Result<Url, NavError> {
+    // `jar` is the shared profile handle: the loader's `&Mutex`
+    // paths take it through deref coercion, and the install path
+    // shares this same `Arc` with the page's JS context.
     let loaded = load_document_blocking(url, jar, timeout, user_agent)?;
     let final_url = loaded.url.clone();
-    complete_navigation(tab, loaded, push_history, user_agent, fonts);
+    complete_navigation(tab, loaded, push_history, user_agent, fonts, jar);
     Ok(final_url)
 }
 
@@ -855,7 +872,7 @@ pub(crate) fn scroll_to_node(
 /// See [`navigate_with_timeout`] for the semantics.
 pub fn navigate(
     tab: &mut Tab,
-    jar: &Mutex<CookieJar>,
+    jar: &Arc<Mutex<CookieJar>>,
     url_str: &str,
     user_agent: &str,
     fonts: &Arc<Mutex<FontCache>>,
@@ -887,7 +904,7 @@ pub fn navigate(
 /// fetched bytes.
 pub fn navigate_with_timeout(
     tab: &mut Tab,
-    jar: &Mutex<CookieJar>,
+    jar: &Arc<Mutex<CookieJar>>,
     url_str: &str,
     timeout: Duration,
     user_agent: &str,
@@ -907,7 +924,7 @@ pub fn navigate_with_timeout(
         // page — the same two steps `complete_navigation` performs for a
         // fetched load.
         tab.history.push(url.clone());
-        crate::window::install_welcome_page(tab, &url, user_agent, fonts);
+        crate::window::install_welcome_page(tab, &url, user_agent, fonts, jar);
         return Ok(());
     }
     load_url(tab, jar, &url, timeout, true, user_agent, fonts)?;
@@ -956,7 +973,7 @@ pub(crate) fn traverse_fragment(
 /// when it pushes), so `current_url` matches the loaded document.
 pub fn go_back(
     tab: &mut Tab,
-    jar: &Mutex<CookieJar>,
+    jar: &Arc<Mutex<CookieJar>>,
     user_agent: &str,
     fonts: &Arc<Mutex<FontCache>>,
 ) -> Result<(), NavError> {
@@ -1002,7 +1019,7 @@ pub(crate) fn replace_history_entry(tab: &mut Tab, index: usize, url: Url) {
 /// newest entry this is a no-op returning `Ok`.
 pub fn go_forward(
     tab: &mut Tab,
-    jar: &Mutex<CookieJar>,
+    jar: &Arc<Mutex<CookieJar>>,
     user_agent: &str,
     fonts: &Arc<Mutex<FontCache>>,
 ) -> Result<(), NavError> {
@@ -1040,7 +1057,7 @@ pub fn go_forward(
 /// of failing on a fetch of a non-fetchable URL.
 pub fn reload(
     tab: &mut Tab,
-    jar: &Mutex<CookieJar>,
+    jar: &Arc<Mutex<CookieJar>>,
     user_agent: &str,
     fonts: &Arc<Mutex<FontCache>>,
 ) -> Result<(), NavError> {
@@ -1052,7 +1069,7 @@ pub fn reload(
 /// honors the caller's timeout rather than the default navigation one.
 fn reload_with_timeout(
     tab: &mut Tab,
-    jar: &Mutex<CookieJar>,
+    jar: &Arc<Mutex<CookieJar>>,
     timeout: Duration,
     user_agent: &str,
     fonts: &Arc<Mutex<FontCache>>,
@@ -1061,7 +1078,7 @@ fn reload_with_timeout(
         return Ok(());
     };
     if url.serialize() == "about:blank" {
-        crate::window::install_welcome_page(tab, &url, user_agent, fonts);
+        crate::window::install_welcome_page(tab, &url, user_agent, fonts, jar);
         return Ok(());
     }
     let final_url = load_url(tab, jar, &url, timeout, false, user_agent, fonts)?;
@@ -1123,12 +1140,12 @@ mod tests {
         Tab::new(Size { w: 800.0, h: 600.0 })
     }
 
-    fn test_jar() -> Mutex<CookieJar> {
-        Mutex::new(CookieJar::new())
+    fn test_jar() -> Arc<Mutex<CookieJar>> {
+        Arc::new(Mutex::new(CookieJar::new()))
     }
 
     /// Profile jar seeded with one cookie, so a wipe would be visible.
-    fn test_jar_with_cookie() -> Mutex<CookieJar> {
+    fn test_jar_with_cookie() -> Arc<Mutex<CookieJar>> {
         let jar = test_jar();
         jar.lock().expect("test jar").set_cookie(
             "session=abc123; Path=/",
@@ -2489,11 +2506,18 @@ mod shared_dom_tests {
     /// prefetched as empty sources (no network): the unit-test stand-in
     /// for a finished load.
     fn load_from(html: &[u8]) -> LoadedDocument {
+        let url = bowser_url::parse("https://example.com/", None).unwrap();
+        load_from_base(html, &url)
+    }
+
+    fn load_from_base(html: &[u8], url: &Url) -> LoadedDocument {
         use crate::script::collect_script_refs;
         use crate::script_executor::prefetch_script_sources;
 
-        let url = bowser_url::parse("https://example.com/", None).unwrap();
-        let (document, _) = bowser_dom::Document::parse_html(html);
+        let url = url.clone();
+        let (document, quirks) = bowser_dom::Document::parse_html(html);
+        // w77 quirks plumbing: the mode travels on the document.
+        debug_assert_eq!(document.quirks_mode(), quirks);
         let script_sources =
             prefetch_script_sources(&collect_script_refs(&document), &url, |_| Ok(String::new()));
         LoadedDocument {
@@ -2567,6 +2591,7 @@ window.__r = results.join(' | ');
             load_from(html),
             "TestBrowser/9.9",
             &Arc::new(Mutex::new(FontCache::new())),
+            &Arc::new(Mutex::new(CookieJar::new())),
         );
         let r = tab
             .page_vm_mut()
@@ -2586,6 +2611,59 @@ window.__r = results.join(' | ');
     }
 
     #[test]
+    fn install_carries_quirks_mode_to_js_style() {
+        // w77 quirks plumbing, production path: a full-quirks document
+        // installed through `install_loaded_document` must keep its
+        // mode on the tab's document, and JS must observe the quirk:
+        // the italic wrapper's font-style must not reach the cell
+        // (§3.11 probe). (Geometry is covered by the layout-crate
+        // quirks tests; a post-install eval has no layout pump, so
+        // offsetHeight reads 0 here regardless of mode.)
+        let html = br#"<!DOCTYPE HTML PUBLIC "-//W3C//DTD HTML 4.0 Transitional//EN"><html><head></head><body><div style="font-style:italic"><table><tr><td id="notitalic">x</td></tr></table></div></body></html>"#;
+        let mut tab = test_tab();
+        install_loaded_document(
+            &mut tab,
+            load_from(html),
+            "TestBrowser/9.9",
+            &Arc::new(Mutex::new(FontCache::new())),
+            &Arc::new(Mutex::new(CookieJar::new())),
+        );
+        let mode = tab.document_ref().expect("document").quirks_mode();
+        assert_eq!(mode, bowser_dom::QuirksMode::Quirks);
+        // Rust-side pin: the installed document's own computed style
+        // for the cell must already be `normal` before JS is involved.
+        {
+            let doc_ref = tab.document_ref().expect("document");
+            let td = doc_ref.query_selector("#notitalic").unwrap().expect("td");
+            let computed = bowser_css::compute_style(
+                &doc_ref,
+                td,
+                &[],
+                &bowser_css::default_ua_stylesheet(),
+                &bowser_css::Viewport { w: 800.0, h: 600.0 },
+            );
+            assert_eq!(
+                computed.get_str("font-style"),
+                Some("normal"),
+                "rust-side computed font-style"
+            );
+        }
+        let fs = tab
+            .page_vm_mut()
+            .expect("page VM installed")
+            .eval("window.getComputedStyle(document.querySelector('#notitalic')).fontStyle")
+            .expect("eval fontStyle");
+        match fs {
+            Value::Str(s) => assert_eq!(
+                s.as_wtf8().to_utf8_lossy().as_ref(),
+                "normal",
+                "font-style via JS"
+            ),
+            other => panic!("expected string font-style, got {other:?}"),
+        }
+    }
+
+    #[test]
     fn install_slot_forces_sync_layout_for_postparse_geometry_reads() {
         // A deferred script runs in the post-parse phase of
         // `install_loaded_document`, with the production web APIs
@@ -2600,6 +2678,7 @@ window.__r = results.join(' | ');
             load_from(html),
             "TestBrowser/9.9",
             &Arc::new(Mutex::new(FontCache::new())),
+            &Arc::new(Mutex::new(CookieJar::new())),
         );
         let w = tab
             .page_vm_mut()
@@ -2627,6 +2706,7 @@ window.__r = results.join(' | ');
             ),
             "TestBrowser/9.9",
             &Arc::new(Mutex::new(FontCache::new())),
+            &Arc::new(Mutex::new(CookieJar::new())),
         );
         let seen = tab
             .document_ref()
@@ -2659,6 +2739,7 @@ window.__r = results.join(' | ');
             load_from(b"<html><head></head><body><p>hi</p></body></html>"),
             "TestBrowser/9.9",
             &Arc::new(Mutex::new(FontCache::new())),
+            &Arc::new(Mutex::new(CookieJar::new())),
         );
         let guard = tab
             .page_vm()
@@ -2744,6 +2825,7 @@ window.__r = results.join(' | ');
                     load_from(html.as_bytes()),
                     "TestBrowser/9.9",
                     &Arc::new(Mutex::new(FontCache::new())),
+                    &Arc::new(Mutex::new(CookieJar::new())),
                 );
                 let errors = tab
                     .script_report()
@@ -2774,6 +2856,7 @@ window.__r = results.join(' | ');
             load_from(b"<html><head></head><body><p>hi</p></body></html>"),
             "TestBrowser/9.9",
             &Arc::new(Mutex::new(FontCache::new())),
+            &Arc::new(Mutex::new(CookieJar::new())),
         );
         // Navigation dirties every stage; start the measurement clean.
         tab.dirty = DirtyFlags::default();
@@ -2828,5 +2911,128 @@ window.__r = results.join(' | ');
             "text-only edit must not re-run the style stage"
         );
         assert!(tab.dirty.layout && tab.dirty.paint);
+    }
+
+    #[test]
+    fn install_shares_profile_jar_with_js_fontface_load() {
+        // w77-L: production wiring for JS `FontFace.load()` credentials.
+        // A local font server records the `Cookie` header of the
+        // same-origin font fetch a page's `FontFace.load()` performs
+        // after `install_loaded_document`. The profile jar is seeded
+        // with a cookie for 127.0.0.1, so the header must carry it —
+        // proving the install shared the profile's live jar with the
+        // JS context, not a snapshot and not nothing. (A snapshot
+        // copy would also send the seeded cookie here, so the
+        // strong-count pin below is the identity half: the JS
+        // context must retain this exact `Arc`, and a later
+        // `Set-Cookie` from a JS load must land in this same jar —
+        // both follow from sharing the handle, not a copy.)
+        use std::io::{Read, Write};
+        use std::net::TcpListener;
+
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind font server");
+        let addr = listener.local_addr().expect("font server addr");
+        let seen: Arc<std::sync::Mutex<Vec<String>>> = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let seen_server = Arc::clone(&seen);
+        let ahem: Vec<u8> = include_bytes!("../../bowser_paint/tests/fixtures/Ahem.ttf").to_vec();
+        std::thread::spawn(move || {
+            for stream in listener.incoming() {
+                let Ok(mut stream) = stream else { continue };
+                let _ = stream.set_read_timeout(Some(Duration::from_secs(5)));
+                let mut buf = Vec::new();
+                let mut chunk = [0u8; 4096];
+                loop {
+                    match stream.read(&mut chunk) {
+                        Ok(0) => break,
+                        Ok(n) => {
+                            buf.extend_from_slice(&chunk[..n]);
+                            if buf.windows(4).any(|w| w == b"\r\n\r\n") || buf.len() > 65_536 {
+                                break;
+                            }
+                        }
+                        Err(_) => break,
+                    }
+                }
+                let head = String::from_utf8_lossy(&buf);
+                let cookie = head
+                    .lines()
+                    .find_map(|line| line.strip_prefix("Cookie:"))
+                    .map(str::trim)
+                    .unwrap_or("(none)")
+                    .to_string();
+                seen_server.lock().expect("seen").push(cookie);
+                let response = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: font/ttf\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                    ahem.len()
+                );
+                let _ = stream.write_all(response.as_bytes());
+                let _ = stream.write_all(&ahem);
+            }
+        });
+
+        let base = bowser_url::parse(&format!("http://{addr}/"), None).unwrap();
+        // Seeded with `session=abc123` for 127.0.0.1 (same seeding
+        // as `tests::test_jar_with_cookie`, inlined: this test lives
+        // in `shared_dom_tests`, which cannot see that helper).
+        let jar: Arc<Mutex<CookieJar>> = Arc::new(Mutex::new(CookieJar::new()));
+        jar.lock().expect("test jar").set_cookie(
+            "session=abc123; Path=/",
+            &bowser_net::cookies::RequestContext {
+                host: "127.0.0.1",
+                path: "/",
+                secure: false,
+                http_api: true,
+                top_host: None,
+                top_secure: None,
+                top_level_safe_navigation: false,
+            },
+            0,
+        );
+        assert_eq!(jar.lock().expect("test jar").len(), 1);
+        assert_eq!(Arc::strong_count(&jar), 1);
+        let mut tab = test_tab();
+        install_loaded_document(
+            &mut tab,
+            load_from_base(b"<html><head></head><body></body></html>", &base),
+            "TestBrowser/9.9",
+            &Arc::new(Mutex::new(FontCache::new())),
+            &jar,
+        );
+        // Identity half: the JS context retained this exact `Arc`
+        // (a copy would leave the count at 1).
+        assert!(
+            Arc::strong_count(&jar) >= 2,
+            "install must share the exact profile jar Arc with the JS context"
+        );
+        tab.page_vm_mut()
+            .expect("page VM installed")
+            .eval(
+                "window.__face = new FontFace('Ahem', 'url(/font.ttf)'); \
+                 document.fonts.add(window.__face); \
+                 window.__face.load().then(function() { window.__loaded = true; }, \
+                 function(e) { window.__err = String(e); });",
+            )
+            .expect("start FontFace.load");
+        // Pump the page event loop until the server sees the fetch
+        // (the pool worker fetches asynchronously; completions arrive
+        // through the pump). Bounded: a missing fetch fails the test
+        // instead of hanging it.
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        while seen.lock().expect("seen").is_empty() && std::time::Instant::now() < deadline {
+            tab.page_vm_mut()
+                .expect("page VM installed")
+                .pump_bounded(1000);
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        let headers = seen.lock().expect("seen").clone();
+        let status = tab
+            .page_vm_mut()
+            .expect("page VM installed")
+            .eval("[window.__loaded, window.__err].join('|')")
+            .ok();
+        assert!(
+            headers.iter().any(|h| h.contains("session=abc123")),
+            "same-origin FontFace.load() must send the profile cookie; got headers {headers:?}, status {status:?}"
+        );
     }
 }

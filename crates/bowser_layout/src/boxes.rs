@@ -27,7 +27,7 @@ use super::style::{
 };
 use super::{BoxType, IntrinsicDims, Rect};
 use bowser_css::{ComputedStyle, Styler, Stylesheet, Viewport, props};
-use bowser_dom::{Document, NodeId, NodeKind};
+use bowser_dom::{Document, NodeId, NodeKind, QuirksMode};
 use std::borrow::Cow;
 use std::collections::HashMap;
 use std::rc::Rc;
@@ -551,6 +551,12 @@ pub(crate) struct Forest {
     /// `scrollbar-gutter: stable` (a scroll container, a `body`) must
     /// not shrink the partial pass's containing block.
     pub root_is_html: bool,
+    /// The document's quirks mode, copied from
+    /// [`Document::quirks_mode`] at box-tree construction (w77 quirks
+    /// plumbing): layout and intrinsic sizing branch on this, never on
+    /// a re-parse of the doctype. The styler reads the same mode from
+    /// the document itself, so style and layout cannot disagree.
+    pub quirks_mode: QuirksMode,
     /// Test-only: counts fragment visits in the inline rect-union pass
     /// (layout.rs step 5 of `do_inline_layout`). The union visits each
     /// fragment exactly once, so tests can assert the single-pass bound
@@ -1723,6 +1729,7 @@ fn build_box_tree_rooted(
         // shrink a partial pass's containing block.
         root_is_html: subtree_root.is_none()
             && matches!(&doc.kind(root_el), NodeKind::Element(e) if e.tag_name == "html"),
+        quirks_mode: doc.quirks_mode(),
         #[cfg(test)]
         union_frag_visits: 0,
     };
@@ -2238,6 +2245,23 @@ fn build_box_tree_rooted(
             .any(|&c| is_block_level(forest.nodes[c].box_type));
         if needs_wrap {
             let parent_data = forest.nodes[i].data.clone();
+            // w77g: a flex container's inline-table children blockify
+            // (css-flexbox-1 §4) instead of being swept into the
+            // anonymous wrapper below: the wrapper is style-less, so
+            // the table's `flex-basis`/margins would never reach the
+            // item. The gate is the parent's raw `display` (the
+            // bucketed `Display` collapses `flex` to `Block`, so the
+            // raw keyword is what identifies a flex container here,
+            // as in `layout::flex_kind`). Non-flex parents keep the
+            // old wrapping: an inline-table in block flow stays an
+            // inline-level `InlineBlock` box.
+            let parent_is_flex = forest.nodes[i]
+                .style
+                .as_ref()
+                .and_then(|s| s.get_str_by_index(props::DISPLAY))
+                .is_some_and(|d| {
+                    d.eq_ignore_ascii_case("flex") || d.eq_ignore_ascii_case("inline-flex")
+                });
             let kids = std::mem::take(&mut forest.nodes[i].children);
             let mut new_children: Vec<usize> = Vec::with_capacity(kids.len());
             let mut run: Vec<usize> = Vec::new();
@@ -2259,6 +2283,22 @@ fn build_box_tree_rooted(
             };
             for c in kids {
                 if is_out_of_flow(&forest, c) {
+                    new_children.push(c);
+                } else if parent_is_flex
+                    && forest.nodes[c].box_type == BoxType::InlineBlock
+                    && forest.nodes[c].data.display == Display::InlineTable
+                {
+                    // w77g blockification (see above): flush any
+                    // pending run, then promote the table to a direct
+                    // child carrying its own style. Its table dispatch
+                    // arms key off `display` as well as `box_type`, so
+                    // it still sizes as an inline-table.
+                    if !run.is_empty() {
+                        let a =
+                            forest.make_anonymous(&parent_data, std::mem::take(&mut run), i, false);
+                        new_children.push(a);
+                    }
+                    forest.nodes[c].box_type = BoxType::Table;
                     new_children.push(c);
                 } else if breaks_run(forest.nodes[c].box_type) {
                     if !run.is_empty() {
@@ -2418,6 +2458,33 @@ mod tests {
             section_kind_of_tag_and_display("tr", Display::TableRowGroup),
             SectionKind::Body
         );
+    }
+
+    #[test]
+    fn forest_carries_document_quirks_mode() {
+        // w77 quirks plumbing: parse -> document -> box tree, for all
+        // three modes, so layout branches on the parsed mode.
+        for (html, expected) in [
+            (
+                b"<!DOCTYPE html><html><body><p>x</p></body></html>".as_slice(),
+                QuirksMode::NoQuirks,
+            ),
+            (
+                b"<!DOCTYPE html PUBLIC \"-//W3C//DTD HTML 4.01 Transitional//EN\" \"http://www.w3.org/TR/html4/loose.dtd\"><html><body><p>x</p></body></html>".as_slice(),
+                QuirksMode::LimitedQuirks,
+            ),
+            (
+                b"<html><body><p>x</p></body></html>".as_slice(),
+                QuirksMode::Quirks,
+            ),
+        ] {
+            let (doc, _) = Document::parse_html(html);
+            assert_eq!(doc.quirks_mode(), expected);
+            let ua = crate::ua_stylesheet();
+            let (forest, _) = build_box_tree(&doc, &[], ua, 800.0, 600.0, &HashMap::new())
+                .expect("box tree builds");
+            assert_eq!(forest.quirks_mode, expected);
+        }
     }
 
     #[test]

@@ -5554,6 +5554,7 @@ mod tests {
             abs_items: Vec::new(),
             gutter_propagated_root: None,
             root_is_html: false,
+            quirks_mode: bowser_dom::QuirksMode::NoQuirks,
             union_frag_visits: 0,
         };
         let mc = forest.add_node(

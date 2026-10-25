@@ -16,7 +16,27 @@ use std::collections::HashMap;
 
 const VP: Size = Size { w: 800.0, h: 600.0 };
 
+/// Standards-mode input for the layout helpers: a doctype-less
+/// fragment parses as quirks mode per spec, which would let the
+/// quirks rules (e.g. §3.13: a table cell's `height` as border-box)
+/// leak into tests whose expectations predate quirks plumbing and
+/// match the real WPT files (which all carry `<!doctype html>`).
+/// A caller-supplied doctype is left alone, so quirks fixtures keep
+/// their mode.
+fn standards_html(html: &str) -> String {
+    if html
+        .trim_start()
+        .to_ascii_lowercase()
+        .starts_with("<!doctype")
+    {
+        html.to_string()
+    } else {
+        format!("<!DOCTYPE html>{html}")
+    }
+}
+
 fn layout_html(html: &str, css: &str) -> LayoutBox {
+    let html = standards_html(html);
     let (doc, _) = bowser_dom::Document::parse_html(html.as_bytes());
     let ss = bowser_css::parse_stylesheet(&[TABLE_TEST_RESET_CSS, css].concat());
     layout(&doc, &[&ss], VP, &FixedFontMetrics)
@@ -25,6 +45,7 @@ fn layout_html(html: &str, css: &str) -> LayoutBox {
 /// Like [`layout_html`], but also returns the `list-style-position:
 /// outside` markers, each tagged with its owning list item's DOM node.
 fn layout_html_markers(html: &str, css: &str) -> (LayoutBox, Vec<MarkerBox>) {
+    let html = standards_html(html);
     let (doc, _) = bowser_dom::Document::parse_html(html.as_bytes());
     let ss = bowser_css::parse_stylesheet(&[TABLE_TEST_RESET_CSS, css].concat());
     crate::layout_impl_with_markers(
@@ -66,7 +87,6 @@ impl FontMetrics for CaseMetrics {
         1.2 * font_size
     }
 }
-
 /// First descendant element of `<body>` with the given tag name.
 fn body_child_tag(doc: &bowser_dom::Document, tag: &str) -> bowser_dom::NodeId {
     let root = doc.document_element().expect("document element");
@@ -4164,6 +4184,137 @@ fn dir_attribute_hint_flips_flex_direction() {
     let c = &body(&l).children[0];
     let i = &c.children[0];
     assert!(approx(i.rect.x, c.rect.x + 150.0));
+}
+
+#[test]
+fn w77g_inline_table_flex_item_blockifies_with_basis_and_margins() {
+    // css-flexbox-1 §4 blockification: `display: inline-table` on a
+    // flex item becomes a table, so the item itself (not a style-less
+    // anonymous wrapper) carries `flex-basis` and margins.
+    // Fail-before: the container's item was the wrapper (basis auto,
+    // no margins), so the table laid out at its 80px content width
+    // at the container's start edge.
+    let l = layout_html(
+        r#"<div class="c"><table class="t"><tr><td><div style="width:40px"></div></td><td><div style="width:40px"></div></td></tr></table><div class="s"></div></div>"#,
+        "body { margin: 0; } .c { display: flex; width: 600px; } \
+         .t { display: inline-table; flex: 0 0 200px; margin: 0 10px; } \
+         .s { width: 50px; height: 20px; }",
+    );
+    let c = &body(&l).children[0];
+    assert_eq!(
+        c.children.len(),
+        2,
+        "want table item + sibling, got {}",
+        c.children.len()
+    );
+    let t = &c.children[0];
+    assert_eq!(t.box_type, BoxType::Table);
+    assert!(approx(t.rect.w, 200.0), "table w={} != 200", t.rect.w);
+    assert!(
+        approx(t.rect.x, c.rect.x + 10.0),
+        "table x={} != container + 10",
+        t.rect.x
+    );
+    let s = &c.children[1];
+    assert!(
+        approx(s.rect.x, c.rect.x + 220.0),
+        "sibling x={} != container + 220",
+        s.rect.x
+    );
+}
+
+#[test]
+fn w77g_inline_table_flex_item_grows() {
+    // The blockified table item's `flex-grow` reaches it too: basis
+    // 100 with grow 1 fills the 600px container. Fail-before: the
+    // wrapper's grow was 0, so the table stayed at 80px.
+    let l = layout_html(
+        r#"<div class="c"><table class="t"><tr><td><div style="width:40px"></div></td><td><div style="width:40px"></div></td></tr></table></div>"#,
+        "body { margin: 0; } .c { display: flex; width: 600px; } \
+         .t { display: inline-table; flex: 1 1 100px; }",
+    );
+    let c = &body(&l).children[0];
+    assert_eq!(c.children.len(), 1);
+    let t = &c.children[0];
+    assert_eq!(t.box_type, BoxType::Table);
+    assert!(approx(t.rect.w, 600.0), "table w={} != 600", t.rect.w);
+}
+
+#[test]
+fn w77g_inline_table_flex_item_extracted_from_text_run() {
+    // An inline-table inside a text run is its own flex item, not
+    // part of the run's anonymous item: "hi" is 12px at 10px font,
+    // so the table starts 12px in and still carries its 200px basis.
+    // Fail-before: one wrapper item held both the text and the table.
+    let l = layout_html(
+        r#"<div class="c">hi<table class="t"><tr><td><div style="width:40px"></div></td><td><div style="width:40px"></div></td></tr></table></div>"#,
+        "body { margin: 0; } .c { display: flex; width: 600px; font-size: 10px; } \
+         .t { display: inline-table; flex: 0 0 200px; }",
+    );
+    let c = &body(&l).children[0];
+    assert_eq!(
+        c.children.len(),
+        2,
+        "want text item + table item, got {}",
+        c.children.len()
+    );
+    assert_eq!(c.children[0].box_type, BoxType::AnonymousBlock);
+    let t = &c.children[1];
+    assert_eq!(t.box_type, BoxType::Table);
+    assert!(approx(t.rect.w, 200.0), "table w={} != 200", t.rect.w);
+    assert!(
+        approx(t.rect.x, c.rect.x + 12.0),
+        "table x={} != container + 12",
+        t.rect.x
+    );
+}
+
+#[test]
+fn w77g_inline_table_outside_flex_unchanged() {
+    // Blockification is a flex-item rule only: an inline-table in
+    // ordinary block flow stays an `InlineBlock` box at its content
+    // width (80px from the two 40px cells).
+    let l = layout_html(
+        r#"<div class="a"><table class="t"><tr><td><div style="width:40px"></div></td><td><div style="width:40px"></div></td></tr></table></div>"#,
+        ".a { width: 400px; } .t { display: inline-table; }",
+    );
+    let t = &body(&l).children[0].children[0];
+    assert_eq!(t.box_type, BoxType::InlineBlock);
+    assert!(approx(t.rect.w, 80.0), "table w={} != 80", t.rect.w);
+}
+
+#[test]
+fn w77g_flex_text_run_still_wraps_as_anonymous_item() {
+    // The wrapper path stays load-bearing for text: a lone text run
+    // is still one anonymous-block item (30px for "hello" at 10px).
+    let l = layout_html(
+        r#"<div class="c">hello</div>"#,
+        "body { margin: 0; } .c { display: flex; width: 200px; font-size: 10px; }",
+    );
+    let c = &body(&l).children[0];
+    assert_eq!(c.children.len(), 1);
+    let w = &c.children[0];
+    assert_eq!(w.box_type, BoxType::AnonymousBlock);
+    assert!(approx(w.rect.w, 30.0), "wrapper w={} != 30", w.rect.w);
+}
+
+#[test]
+fn w77g_flex_inline_block_item_still_wrapped() {
+    // Only inline-table blockifies here: an inline-block flex item
+    // keeps the old wrapper shape (wrapper > inline-block at 60px),
+    // so other inline items are untouched by this change.
+    let l = layout_html(
+        r#"<div class="c"><div class="i"></div></div>"#,
+        "body { margin: 0; } .c { display: flex; width: 200px; } \
+         .i { display: inline-block; width: 60px; height: 20px; }",
+    );
+    let c = &body(&l).children[0];
+    assert_eq!(c.children.len(), 1);
+    let w = &c.children[0];
+    assert_eq!(w.box_type, BoxType::AnonymousBlock);
+    let i = &w.children[0];
+    assert_eq!(i.box_type, BoxType::InlineBlock);
+    assert!(approx(i.rect.w, 60.0), "inline-block w={} != 60", i.rect.w);
 }
 
 #[test]
@@ -9704,6 +9855,7 @@ fn pseudo_forest(style: &bowser_css::ComputedStyle) -> (super::boxes::Forest, us
         abs_items: Vec::new(),
         gutter_propagated_root: None,
         root_is_html: false,
+        quirks_mode: bowser_dom::QuirksMode::NoQuirks,
         #[cfg(test)]
         union_frag_visits: 0,
     };
@@ -10484,4 +10636,457 @@ fn colgroup_col_span_widths() {
     for (i, (&got, &exp)) in widths.iter().zip(expected.iter()).enumerate() {
         assert!(approx(got, exp), "col {i}: got {got}, exp {exp}");
     }
+}
+
+/// First descendant element of the document with the given tag name
+/// (depth-first, document order).
+fn descendant_tag(doc: &bowser_dom::Document, tag: &str) -> bowser_dom::NodeId {
+    fn walk(
+        doc: &bowser_dom::Document,
+        n: bowser_dom::NodeId,
+        tag: &str,
+    ) -> Option<bowser_dom::NodeId> {
+        if matches!(&doc.kind(n), bowser_dom::NodeKind::Element(e) if e.tag_name == tag) {
+            return Some(n);
+        }
+        doc.children(n).into_iter().find_map(|c| walk(doc, c, tag))
+    }
+    walk(doc, doc.document_element().expect("root"), tag).expect("tagged descendant")
+}
+
+#[test]
+fn w77_replaced_flex_basis_max_content_ignores_definite_width() {
+    // w77 task 2: a replaced flex item's content-keyword basis
+    // measures its intrinsic natural size, not its definite width:
+    // <img width:100px> + flex-basis:max-content over a 300px natural
+    // size bases at 300, not 100. Block-level so the img is the flex
+    // item itself (an inline img is wrapped in an anonymous item).
+    let (doc, _) =
+        bowser_dom::Document::parse_html(r#"<div class="c"><img class="i"></div>"#.as_bytes());
+    let img = descendant_tag(&doc, "img");
+    let mut map = HashMap::new();
+    map.insert(img, IntrinsicDims::from_size(300.0, 150.0));
+    let l = layout_doc_with_intrinsics(
+        &doc,
+        "body { margin: 0; } .c { display: flex; width: 800px; } \
+         .i { display: block; width: 100px; flex-basis: max-content; flex-grow: 0; flex-shrink: 0; }",
+        &FixedFontMetrics,
+        &map,
+    );
+    let item = &body(&l).children[0].children[0];
+    assert!(
+        approx(item.rect.w, 300.0),
+        "replaced max-content basis {w} != 300",
+        w = item.rect.w
+    );
+}
+
+#[test]
+fn w77_replaced_flex_basis_min_content_ignores_definite_width() {
+    // Same shape with flex-basis:min-content: a replaced box's
+    // min-content is its intrinsic size, not the definite floor.
+    let (doc, _) =
+        bowser_dom::Document::parse_html(r#"<div class="c"><img class="i"></div>"#.as_bytes());
+    let img = descendant_tag(&doc, "img");
+    let mut map = HashMap::new();
+    map.insert(img, IntrinsicDims::from_size(300.0, 150.0));
+    let l = layout_doc_with_intrinsics(
+        &doc,
+        "body { margin: 0; } .c { display: flex; width: 800px; } \
+         .i { display: block; width: 100px; flex-basis: min-content; flex-grow: 0; flex-shrink: 0; }",
+        &FixedFontMetrics,
+        &map,
+    );
+    let item = &body(&l).children[0].children[0];
+    assert!(
+        approx(item.rect.w, 300.0),
+        "replaced min-content basis {w} != 300",
+        w = item.rect.w
+    );
+}
+
+#[test]
+fn w77_replaced_flex_basis_border_box_strips_padding_border() {
+    // The keyword basis is content-box (like every other
+    // flex_basis_content_width result): under border-box, the
+    // intrinsic 300px is stripped of padding/border for the basis
+    // and re-added at used size, so the item still lands at 300
+    // border-box — not 330 (raw intrinsic as content) or 100.
+    let (doc, _) =
+        bowser_dom::Document::parse_html(r#"<div class="c"><img class="i"></div>"#.as_bytes());
+    let img = descendant_tag(&doc, "img");
+    let mut map = HashMap::new();
+    map.insert(img, IntrinsicDims::from_size(300.0, 150.0));
+    let l = layout_doc_with_intrinsics(
+        &doc,
+        "body { margin: 0; } .c { display: flex; width: 800px; } \
+         .i { display: block; width: 100px; box-sizing: border-box; padding: 10px; border: 5px solid black; \
+              flex-basis: max-content; flex-grow: 0; flex-shrink: 0; }",
+        &FixedFontMetrics,
+        &map,
+    );
+    let item = &body(&l).children[0].children[0];
+    assert!(
+        approx(item.rect.w, 300.0),
+        "border-box replaced basis {w} != 300",
+        w = item.rect.w
+    );
+}
+
+#[test]
+fn w77_intrinsic_width_collapses_cross_node_space_seam() {
+    // w77 task 3: line layout's collapse_adjacent_spaces zeroes one
+    // of two adjacent spaces across a text-node/inline boundary, but
+    // the max-content walk counted both. A shrink-to-fit inline-block
+    // over <span>a </span> + text " b" must measure "a b" (18px at
+    // 10px Fixed metrics), not "a  b" (24px).
+    let l = layout_html(
+        r#"<div class="a"><span>a </span> b</div>"#,
+        ".a { display: inline-block; font-size: 10px; }",
+    );
+    let a = &body(&l).children[0];
+    assert!(
+        approx(a.rect.w, 18.0),
+        "seam max-content {w} != 18",
+        w = a.rect.w
+    );
+}
+
+#[test]
+fn w77_intrinsic_width_collapses_space_seam_between_inlines() {
+    // Same seam with both sides inside inline wrappers: the second
+    // span's leading space collapses against the first span's
+    // trailing space, so the inline-block measures 18, not 24.
+    let l = layout_html(
+        r#"<div class="a"><span>a </span><span> b</span></div>"#,
+        ".a { display: inline-block; font-size: 10px; }",
+    );
+    let a = &body(&l).children[0];
+    assert!(
+        approx(a.rect.w, 18.0),
+        "inline-inline seam {w} != 18",
+        w = a.rect.w
+    );
+}
+
+#[test]
+fn w77_intrinsic_width_single_sided_space_is_not_dropped() {
+    // Control: only one side of the seam holds a space, so nothing
+    // collapses — "a" + " b" is still 18, and the fix must not drop
+    // a lone leading space (which would give 12).
+    let l = layout_html(
+        r#"<div class="a"><span>a</span> b</div>"#,
+        ".a { display: inline-block; font-size: 10px; }",
+    );
+    let a = &body(&l).children[0];
+    assert!(
+        approx(a.rect.w, 18.0),
+        "single-sided space {w} != 18",
+        w = a.rect.w
+    );
+}
+
+#[test]
+fn w77_intrinsic_width_pre_seam_spaces_are_preserved() {
+    // Control: under white-space:pre, seam spaces are preserved in
+    // line layout too, so the max-content width keeps both: 24.
+    let l = layout_html(
+        r#"<div class="a"><span>a </span> b</div>"#,
+        ".a { display: inline-block; font-size: 10px; white-space: pre; }",
+    );
+    let a = &body(&l).children[0];
+    assert!(approx(a.rect.w, 24.0), "pre seam {w} != 24", w = a.rect.w);
+}
+
+#[test]
+fn w77d_vertical_table_caption_margins_grow_block_size() {
+    // WPT css/css-tables/caption-orthogonal-margin-in-table-block-axis:
+    // a vertical-rl table's block axis is physical-horizontal, so the
+    // caption's two 40px horizontal margins must grow the table's
+    // physical width by 80px versus the no-margin table, in both the
+    // same-writing-mode and the orthogonal-caption subtests. Before
+    // the w77-d fix the growth was only 50px: the block engine
+    // subtracted the margins from the caption's fill width (30px
+    // extent collapsed to 0) and `place_table_rows` added them again.
+    let probe = |cap_wm: &str, margin: &str| -> (f32, f32) {
+        let html = r#"<table class="t"><caption>c</caption><tr><td></td></tr></table>"#.to_string();
+        let css = format!(
+            ".t {{ writing-mode: vertical-rl; border-spacing: 0; }} caption {{ writing-mode: {}; margin: {}; font-size: 10px; }} td {{ width: 50px; height: 50px; padding: 0; }} table, td {{ border: 0; }}",
+            cap_wm, margin
+        );
+        let l = layout_html(&html, &css);
+        let table = &body(&l).children[0];
+        let cap = table
+            .children
+            .iter()
+            .find(|c| c.box_type == BoxType::Block)
+            .expect("caption");
+        (table.rect.w, cap.rect.w)
+    };
+    for cap_wm in ["vertical-rl", "horizontal-tb"] {
+        let (w_m, cap_m) = probe(cap_wm, "10px 40px");
+        let (w_n, cap_n) = probe(cap_wm, "0");
+        assert!(
+            approx(w_m - w_n, 80.0),
+            "{cap_wm}: margin growth {} != 80 ({} vs {})",
+            w_m - w_n,
+            w_m,
+            w_n
+        );
+        assert!(
+            approx(cap_m, cap_n),
+            "{cap_wm}: caption extent {} != no-margin {}",
+            cap_m,
+            cap_n
+        );
+    }
+}
+
+#[test]
+fn w77d_deferred_orthogonal_caption_rewraps_against_block_size() {
+    // W77-d task 1: vertical-lr table, auto block size, a horizontal
+    // caption whose text wraps. Rows give a 50px block size; the
+    // caption must re-lay against 50, not the 30px inline content
+    // width: 10 "aa" words wrap 3/line (48px tall, 50 wide), not
+    // 2/line (60px tall, 30 wide). Fail-before: table 80, cap 30x60.
+    let html = r#"<table class="t"><caption>aa aa aa aa aa aa aa aa aa aa</caption><tr><td></td></tr></table>"#.to_string();
+    let css = ".t { writing-mode: vertical-lr; border-spacing: 0; } caption { font-size: 10px; writing-mode: horizontal-tb; } td { width: 50px; height: 30px; padding: 0; } table, td { border: 0; }";
+    let l = layout_html(&html, css);
+    let table = &body(&l).children[0];
+    let cap = table
+        .children
+        .iter()
+        .find(|c| c.box_type == BoxType::Block)
+        .expect("caption");
+    assert!(approx(cap.rect.w, 50.0), "cap w {} != 50", cap.rect.w);
+    assert!(approx(cap.rect.h, 48.0), "cap h {} != 48", cap.rect.h);
+    assert!(
+        approx(table.rect.w, 100.0),
+        "table w {} != 100",
+        table.rect.w
+    );
+    assert!(approx(table.rect.h, 30.0), "table h {} != 30", table.rect.h);
+    assert!(
+        approx(cap.rect.x, table.rect.x),
+        "cap x {} != table x {}",
+        cap.rect.x,
+        table.rect.x
+    );
+}
+
+#[test]
+fn w77d_deferred_orthogonal_caption_vertical_rl_mirrors() {
+    // Vertical-rl mirror of the rewrap test: the top caption sits at
+    // the block-start (right) edge, flush with the table's right edge.
+    let html = r#"<table class="t"><caption>aa aa aa aa aa aa aa aa aa aa</caption><tr><td></td></tr></table>"#.to_string();
+    let css = ".t { writing-mode: vertical-rl; border-spacing: 0; } caption { font-size: 10px; writing-mode: horizontal-tb; } td { width: 50px; height: 30px; padding: 0; } table, td { border: 0; }";
+    let l = layout_html(&html, css);
+    let table = &body(&l).children[0];
+    let cap = table
+        .children
+        .iter()
+        .find(|c| c.box_type == BoxType::Block)
+        .expect("caption");
+    assert!(approx(cap.rect.w, 50.0), "cap w {} != 50", cap.rect.w);
+    assert!(approx(cap.rect.h, 48.0), "cap h {} != 48", cap.rect.h);
+    assert!(
+        approx(table.rect.w, 100.0),
+        "table w {} != 100",
+        table.rect.w
+    );
+    let gap = (table.rect.x + table.rect.w) - (cap.rect.x + cap.rect.w);
+    assert!(approx(gap, 0.0), "block-start gap {} != 0", gap);
+}
+
+#[test]
+fn w77d_deferred_orthogonal_caption_bottom_stacks_after_rows() {
+    // Bottom deferred caption: it stacks after the rows toward the
+    // block-end (right side for vertical-lr), not at the block-start.
+    let html = r#"<table class="t"><caption>aa aa aa aa aa aa aa aa aa aa</caption><tr><td></td></tr></table>"#.to_string();
+    let css = ".t { writing-mode: vertical-lr; border-spacing: 0; } caption { font-size: 10px; writing-mode: horizontal-tb; caption-side: bottom; } td { width: 50px; height: 30px; padding: 0; } table, td { border: 0; }";
+    let l = layout_html(&html, css);
+    let table = &body(&l).children[0];
+    let cap = table
+        .children
+        .iter()
+        .find(|c| c.box_type == BoxType::Block)
+        .expect("caption");
+    assert!(approx(cap.rect.w, 50.0), "cap w {} != 50", cap.rect.w);
+    assert!(approx(cap.rect.h, 48.0), "cap h {} != 48", cap.rect.h);
+    assert!(
+        approx(table.rect.w, 100.0),
+        "table w {} != 100",
+        table.rect.w
+    );
+    assert!(
+        approx(cap.rect.x - table.rect.x, 50.0),
+        "cap x rel {} != 50",
+        cap.rect.x - table.rect.x
+    );
+}
+
+#[test]
+fn w77d_deferred_orthogonal_caption_fixed_margins_preserved() {
+    // Deferred caption with fixed horizontal margins: the re-laid
+    // border stays at the 50px block size (task 2 override at the
+    // final push) and the 40px margins add on top: table 50 + 130.
+    let html = r#"<table class="t"><caption>aa aa aa aa aa aa aa aa aa aa</caption><tr><td></td></tr></table>"#.to_string();
+    let css = ".t { writing-mode: vertical-lr; border-spacing: 0; } caption { font-size: 10px; writing-mode: horizontal-tb; margin: 10px 40px; } td { width: 50px; height: 30px; padding: 0; } table, td { border: 0; }";
+    let l = layout_html(&html, css);
+    let table = &body(&l).children[0];
+    let cap = table
+        .children
+        .iter()
+        .find(|c| c.box_type == BoxType::Block)
+        .expect("caption");
+    assert!(approx(cap.rect.w, 50.0), "cap w {} != 50", cap.rect.w);
+    assert!(approx(cap.rect.h, 48.0), "cap h {} != 48", cap.rect.h);
+    assert!(
+        approx(table.rect.w, 180.0),
+        "table w {} != 180",
+        table.rect.w
+    );
+    assert!(
+        approx(cap.rect.x - table.rect.x, 40.0),
+        "cap x rel {} != 40",
+        cap.rect.x - table.rect.x
+    );
+    assert!(
+        approx(cap.rect.y - table.rect.y, 10.0),
+        "cap y rel {} != 10",
+        cap.rect.y - table.rect.y
+    );
+}
+
+#[test]
+fn w77d_deferred_orthogonal_caption_auto_margins_recenter_after_rewrap() {
+    // W77-d task 1b: auto top/bottom margins distribute against the
+    // re-laid caption height. Inline content 100, caption re-wraps
+    // to 48 tall at the 50px block width, so free 52 splits 26/26.
+    // Fail-before: cap 100x24 at y rel 38.
+    let html = r#"<table class="t"><caption>aa aa aa aa aa aa aa aa aa aa</caption><tr><td></td></tr></table>"#.to_string();
+    let css = ".t { writing-mode: vertical-lr; border-spacing: 0; } caption { font-size: 10px; writing-mode: horizontal-tb; margin: auto 0; } td { width: 50px; height: 100px; padding: 0; } table, td { border: 0; }";
+    let l = layout_html(&html, css);
+    let table = &body(&l).children[0];
+    let cap = table
+        .children
+        .iter()
+        .find(|c| c.box_type == BoxType::Block)
+        .expect("caption");
+    assert!(approx(cap.rect.w, 50.0), "cap w {} != 50", cap.rect.w);
+    assert!(approx(cap.rect.h, 48.0), "cap h {} != 48", cap.rect.h);
+    assert!(
+        approx(cap.rect.y - table.rect.y, 26.0),
+        "cap y rel {} != 26",
+        cap.rect.y - table.rect.y
+    );
+}
+
+#[test]
+fn w77d_deferred_caption_interleaves_with_nondeferred_in_dom_order() {
+    // W77-d task 1 (merged stacking): an auto vertical-lr table with
+    // two top captions in DOM order — a same-mode (non-deferred)
+    // caption first, then a deferred orthogonal caption. First place
+    // stacks the 30px same-mode caption + 50px rows (80); the
+    // deferred caption then re-lays against that finalized 80 (4
+    // words/line, 36 tall). The final placement must keep the
+    // same-mode caption at offset 0 and put the deferred caption at
+    // offset 30 (table 160), not stack the deferred caption first
+    // and shift the same-mode one to 50.
+    let html = r#"<table class="t"><caption style="writing-mode: vertical-rl;">v</caption><caption style="writing-mode: horizontal-tb;">aa aa aa aa aa aa aa aa aa aa</caption><tr><td></td></tr></table>"#.to_string();
+    let css = ".t { writing-mode: vertical-lr; border-spacing: 0; } caption { font-size: 10px; } td { width: 50px; height: 30px; padding: 0; } table, td { border: 0; }";
+    let l = layout_html(&html, css);
+    let table = &body(&l).children[0];
+    let caps: Vec<&LayoutBox> = table
+        .children
+        .iter()
+        .filter(|c| c.box_type == BoxType::Block)
+        .collect();
+    assert_eq!(caps.len(), 2, "want 2 caption boxes, got {}", caps.len());
+    assert!(
+        approx(caps[0].rect.w, 30.0),
+        "same-mode cap w {} != 30",
+        caps[0].rect.w
+    );
+    assert!(
+        approx(caps[0].rect.x, table.rect.x),
+        "same-mode cap x {} != table x {}",
+        caps[0].rect.x,
+        table.rect.x
+    );
+    assert!(
+        approx(caps[1].rect.w, 80.0),
+        "deferred cap w {} != 80",
+        caps[1].rect.w
+    );
+    assert!(
+        approx(caps[1].rect.h, 36.0),
+        "deferred cap h {} != 36",
+        caps[1].rect.h
+    );
+    assert!(
+        approx(caps[1].rect.x - table.rect.x, 30.0),
+        "deferred cap x rel {} != 30",
+        caps[1].rect.x - table.rect.x
+    );
+    assert!(
+        approx(table.rect.w, 160.0),
+        "table w {} != 160",
+        table.rect.w
+    );
+}
+
+// w77 (grids, mirroring the w76fix table arm): a definite-width
+// grid item with a max-content basis measures its tracks (150 +
+// 150 = 300), not its width (100). The shrink-to-fit flex
+// container pins the base: its width is set from the item bases
+// before any grid layout runs, so the grid-growth masking that
+// makes a plain final-width assertion pass either way cannot hide
+// a floored base here. Before the fix the container measured 100.
+#[test]
+fn w77_grid_basis_max_content_uses_track_sum() {
+    let l = layout_html(
+        r#"<div class="wrap"><div class="c"><div class="g"><div class="i"></div><div class="i"></div></div></div></div>"#,
+        "body { margin: 0; } .wrap { float: left; } .c { display: flex; } \
+         .g { display: grid; grid-template-columns: 150px 150px; width: 100px; \
+              flex-basis: max-content; flex-grow: 0; flex-shrink: 0; } .i { height: 20px; }",
+    );
+    let c = &body(&l).children[0].children[0];
+    assert!(
+        approx(c.rect.w, 300.0),
+        "shrink flex container w={}",
+        c.rect.w
+    );
+}
+
+// Control: ordinary (non-flex-basis) grid layout is unchanged.
+// A definite-width grid still lays out at its width with its
+// tracks overflowing (second item at x=150), and its ordinary
+// preferred width still floors at the definite width: a float
+// wrapper around it measures 100, not the 300 track sum.
+#[test]
+fn w77_grid_ordinary_layout_definite_width_unchanged() {
+    let l = layout_html(
+        r#"<div class="g"><div class="i"></div><div class="i"></div></div>"#,
+        ".g { display: grid; grid-template-columns: 150px 150px; width: 100px; } \
+         .i { height: 20px; }",
+    );
+    let g = grid_box(&l);
+    assert!(approx(g.rect.w, 100.0), "ordinary grid w={}", g.rect.w);
+    assert!(
+        approx(g.children[1].rect.x, 150.0),
+        "item2 x={}",
+        g.children[1].rect.x
+    );
+    let l = layout_html(
+        r#"<div class="wrap"><div class="g"><div class="i"></div><div class="i"></div></div></div>"#,
+        ".wrap { float: left; } .g { display: grid; grid-template-columns: 150px 150px; width: 100px; } \
+         .i { height: 20px; }",
+    );
+    let wrap = &body(&l).children[0];
+    assert!(
+        approx(wrap.rect.w, 100.0),
+        "ordinary shrink wrap w={}",
+        wrap.rect.w
+    );
 }

@@ -2809,6 +2809,37 @@ pub(crate) fn grid_pref_width(
     fonts: &dyn FontMetrics,
     pw_cache: &mut PrefWidthCache,
 ) -> f32 {
+    grid_pref_width_impl(forest, idx, fonts, pw_cache, false)
+}
+
+/// Definite-ignoring max-content width of the grid container (w77):
+/// the same track computation as [`grid_pref_width`], but a definite
+/// specified `width` (or a replaced intrinsic size, already handled by
+/// the caller's replaced arm) does not floor the result at that width.
+/// Used only by the `flex-basis` content-keyword path
+/// ([`super::flex_basis_content_width`]): a `width:100px` grid with
+/// 300px of tracks measures 300, not 100, for its basis. Ordinary
+/// layout keeps [`grid_pref_width`] and its fast path unchanged.
+/// The final value is still clamped by the grid's own
+/// `min-width`/`max-width` ([`super::clamp_content_width_by_minmax`]),
+/// exactly the clamp [`grid_pref_adjusted`] applies to the raw
+/// track sum on the non-definite path.
+pub(crate) fn grid_pref_width_ignoring_definite(
+    forest: &mut Forest,
+    idx: usize,
+    fonts: &dyn FontMetrics,
+    pw_cache: &mut PrefWidthCache,
+) -> f32 {
+    grid_pref_width_impl(forest, idx, fonts, pw_cache, true)
+}
+
+fn grid_pref_width_impl(
+    forest: &mut Forest,
+    idx: usize,
+    fonts: &dyn FontMetrics,
+    pw_cache: &mut PrefWidthCache,
+    ignore_definite: bool,
+) -> f32 {
     wrap_grid_text_runs(forest, idx);
 
     // One scratch triple serves every item's intrinsic measurement
@@ -2916,15 +2947,17 @@ pub(crate) fn grid_pref_width(
     // `wrap_grid_text_runs` has run, and the track machinery's mutations
     // are either re-done inside the min-content walk (`resolve_metrics`
     // in `grid_min_width`) or invisible to it (pref-width cache fills).
-    if matches!(forest.nodes[idx].data.width, SpecLen::MinContent) {
-        let mut early_mcw = Vec::new();
-        let mut early_bufs = WalkBufs::new();
-        return min_content_width_pooled(forest, idx, fonts, &mut early_mcw, &mut early_bufs);
-    }
-    if let Some(definite) = definite_specified_content_width(forest, idx)
-        .or_else(|| intrinsic_content_width(forest, idx))
-    {
-        return definite;
+    if !ignore_definite {
+        if matches!(forest.nodes[idx].data.width, SpecLen::MinContent) {
+            let mut early_mcw = Vec::new();
+            let mut early_bufs = WalkBufs::new();
+            return min_content_width_pooled(forest, idx, fonts, &mut early_mcw, &mut early_bufs);
+        }
+        if let Some(definite) = definite_specified_content_width(forest, idx)
+            .or_else(|| intrinsic_content_width(forest, idx))
+        {
+            return definite;
+        }
     }
 
     let (root_fs, vp_w, vp_h, font_size) = (
@@ -3050,7 +3083,14 @@ pub(crate) fn grid_pref_width(
 
     let gaps = col_gap * (ncols as f32 - 1.0).max(0.0);
     let intrinsic = col_w.iter().sum::<f32>() + gaps;
-    grid_pref_adjusted(forest, idx, fonts, intrinsic, &mut int_mcw, &mut int_bufs)
+    if ignore_definite {
+        // `grid_pref_adjusted` would re-apply the definite /
+        // `min-content` floors this variant exists to skip, so clamp
+        // only by min/max-width, mirroring its non-definite arm.
+        super::clamp_content_width_by_minmax(forest, idx, intrinsic)
+    } else {
+        grid_pref_adjusted(forest, idx, fonts, intrinsic, &mut int_mcw, &mut int_bufs)
+    }
 }
 
 /// Min-content width of the grid container (css-grid-1 §12.5): the
@@ -4556,6 +4596,124 @@ mod grid_tests {
         assert!(
             approx(pref, 200.0),
             "definite width should contribute exactly without measuring items: {pref}"
+        );
+    }
+
+    // w77: the definite-ignoring variant used by the `flex-basis`
+    // content-keyword arm. A definite-width grid measures its
+    // tracks (150 + 150 = 300), not its width (100), while the
+    // ordinary `grid_pref_width` on the same forest still floors
+    // at 100 — the fast path is untouched. Content-sized tracks
+    // measure the same way (two 150px items over `auto` tracks),
+    // and gaps join the sum (150 + 150 + 10).
+    #[test]
+    fn grid_pref_width_ignoring_definite_uses_track_sum() {
+        let (mut forest, grid) = forest_grid(
+            r#"<div class="g"><div class="i"></div><div class="i"></div></div>"#,
+            ".g { display: grid; grid-template-columns: 150px 150px; width: 100px; } \
+             .i { height: 20px; }",
+        );
+        let mut cache = PrefWidthCache::new(forest.nodes.len());
+        let ordinary = grid_pref_width(&mut forest, grid, &crate::FixedFontMetrics, &mut cache);
+        assert!(
+            approx(ordinary, 100.0),
+            "ordinary pref still floors: {ordinary}"
+        );
+        let mut cache = PrefWidthCache::new(forest.nodes.len());
+        let ignoring = grid_pref_width_ignoring_definite(
+            &mut forest,
+            grid,
+            &crate::FixedFontMetrics,
+            &mut cache,
+        );
+        assert!(
+            approx(ignoring, 300.0),
+            "ignoring pref is the track sum: {ignoring}"
+        );
+
+        let (mut forest, grid) = forest_grid(
+            r#"<div class="g"><div class="i"></div><div class="i"></div></div>"#,
+            ".g { display: grid; grid-template-columns: auto auto; width: 100px; } \
+             .i { width: 150px; height: 20px; }",
+        );
+        let mut cache = PrefWidthCache::new(forest.nodes.len());
+        let ignoring = grid_pref_width_ignoring_definite(
+            &mut forest,
+            grid,
+            &crate::FixedFontMetrics,
+            &mut cache,
+        );
+        assert!(approx(ignoring, 300.0), "content tracks sum: {ignoring}");
+
+        let (mut forest, grid) = forest_grid(
+            r#"<div class="g"><div class="i"></div><div class="i"></div></div>"#,
+            ".g { display: grid; grid-template-columns: 150px 150px; gap: 10px; width: 100px; } \
+             .i { height: 20px; }",
+        );
+        let mut cache = PrefWidthCache::new(forest.nodes.len());
+        let ignoring = grid_pref_width_ignoring_definite(
+            &mut forest,
+            grid,
+            &crate::FixedFontMetrics,
+            &mut cache,
+        );
+        assert!(approx(ignoring, 310.0), "tracks plus gap: {ignoring}");
+    }
+
+    // w77, inline-grid equivalent of the test above, measured
+    // directly on the inline-grid node: the ordinary value floors
+    // at 100, the definite-ignoring variant measures the 300px
+    // track sum. (End to end, an inline-grid flex item is swept
+    // into a style-less anonymous wrapper, so its own basis never
+    // reaches the item — the wrapper gap, not this variant — and
+    // only the direct pin can show the arm for inline-grids.)
+    #[test]
+    fn inline_grid_pref_width_ignoring_definite_uses_track_sum() {
+        use crate::style::Display;
+        let (doc, _) = bowser_dom::Document::parse_html(
+            r#"<div class="g"><div class="i"></div><div class="i"></div></div>"#.as_bytes(),
+        );
+        let ss = bowser_css::parse_stylesheet(
+            ".g { display: inline-grid; grid-template-columns: 150px 150px; width: 100px; } \
+             .i { height: 20px; }",
+        );
+        let ua = bowser_css::default_ua_stylesheet();
+        let Some((mut forest, root)) = crate::boxes::build_box_tree(
+            &doc,
+            &[&ss],
+            &ua,
+            800.0,
+            600.0,
+            &std::collections::HashMap::new(),
+        ) else {
+            panic!("no root box");
+        };
+        let mut stack = vec![root];
+        let mut grid = None;
+        while let Some(i) = stack.pop() {
+            if forest.nodes[i].data.display == Display::InlineGrid {
+                grid = Some(i);
+                break;
+            }
+            stack.extend(forest.nodes[i].children.iter().copied());
+        }
+        let grid = grid.expect("inline-grid box");
+        let mut cache = PrefWidthCache::new(forest.nodes.len());
+        let ordinary = grid_pref_width(&mut forest, grid, &crate::FixedFontMetrics, &mut cache);
+        assert!(
+            approx(ordinary, 100.0),
+            "ordinary pref still floors: {ordinary}"
+        );
+        let mut cache = PrefWidthCache::new(forest.nodes.len());
+        let ignoring = grid_pref_width_ignoring_definite(
+            &mut forest,
+            grid,
+            &crate::FixedFontMetrics,
+            &mut cache,
+        );
+        assert!(
+            approx(ignoring, 300.0),
+            "ignoring pref is the track sum: {ignoring}"
         );
     }
 

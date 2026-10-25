@@ -40,14 +40,11 @@ Read this before writing any code. It overrides general habits.
 - Public APIs are minimal and documented. Prefer concrete internals over
   clever abstraction.
 
-## Workflow (local-first, hard rule)
+## Workflow
 
-- All work happens locally. No pushes, no new branches, no PRs, no merges,
-  ever, until the user explicitly approves. Open GitHub PRs stay
-  untouched.
-- When a genuine completion checkpoint is reached, report it and stop
-  push-related work. If a push is ever approved, it goes to exactly one
-  work branch per project (`<name>/work-<task>`), never to master/default.
+- All work happens locally on master. Completed work syncs directly to the
+  `develop` branch on GitHub; never push to master/main, never open a PR
+  unless the maintainer explicitly approves one.
 - Never commit broken code. If it does not compile and pass `cargo test`
   for its crate, it does not land.
 - Commit messages: imperative and scoped, e.g.

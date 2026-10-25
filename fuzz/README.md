@@ -25,14 +25,14 @@ cargo +nightly install cargo-fuzz --locked
 Use this target dir (never the shared workspace `target/`):
 
 ```sh
-export CARGO_TARGET_DIR=~/workspace/scratch/bowser-orch5/fix-fuzz/target
+export CARGO_TARGET_DIR=<scratch>/target
 ```
 
 ## Smoke run (what CI / a quick check should do)
 
 ```sh
 cd ~/workspace/bowser/fuzz
-export CARGO_TARGET_DIR=~/workspace/scratch/bowser-orch5/fix-fuzz/target
+export CARGO_TARGET_DIR=<scratch>/target
 cargo +nightly fuzz run fuzz_tls_handshake -- -max_total_time=600 -timeout=30 -rss_limit_mb=2048
 cargo +nightly fuzz run fuzz_x509          -- -max_total_time=600 -timeout=30 -rss_limit_mb=2048
 ```
@@ -44,7 +44,7 @@ interesting inputs persist across runs:
 
 ```sh
 cd ~/workspace/bowser/fuzz
-export CARGO_TARGET_DIR=~/workspace/scratch/bowser-orch5/fix-fuzz/target
+export CARGO_TARGET_DIR=<scratch>/target
 
 # build once
 cargo +nightly fuzz build -O
@@ -75,7 +75,7 @@ as `crash-<sha1>` / `timeout-<sha1>` / `oom-<sha1>` plus the libfuzzer log.)
 ## Triaging a crash
 
 ```sh
-export CARGO_TARGET_DIR=~/workspace/scratch/bowser-orch5/fix-fuzz/target
+export CARGO_TARGET_DIR=<scratch>/target
 # reproduce the exact input (also re-runs under gdb/asan as needed):
 cargo +nightly fuzz run fuzz_x509 fuzz/artifacts/fuzz_x509/crash-<sha1>
 # minimize the reproducer:

@@ -2557,6 +2557,7 @@ pub(crate) fn install_welcome_page(
     url: &Url,
     user_agent: &str,
     fonts: &Arc<Mutex<FontCache>>,
+    cookie_jar: &Arc<Mutex<CookieJar>>,
 ) {
     let (document, _quirks) = Document::parse_html(WELCOME_HTML.as_bytes());
     crate::navigation::install_loaded_document(
@@ -2575,6 +2576,7 @@ pub(crate) fn install_welcome_page(
         },
         user_agent,
         fonts,
+        cookie_jar,
     );
 }
 
@@ -3236,7 +3238,7 @@ pub fn load_tab_headless(
     viewport: Size,
 ) -> Result<Tab, crate::navigation::NavError> {
     let mut tab = Tab::new(viewport);
-    let jar = Mutex::new(CookieJar::new());
+    let jar = Arc::new(Mutex::new(CookieJar::new()));
     let url = bowser_url::parse(url_str, None).map_err(crate::navigation::NavError::Url)?;
     // Defer the window `load` event until after the first layout
     // publishes: `load` handlers must observe geometry (WPT
@@ -3258,7 +3260,7 @@ pub fn load_tab_headless(
     if url.serialize() == "about:blank" {
         // Headless has no `BrowserConfig`: the welcome page carries the
         // default UA, like every other headless install.
-        install_welcome_page(&mut tab, &url, bowser_net::fetch::USER_AGENT, &fonts);
+        install_welcome_page(&mut tab, &url, bowser_net::fetch::USER_AGENT, &fonts, &jar);
         tab.history.push(url);
     } else {
         crate::navigation::navigate(
@@ -3426,13 +3428,14 @@ fn install_final_document(
     loaded: LoadedDocument,
     user_agent: &str,
     fonts: &Arc<Mutex<FontCache>>,
+    cookie_jar: &Arc<Mutex<CookieJar>>,
 ) {
     // Webfonts are installed centrally by `install_loaded_document`
     // (before first layout), so every load path — initial, push, and
     // traversal — gets them; this function only adds the history-entry
     // rewrite below.
     let final_url = loaded.url.clone();
-    crate::navigation::install_loaded_document(tab, loaded, user_agent, fonts);
+    crate::navigation::install_loaded_document(tab, loaded, user_agent, fonts, cookie_jar);
     // Same rewrite rule back/forward traversals apply, so the entry and
     // the installed document can never disagree.
     let current = tab.history.index();
@@ -3499,8 +3502,9 @@ fn init_gpu(window: &Arc<Window>, fonts: &Arc<Mutex<FontCache>>) -> Result<Gpu, 
 
 /// winit application driving one window for one tab.
 ///
-/// `tabs`/`jar` are disjoint borrows of the [`crate::browser::Browser`]
-/// (the tab arena mutably, the profile cookie jar shared). Document loads
+/// `tabs` is a disjoint borrow of the [`crate::browser::Browser`]
+/// (mutably) and `jar` a clone of its profile cookie jar handle.
+/// Document loads
 /// run on detached worker threads that own a private cookie jar swapped
 /// out of `jar` — the profile lock is never held across a load — and
 /// report back through a channel the event loop polls in `about_to_wait`.
@@ -3512,7 +3516,11 @@ fn init_gpu(window: &Arc<Window>, fonts: &Arc<Mutex<FontCache>>) -> Result<Gpu, 
 /// browser exit.
 struct WindowApp<'a> {
     tabs: &'a mut TabArena,
-    jar: &'a Mutex<CookieJar>,
+    /// The profile's cookie jar handle: a clone of the profile's
+    /// `Arc`, so the loader swap below and the JS contexts installed
+    /// from this window lock the same jar (see
+    /// [`crate::navigation::install_loaded_document`]).
+    jar: Arc<Mutex<CookieJar>>,
     tab: TabId,
     /// Logical viewport (CSS px) the window was configured with.
     viewport: (u32, u32),
@@ -3594,8 +3602,9 @@ impl<'a> WindowApp<'a> {
             // fonts handle first.
             let user_agent = self.user_agent.clone();
             let fonts = Arc::clone(&self.fonts);
+            let cookie_jar = Arc::clone(&self.jar);
             if let Some(tab) = self.tab_mut() {
-                install_welcome_page(tab, &url, &user_agent, &fonts);
+                install_welcome_page(tab, &url, &user_agent, &fonts, &cookie_jar);
             }
             self.needs_redraw = true;
         } else {
@@ -3637,7 +3646,7 @@ impl<'a> WindowApp<'a> {
             self.handoff_tx = Some(jar_tx);
             JarSource::Handoff(jar_rx)
         } else {
-            JarSource::Owned(crate::navigation::take_profile_jar(self.jar))
+            JarSource::Owned(crate::navigation::take_profile_jar(&self.jar))
         };
         thread::spawn(move || {
             // Closing: never touch the network — but still hand the jar
@@ -3809,7 +3818,7 @@ impl<'a> WindowApp<'a> {
                  keeping the superseded jar"
             );
         } else {
-            crate::navigation::restore_profile_jar(self.jar, report.jar);
+            crate::navigation::restore_profile_jar(&self.jar, report.jar);
         }
         match report.result {
             Some(Ok(loaded)) => {
@@ -3817,6 +3826,7 @@ impl<'a> WindowApp<'a> {
                 // the fonts handle first.
                 let user_agent = self.user_agent.clone();
                 let fonts = Arc::clone(&self.fonts);
+                let cookie_jar = Arc::clone(&self.jar);
                 if let Some(tab) = self.tab_mut() {
                     if push_history {
                         // One completion rule for both load paths: push
@@ -3828,6 +3838,7 @@ impl<'a> WindowApp<'a> {
                             true,
                             &user_agent,
                             &fonts,
+                            &cookie_jar,
                         );
                     } else {
                         // Traversals move the history index to the loaded
@@ -3845,7 +3856,7 @@ impl<'a> WindowApp<'a> {
                             }
                             None => {}
                         }
-                        install_final_document(tab, loaded, &user_agent, &fonts);
+                        install_final_document(tab, loaded, &user_agent, &fonts, &cookie_jar);
                     }
                 }
                 self.needs_redraw = true;
@@ -3914,7 +3925,7 @@ impl<'a> WindowApp<'a> {
             }
         }
         if let Some(jar) = jar {
-            crate::navigation::restore_profile_jar(self.jar, jar);
+            crate::navigation::restore_profile_jar(&self.jar, jar);
         }
         self.handoff_tx = None;
     }
@@ -4903,8 +4914,9 @@ impl<'a> WindowApp<'a> {
         // data-URL install synchronously triggered from one would
         // otherwise paint stale metrics for a frame: re-drain here so
         // the full reflow is marked before `handle_redraw`'s refresh.
-        // Per-context flag only; no shared-cache generation counter
-        // (wave-77 item).
+        // Generation-based drain: a repeated drain in the same
+        // iteration reports nothing new, so the re-drain is free
+        // unless another install landed meanwhile.
         let mut redrain_paint = false;
         for id in self.tabs.live_ids() {
             let Some(tab) = self.tabs.get_mut(id) else {
@@ -5039,11 +5051,20 @@ fn drain_pending_smooth_scroll(tab: &mut Tab) {
 /// windowed pump calls this directly, and the headless pump calls it
 /// through [`drain_pending_font_load_invalidation_headless`]
 /// (which is a plain delegation, not a separate implementation).
+///
+/// Generation-based (not a bare bool drain): the bindings report
+/// `Some(gen)` only when the shared-cache generation advanced past
+/// the last generation they reported, so this reflows exactly once
+/// per install batch and the reported generation identifies which
+/// snapshot went stale. The last-seen baseline lives per context
+/// in the bindings (see `WebApis::take_pending_font_load_generation`),
+/// not on the tab, so a new page's context can never inherit a
+/// stale baseline from a dead one.
 fn drain_pending_font_load_invalidation(tab: &mut Tab) {
     let ctx = tab.page_vm().and_then(|p| p.web_api_context());
     if ctx
-        .map(bowser_js::take_pending_font_load_invalidation)
-        .unwrap_or(false)
+        .and_then(bowser_js::take_pending_font_load_generation)
+        .is_some()
     {
         tab.mark_layout_dirty_full();
         tab.dirty.paint = true;
@@ -5158,8 +5179,9 @@ fn drain_pending_smooth_scroll_headless(tab: &mut Tab) {
     tab.scroll().set_offset(tx, ty);
 }
 
-/// Headless twin of [`drain_pending_font_load_invalidation`]: the
-/// flag means the same full reflow here, and the same iteration's
+/// Headless twin of [`drain_pending_font_load_invalidation`]: a
+/// newly reported generation means the same full reflow here, and
+/// the same iteration's
 /// `if tab.dirty.layout || tab.dirty.style { refresh(tab, fonts); }`
 /// check picks it up, so a font installed by initial scripts reflows
 /// before the headless rasterize reads the tree.
@@ -5322,13 +5344,15 @@ pub fn run_windowed_with_js(
     js: Option<Box<dyn JsDispatch>>,
 ) -> Result<(), WindowError> {
     let event_loop = EventLoop::new().map_err(|e| WindowError::EventLoop(e.to_string()))?;
-    // Disjoint field borrows: the event loop mutates `tabs` while loader
-    // workers briefly borrow `jar` for the cookie swap. `viewport` is
-    // `Copy`, so its borrow ends before the mutable borrows begin.
+    // Disjoint borrows: the event loop mutates `tabs` while loader
+    // workers briefly borrow the jar for the cookie swap, through the
+    // cloned `Arc` handle below (the window owns no borrow of the
+    // profile itself). `viewport` is `Copy`, so its borrow ends before
+    // the mutable borrows begin.
     let viewport = browser.config().viewport;
     let user_agent = browser.config().user_agent.clone();
     let tabs: &mut TabArena = &mut browser.tabs;
-    let jar: &Mutex<CookieJar> = &browser.profile.cookie_jar;
+    let jar = Arc::clone(&browser.profile.cookie_jar);
     let mut app = WindowApp {
         tabs,
         jar,
@@ -6358,7 +6382,7 @@ mod tests {
         let port = tab.scroll_tree.container(isc).scrollport;
         let mut tabs = TabArena::default();
         let tab_id = tabs.insert(tab);
-        let jar = Mutex::new(CookieJar::new());
+        let jar = Arc::new(Mutex::new(CookieJar::new()));
         let stub = StubDispatch::default();
         let log = stub.log.clone();
         let mut app = test_app_with_js(&mut tabs, &jar, tab_id, Some(Box::new(stub)));
@@ -6395,7 +6419,7 @@ mod tests {
         let (tab, _, _) = tab_with_scroller();
         let mut tabs = TabArena::default();
         let tab_id = tabs.insert(tab);
-        let jar = Mutex::new(CookieJar::new());
+        let jar = Arc::new(Mutex::new(CookieJar::new()));
         let stub = StubDispatch::default();
         let log = stub.log.clone();
         let mut app = test_app_with_js(&mut tabs, &jar, tab_id, Some(Box::new(stub)));
@@ -6414,7 +6438,7 @@ mod tests {
         let (tab, sc, _) = tab_with_scroller();
         let mut tabs = TabArena::default();
         let tab_id = tabs.insert(tab);
-        let jar = Mutex::new(CookieJar::new());
+        let jar = Arc::new(Mutex::new(CookieJar::new()));
         let mut app = test_app(&mut tabs, &jar, tab_id);
 
         // Viewport offset is zero: viewport coords == page coords.
@@ -6492,7 +6516,7 @@ mod tests {
         let (tab, sc, _) = tab_with_scroller();
         let mut tabs = TabArena::default();
         let tab_id = tabs.insert(tab);
-        let jar = Mutex::new(CookieJar::new());
+        let jar = Arc::new(Mutex::new(CookieJar::new()));
         let mut app = test_app(&mut tabs, &jar, tab_id);
 
         // Anchor at the center of `#sc`'s scrollport (100px tall,
@@ -6545,7 +6569,7 @@ mod tests {
         let (tab, sc, _) = tab_with_scroller();
         let mut tabs = TabArena::default();
         let tab_id = tabs.insert(tab);
-        let jar = Mutex::new(CookieJar::new());
+        let jar = Arc::new(Mutex::new(CookieJar::new()));
         let mut app = test_app(&mut tabs, &jar, tab_id);
 
         let (ax, ay) = {
@@ -6617,7 +6641,7 @@ mod tests {
         let (tab, sc, _) = tab_with_snap_scroller();
         let mut tabs = TabArena::default();
         let tab_id = tabs.insert(tab);
-        let jar = Mutex::new(CookieJar::new());
+        let jar = Arc::new(Mutex::new(CookieJar::new()));
         let mut app = test_app(&mut tabs, &jar, tab_id);
 
         let (thumb_cx, thumb_cy) = {
@@ -6666,7 +6690,7 @@ mod tests {
         let (tab, sc, _) = tab_with_scroller();
         let mut tabs = TabArena::default();
         let tab_id = tabs.insert(tab);
-        let jar = Mutex::new(CookieJar::new());
+        let jar = Arc::new(Mutex::new(CookieJar::new()));
         let mut app = test_app(&mut tabs, &jar, tab_id);
 
         let (cx, below_thumb, above_thumb) = {
@@ -6717,7 +6741,7 @@ mod tests {
         tab.scroll_tree.start_smooth_scroll(isc, 0.0, 200.0);
         let mut tabs = TabArena::default();
         let tab_id = tabs.insert(tab);
-        let jar = Mutex::new(CookieJar::new());
+        let jar = Arc::new(Mutex::new(CookieJar::new()));
         let stub = StubDispatch::default();
         let log = stub.log.clone();
         let mut app = test_app_with_js(&mut tabs, &jar, tab_id, Some(Box::new(stub)));
@@ -6756,6 +6780,35 @@ mod tests {
         // exactly once.
         app.pump_scripts();
         assert_eq!(log.borrow().scrollends, vec![sc]);
+    }
+
+    #[test]
+    fn share_cookie_jar_reexport_retains_jar_in_js_context() {
+        // w77-J: the `bowser_js::share_cookie_jar` re-export is the
+        // app-side half of the W-E2 FontFace.load credentials wiring:
+        // before it, `bowser_app` could not even name the function.
+        // Retention is the observable: the context holds an `Arc`
+        // clone, so the strong count rises, proving the JS context
+        // received this exact jar (not a copy). NOTE: this proves the
+        // share function, not the production install point — no
+        // production install calls it yet (see the w77-J report:
+        // `install_loaded_document` takes no jar, and `Profile` holds
+        // a plain `Mutex`, not the `Arc` the share takes).
+        let (doc, _) = Document::parse_html(b"<html><body><p>hi</p></body></html>");
+        let doc = Rc::new(RefCell::new(doc));
+        let url = bowser_url::parse("http://example.com/", None).expect("test url");
+        let page_vm = crate::script::PageVm::new_for_document(doc, &url, "test", &[])
+            .expect("install web apis");
+        let ctx = page_vm.web_api_context().expect("web api ctx");
+        let jar: Arc<Mutex<CookieJar>> = Arc::new(Mutex::new(CookieJar::new()));
+        assert_eq!(Arc::strong_count(&jar), 1);
+        bowser_js::share_cookie_jar(ctx, Arc::clone(&jar));
+        assert!(
+            Arc::strong_count(&jar) >= 2,
+            "the JS context must retain the shared jar"
+        );
+        // Unknown contexts are ignored, never a panic.
+        bowser_js::share_cookie_jar(u32::MAX, Arc::clone(&jar));
     }
 
     #[test]
@@ -6844,7 +6897,7 @@ mod tests {
         let mut tabs = TabArena::default();
         let _bg_id = tabs.insert(bg_tab);
         let fg_id = tabs.insert(fg_tab);
-        let jar = Mutex::new(CookieJar::new());
+        let jar = Arc::new(Mutex::new(CookieJar::new()));
         // Active tab is the foreground one, with no animation of its own.
         let mut app = test_app(&mut tabs, &jar, fg_id);
         assert!(
@@ -6887,7 +6940,7 @@ mod tests {
         // Nothing in flight anywhere: the loop may idle.
         let mut tabs = TabArena::default();
         let fg_id = tabs.insert(test_tab());
-        let jar = Mutex::new(CookieJar::new());
+        let jar = Arc::new(Mutex::new(CookieJar::new()));
         let app = test_app(&mut tabs, &jar, fg_id);
         assert!(!app.animations_in_flight());
     }
@@ -6906,7 +6959,7 @@ mod tests {
 
         let mut tabs = TabArena::default();
         let tab_id = tabs.insert(tab);
-        let jar = Mutex::new(CookieJar::new());
+        let jar = Arc::new(Mutex::new(CookieJar::new()));
         let mut app = test_app(&mut tabs, &jar, tab_id);
         assert!(
             app.animations_in_flight(),
@@ -6955,7 +7008,7 @@ mod tests {
 
         let mut tabs = TabArena::default();
         let tab_id = tabs.insert(tab);
-        let jar = Mutex::new(CookieJar::new());
+        let jar = Arc::new(Mutex::new(CookieJar::new()));
         let mut app = test_app(&mut tabs, &jar, tab_id);
         assert!(
             app.animations_in_flight(),
@@ -6999,7 +7052,7 @@ mod tests {
         tab.scroll_tree.start_smooth_scroll(isc, 0.0, 200.0);
         let mut tabs = TabArena::default();
         let tab_id = tabs.insert(tab);
-        let jar = Mutex::new(CookieJar::new());
+        let jar = Arc::new(Mutex::new(CookieJar::new()));
         let stub = StubDispatch::default();
         let log = stub.log.clone();
         let mut app = test_app_with_js(&mut tabs, &jar, tab_id, Some(Box::new(stub)));
@@ -7248,7 +7301,13 @@ mod tests {
         let url = bowser_url::parse("http://example.com/", None).expect("test url");
         // Production install path: web APIs installed, scroll states
         // shared, everything dirty so the next `refresh` lays out.
-        install_welcome_page(&mut tab, &url, "BowserTest/1.0", &test_fonts());
+        install_welcome_page(
+            &mut tab,
+            &url,
+            "BowserTest/1.0",
+            &test_fonts(),
+            &test_cookie_jar(),
+        );
         assert!(
             tab.page_vm().and_then(|vm| vm.web_api_context()).is_some(),
             "web APIs must install for the publish to have a target"
@@ -7290,7 +7349,13 @@ mod tests {
     fn publish_layout_tree_clears_stale_tree_without_layout_root() {
         let mut tab = test_tab();
         let url = bowser_url::parse("http://example.com/", None).expect("test url");
-        install_welcome_page(&mut tab, &url, "BowserTest/1.0", &test_fonts());
+        install_welcome_page(
+            &mut tab,
+            &url,
+            "BowserTest/1.0",
+            &test_fonts(),
+            &test_cookie_jar(),
+        );
         assert!(
             tab.page_vm().and_then(|vm| vm.web_api_context()).is_some(),
             "web APIs must install for the publish to have a target"
@@ -7668,7 +7733,7 @@ mod tests {
 
         let mut tabs = TabArena::default();
         let tab_id = tabs.insert(tab);
-        let jar = Mutex::new(CookieJar::new());
+        let jar = Arc::new(Mutex::new(CookieJar::new()));
         let stub = StubDispatch::default();
         let log = stub.log.clone();
         let mut app = test_app_with_js(&mut tabs, &jar, tab_id, Some(Box::new(stub)));
@@ -7739,7 +7804,7 @@ mod tests {
 
         let mut tabs = TabArena::default();
         let tab_id = tabs.insert(tab);
-        let jar = Mutex::new(CookieJar::new());
+        let jar = Arc::new(Mutex::new(CookieJar::new()));
         let stub = StubDispatch::default();
         let log = stub.log.clone();
         let mut app = test_app_with_js(&mut tabs, &jar, tab_id, Some(Box::new(stub)));
@@ -7798,6 +7863,12 @@ mod tests {
     /// Throwaway font cache for [`refresh`] tests (no window owns one).
     fn test_fonts() -> Arc<Mutex<FontCache>> {
         Arc::new(Mutex::new(FontCache::new()))
+    }
+
+    /// Throwaway profile cookie jar handle for install call sites
+    /// (w77-L: `install_loaded_document` takes the shared `Arc`).
+    fn test_cookie_jar() -> Arc<Mutex<CookieJar>> {
+        Arc::new(Mutex::new(CookieJar::new()))
     }
 
     #[test]
@@ -9122,6 +9193,7 @@ mod tests {
             loaded,
             "TestBrowser/9.9",
             &test_fonts(),
+            &test_cookie_jar(),
         );
         assert_eq!(tab.title, "hello");
         assert_eq!(tab.scroll().offset(), (0.0, 0.0));
@@ -9185,6 +9257,7 @@ mod tests {
             true,
             "TestBrowser/9.9",
             &fonts,
+            &test_cookie_jar(),
         );
         assert_eq!(tab.history.len(), 1, "push path must record the entry");
         let after = {
@@ -9233,6 +9306,7 @@ mod tests {
             true,
             "TestBrowser/9.9",
             &fonts,
+            &test_cookie_jar(),
         );
         let vm = tab.page_vm_mut().expect("page VM installed");
         let status = match vm
@@ -9316,6 +9390,7 @@ mod tests {
             true,
             "TestBrowser/9.9",
             &fonts,
+            &test_cookie_jar(),
         );
         refresh(&mut tab, &fonts);
         let before = text_box_width(&tab, "X").expect("text box after initial layout");
@@ -9413,6 +9488,7 @@ mod tests {
             true,
             "TestBrowser/9.9",
             &fonts,
+            &test_cookie_jar(),
         );
         refresh(&mut tab, &fonts);
         let before = text_box_width(&tab, "X").expect("text box after initial layout");
@@ -9434,10 +9510,10 @@ mod tests {
         }
         let mut tabs = TabArena::default();
         let tab_id = tabs.insert(tab);
-        let jar = Mutex::new(CookieJar::new());
+        let jar = Arc::new(Mutex::new(CookieJar::new()));
         let mut app = WindowApp {
             tabs: &mut tabs,
-            jar: &jar,
+            jar: Arc::clone(&jar),
             tab: tab_id,
             viewport: (800, 600),
             window: None,
@@ -9582,6 +9658,7 @@ mod tests {
             true,
             "TestBrowser/9.9",
             &fonts,
+            &test_cookie_jar(),
         );
         refresh(&mut tab, &fonts);
         let before = text_box_width(&tab, "X").expect("text box after initial layout");
@@ -9668,6 +9745,7 @@ mod tests {
             ),
             "TestBrowser/9.9",
             &test_fonts(),
+            &test_cookie_jar(),
         );
         let report = tab.script_report().expect("page VM installed");
         assert_eq!(report.executed, 1);
@@ -9686,6 +9764,7 @@ mod tests {
             load_from(b"<html><head><script>marker = 'second';</script></head></html>"),
             "TestBrowser/9.9",
             &test_fonts(),
+            &test_cookie_jar(),
         );
         let vm = tab.page_vm_mut().expect("page VM installed");
         let marker = vm.eval("marker === 'second'").expect("marker");
@@ -9774,7 +9853,7 @@ mod tests {
             &pending[0].url.serialize(),
             DecodedImage::from_rgba(4, 2, vec![255; 4 * 2 * 4]),
         );
-        let jar = Mutex::new(CookieJar::new());
+        let jar = Arc::new(Mutex::new(CookieJar::new()));
         let intrinsics = fetch_late_image(&pending[0].url, &url, &jar, "TestBrowser/9.9");
         assert_eq!(intrinsics, Some(IntrinsicDims::from_size(4.0, 2.0)));
 
@@ -9877,7 +9956,7 @@ mod tests {
             &pending[0].url.serialize(),
             DecodedImage::from_rgba(4, 2, vec![1; 4 * 2 * 4]),
         );
-        let jar = Mutex::new(CookieJar::new());
+        let jar = Arc::new(Mutex::new(CookieJar::new()));
         let size = fetch_late_image(&pending[0].url, &url, &jar, "TestBrowser/9.9");
         tab.note_image_loaded(img, pending[0].generation, size);
         assert_eq!(
@@ -9959,7 +10038,7 @@ mod tests {
             &pending[0].url.serialize(),
             DecodedImage::from_rgba(4, 2, vec![1; 4 * 2 * 4]),
         );
-        let jar = Mutex::new(CookieJar::new());
+        let jar = Arc::new(Mutex::new(CookieJar::new()));
         let size = fetch_late_image(&pending[0].url, &url, &jar, "TestBrowser/9.9");
         tab.note_image_loaded(img, pending[0].generation, size);
         assert_eq!(
@@ -10237,6 +10316,7 @@ mod tests {
             },
             bowser_net::fetch::USER_AGENT,
             &test_fonts(),
+            &test_cookie_jar(),
         );
         assert_eq!(tab.title, "landed", "final document installed");
         assert_eq!(tab.history.len(), 1, "no new entry pushed");
@@ -10270,6 +10350,7 @@ mod tests {
             },
             bowser_net::fetch::USER_AGENT,
             &test_fonts(),
+            &test_cookie_jar(),
         );
         assert_eq!(tab.history.len(), 1, "no new entry pushed");
         assert_eq!(tab.current_url(), Some(&url), "entry untouched");
@@ -10281,7 +10362,7 @@ mod tests {
 
         let mut tabs = TabArena::default();
         let tab = tabs.insert(Tab::new(Size { w: 800.0, h: 600.0 }));
-        let jar = Mutex::new(CookieJar::new());
+        let jar = Arc::new(Mutex::new(CookieJar::new()));
         let mut app = test_app(&mut tabs, &jar, tab);
 
         // No page VM yet (no document installed): the pump is a no-op,
@@ -10327,7 +10408,7 @@ mod tests {
         let mut tabs = TabArena::default();
         let active = tabs.insert(Tab::new(Size { w: 800.0, h: 600.0 }));
         let background = tabs.insert(Tab::new(Size { w: 800.0, h: 600.0 }));
-        let jar = Mutex::new(CookieJar::new());
+        let jar = Arc::new(Mutex::new(CookieJar::new()));
         let mut app = test_app(&mut tabs, &jar, active);
 
         // The background tab's page registers a 0 ms timer.
@@ -10420,7 +10501,7 @@ mod tests {
     fn browser_back_key_uses_fragment_fast_path() {
         let mut tabs = TabArena::default();
         let tab = tabs.insert(test_tab());
-        let jar = Mutex::new(CookieJar::new());
+        let jar = Arc::new(Mutex::new(CookieJar::new()));
         let mut app = test_app(&mut tabs, &jar, tab);
 
         // Two same-document entries with a loaded document: traversal
@@ -10474,7 +10555,7 @@ mod tests {
         let (url_a, url_b) = serve_two_pages();
         let mut tabs = TabArena::default();
         let tab = tabs.insert(test_tab());
-        let jar = Mutex::new(CookieJar::new());
+        let jar = Arc::new(Mutex::new(CookieJar::new()));
         let mut app = test_app(&mut tabs, &jar, tab);
 
         // Initial load of A (entry recorded at tab creation, like
@@ -10557,7 +10638,7 @@ mod tests {
 
     fn test_app<'a>(
         tabs: &'a mut TabArena,
-        jar: &'a Mutex<CookieJar>,
+        jar: &Arc<Mutex<CookieJar>>,
         tab: TabId,
     ) -> WindowApp<'a> {
         test_app_with_js(tabs, jar, tab, None)
@@ -10565,13 +10646,13 @@ mod tests {
 
     fn test_app_with_js<'a>(
         tabs: &'a mut TabArena,
-        jar: &'a Mutex<CookieJar>,
+        jar: &Arc<Mutex<CookieJar>>,
         tab: TabId,
         js: Option<Box<dyn JsDispatch>>,
     ) -> WindowApp<'a> {
         WindowApp {
             tabs,
-            jar,
+            jar: Arc::clone(jar),
             tab,
             viewport: (800, 600),
             window: None,
@@ -10722,7 +10803,7 @@ mod tests {
         let (tab, sc, b) = tab_with_two_target_snap_scroller();
         let mut tabs = TabArena::default();
         let tab_id = tabs.insert(tab);
-        let jar = Mutex::new(CookieJar::new());
+        let jar = Arc::new(Mutex::new(CookieJar::new()));
         let stub = StubDispatch::default();
         let log = stub.log.clone();
         let mut app = test_app_with_js(&mut tabs, &jar, tab_id, Some(Box::new(stub)));
@@ -10811,7 +10892,7 @@ mod tests {
 
         let mut tabs = TabArena::default();
         let tab_id = tabs.insert(tab);
-        let jar = Mutex::new(CookieJar::new());
+        let jar = Arc::new(Mutex::new(CookieJar::new()));
         let stub = StubDispatch::default();
         let log = stub.log.clone();
         let mut app = test_app_with_js(&mut tabs, &jar, tab_id, Some(Box::new(stub)));
@@ -10943,7 +11024,7 @@ mod tests {
 
         let mut tabs = TabArena::default();
         let tab_id = tabs.insert(tab);
-        let jar = Mutex::new(CookieJar::new());
+        let jar = Arc::new(Mutex::new(CookieJar::new()));
         let stub = StubDispatch::default();
         let log = stub.log.clone();
         let mut app = test_app_with_js(&mut tabs, &jar, tab_id, Some(Box::new(stub)));
@@ -10998,7 +11079,7 @@ mod tests {
 
         let mut tabs = TabArena::default();
         let tab_id = tabs.insert(tab);
-        let jar = Mutex::new(CookieJar::new());
+        let jar = Arc::new(Mutex::new(CookieJar::new()));
         let stub = StubDispatch::default();
         let log = stub.log.clone();
         let mut app = test_app_with_js(&mut tabs, &jar, tab_id, Some(Box::new(stub)));
@@ -11039,7 +11120,7 @@ mod tests {
 
         let mut tabs = TabArena::default();
         let tab_id = tabs.insert(tab);
-        let jar = Mutex::new(CookieJar::new());
+        let jar = Arc::new(Mutex::new(CookieJar::new()));
         let stub = StubDispatch::default();
         let log = stub.log.clone();
         let mut app = test_app_with_js(&mut tabs, &jar, tab_id, Some(Box::new(stub)));
@@ -11091,7 +11172,7 @@ mod tests {
 
         let mut tabs = TabArena::default();
         let tab_id = tabs.insert(tab);
-        let jar = Mutex::new(CookieJar::new());
+        let jar = Arc::new(Mutex::new(CookieJar::new()));
         let stub = StubDispatch::default();
         let mut app = test_app_with_js(&mut tabs, &jar, tab_id, Some(Box::new(stub)));
 
@@ -11136,7 +11217,7 @@ mod tests {
 
         let mut tabs = TabArena::default();
         let tab_id = tabs.insert(tab);
-        let jar = Mutex::new(CookieJar::new());
+        let jar = Arc::new(Mutex::new(CookieJar::new()));
         let stub = StubDispatch::default();
         let mut app = test_app_with_js(&mut tabs, &jar, tab_id, Some(Box::new(stub)));
         // Fire the wheel's `scroll` through the direct-path dispatch.
@@ -11165,7 +11246,7 @@ mod tests {
         tab.install_test_document(Rc::new(RefCell::new(doc)));
         let mut tabs = TabArena::default();
         let tab_id = tabs.insert(tab);
-        let jar = Mutex::new(CookieJar::new());
+        let jar = Arc::new(Mutex::new(CookieJar::new()));
         let stub = StubDispatch {
             prevent: true,
             ..Default::default()
@@ -11194,7 +11275,7 @@ mod tests {
         tab.install_test_document(Rc::new(RefCell::new(doc)));
         let mut tabs = TabArena::default();
         let tab_id = tabs.insert(tab);
-        let jar = Mutex::new(CookieJar::new());
+        let jar = Arc::new(Mutex::new(CookieJar::new()));
         let stub = StubDispatch::default();
         let log = stub.log.clone();
         let mut app = test_app_with_js(&mut tabs, &jar, tab_id, Some(Box::new(stub)));
@@ -11221,7 +11302,7 @@ mod tests {
         tab.install_test_document(Rc::new(RefCell::new(doc)));
         let mut tabs = TabArena::default();
         let tab_id = tabs.insert(tab);
-        let jar = Mutex::new(CookieJar::new());
+        let jar = Arc::new(Mutex::new(CookieJar::new()));
         let mut app = test_app(&mut tabs, &jar, tab_id);
 
         app.on_click(anchor);
@@ -11237,7 +11318,7 @@ mod tests {
     fn key_with_dispatcher_reaches_page_scripts() {
         let mut tabs = TabArena::default();
         let tab_id = tabs.insert(test_tab());
-        let jar = Mutex::new(CookieJar::new());
+        let jar = Arc::new(Mutex::new(CookieJar::new()));
         let stub = StubDispatch::default();
         let log = stub.log.clone();
         let mut app = test_app_with_js(&mut tabs, &jar, tab_id, Some(Box::new(stub)));
@@ -11261,7 +11342,7 @@ mod tests {
         tab.scroll().set_max_offset((0.0, 200.0));
         let mut tabs = TabArena::default();
         let tab_id = tabs.insert(tab);
-        let jar = Mutex::new(CookieJar::new());
+        let jar = Arc::new(Mutex::new(CookieJar::new()));
         let stub = StubDispatch {
             prevent: true,
             ..Default::default()
@@ -11292,7 +11373,7 @@ mod tests {
         tab.scroll().set_max_offset((0.0, 200.0));
         let mut tabs = TabArena::default();
         let tab_id = tabs.insert(tab);
-        let jar = Mutex::new(CookieJar::new());
+        let jar = Arc::new(Mutex::new(CookieJar::new()));
         let stub = StubDispatch::default();
         let log = stub.log.clone();
         let mut app = test_app_with_js(&mut tabs, &jar, tab_id, Some(Box::new(stub)));
@@ -11313,7 +11394,7 @@ mod tests {
         tab.scroll().set_max_offset((0.0, 200.0));
         let mut tabs = TabArena::default();
         let tab_id = tabs.insert(tab);
-        let jar = Mutex::new(CookieJar::new());
+        let jar = Arc::new(Mutex::new(CookieJar::new()));
         let stub = StubDispatch::default();
         let log = stub.log.clone();
         let mut app = test_app_with_js(&mut tabs, &jar, tab_id, Some(Box::new(stub)));
@@ -11414,7 +11495,7 @@ mod tests {
         let (tab, _outer, _inner, _tall, _iouter, iinner) = tab_with_nested_scrollers();
         let mut tabs = TabArena::default();
         let tab_id = tabs.insert(tab);
-        let jar = Mutex::new(CookieJar::new());
+        let jar = Arc::new(Mutex::new(CookieJar::new()));
         let mut app = test_app_with_js(&mut tabs, &jar, tab_id, None);
         // Cursor over #inner (10, 10).
         app.input.cursor = (10.0, 10.0);
@@ -11435,7 +11516,7 @@ mod tests {
         let (tab, _outer, _inner, _tall, _iouter, _iinner) = tab_with_nested_scrollers();
         let mut tabs = TabArena::default();
         let tab_id = tabs.insert(tab);
-        let jar = Mutex::new(CookieJar::new());
+        let jar = Arc::new(Mutex::new(CookieJar::new()));
         let mut app = test_app_with_js(&mut tabs, &jar, tab_id, None);
         // Cursor at (700, 590): outside #outer (300px wide), over the page.
         app.input.cursor = (700.0, 590.0);
@@ -11456,7 +11537,7 @@ mod tests {
         let (tab, _outer, _inner, _tall, iouter, iinner) = tab_with_nested_scrollers();
         let mut tabs = TabArena::default();
         let tab_id = tabs.insert(tab);
-        let jar = Mutex::new(CookieJar::new());
+        let jar = Arc::new(Mutex::new(CookieJar::new()));
         let mut app = test_app_with_js(&mut tabs, &jar, tab_id, None);
         let t = Instant::now();
         // First event over #inner latches it and reports its page unit.
@@ -11532,7 +11613,7 @@ mod tests {
         let (tab, _outer, _inner, _tall, iouter, iinner) = tab_with_nested_scrollers();
         let mut tabs = TabArena::default();
         let tab_id = tabs.insert(tab);
-        let jar = Mutex::new(CookieJar::new());
+        let jar = Arc::new(Mutex::new(CookieJar::new()));
         let mut app = test_app_with_js(&mut tabs, &jar, tab_id, None);
         let t = Instant::now();
         // First event over #inner latches it.
@@ -11575,7 +11656,7 @@ mod tests {
         let (tab, _outer, _inner, _tall, _iouter, iinner) = tab_with_nested_scrollers();
         let mut tabs = TabArena::default();
         let tab_id = tabs.insert(tab);
-        let jar = Mutex::new(CookieJar::new());
+        let jar = Arc::new(Mutex::new(CookieJar::new()));
         let mut app = test_app_with_js(&mut tabs, &jar, tab_id, None);
         let t = Instant::now();
         // No gesture ever started: a stray `Ended` scrolls nothing and
@@ -11617,7 +11698,7 @@ mod tests {
         let (tab, _outer, _inner, tall, _iouter, iinner) = tab_with_nested_scrollers();
         let mut tabs = TabArena::default();
         let tab_id = tabs.insert(tab);
-        let jar = Mutex::new(CookieJar::new());
+        let jar = Arc::new(Mutex::new(CookieJar::new()));
         let mut app = test_app_with_js(&mut tabs, &jar, tab_id, None);
         let t = Instant::now();
         let (start, _) = app
@@ -11644,7 +11725,7 @@ mod tests {
         let (tab, _outer, _inner, _tall, _iouter, iinner) = tab_with_nested_scrollers();
         let mut tabs = TabArena::default();
         let tab_id = tabs.insert(tab);
-        let jar = Mutex::new(CookieJar::new());
+        let jar = Arc::new(Mutex::new(CookieJar::new()));
         let mut app = test_app_with_js(&mut tabs, &jar, tab_id, None);
         // First wheel over #inner latches it.
         app.input.cursor = (10.0, 10.0);
@@ -11683,7 +11764,7 @@ mod tests {
         let (tab, _outer, inner, _tall, _iouter, iinner) = tab_with_nested_scrollers();
         let mut tabs = TabArena::default();
         let tab_id = tabs.insert(tab);
-        let jar = Mutex::new(CookieJar::new());
+        let jar = Arc::new(Mutex::new(CookieJar::new()));
         let mut app = test_app_with_js(&mut tabs, &jar, tab_id, None);
         // Middle press over #inner latches its node.
         app.on_middle_button(true, 10.0, 10.0);
@@ -11715,7 +11796,7 @@ mod tests {
         let (tab, _outer, _inner, tall, _iouter, iinner) = tab_with_nested_scrollers();
         let mut tabs = TabArena::default();
         let tab_id = tabs.insert(tab);
-        let jar = Mutex::new(CookieJar::new());
+        let jar = Arc::new(Mutex::new(CookieJar::new()));
         let mut app = test_app_with_js(&mut tabs, &jar, tab_id, None);
         app.on_middle_button(true, 10.0, 10.0);
         assert!(app.autoscroll.is_some());
@@ -11756,7 +11837,7 @@ mod tests {
 
         let mut tabs = TabArena::default();
         let tab = tabs.insert(Tab::new(Size { w: 800.0, h: 600.0 }));
-        let jar = Mutex::new(CookieJar::new());
+        let jar = Arc::new(Mutex::new(CookieJar::new()));
         let mut app = test_app(&mut tabs, &jar, tab);
 
         // Simulate a superseded worker's jar carrying a cookie.
@@ -11832,7 +11913,7 @@ mod tests {
 
         let mut tabs = TabArena::default();
         let tab = tabs.insert(Tab::new(Size { w: 800.0, h: 600.0 }));
-        let jar = Mutex::new(CookieJar::new());
+        let jar = Arc::new(Mutex::new(CookieJar::new()));
         let mut app = test_app(&mut tabs, &jar, tab);
         let url_a = bowser_url::parse(&format!("{base}/a.html"), None).unwrap();
         let url_b = bowser_url::parse(&format!("{base}/b.html"), None).unwrap();
@@ -11871,7 +11952,7 @@ mod tests {
 
         let mut tabs = TabArena::default();
         let tab = tabs.insert(Tab::new(Size { w: 800.0, h: 600.0 }));
-        let jar = Mutex::new(CookieJar::new());
+        let jar = Arc::new(Mutex::new(CookieJar::new()));
         let mut app = test_app(&mut tabs, &jar, tab);
         let url = bowser_url::parse(&format!("http://127.0.0.1:{port}/stall.html"), None).unwrap();
         app.spawn_load(&url, false, None);
@@ -11925,7 +12006,7 @@ mod tests {
         let mut tabs = TabArena::default();
         let tab = tabs.insert(Tab::new(Size { w: 800.0, h: 600.0 }));
         // The profile jar holds a real cookie before the load starts.
-        let jar = Mutex::new(jar_with_cookie("session=real; Path=/"));
+        let jar = Arc::new(Mutex::new(jar_with_cookie("session=real; Path=/")));
         let mut app = test_app(&mut tabs, &jar, tab);
 
         // Exactly what `spawn_load` does with no load in flight: swap the
@@ -11972,7 +12053,7 @@ mod tests {
         let mut tabs = TabArena::default();
         let tab = tabs.insert(Tab::new(Size { w: 800.0, h: 600.0 }));
         // The profile jar holds a real cookie before the load starts.
-        let jar = Mutex::new(jar_with_cookie("session=real; Path=/"));
+        let jar = Arc::new(Mutex::new(jar_with_cookie("session=real; Path=/")));
         let mut app = test_app(&mut tabs, &jar, tab);
 
         // Exactly what `spawn_load` does with no load in flight: swap the
@@ -12022,7 +12103,7 @@ mod tests {
     fn shutdown_prefers_pending_jar_over_stale() {
         let mut tabs = TabArena::default();
         let tab = tabs.insert(Tab::new(Size { w: 800.0, h: 600.0 }));
-        let jar = Mutex::new(CookieJar::new());
+        let jar = Arc::new(Mutex::new(CookieJar::new()));
         let mut app = test_app(&mut tabs, &jar, tab);
 
         // A superseded worker's buffered report (older cookies)...
@@ -12069,7 +12150,7 @@ mod tests {
     fn shutdown_empty_pending_jar_does_not_clobber_real_jar() {
         let mut tabs = TabArena::default();
         let tab = tabs.insert(Tab::new(Size { w: 800.0, h: 600.0 }));
-        let jar = Mutex::new(CookieJar::new());
+        let jar = Arc::new(Mutex::new(CookieJar::new()));
         let mut app = test_app(&mut tabs, &jar, tab);
 
         // A superseded worker's buffered report carrying the real
@@ -12120,7 +12201,7 @@ mod tests {
     /// report sender (carrying the real jar), and B's report sender.
     fn supersede_handoff_setup<'a>(
         tabs: &'a mut TabArena,
-        jar: &'a Mutex<CookieJar>,
+        jar: &Arc<Mutex<CookieJar>>,
         tab: TabId,
     ) -> (
         WindowApp<'a>,
@@ -12156,7 +12237,7 @@ mod tests {
     fn supersede_handoff_timeout_keeps_profile_cookies() {
         let mut tabs = TabArena::default();
         let tab = tabs.insert(Tab::new(Size { w: 800.0, h: 600.0 }));
-        let jar = Mutex::new(jar_with_cookie("session=real; Path=/"));
+        let jar = Arc::new(Mutex::new(jar_with_cookie("session=real; Path=/")));
         let (mut app, worker_jar, stale_tx, pending_tx) =
             supersede_handoff_setup(&mut tabs, &jar, tab);
 
@@ -12202,7 +12283,7 @@ mod tests {
     fn supersede_handoff_timeout_stale_reports_first() {
         let mut tabs = TabArena::default();
         let tab = tabs.insert(Tab::new(Size { w: 800.0, h: 600.0 }));
-        let jar = Mutex::new(jar_with_cookie("session=real; Path=/"));
+        let jar = Arc::new(Mutex::new(jar_with_cookie("session=real; Path=/")));
         let (mut app, worker_jar, stale_tx, pending_tx) =
             supersede_handoff_setup(&mut tabs, &jar, tab);
 
@@ -12247,7 +12328,7 @@ mod tests {
         let mut tabs = TabArena::default();
         let tab = tabs.insert(Tab::new(Size { w: 800.0, h: 600.0 }));
         // The profile jar holds a real cookie before the load starts.
-        let jar = Mutex::new(jar_with_cookie("session=real; Path=/"));
+        let jar = Arc::new(Mutex::new(jar_with_cookie("session=real; Path=/")));
         let mut app = test_app(&mut tabs, &jar, tab);
 
         // Spawn a load, then close before the worker thread runs: the
@@ -12317,7 +12398,7 @@ mod tests {
         // Asynchronous path: the window worker's spawn_load + poll_pending.
         let mut tabs = TabArena::default();
         let tab = tabs.insert(Tab::new(Size { w: 800.0, h: 600.0 }));
-        let jar = Mutex::new(CookieJar::new());
+        let jar = Arc::new(Mutex::new(CookieJar::new()));
         let mut app = test_app(&mut tabs, &jar, tab);
         let parsed = bowser_url::parse(&url, None).unwrap();
         app.spawn_load(&parsed, true, None);
@@ -12352,7 +12433,7 @@ mod tests {
 
         let mut tabs = TabArena::default();
         let tab = tabs.insert(Tab::new(Size { w: 800.0, h: 600.0 }));
-        let jar = Mutex::new(CookieJar::new());
+        let jar = Arc::new(Mutex::new(CookieJar::new()));
         let mut app = test_app(&mut tabs, &jar, tab);
         let parsed = bowser_url::parse(&url, None).unwrap();
         app.spawn_load(&parsed, true, None);
@@ -12433,7 +12514,7 @@ mod tests {
         tab.install_test_document(Rc::new(RefCell::new(document)));
         let mut tabs = TabArena::default();
         let tab_id = tabs.insert(tab);
-        let jar = Mutex::new(CookieJar::new());
+        let jar = Arc::new(Mutex::new(CookieJar::new()));
         let mut app = test_app(&mut tabs, &jar, tab_id);
 
         // What the click path hands over: the anchor's raw href.
@@ -12508,6 +12589,7 @@ mod tests {
             loaded_page_from(b"<html class=\"reftest-wait\"><head></head><body></body></html>"),
             "TestBrowser/9.9",
             &test_fonts(),
+            &test_cookie_jar(),
         );
         let fonts = Arc::new(Mutex::new(FontCache::new()));
         // Production realm: `document.addEventListener` lives on the
@@ -12568,6 +12650,7 @@ mod tests {
             ),
             "TestBrowser/9.9",
             &test_fonts(),
+            &test_cookie_jar(),
         );
         let fonts = Arc::new(Mutex::new(FontCache::new()));
         // Baseline layout, so the settle's refresh is a re-layout.
@@ -12622,6 +12705,7 @@ mod tests {
             loaded_page_from(b"<html class=\"reftest-wait\"><head></head><body></body></html>"),
             "TestBrowser/9.9",
             &test_fonts(),
+            &test_cookie_jar(),
         );
         let fonts = Arc::new(Mutex::new(FontCache::new()));
         tab.page_vm_mut()
@@ -12669,6 +12753,7 @@ mod tests {
             ),
             "TestBrowser/9.9",
             &test_fonts(),
+            &test_cookie_jar(),
         );
         let fonts = Arc::new(Mutex::new(FontCache::new()));
 
@@ -12696,6 +12781,7 @@ mod tests {
             loaded_page_from(b"<html class=\"reftest-wait\"><head></head><body></body></html>"),
             "TestBrowser/9.9",
             &test_fonts(),
+            &test_cookie_jar(),
         );
         let fonts = Arc::new(Mutex::new(FontCache::new()));
 
@@ -13506,6 +13592,7 @@ mod tests {
             ),
             "TestBrowser/9.9",
             &test_fonts(),
+            &test_cookie_jar(),
         );
         let report = tab.script_report().expect("page VM installed");
         assert_eq!(report.executed, 1);
@@ -13558,6 +13645,7 @@ mod tests {
             loaded_page_from(html.as_bytes()),
             "TestBrowser/9.9",
             &test_fonts(),
+            &test_cookie_jar(),
         );
         assert!(
             tab.page_vm().is_some_and(|vm| vm.harness_reporter_armed()),
@@ -13598,6 +13686,7 @@ mod tests {
             loaded_page_from(html.as_bytes()),
             "TestBrowser/9.9",
             &test_fonts(),
+            &test_cookie_jar(),
         );
         assert!(
             tab.page_vm().is_some_and(|vm| vm.harness_reporter_armed()),
@@ -13641,6 +13730,7 @@ mod tests {
             ),
             "TestBrowser/9.9",
             &test_fonts(),
+            &test_cookie_jar(),
         );
 
         let start = Instant::now();
@@ -13677,6 +13767,7 @@ mod tests {
             ),
             "TestBrowser/9.9",
             &test_fonts(),
+            &test_cookie_jar(),
         );
         assert!(tab.page_vm().is_some(), "realm installed");
         // The only observable `Weak` to the installed document: upgrade

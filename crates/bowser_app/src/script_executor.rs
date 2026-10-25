@@ -745,6 +745,24 @@ mod tests {
     }
 
     #[test]
+    fn parse_with_executor_carries_quirks_mode_on_document() {
+        // w77 quirks plumbing: the scripting parse stamps the mode on
+        // the document, not just in its return value, so mid-parse and
+        // post-parse layout see the same mode.
+        let base = bowser_url::parse("https://example.com/", None).unwrap();
+        let mut page_vm = PageVm::new();
+        let prefetch = HashMap::new();
+        let mut executor = ParserExecutor::new(&mut page_vm, &base, &prefetch, None);
+        let (document, quirks) = Document::parse_html_with_executor(
+            b"<!DOCTYPE HTML PUBLIC \"-//W3C//DTD HTML 4.0 Transitional//EN\"><html></html>",
+            true,
+            &mut executor,
+        );
+        assert_eq!(quirks, bowser_dom::QuirksMode::Quirks);
+        assert_eq!(document.quirks_mode(), bowser_dom::QuirksMode::Quirks);
+    }
+
+    #[test]
     fn prefetch_fetches_async_scripts_on_threads() {
         use std::sync::Mutex;
         // Each fetch records its thread: with concurrent fetching, the

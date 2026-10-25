@@ -915,8 +915,41 @@ pub fn fetch_with_trace_in_context(
     jar: Option<&mut CookieJar>,
     nav: &NavigationContext,
 ) -> Result<(Response, FetchTrace), FetchError> {
-    let (response, trace) = fetch_impl(req, jar, Timeouts::default(), nav, None, None)?;
-    Ok((response, trace))
+    fetch_impl(req, jar, Timeouts::default(), nav, None, None)
+        .map(|(response, trace, _)| (response, trace))
+}
+
+/// Fetch `req` with cookies and report the redirect chain plus
+/// whether any hop actually sent a credential: a `Cookie` header
+/// from the jar (including a cookie a redirect hop's `Set-Cookie`
+/// stored into a scratch jar and a later hop then sent) or an
+/// `Authorization` header that survived the per-hop strip (see
+/// [`fetch_once`]). Callers that gate on credentials — CORS, which
+/// accepts `*` only when no credentials were sent — must use this
+/// variant, not infer credentials from the initial URL: a chain's
+/// first hop can be credentialless while a later hop is not, and
+/// vice versa.
+///
+/// `FetchTrace` itself carries no such flag: other crates build it
+/// with struct literals, so adding a field there would break their
+/// construction sites; the flag travels alongside the trace instead.
+pub fn fetch_with_trace_credentials(
+    req: &Request,
+    jar: Option<&mut CookieJar>,
+) -> Result<(Response, FetchTrace, bool), FetchError> {
+    fetch_with_trace_credentials_in_context(req, jar, &NavigationContext::default())
+}
+
+/// [`fetch_with_trace_credentials`], but in the given `SameSite`
+/// navigation context. Subresource fetches pass the document's host
+/// with `top_level_safe_navigation: false`; the context applies to
+/// every redirect hop of this fetch.
+pub fn fetch_with_trace_credentials_in_context(
+    req: &Request,
+    jar: Option<&mut CookieJar>,
+    nav: &NavigationContext,
+) -> Result<(Response, FetchTrace, bool), FetchError> {
+    fetch_impl(req, jar, Timeouts::default(), nav, None, None)
 }
 
 /// Fetch `req` with HSTS state in `hsts`: `Strict-Transport-Security`
@@ -956,6 +989,7 @@ pub fn fetch_with_trace_hsts_in_context(
     nav: &NavigationContext,
 ) -> Result<(Response, FetchTrace), FetchError> {
     fetch_impl(req, jar, Timeouts::default(), nav, Some(hsts), None)
+        .map(|(response, trace, _)| (response, trace))
 }
 
 /// Fetch `req` through `proxy` (see [`ProxyConfig`]): `http` URLs go to
@@ -992,6 +1026,7 @@ pub fn fetch_with_trace_proxy_in_context(
     nav: &NavigationContext,
 ) -> Result<(Response, FetchTrace), FetchError> {
     fetch_impl(req, jar, Timeouts::default(), nav, None, Some(proxy))
+        .map(|(response, trace, _)| (response, trace))
 }
 
 /// Which HSTS store one fetch consults: a caller-provided store, or the
@@ -1031,7 +1066,7 @@ fn fetch_impl(
     nav: &NavigationContext,
     hsts: Option<&mut HstsStore>,
     proxy: Option<&ProxyConfig>,
-) -> Result<(Response, FetchTrace), FetchError> {
+) -> Result<(Response, FetchTrace, bool), FetchError> {
     let mut scratch = CookieJar::new();
     let jar: &mut CookieJar = match jar {
         Some(j) => j,
@@ -1073,6 +1108,9 @@ fn fetch_impl(
     // B's Strict cookies).
     let mut anchored_nav: Option<NavigationContext> = None;
     let mut trace = FetchTrace { hops: Vec::new() };
+    // OR over every hop: one credentialed hop taints the whole chain
+    // for CORS purposes, whatever the initial hop did.
+    let mut credentials_sent = false;
     for _ in 0..=MAX_REDIRECTS {
         let now = now_secs();
         // HSTS (RFC 6797): upgrade before fetching. The upgraded URL is
@@ -1087,7 +1125,7 @@ fn fetch_impl(
             nav
         };
         trace.hops.push(current.clone());
-        let response = fetch_once(
+        let (response, hop_credentials) = fetch_once(
             &method,
             &current,
             &req.headers,
@@ -1100,12 +1138,13 @@ fn fetch_impl(
             pool,
             proxy,
         )?;
+        credentials_sent |= hop_credentials;
         // Learn HSTS policy from the response before following any
         // redirect: a later hop to the same host upgrades immediately.
         // `note_response` ignores non-https responses itself.
         hsts.with(|s| s.note_response(&current, &response.headers, now));
         if !matches!(response.status, 301 | 302 | 303 | 307 | 308) {
-            return Ok((response, trace));
+            return Ok((response, trace, credentials_sent));
         }
         let location = response
             .header("location")
@@ -2368,7 +2407,7 @@ fn fetch_once(
     nav: &NavigationContext,
     pool: &Pool,
     proxy: Option<&ProxyConfig>,
-) -> Result<Response, FetchError> {
+) -> Result<(Response, bool), FetchError> {
     let (host, port, secure) = authority(url)?;
     // The proxy applies per hop: each redirect target re-evaluates
     // `no_proxy` against its own host.
@@ -2383,6 +2422,20 @@ fn fetch_once(
     let now = now_secs();
     let ctx = request_context(url, method, nav);
     let cookie: Option<String> = ctx.as_ref().and_then(|ctx| jar.cookie_header(ctx, now));
+    // What actually went on the wire for this hop: a `Cookie` header
+    // the jar produced, or a caller `Authorization` header that
+    // `request_headers` did not strip (a stripped one — cross-origin
+    // redirect, `strip_auth` — counts for nothing: it never left).
+    // `Proxy-Authorization` is deliberately excluded: it is addressed
+    // to the proxy, not the origin, so it is not an origin credential
+    // for CORS purposes. URL userinfo is likewise excluded: it is
+    // stripped from the request-target and never sent (see
+    // `request_target`).
+    let credentials_sent = cookie.is_some()
+        || (!strip_auth
+            && extra_headers
+                .iter()
+                .any(|(n, _)| n.eq_ignore_ascii_case("authorization")));
     let head = request_head_bytes(
         method,
         url,
@@ -2495,7 +2548,7 @@ fn fetch_once(
                 now,
             );
             match result {
-                Ok(response) => return Ok(response),
+                Ok(response) => return Ok((response, credentials_sent)),
                 Err(e) => {
                     // The stream handle's `Drop` releases its slot; a
                     // dead session was already flagged inside, so the
@@ -2554,7 +2607,7 @@ fn fetch_once(
                         // shutting down.
                         pool.discard(&key, session.into_inner());
                     }
-                    return Ok(response);
+                    return Ok((response, credentials_sent));
                 }
                 Err(e) => {
                     // Harvest session tickets even from a failed
@@ -2618,13 +2671,13 @@ fn fetch_once(
                     // later tunnel can resume.
                     pool.discard(&key, conn);
                 }
-                return Ok(response);
+                return Ok((response, credentials_sent));
             }
             Ok((response, false)) => {
                 // `discard` harvests tickets without pooling, for direct
                 // and proxied connections alike.
                 pool.discard(&key, conn);
-                return Ok(response);
+                return Ok((response, credentials_sent));
             }
             Err(e) => {
                 // Harvest session tickets even from a failed connection:
@@ -3493,6 +3546,146 @@ mod tests {
         assert_eq!(trace.hops, expected);
     }
 
+    /// Base URL of the request's own absolute-form target, with the
+    /// host swapped to `localhost`: the test server listens on
+    /// `127.0.0.1`, so a redirect to the `localhost` spelling is a
+    /// cross-origin hop that still lands on the same server.
+    fn req_target_host_local(raw: &[u8]) -> String {
+        let target = raw_request_target(raw).replacen("127.0.0.1", "localhost", 1);
+        if !target.starts_with("http://") {
+            return target;
+        }
+        let end = target[7..].find('/').map(|i| i + 7).unwrap_or(target.len());
+        target[..end].to_string()
+    }
+
+    /// w77: per-hop credentials on redirect chains, as reported by
+    /// `fetch_with_trace_credentials`. The flag is an OR over every
+    /// hop — one credentialed hop taints the chain — never a
+    /// property of the initial URL alone.
+    #[test]
+    fn trace_credentials_reports_any_hop() {
+        // (a) Scratch-jar ride: no jar was passed, yet the redirect
+        // hop's `Set-Cookie` is sent on the final hop, so the chain
+        // is credentialed even though its first hop was not.
+        let base = spawn_server(8, |req| match request_path(req) {
+            "/set" => head(
+                302,
+                &[("Location", "/echo"), ("Set-Cookie", "session=abc; Path=/")],
+            ),
+            _ => {
+                let s = String::from_utf8_lossy(req);
+                let cookie = s
+                    .lines()
+                    .find(|l| l.to_ascii_lowercase().starts_with("cookie:"))
+                    .map(|l| l["cookie:".len()..].trim().to_owned())
+                    .unwrap_or_else(|| "none".to_owned());
+                let mut r = head(200, &[("Content-Length", &cookie.len().to_string())]);
+                r.extend_from_slice(cookie.as_bytes());
+                r
+            }
+        });
+        let (_, _, creds) =
+            fetch_with_trace_credentials(&get_request(&format!("{base}/set")), None).unwrap();
+        assert!(creds, "scratch-jar cookie riding the final hop must count");
+        let (resp, _, creds) =
+            fetch_with_trace_credentials(&get_request(&format!("{base}/set")), None).unwrap();
+        assert_eq!(String::from_utf8_lossy(&resp.body), "session=abc");
+        assert!(creds);
+
+        // (b) Seeded jar cookie sent on a single hop, and (c) no
+        // credentials at all on a plain hop.
+        let base = spawn_server(8, |req| match request_path(req) {
+            "/set" => head(200, &[("Set-Cookie", "k=v; Path=/")]),
+            _ => {
+                let mut r = head(200, &[("Content-Length", "2")]);
+                r.extend_from_slice(b"ok");
+                r
+            }
+        });
+        let mut jar = CookieJar::new();
+        fetch_with_jar(&get_request(&format!("{base}/set")), Some(&mut jar)).unwrap();
+        let (_, _, creds) =
+            fetch_with_trace_credentials(&get_request(&format!("{base}/plain")), Some(&mut jar))
+                .unwrap();
+        assert!(creds, "seeded jar cookie sent on the hop must count");
+        let mut empty = CookieJar::new();
+        let (_, _, creds) =
+            fetch_with_trace_credentials(&get_request(&format!("{base}/plain")), Some(&mut empty))
+                .unwrap();
+        assert!(!creds, "no cookie, no auth on any hop must not count");
+
+        // (d) `Authorization` on a single hop counts.
+        let mut req = get_request(&format!("{base}/plain"));
+        req.headers
+            .push(("Authorization".to_string(), "Bearer x".to_string()));
+        let (_, _, creds) = fetch_with_trace_credentials(&req, None).unwrap();
+        assert!(creds, "an Authorization header sent on a hop must count");
+
+        // (e) `Authorization` stripped on a cross-origin redirect
+        // still counts: the FIRST hop sent it, even though the final
+        // hop (which echoes auth presence) did not receive it.
+        let base = spawn_server(8, |req| match request_path(req) {
+            "/redir" => {
+                let local = req_target_host_local(req);
+                head(302, &[("Location", &format!("{local}/final"))])
+            }
+            _ => {
+                let s = String::from_utf8_lossy(req);
+                let seen = if s.to_ascii_lowercase().contains("authorization:") {
+                    "auth"
+                } else {
+                    "noauth"
+                };
+                let mut r = head(200, &[("Content-Length", &seen.len().to_string())]);
+                r.extend_from_slice(seen.as_bytes());
+                r
+            }
+        });
+        let mut req = get_request(&format!("{base}/redir"));
+        req.headers
+            .push(("Authorization".to_string(), "Bearer x".to_string()));
+        let (resp, _, creds) = fetch_with_trace_credentials(&req, None).unwrap();
+        assert_eq!(String::from_utf8_lossy(&resp.body), "noauth");
+        assert!(
+            creds,
+            "auth sent on the initial hop must taint the chain even after a cross-origin strip"
+        );
+
+        // (f) Cross-origin start, same-origin finish, seeded cookie
+        // for the final host only: the initial hop sent nothing, the
+        // final hop sent the seeded cookie, so the chain counts.
+        let base = spawn_server(8, |req| match request_path(req) {
+            "/set" => head(200, &[("Set-Cookie", "fin=1; Path=/")]),
+            "/redir" => {
+                let local = req_target_host_local(req);
+                head(302, &[("Location", &format!("{local}/echo"))])
+            }
+            _ => {
+                let s = String::from_utf8_lossy(req);
+                let cookie = s
+                    .lines()
+                    .find(|l| l.to_ascii_lowercase().starts_with("cookie:"))
+                    .map(|l| l["cookie:".len()..].trim().to_owned())
+                    .unwrap_or_else(|| "none".to_owned());
+                let mut r = head(200, &[("Content-Length", &cookie.len().to_string())]);
+                r.extend_from_slice(cookie.as_bytes());
+                r
+            }
+        });
+        let base_local = base.replacen("127.0.0.1", "localhost", 1);
+        let mut jar = CookieJar::new();
+        fetch_with_jar(&get_request(&format!("{base_local}/set")), Some(&mut jar)).unwrap();
+        let (resp, _, creds) =
+            fetch_with_trace_credentials(&get_request(&format!("{base}/redir")), Some(&mut jar))
+                .unwrap();
+        assert_eq!(String::from_utf8_lossy(&resp.body), "fin=1");
+        assert!(
+            creds,
+            "a cookie sent only on the final hop must count, whatever the initial hop did"
+        );
+    }
+
     #[test]
     fn redirect_303_rewrites_post_to_get() {
         let base = spawn_server(2, |req| {
@@ -3892,7 +4085,7 @@ mod tests {
             None,
             None,
         )
-        .map(|(response, _)| response)
+        .map(|(response, _, _)| response)
         {
             Err(FetchError::Timeout(_)) => {}
             other => panic!("expected FetchError::Timeout, got {other:?}"),
@@ -3940,7 +4133,7 @@ mod tests {
             None,
             None,
         )
-        .map(|(response, _)| response)
+        .map(|(response, _, _)| response)
         {
             Err(FetchError::Timeout(_)) => {}
             other => panic!("expected FetchError::Timeout, got {other:?}"),

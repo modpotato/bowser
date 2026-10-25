@@ -3216,7 +3216,7 @@ mod tests {
 }
 
 /// Manual benchmarks (no external deps per AGENTS.md). Run:
-/// `CARGO_TARGET_DIR=~/workspace/scratch/bowser-regexp-opt2/target cargo test
+/// `CARGO_TARGET_DIR=<scratch>/target cargo test
 /// -p bowser_js --release builtin_regexp::bench -- --nocapture`.
 /// They print ns/op; they assert nothing and must stay fast enough to run
 /// inside the normal `cargo test` suite. Warmup and timing are

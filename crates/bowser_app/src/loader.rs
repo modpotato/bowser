@@ -118,7 +118,7 @@ use bowser_layout::IntrinsicDims;
 use bowser_net::cookies::CookieJar;
 use bowser_net::fetch::{
     FetchError, FetchTrace, NavigationContext, Request, Response, fetch_with_jar_in_context,
-    fetch_with_trace,
+    fetch_with_trace, fetch_with_trace_credentials_in_context,
 };
 use bowser_paint::fonts::{FontCache, FontStyle, decode_webfont};
 use bowser_paint::images::{DecodedImage, decode_image};
@@ -378,8 +378,8 @@ pub struct Webfont {
     pub style: String,
     /// The decoded SFNT font bytes. WOFF1 sources are decoded by
     /// `fetch_webfonts` before storage, so the cache always holds
-    /// SFNT; woff2 and garbage are rejected at fetch time (the next
-    /// `src` entry is tried instead).
+    /// SFNT; garbage is rejected at fetch time (the next `src` entry
+    /// is tried instead).
     pub bytes: Arc<[u8]>,
 }
 
@@ -489,8 +489,13 @@ fn load_document_inner(
     }
     check_html_content_type(&response)?;
 
-    // 2. Parse.
-    let (document, _quirks) = Document::parse_html(&response.body);
+    // 2. Parse. The quirks mode travels on the document itself
+    // (`Document::quirks_mode`, stamped by `parse_html`): layout and
+    // style read it from there, so no separate threading is needed —
+    // the assert below pins the agreement between the returned mode
+    // and the carried field (w77 quirks plumbing).
+    let (document, quirks) = Document::parse_html(&response.body);
+    debug_assert_eq!(document.quirks_mode(), quirks);
     let final_url = response.url.clone();
     let base = effective_base_url(&document, &final_url);
 
@@ -974,8 +979,8 @@ fn collect_imported_sheets(
 /// entries are skipped by `url_srcs`: they name already-installed
 /// faces); the first entry that fetches AND decodes to SFNT wins, and
 /// later entries are not fetched. SFNT passes through
-/// [`decode_webfont`]; WOFF1 is decoded to SFNT there; woff2 and
-/// garbage return `None` and fall through to the next entry, exactly
+/// [`decode_webfont`]; WOFF1 and WOFF2 are decoded to SFNT there;
+/// garbage returns `None` and falls through to the next entry, exactly
 /// like a failed fetch. A rule whose entries all fail records
 /// nothing. Counts are capped at [`MAX_WEBFONTS`], single fetched
 /// fonts at [`FONT_MAX_BYTES`], single decoded fonts at paint's
@@ -1039,8 +1044,8 @@ fn fetch_webfonts(
                 };
                 // Decode before the budget check: the budget counts
                 // decoded bytes, and a WOFF1 file's decoded size is
-                // what the cache will retain. woff2/garbage decode to
-                // `None` and fall through to the next src entry.
+                // what the cache will retain. garbage decodes to
+                // `None` and falls through to the next src entry.
                 let Some(bytes) = decode_webfont(&bytes) else {
                     continue;
                 };
@@ -1087,11 +1092,14 @@ fn fetch_webfonts(
 ///   response (after redirects, so `response.url`'s origin, not the
 ///   request URL's) must then pass [`cors_check`]: same-origin
 ///   responses pass unconditionally, otherwise exactly one ACAO
-///   value must be `*` or exactly the document origin. Because the
-///   jar is bypassed, no credentials were sent on a cross-origin
-///   request, so `*` is valid there; when the request itself was
-///   same-origin (so the jar was in play) but a redirect landed
-///   cross-origin, `*` is not accepted. A failed check fails that
+///   value must be `*` or exactly the document origin. Whether `*`
+///   is valid is judged by what actually went on the wire across
+///   the whole redirect chain (see
+///   `fetch_with_trace_credentials_in_context`), NOT by the
+///   initial URL: a cross-origin start can still send a credential
+///   when a redirect hop's `Set-Cookie` rides a later hop from
+///   the scratch jar, and a same-origin start sends none when the
+///   jar holds no matching cookie. A failed check fails that
 ///   `src` entry, so `fetch_webfonts` tries the rule's next entry.
 fn fetch_font_bytes(url: &Url, sub: &SubresourceFetch<'_>) -> Option<Vec<u8>> {
     if url.scheme().eq_ignore_ascii_case("data") {
@@ -1106,11 +1114,15 @@ fn fetch_font_bytes(url: &Url, sub: &SubresourceFetch<'_>) -> Option<Vec<u8>> {
         sub.user_agent,
         vec![("Origin".to_string(), sub.document_origin.serialize())],
     );
-    let response = if cross_origin {
-        fetch_with_jar_in_context(&request, None, &sub.nav).ok()?
+    // Per-hop credentials, not the initial URL's origin: see the
+    // CORS note above. The cross-origin branch still bypasses the
+    // profile jar (a scratch jar only), but a redirect hop's
+    // `Set-Cookie` can still ride a later hop — and that counts.
+    let (response, _trace, credentials_sent) = if cross_origin {
+        fetch_with_trace_credentials_in_context(&request, None, &sub.nav).ok()?
     } else {
         let mut guard = sub.jar.lock().expect("loader: cookie jar mutex poisoned");
-        fetch_with_jar_in_context(&request, Some(&mut guard), &sub.nav).ok()?
+        fetch_with_trace_credentials_in_context(&request, Some(&mut guard), &sub.nav).ok()?
     };
     if !(200..300).contains(&response.status) {
         return None;
@@ -1127,8 +1139,7 @@ fn fetch_font_bytes(url: &Url, sub: &SubresourceFetch<'_>) -> Option<Vec<u8>> {
         &sub.document_origin,
         &response.url.origin(),
         &acao,
-        // Credentials were in play exactly when the jar was used.
-        !cross_origin,
+        credentials_sent,
     ) {
         return None;
     }
@@ -2312,6 +2323,119 @@ mod tests {
                 "cross-origin request must carry Origin: {doc_origin}"
             );
         }
+    }
+
+    /// w77: per-hop credentials for `fetch_font_bytes`. The font
+    /// server is cross-origin to the document (different port, same
+    /// host, so same-site) and redirects `/redir` to `/final`,
+    /// setting a Lax cookie on the redirect hop. The scratch jar
+    /// (cross-origin requests bypass the profile jar) then sends
+    /// that cookie on the final hop, so `ACAO: *` must be rejected
+    /// even though the INITIAL hop was credentialless: the old
+    /// `!cross_origin` rule judged the chain by its first hop and
+    /// wrongly accepted `*`.
+    fn cross_origin_redirect_font(acao: &str) -> Option<Vec<u8>> {
+        let acao = acao.to_string();
+        let server = TestServer::start_with(move |path, _| match path {
+            "/redir" => (
+                302,
+                "Found",
+                vec![
+                    ("Location", "/final".to_string()),
+                    ("Set-Cookie", "ride=1; Path=/".to_string()),
+                ],
+                vec![],
+            ),
+            "/final" => (
+                200,
+                "OK",
+                vec![
+                    ("Content-Type", "font/ttf".to_string()),
+                    ("Access-Control-Allow-Origin", acao.clone()),
+                ],
+                b"fontbytes".to_vec(),
+            ),
+            _ => (404, "Not Found", vec![], vec![]),
+        });
+        // A document origin on the same host but a port the font
+        // server never binds: cross-origin, same-site.
+        let doc_origin = bowser_url::parse("http://127.0.0.1:9/doc.html", None)
+            .expect("doc url")
+            .origin();
+        let jar = Mutex::new(CookieJar::new());
+        let sub = SubresourceFetch {
+            jar: &jar,
+            user_agent: "bowser-test",
+            document_origin: doc_origin,
+            nav: NavigationContext {
+                top_host: Some("127.0.0.1".to_string()),
+                top_secure: Some(false),
+                top_level_safe_navigation: false,
+            },
+        };
+        fetch_font_bytes(&server.url("/redir"), &sub)
+    }
+
+    #[test]
+    fn webfont_cross_origin_redirect_scratch_cookie_rejects_star() {
+        assert!(
+            cross_origin_redirect_font("*").is_none(),
+            "a cookie riding the final hop of a cross-origin redirect chain must make `*` invalid"
+        );
+        // The same chain with an exact-origin ACAO still loads:
+        // credentials-sent only invalidates the wildcard.
+        let doc_origin = bowser_url::parse("http://127.0.0.1:9/doc.html", None)
+            .expect("doc url")
+            .origin_serialized();
+        assert!(
+            cross_origin_redirect_font(&doc_origin).is_some(),
+            "exact-origin ACAO must load even when credentials were sent"
+        );
+    }
+
+    /// w77: the mirror case. The initial font URL is same-origin
+    /// to the document, but the profile jar holds no matching
+    /// cookie and no `Authorization` is sent, and the chain
+    /// redirects cross-origin (different port) to a final response
+    /// with `ACAO: *`. Judged by the initial hop, the old
+    /// `!cross_origin` rule claimed credentials were in play and
+    /// wrongly rejected `*`; judged by what actually went on the
+    /// wire, nothing credentialed was sent, so `*` is valid.
+    #[test]
+    fn webfont_same_origin_redirect_no_credentials_accepts_star() {
+        let font = TestServer::start_with(|path, _| match path {
+            "/final" => (
+                200,
+                "OK",
+                vec![
+                    ("Content-Type", "font/ttf".to_string()),
+                    ("Access-Control-Allow-Origin", "*".to_string()),
+                ],
+                b"fontbytes".to_vec(),
+            ),
+            _ => (404, "Not Found", vec![], vec![]),
+        });
+        let font_final = font.url("/final").serialize();
+        let doc = TestServer::start_with(move |path, _| match path {
+            "/redir" => (302, "Found", vec![("Location", font_final.clone())], vec![]),
+            _ => (404, "Not Found", vec![], vec![]),
+        });
+        let doc_url = doc.url("/doc.html");
+        let jar = Mutex::new(CookieJar::new());
+        let sub = SubresourceFetch {
+            jar: &jar,
+            user_agent: "bowser-test",
+            document_origin: doc_url.origin(),
+            nav: NavigationContext {
+                top_host: doc_url.host().map(str::to_owned),
+                top_secure: Some(false),
+                top_level_safe_navigation: false,
+            },
+        };
+        assert!(
+            fetch_font_bytes(&doc.url("/redir"), &sub).is_some(),
+            "no cookie or auth on any hop means `*` must be accepted even after a same-origin start"
+        );
     }
 
     #[test]

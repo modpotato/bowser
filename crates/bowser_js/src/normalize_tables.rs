@@ -1,7 +1,7 @@
 //! Unicode normalization tables (UAX #15), generated from Unicode 16.0.0 UCD.
 //!
 //! Source files: UnicodeData.txt, DerivedNormalizationProps.txt.
-//! Generator: `~/workspace/scratch/w36-normalize/gen_tables.py`.
+//! Generator: `gen_tables.py`.
 //! Hangul syllables (U+AC00..U+D7A3) are handled algorithmically in
 //! `normalize.rs` and have no table entries (as in the UCD).
 //!

@@ -9557,15 +9557,15 @@ sys.exit(main())
 /// the `tests` module above is owned separately.)
 ///
 /// Manual smoke against the real WPT checkout (needs the
-/// `/home/hatch/wpt` blobs: `git -C /home/hatch/wpt sparse-checkout add
+/// `<wpt-checkout>` blobs: `git -C <wpt-checkout> sparse-checkout add
 /// encoding resources`; not part of this suite by design):
 /// ```sh
 /// cargo build -p bowser_app --features wpt-driver --bin bowser-wpt --bin bowser
-/// ./target/debug/bowser-wpt --wpt-root /home/hatch/wpt --kind testharness \
+/// ./target/debug/bowser-wpt --wpt-root <wpt-checkout> --kind testharness \
 ///   --include encoding/big5-encoder.html
 /// # .any.html synthesis via the full manifest (worker variants 404 by design):
-/// unzstd -c /home/hatch/wpt/MANIFEST-full.json.zst > /tmp/MANIFEST-full.json
-/// ./target/debug/bowser-wpt --wpt-root /home/hatch/wpt \
+/// unzstd -c <wpt-checkout>/MANIFEST-full.json.zst > /tmp/MANIFEST-full.json
+/// ./target/debug/bowser-wpt --wpt-root <wpt-checkout> \
 ///   --manifest /tmp/MANIFEST-full.json --kind testharness \
 ///   --include "encoding/api-basics"
 /// ```

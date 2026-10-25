@@ -1,3 +1,5 @@
 /target
 /scratch
 vendor-sources/test262/
+__pycache__/
+*.pyc

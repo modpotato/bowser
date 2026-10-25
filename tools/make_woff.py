@@ -10,6 +10,17 @@ is), decode rebuilds the original SFNT byte-for-byte. That
 byte-for-byte claim holds only for such sorted inputs: the decoder
 sorts records by tag, so an unsorted source would round-trip with
 the same table bytes but a re-sorted directory, not byte-for-byte.
+
+An optional fourth argument writes a WOFF2 file via fontTools
+(`TTFont` with `flavor = "woff2"`, default transforms: transformed
+`glyf`/`loca`, untransformed `hmtx` for Ahem). Regenerating is
+equivalent but not byte-identical: fontTools stamps `head.modified`
+on save (and recomputes `checkSumAdjustment` from it), so the
+`head` bytes differ between runs; every other table is stable.
+WOFF2 round-tripping is semantic, not byte-for-byte: the decoder
+re-encodes glyph coordinates (no short forms) and pads short-`loca`
+glyphs to even lengths, so its rebuilt `glyf`/`loca` differ in bytes
+from the source while describing identical glyphs.
 """
 import struct
 import sys
@@ -53,6 +64,14 @@ def main() -> None:
     ttf = open(src, "rb").read()
     open(sys.argv[2], "wb").write(build(ttf, stored=False))
     open(sys.argv[3], "wb").write(build(ttf, stored=True))
+    if len(sys.argv) > 4:
+        # WOFF2 via fontTools (needs the fonttools + brotli packages;
+        # fixture generation only, never a build dependency).
+        from fontTools.ttLib import TTFont
+
+        font = TTFont(src)
+        font.flavor = "woff2"
+        font.save(sys.argv[4])
 
 
 if __name__ == "__main__":

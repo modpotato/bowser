@@ -21,6 +21,14 @@ read-fonts = "=0.41.0"
 # in the tree via png, so no new crate enters the tree; default
 # features (miniz_oxide backend) only.
 flate2 = "=1.1.10"
+# WOFF2 decoding needs a Brotli decoder, which std cannot do
+# (brotli-decompressor is the smallest pure-Rust option, added
+# with orchestrator approval for wave 77: from-scratch Brotli would
+# be ~1500-2500 lines of security-sensitive decoder plus
+# dictionary data). Pinned to the exact version in the tree;
+# default features off, only `std` enabled (no `ffi-api`,
+# `unsafe`, or `seccomp`).
+brotli-decompressor = { version = "=5.0.3", default-features = false, features = ["std"] }
 png = "0.17"
 zune-jpeg = "0.4"
 tiny-skia = { version = "0.11", default-features = false, features = ["std", "simd"] }
