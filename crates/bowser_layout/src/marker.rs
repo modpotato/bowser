@@ -27,7 +27,7 @@ use bowser_dom::{Document, NodeId, NodeKind};
 use std::rc::Rc;
 
 use super::boxes::{Forest, MarkerLayout, apply_text_transform};
-use super::style::{Display, StyleData, resolve_font_size, resolve_line_height};
+use super::style::{Display, StyleData, font_family_name, resolve_font_size, resolve_line_height};
 use super::{BoxType, FontMetrics, Rect};
 
 /// The marker spec for one list item, built at box-construction time.
@@ -211,6 +211,7 @@ pub(crate) fn attach(
     root_fs: f32,
     vp_w: f32,
     vp_h: f32,
+    fonts: &dyn FontMetrics,
 ) {
     let li_fs = forest.nodes[idx].data.font_size;
     let marker_fs = match &spec.marker_style {
@@ -224,7 +225,7 @@ pub(crate) fn attach(
         None => li_fs,
     };
     if spec.position_inside {
-        attach_inside(forest, idx, spec, marker_fs, root_fs, vp_w, vp_h);
+        attach_inside(forest, idx, spec, marker_fs, root_fs, vp_w, vp_h, fonts);
         return;
     }
     let rtl = forest.nodes[idx].data.rtl;
@@ -241,6 +242,10 @@ pub(crate) fn attach(
 /// box of the principal box — an inline wrapper carrying the
 /// `::marker` style (so its color/font apply when a rule matched)
 /// around the marker text plus a separating space.
+// Mirrors `attach`'s argument set plus the resolved marker font
+// size: the established shape for this module's attach path, hence
+// the argument count.
+#[allow(clippy::too_many_arguments)]
 fn attach_inside(
     forest: &mut Forest,
     idx: usize,
@@ -249,6 +254,7 @@ fn attach_inside(
     root_fs: f32,
     vp_w: f32,
     vp_h: f32,
+    fonts: &dyn FontMetrics,
 ) {
     let mut data = StyleData::inherit(&forest.nodes[idx].data);
     data.display = Display::Inline;
@@ -260,6 +266,8 @@ fn attach_inside(
             root_fs,
             vp_w,
             vp_h,
+            fonts,
+            font_family_name(ms),
         ),
         None => forest.nodes[idx].data.line_height,
     };

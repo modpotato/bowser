@@ -4289,7 +4289,11 @@ mod tests {
         // Transformed loca without glyf, transformed glyf with an
         // untransformed loca, transformed glyf with no loca, maxp
         // count mismatch, transformed hmtx without hhea, zero
-        // glyphs in a transformed glyf, and zero hmtx metrics.
+        // glyphs in a transformed glyf, zero hmtx metrics, and
+        // transformed hmtx with raw glyf/loca, no maxp, and a
+        // 1-byte short-format loca (shorter than one entry:
+        // deriving the count as `len / entry_size - 1` would
+        // underflow in a debug build without the guard).
         for name in [
             "woff2-synth-loca-no-glyf.woff2",
             "woff2-synth-glyf-untrans-loca.woff2",
@@ -4298,11 +4302,43 @@ mod tests {
             "woff2-synth-hmtx-no-hhea.woff2",
             "woff2-synth-zero-glyph.woff2",
             "woff2-synth-zero-metrics.woff2",
+            "woff2-synth-hmtx-short-loca.woff2",
         ] {
             let path = format!("tests/fixtures/{name}");
             let bytes = std::fs::read(path).expect("fixture must exist");
             assert!(decode_webfont(&bytes).is_none(), "{name} must reject");
         }
+    }
+
+    #[test]
+    fn woff2_synth_empty_bbox_end_to_end() {
+        // End-to-end counterpart of the stream-level empty-bbox
+        // checks: an empty glyph with an all-zero explicit bbox
+        // decodes (that accept is intentional), and the following
+        // simple glyph still reads its own bbox.
+        let bytes = include_bytes!("../tests/fixtures/woff2-synth-empty-bbox-zero.woff2");
+        let decoded = decode_webfont(bytes).expect("zero empty bbox must decode");
+        let glyphs = parse_test_glyphs(&decoded);
+        assert_eq!(glyphs.len(), 2);
+        assert!(matches!(glyphs[0], TestGlyph::Empty));
+        assert!(
+            matches!(
+                glyphs[1],
+                TestGlyph::Simple {
+                    bbox: (3, 4, 10, 5),
+                    ..
+                }
+            ),
+            "simple glyph must read its own bbox, got {:?}",
+            glyphs[1]
+        );
+        // Same input with a nonzero explicit bbox on the empty
+        // glyph must reject end to end, not just at stream level.
+        let bytes = include_bytes!("../tests/fixtures/woff2-synth-empty-bbox-nonzero.woff2");
+        assert!(
+            decode_webfont(bytes).is_none(),
+            "nonzero empty bbox must reject"
+        );
     }
 
     #[test]

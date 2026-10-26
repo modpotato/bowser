@@ -7,6 +7,7 @@
 //!   inheritance is expected from it (font-size inheritance is handled by
 //!   the caller passing the parent font size down).
 
+use crate::FontMetrics;
 use bowser_css::{CalcSizeBasis, ComputedStyle, CssValue, LengthUnit, Styler, length_to_px, props};
 use bowser_dom::NodeId;
 use std::rc::Rc;
@@ -448,15 +449,46 @@ pub fn resolve_font_size(
     sane_len(fs).max(0.0)
 }
 
-/// Resolve `line-height` to an absolute pixel value. `normal` -> 1.2x.
+/// First family name of the computed `font-family` value. Mirrors
+/// [`crate::layout::css_font_family_name`], duplicated here because
+/// `style` is the layer `layout` builds on (importing `layout` from
+/// `style` would invert that dependency).
+pub(crate) fn font_family_name(style: &ComputedStyle) -> &str {
+    match style.get_by_index(props::FONT_FAMILY) {
+        Some(CssValue::List(items)) => items
+            .iter()
+            .find_map(|v| match v {
+                CssValue::String(s) => Some(s.as_str()),
+                CssValue::Keyword(s) => Some(s.as_str()),
+                _ => None,
+            })
+            .unwrap_or("serif"),
+        _ => style
+            .get_str_by_index(props::FONT_FAMILY)
+            .unwrap_or("serif"),
+    }
+}
+
+/// Resolve `line-height` to an absolute pixel value. `normal` (and any
+/// missing / unresolvable value, which degrades to `normal`) resolves
+/// through the face's real typographic line height
+/// ([`FontMetrics::line_height`]) instead of the historical hardcoded
+/// 1.2em: with [`crate::FixedFontMetrics`] that call returns exactly
+/// 1.2em, so placeholder-metric tests keep their exact values, while
+/// a real backend (paint's `FontCache`) returns its typo metrics.
+/// This is the single production resolution site: every other
+/// `line-height` consumer reads the `StyleData` value built here
+/// (or inherits it), never re-resolves the computed value.
 pub(crate) fn resolve_line_height(
     value: Option<&CssValue>,
     font_size: f32,
     root_fs: f32,
     vp_w: f32,
     vp_h: f32,
+    fonts: &dyn FontMetrics,
+    family_name: &str,
 ) -> f32 {
-    let normal = 1.2 * font_size;
+    let normal = fonts.line_height(font_size, fonts.intern_family(family_name));
     let raw = match value {
         None => normal,
         Some(CssValue::Keyword(_)) => normal,
@@ -892,6 +924,7 @@ impl StyleData {
         root_fs: f32,
         vp_w: f32,
         vp_h: f32,
+        fonts: &dyn FontMetrics,
     ) -> StyleData {
         let font_size = resolve_font_size(
             style.get_by_index(props::FONT_SIZE),
@@ -909,6 +942,8 @@ impl StyleData {
                 root_fs,
                 vp_w,
                 vp_h,
+                fonts,
+                font_family_name(style),
             ),
             white_space: white_space_of(style),
             text_align: text_align_of(style),

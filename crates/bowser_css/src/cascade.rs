@@ -48,7 +48,7 @@ pub struct Viewport {
 /// resolved and inheritance applied.
 ///
 /// Sparse storage (wave 50): a full-width slot array costs
-/// `PROP_COUNT * 8 = 1480` heap bytes per uniquely-styled element, yet
+/// `PROP_COUNT * 8 = 1496` heap bytes per uniquely-styled element, yet
 /// most slots just hold the shared initial value (see [`initials`]).
 /// Instead `delta` stores only the slots whose computed value deviates
 /// from the initial value, as `(index, value)` pairs sorted by index:
@@ -637,6 +637,25 @@ fn table_presentational_hints(doc: &Document, node: NodeId) -> Vec<Declaration> 
         // `tr`/section mappings above): only the table-derived
         // border/padding hints need an ancestor table.
         cell_dimension_hints(doc, node, &mut text);
+        // w78fix: the HTML rendering `td[nowrap], th[nowrap]
+        // { white-space: nowrap }` rule as a presentational hint:
+        // injected here at the presentational-hint cascade level, so
+        // it beats UA declarations and loses to any author
+        // declaration (including an author `white-space: normal`,
+        // which the old layout-level floor arm could not see). It is
+        // gated to quirks / limited-quirks documents: the task's
+        // standards-mode control must stay wrapping, and the §3.9
+        // floor in `bowser_layout` remains quirks-only. (HTML §15.3.8
+        // writes the rule for all documents; ungating it here would
+        // also unwrap standards-mode nowrap cells — a deliberate
+        // follow-up, not a silent change, if full spec fidelity is
+        // wanted.) Presence of the attribute is enough; its value is
+        // irrelevant, like the layout arm's `nowrap_attr`.
+        if !matches!(doc.quirks_mode(), QuirksMode::NoQuirks)
+            && doc.get_attribute(node, "nowrap").is_some()
+        {
+            hint_decl(&mut text, "white-space", "nowrap");
+        }
     } else if tag.eq_ignore_ascii_case("tr") {
         // WHATWG HTML rendering § "Tables": the `tr` element's
         // `height` attribute maps to the `height` property (no
@@ -1424,6 +1443,13 @@ computed_props! {
     // adjustments (pseudo-element counters are future work).
     COUNTER_RESET = "counter-reset",
     COUNTER_INCREMENT = "counter-increment",
+    // w78fix: appended at the END of the list, never inserted
+    // mid-list: `props::*` indices are cascade slots, and existing
+    // indices must not shift. Both were previously slot-less, so
+    // `ComputedStyle::get` returned `None` for them and
+    // `getComputedStyle` had nothing to project.
+    OUTLINE_COLOR = "outline-color",
+    TEXT_DECORATION_COLOR = "text-decoration-color",
 }
 
 // `Styler` keys its resolved-value memo by `COMPUTED_PROPS` index as `u8`.
@@ -5756,6 +5782,15 @@ fn initial_value(property: &str) -> Option<CssValue> {
         }
         "text-decoration" => kw("none"),
         "text-decoration-style" => kw("solid"),
+        // CSS Text Decoration 3: `text-decoration-color` is not
+        // inherited; its initial is `currentcolor`, like the border
+        // colors (left unresolved at computed-value time, per the
+        // border-color convention).
+        "text-decoration-color" => kw("currentcolor"),
+        // CSS UI 4: `outline-color` is not inherited; its initial is
+        // `auto` (the computed value stays `auto` here, as for the
+        // other `auto`-initial properties).
+        "outline-color" => kw("auto"),
         "vertical-align" => kw("baseline"),
         "list-style-type" => kw("disc"),
         "list-style-position" => kw("outside"),
@@ -6069,6 +6104,18 @@ pub fn is_valid_for_property(property: &str, value: &CssValue) -> bool {
         | "border-block-end-color"
         | "column-rule-color" => {
             matches!(value, CssValue::Color(_)) || is_kw(value, &["currentcolor"])
+        }
+        // `text-decoration-color` is `<color>` (CSS Text Decoration 3);
+        // `outline-color` is `auto | <color>` (CSS UI 4) with legacy
+        // `invert` still accepted — the old catch-all arm accepted
+        // both, so the explicit arms must keep accepting them while
+        // now rejecting non-color values (lengths, etc.).
+        "text-decoration-color" => {
+            matches!(value, CssValue::Color(_)) || is_kw(value, &["currentcolor"])
+        }
+        "outline-color" => {
+            matches!(value, CssValue::Color(_))
+                || is_kw(value, &["currentcolor", "auto", "invert"])
         }
         "margin-top" | "margin-right" | "margin-bottom" | "margin-left" => {
             is_length_or_pct(value) || is_kw(value, &["auto"])
@@ -11147,6 +11194,95 @@ mod tests {
     }
 
     #[test]
+    fn color_longhand_validation_arms() {
+        // colors-007 Family A: `outline-color` and
+        // `text-decoration-color` previously fell through to the
+        // catch-all arm (any value valid); the explicit arms accept
+        // colors, `currentcolor`, and (outline only) `auto`/`invert`,
+        // and reject non-color values. The `border-*-color` arms
+        // already existed and are re-asserted here so a future
+        // refactor cannot silently drop them.
+        let red = CssValue::Color(Color {
+            r: 255,
+            g: 0,
+            b: 0,
+            a: 255,
+        });
+        for prop in [
+            "border-top-color",
+            "border-right-color",
+            "border-bottom-color",
+            "border-left-color",
+            "outline-color",
+            "text-decoration-color",
+        ] {
+            assert!(is_valid_for_property(prop, &red));
+            assert!(is_valid_for_property(prop, &kw("currentcolor")));
+            assert!(!is_valid_for_property(
+                prop,
+                &CssValue::Length(10.0, LengthUnit::Px)
+            ));
+        }
+        assert!(is_valid_for_property("outline-color", &kw("auto")));
+        assert!(is_valid_for_property("outline-color", &kw("invert")));
+        assert!(!is_valid_for_property("text-decoration-color", &kw("auto")));
+    }
+
+    #[test]
+    fn outline_and_text_decoration_color_have_computed_slots() {
+        // w78fix item 2 (fail-before: both read back as `None` with no
+        // cascade slot, so `getComputedStyle` has nothing to project):
+        // `outline-color` / `text-decoration-color` are computed
+        // properties, appended at the end of `COMPUTED_PROPS` so no
+        // existing slot index moves. Specified `aqua` computes to its
+        // `Color` value, exactly as for `border-*-color`; unspecified
+        // they read their initials (`auto` for outline, `currentcolor`
+        // for text-decoration, mirroring the border-color convention
+        // of leaving `currentcolor` unresolved at computed-value
+        // time); an explicit `currentcolor` likewise stays the
+        // keyword.
+        let n = COMPUTED_PROPS.len();
+        assert_eq!(
+            COMPUTED_PROPS.iter().position(|p| *p == "outline-color"),
+            Some(n - 2),
+            "outline-color must be appended second-to-last"
+        );
+        assert_eq!(
+            COMPUTED_PROPS
+                .iter()
+                .position(|p| *p == "text-decoration-color"),
+            Some(n - 1),
+            "text-decoration-color must be appended last"
+        );
+        let aqua = CssValue::Color(Color {
+            r: 0,
+            g: 255,
+            b: 255,
+            a: 255,
+        });
+        let (doc, div, _) = sample();
+        let s = style(
+            &doc,
+            div,
+            "div { outline-color: aqua; text-decoration-color: aqua; }",
+            &vp(),
+        );
+        assert_eq!(s.get("outline-color"), Some(&aqua));
+        assert_eq!(s.get("text-decoration-color"), Some(&aqua));
+        let s = style(&doc, div, "", &vp());
+        assert_eq!(s.get("outline-color"), Some(&kw("auto")));
+        assert_eq!(s.get("text-decoration-color"), Some(&kw("currentcolor")));
+        let s = style(
+            &doc,
+            div,
+            "div { outline-color: currentcolor; text-decoration-color: currentcolor; }",
+            &vp(),
+        );
+        assert_eq!(s.get("outline-color"), Some(&kw("currentcolor")));
+        assert_eq!(s.get("text-decoration-color"), Some(&kw("currentcolor")));
+    }
+
+    #[test]
     fn border_spacing_negative_math_clamps_per_component() {
         // A math expression that evaluates negative clamps to `0px`
         // component-wise (CSS Values 4 range checking), instead of the
@@ -11891,6 +12027,44 @@ mod tests {
     }
 
     #[test]
+    fn nowrap_presentational_hint() {
+        // w78fix item 1 (fail-before: limited-quirks `td nowrap`
+        // computes `white-space: normal`, so the cell wraps): the
+        // HTML rendering presentational hint `td[nowrap],
+        // th[nowrap] { white-space: nowrap }`, implemented in
+        // `table_presentational_hints` at the presentational-hint
+        // cascade level — beating UA declarations, losing to any
+        // author declaration — and gated to quirks / limited-quirks
+        // documents so standards mode is unchanged (see the layout
+        // tests for the table-measurement consequences).
+        let limited = "<!DOCTYPE HTML PUBLIC \"-//W3C//DTD HTML 4.01 Transitional//EN\" \"http://www.w3.org/TR/html4/loose.dtd\"><html><body><table><tr><td nowrap>x</td><th nowrap>y</th></tr></table></body></html>";
+        let (doc, _) = Document::parse_html(limited.as_bytes());
+        let td = doc.query_selector("td").unwrap().expect("td");
+        let th = doc.query_selector("th").unwrap().expect("th");
+        let s = compute_style(&doc, td, &[], &ua(), &vp());
+        assert_eq!(s.get_str("white-space"), Some("nowrap"));
+        let s = compute_style(&doc, th, &[], &ua(), &vp());
+        assert_eq!(s.get_str("white-space"), Some("nowrap"));
+        // An author rule beats the hint (CSS2 `html-attribute-024`).
+        let s = style(&doc, td, "td { white-space: normal; }", &vp());
+        assert_eq!(s.get_str("white-space"), Some("normal"));
+        // Full quirks: the hint applies too.
+        let (doc, _) = Document::parse_html(
+            b"<!DOCTYPE HTML PUBLIC \"-//W3C//DTD HTML 4.0 Transitional//EN\"><html><body><table><tr><td nowrap>x</td></tr></table></body></html>",
+        );
+        let td = doc.query_selector("td").unwrap().expect("td");
+        let s = compute_style(&doc, td, &[], &ua(), &vp());
+        assert_eq!(s.get_str("white-space"), Some("nowrap"));
+        // Standards mode: no hint, the cell keeps the initial value.
+        let (doc, _) = Document::parse_html(
+            b"<!DOCTYPE html><html><body><table><tr><td nowrap>x</td></tr></table></body></html>",
+        );
+        let td = doc.query_selector("td").unwrap().expect("td");
+        let s = compute_style(&doc, td, &[], &ua(), &vp());
+        assert_eq!(s.get_str("white-space"), Some("normal"));
+    }
+
+    #[test]
     fn counter_properties_validate_and_compute() {
         // Initial `none`, not inherited.
         assert_eq!(initial_value("counter-reset"), Some(kw("none")));
@@ -12345,13 +12519,13 @@ mod tests {
         // The style value itself stays one box header + one word, and
         // the per-node memo is a bitset plus a vec header — versus the
         // old 1464 heap bytes per style and 2928 heap bytes per memo
-        // (185 slots * 8 / 16 bytes), now paid only per deviating
+        // (187 slots * 8 / 16 bytes), now paid only per deviating
         // slot at 16 bytes each.
         assert_eq!(std::mem::size_of::<ComputedStyle>(), 24);
         assert!(std::mem::size_of::<MemoSet>() <= 48);
         assert_eq!(
             PROP_COUNT * std::mem::size_of::<Option<Arc<CssValue>>>(),
-            1480
+            1496
         );
     }
 

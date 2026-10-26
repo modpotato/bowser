@@ -2952,9 +2952,15 @@ fn deep_inline_nesting_rect_union_is_single_pass() {
     let (doc, _) = bowser_dom::Document::parse_html(html.as_bytes());
     let ss = bowser_css::parse_stylesheet(".a { font-size: 10px; white-space: nowrap; }");
     let ua = bowser_css::default_ua_stylesheet();
-    let Some((mut forest, root)) =
-        super::boxes::build_box_tree(&doc, &[&ss], &ua, VP.w, VP.h, &HashMap::new())
-    else {
+    let Some((mut forest, root)) = super::boxes::build_box_tree_with_fonts(
+        &doc,
+        &[&ss],
+        &ua,
+        VP.w,
+        VP.h,
+        &HashMap::new(),
+        &crate::FixedFontMetrics,
+    ) else {
         panic!("no root box");
     };
     super::layout::layout_forest(&mut forest, root, &FixedFontMetrics);
@@ -4352,22 +4358,33 @@ fn w77g_flex_text_run_still_wraps_as_anonymous_item() {
 }
 
 #[test]
-fn w77g_flex_inline_block_item_still_wrapped() {
-    // Only inline-table blockifies here: an inline-block flex item
-    // keeps the old wrapper shape (wrapper > inline-block at 60px),
-    // so other inline items are untouched by this change.
+fn w78_flex_inline_block_item_blockifies() {
+    // w78, inverting the w77g pin: css-flexbox-1 §4 blockifies an
+    // inline-block flex item to a block box carrying its own style,
+    // so `flex-basis` and margins reach the item instead of being
+    // swallowed by a style-less anonymous wrapper. Fail-before (old
+    // shape): one AnonymousBlock wrapper holding a 0px inner box.
     let l = layout_html(
-        r#"<div class="c"><div class="i"></div></div>"#,
-        "body { margin: 0; } .c { display: flex; width: 200px; } \
-         .i { display: inline-block; width: 60px; height: 20px; }",
+        r#"<div class="c"><div class="i"></div><div class="s"></div></div>"#,
+        "body { margin: 0; } .c { display: flex; width: 600px; } \
+         .i { display: inline-block; flex: 0 0 200px; margin: 0 10px; height: 20px; } \
+         .s { width: 50px; height: 20px; }",
     );
     let c = &body(&l).children[0];
-    assert_eq!(c.children.len(), 1);
-    let w = &c.children[0];
-    assert_eq!(w.box_type, BoxType::AnonymousBlock);
-    let i = &w.children[0];
-    assert_eq!(i.box_type, BoxType::InlineBlock);
-    assert!(approx(i.rect.w, 60.0), "inline-block w={} != 60", i.rect.w);
+    assert_eq!(c.children.len(), 2, "want item + sibling");
+    let i = &c.children[0];
+    assert_eq!(i.box_type, BoxType::Block);
+    assert!(approx(i.rect.w, 200.0), "item w={} != 200", i.rect.w);
+    assert!(
+        approx(i.rect.x, c.rect.x + 10.0),
+        "item x={} != container + 10",
+        i.rect.x
+    );
+    assert!(
+        approx(c.children[1].rect.x, c.rect.x + 220.0),
+        "sibling x={} != container + 220",
+        c.children[1].rect.x
+    );
 }
 
 #[test]
@@ -4420,6 +4437,623 @@ fn w77fix_inline_table_blockifies_through_both_triggers() {
         approx(t.rect.x, c.rect.x + 22.0),
         "B: table x={} != container + 22 (12 text + 10 margin)",
         t.rect.x
+    );
+}
+
+#[test]
+fn w78_flex_inline_block_item_blockifies_from_text_run() {
+    // Trigger two for inline-block: a text run beside the item means
+    // boxes pass 3 does not fire, so `wrap_flex_text_runs` must
+    // promote it. "hi" is 12px at 10px font, plus the 10px margin.
+    let l = layout_html(
+        r#"<div class="c">hi<div class="i"></div></div>"#,
+        "body { margin: 0; } .c { display: flex; width: 600px; font-size: 10px; } \
+         .i { display: inline-block; flex: 0 0 200px; margin: 0 10px; height: 20px; }",
+    );
+    let c = &body(&l).children[0];
+    assert_eq!(c.children.len(), 2, "want text item + item");
+    assert_eq!(c.children[0].box_type, BoxType::AnonymousBlock);
+    let i = &c.children[1];
+    assert_eq!(i.box_type, BoxType::Block);
+    assert!(approx(i.rect.w, 200.0), "item w={} != 200", i.rect.w);
+    assert!(
+        approx(i.rect.x, c.rect.x + 22.0),
+        "item x={} != container + 22",
+        i.rect.x
+    );
+}
+
+#[test]
+fn w78_flex_inline_block_joint_both_triggers() {
+    // Clone of the w77fix inline-table joint pin, for inline-block:
+    // trigger one (block sibling, boxes pass 3) and trigger two
+    // (text run, wrap_flex_text_runs) must land identically.
+    let css = "body { margin: 0; } .c { display: flex; width: 600px; font-size: 10px; } \
+         .i { display: inline-block; flex: 0 0 200px; margin: 0 10px; height: 20px; } \
+         .s { width: 50px; height: 20px; }";
+    let l = layout_html(
+        r#"<div class="c"><div class="i"></div><div class="s"></div></div>"#,
+        css,
+    );
+    let c = &body(&l).children[0];
+    assert_eq!(c.children.len(), 2, "A: want item + sibling");
+    assert_eq!(c.children[0].box_type, BoxType::Block, "A: must promote");
+    assert!(
+        approx(c.children[0].rect.w, 200.0),
+        "A: w={}",
+        c.children[0].rect.w
+    );
+    assert!(
+        approx(c.children[0].rect.x, c.rect.x + 10.0),
+        "A: x={}",
+        c.children[0].rect.x
+    );
+    assert!(
+        approx(c.children[1].rect.x, c.rect.x + 220.0),
+        "A: sib x={}",
+        c.children[1].rect.x
+    );
+    let l = layout_html(r#"<div class="c">hi<div class="i"></div></div>"#, css);
+    let c = &body(&l).children[0];
+    assert_eq!(c.children.len(), 2, "B: want text item + item");
+    let i = &c.children[1];
+    assert_eq!(i.box_type, BoxType::Block, "B: must promote");
+    assert!(approx(i.rect.w, 200.0), "B: w={}", i.rect.w);
+    assert!(approx(i.rect.x, c.rect.x + 22.0), "B: x={}", i.rect.x);
+}
+
+#[test]
+fn w78_flex_inline_flex_item_blockifies_with_basis_and_margins() {
+    // inline-flex blockifies to a Block box, but its raw display is
+    // still inline-flex, so `flex_kind()` is still Some(false) and
+    // `layout_block` still dispatches to `layout_flex`: the two
+    // 40px inner items share one row inside the 200px item.
+    let l = layout_html(
+        r#"<div class="c"><div class="i"><div class="a"></div><div class="b"></div></div><div class="s"></div></div>"#,
+        "body { margin: 0; } .c { display: flex; width: 600px; } \
+         .i { display: inline-flex; flex: 0 0 200px; margin: 0 10px; } \
+         .a { width: 40px; height: 20px; } .b { width: 40px; height: 20px; } \
+         .s { width: 50px; height: 20px; }",
+    );
+    let c = &body(&l).children[0];
+    assert_eq!(c.children.len(), 2, "want item + sibling");
+    let i = &c.children[0];
+    assert_eq!(i.box_type, BoxType::Block);
+    assert!(approx(i.rect.w, 200.0), "item w={} != 200", i.rect.w);
+    assert!(approx(i.rect.x, c.rect.x + 10.0), "item x={}", i.rect.x);
+    assert_eq!(i.children.len(), 2, "inner flex items");
+    assert!(
+        approx(i.children[1].rect.x, i.rect.x + 40.0),
+        "inner b x={}",
+        i.children[1].rect.x
+    );
+    assert!(
+        approx(c.children[1].rect.x, c.rect.x + 220.0),
+        "sib x={}",
+        c.children[1].rect.x
+    );
+}
+
+#[test]
+fn w78_flex_inline_flex_item_grows() {
+    // The promoted inline-flex item's own grow reaches it.
+    let l = layout_html(
+        r#"<div class="c"><div class="i"><div class="a"></div></div></div>"#,
+        "body { margin: 0; } .c { display: flex; width: 600px; } \
+         .i { display: inline-flex; flex: 1 1 100px; } .a { width: 40px; height: 20px; }",
+    );
+    let c = &body(&l).children[0];
+    assert_eq!(c.children.len(), 1);
+    let i = &c.children[0];
+    assert_eq!(i.box_type, BoxType::Block);
+    assert!(approx(i.rect.w, 600.0), "item w={} != 600", i.rect.w);
+}
+
+#[test]
+fn w78_flex_inline_flex_joint_both_triggers() {
+    // Clone of the w77fix joint pin, for inline-flex.
+    let css = "body { margin: 0; } .c { display: flex; width: 600px; font-size: 10px; } \
+         .i { display: inline-flex; flex: 0 0 200px; margin: 0 10px; } \
+         .a { width: 40px; height: 20px; } .s { width: 50px; height: 20px; }";
+    let item = r#"<div class="i"><div class="a"></div></div>"#;
+    let l = layout_html(
+        &format!(r#"<div class="c">{item}<div class="s"></div></div>"#),
+        css,
+    );
+    let c = &body(&l).children[0];
+    assert_eq!(c.children.len(), 2, "A: want item + sibling");
+    assert_eq!(c.children[0].box_type, BoxType::Block, "A: must promote");
+    assert!(
+        approx(c.children[0].rect.w, 200.0),
+        "A: w={}",
+        c.children[0].rect.w
+    );
+    assert!(
+        approx(c.children[0].rect.x, c.rect.x + 10.0),
+        "A: x={}",
+        c.children[0].rect.x
+    );
+    assert!(
+        approx(c.children[1].rect.x, c.rect.x + 220.0),
+        "A: sib x={}",
+        c.children[1].rect.x
+    );
+    let l = layout_html(&format!(r#"<div class="c">hi{item}</div>"#), css);
+    let c = &body(&l).children[0];
+    assert_eq!(c.children.len(), 2, "B: want text item + item");
+    let i = &c.children[1];
+    assert_eq!(i.box_type, BoxType::Block, "B: must promote");
+    assert!(approx(i.rect.w, 200.0), "B: w={}", i.rect.w);
+    assert!(approx(i.rect.x, c.rect.x + 22.0), "B: x={}", i.rect.x);
+}
+
+#[test]
+fn w78_flex_inline_grid_item_blockifies_with_basis_and_margins() {
+    // inline-grid blockifies to a Grid box (display still
+    // InlineGrid, so track sizing dispatches identically); the two
+    // 40px tracks sit inside the 200px item.
+    let l = layout_html(
+        r#"<div class="c"><div class="i"><div class="a"></div><div class="b"></div></div><div class="s"></div></div>"#,
+        "body { margin: 0; } .c { display: flex; width: 600px; } \
+         .i { display: inline-grid; grid-template-columns: 40px 40px; flex: 0 0 200px; margin: 0 10px; } \
+         .a { height: 20px; } .b { height: 20px; } .s { width: 50px; height: 20px; }",
+    );
+    let c = &body(&l).children[0];
+    assert_eq!(c.children.len(), 2, "want item + sibling");
+    let i = &c.children[0];
+    assert_eq!(i.box_type, BoxType::Grid);
+    assert!(approx(i.rect.w, 200.0), "item w={} != 200", i.rect.w);
+    assert!(approx(i.rect.x, c.rect.x + 10.0), "item x={}", i.rect.x);
+    assert_eq!(i.children.len(), 2, "inner grid items");
+    assert!(
+        approx(i.children[1].rect.x, i.rect.x + 40.0),
+        "inner b x={}",
+        i.children[1].rect.x
+    );
+    assert!(
+        approx(c.children[1].rect.x, c.rect.x + 220.0),
+        "sib x={}",
+        c.children[1].rect.x
+    );
+}
+
+#[test]
+fn w78_flex_inline_grid_joint_both_triggers() {
+    // Clone of the w77fix joint pin, for inline-grid.
+    let css = "body { margin: 0; } .c { display: flex; width: 600px; font-size: 10px; } \
+         .i { display: inline-grid; grid-template-columns: 40px 40px; flex: 0 0 200px; margin: 0 10px; } \
+         .a { height: 20px; } .s { width: 50px; height: 20px; }";
+    let item = r#"<div class="i"><div class="a"></div></div>"#;
+    let l = layout_html(
+        &format!(r#"<div class="c">{item}<div class="s"></div></div>"#),
+        css,
+    );
+    let c = &body(&l).children[0];
+    assert_eq!(c.children.len(), 2, "A: want item + sibling");
+    assert_eq!(c.children[0].box_type, BoxType::Grid, "A: must promote");
+    assert!(
+        approx(c.children[0].rect.w, 200.0),
+        "A: w={}",
+        c.children[0].rect.w
+    );
+    assert!(
+        approx(c.children[0].rect.x, c.rect.x + 10.0),
+        "A: x={}",
+        c.children[0].rect.x
+    );
+    assert!(
+        approx(c.children[1].rect.x, c.rect.x + 220.0),
+        "A: sib x={}",
+        c.children[1].rect.x
+    );
+    let l = layout_html(&format!(r#"<div class="c">hi{item}</div>"#), css);
+    let c = &body(&l).children[0];
+    assert_eq!(c.children.len(), 2, "B: want text item + item");
+    let i = &c.children[1];
+    assert_eq!(i.box_type, BoxType::Grid, "B: must promote");
+    assert!(approx(i.rect.w, 200.0), "B: w={}", i.rect.w);
+    assert!(approx(i.rect.x, c.rect.x + 22.0), "B: x={}", i.rect.x);
+}
+
+#[test]
+fn w78_flex_basis_max_content_reaches_promoted_shapes() {
+    // Direct pin for the `flex_basis_*` arms: a definite width must
+    // not floor a max-content basis, for any promoted shape. The
+    // inline-block (generic read-back, 300px of text), the
+    // inline-flex (flex intrinsic sum, 3 x 100px inner items), and
+    // the inline-grid (track sum via the definite-ignoring arm,
+    // 150px + 150px tracks) all base at 300, not at their 100px width.
+    let word = "a".repeat(50);
+    let l = layout_html(
+        &format!(r#"<div class="c"><div class="i">{word}</div></div>"#),
+        "body { margin: 0; } .c { display: flex; width: 600px; font-size: 10px; } \
+         .i { display: inline-block; width: 100px; flex-basis: max-content; height: 20px; }",
+    );
+    let i = &body(&l).children[0].children[0];
+    assert_eq!(i.box_type, BoxType::Block);
+    assert!(
+        approx(i.rect.w, 300.0),
+        "inline-block basis w={} != 300",
+        i.rect.w
+    );
+    let l = layout_html(
+        r#"<div class="c"><div class="i"><div class="a"></div><div class="a"></div><div class="a"></div></div></div>"#,
+        "body { margin: 0; } .c { display: flex; width: 600px; } \
+         .i { display: inline-flex; width: 100px; flex-basis: max-content; } \
+         .a { width: 100px; height: 20px; }",
+    );
+    let i = &body(&l).children[0].children[0];
+    assert_eq!(i.box_type, BoxType::Block);
+    assert!(
+        approx(i.rect.w, 300.0),
+        "inline-flex basis w={} != 300",
+        i.rect.w
+    );
+    let l = layout_html(
+        r#"<div class="c"><div class="i"><div class="a"></div><div class="a"></div></div></div>"#,
+        "body { margin: 0; } .c { display: flex; width: 600px; } \
+         .i { display: inline-grid; grid-template-columns: 150px 150px; width: 100px; flex-basis: max-content; } \
+         .a { height: 20px; }",
+    );
+    let i = &body(&l).children[0].children[0];
+    assert_eq!(i.box_type, BoxType::Grid);
+    assert!(
+        approx(i.rect.w, 300.0),
+        "inline-grid basis w={} != 300",
+        i.rect.w
+    );
+}
+
+#[test]
+fn w78_flex_inline_block_intrinsic_parity_with_direct_block() {
+    // Promoted inline-block -> Block in the intrinsic walks: a
+    // shrink-to-fit wrapper around a flex container must measure
+    // the same max-content for an inline-block item as for a direct
+    // block item (one 60px word at 10px font), and the same
+    // min-content for a two-word item under `width: min-content`
+    // (widest word 24px). Definite widths coincide by construction;
+    // these are the auto/min-content parity pins.
+    let css_max = ".w { display: inline-block; } .c { display: flex; font-size: 10px; }";
+    let l = layout_html(
+        r#"<div class="w"><div class="c"><div class="i">aaaaaaaaaa</div></div></div>"#,
+        &format!("{css_max} .i {{ display: inline-block; }}"),
+    );
+    let w_inline = body(&l).children[0].rect.w;
+    let l = layout_html(
+        r#"<div class="w"><div class="c"><div class="i">aaaaaaaaaa</div></div></div>"#,
+        &format!("{css_max} .i {{ display: block; }}"),
+    );
+    let w_block = body(&l).children[0].rect.w;
+    assert!(approx(w_inline, 60.0), "inline max w={} != 60", w_inline);
+    assert!(approx(w_block, 60.0), "block max w={} != 60", w_block);
+    assert!(
+        approx(w_inline, w_block),
+        "max parity: {w_inline} vs {w_block}"
+    );
+    let css_min = ".c { display: flex; width: min-content; font-size: 10px; }";
+    let l = layout_html(
+        r#"<div class="c"><div class="i">aaaa bbbb</div></div>"#,
+        &format!("{css_min} .i {{ display: inline-block; }}"),
+    );
+    let c_inline = body(&l).children[0].rect.w;
+    let l = layout_html(
+        r#"<div class="c"><div class="i">aaaa bbbb</div></div>"#,
+        &format!("{css_min} .i {{ display: block; }}"),
+    );
+    let c_block = body(&l).children[0].rect.w;
+    assert!(approx(c_inline, 24.0), "inline min w={} != 24", c_inline);
+    assert!(approx(c_block, 24.0), "block min w={} != 24", c_block);
+    assert!(
+        approx(c_inline, c_block),
+        "min parity: {c_inline} vs {c_block}"
+    );
+}
+
+#[test]
+fn w78_grid_inline_block_item_blockifies() {
+    // css-grid-1 §5.1 blockification, trigger one (block sibling,
+    // boxes pass 3): the inline-block grid item is a Block box at
+    // its own width plus margins in its placed track, not a
+    // style-less wrapper filling the 200px track.
+    let l = layout_html(
+        r#"<div class="g"><div class="i"></div><div class="s"></div></div>"#,
+        "body { margin: 0; } .g { display: grid; grid-template-columns: 200px 200px; width: 600px; } \
+         .i { display: inline-block; width: 80px; height: 20px; margin: 0 10px; grid-column: 1; justify-self: start; } \
+         .s { width: 50px; height: 20px; grid-column: 2; }",
+    );
+    let g = &body(&l).children[0];
+    assert_eq!(g.children.len(), 2, "want item + sibling");
+    let i = &g.children[0];
+    assert_eq!(i.box_type, BoxType::Block);
+    assert!(approx(i.rect.w, 80.0), "item w={} != 80", i.rect.w);
+    assert!(
+        approx(i.rect.x, g.rect.x + 10.0),
+        "item x={} != grid + 10",
+        i.rect.x
+    );
+    assert!(
+        approx(g.children[1].rect.x, g.rect.x + 200.0),
+        "sib x={}",
+        g.children[1].rect.x
+    );
+}
+
+#[test]
+fn w78_grid_inline_block_item_blockifies_from_text_run() {
+    // Trigger two for grid: a text run auto-places into track 1, so
+    // `wrap_grid_text_runs` must promote the inline-block into
+    // track 2 at its own width plus margins.
+    let l = layout_html(
+        r#"<div class="g">hi<div class="i"></div></div>"#,
+        "body { margin: 0; } .g { display: grid; grid-template-columns: 200px 200px; width: 600px; font-size: 10px; } \
+         .i { display: inline-block; width: 80px; height: 20px; margin: 0 10px; justify-self: start; }",
+    );
+    let g = &body(&l).children[0];
+    assert_eq!(g.children.len(), 2, "want text item + item");
+    assert_eq!(g.children[0].box_type, BoxType::AnonymousBlock);
+    let i = &g.children[1];
+    assert_eq!(i.box_type, BoxType::Block);
+    assert!(approx(i.rect.w, 80.0), "item w={} != 80", i.rect.w);
+    assert!(
+        approx(i.rect.x, g.rect.x + 210.0),
+        "item x={} != grid + 210",
+        i.rect.x
+    );
+}
+
+#[test]
+fn w78_grid_inline_block_joint_both_triggers() {
+    // Clone of the w77fix joint pin, for grid inline-block items:
+    // both triggers must place the item at the same track-relative
+    // geometry (80px wide, 10px margin into its track).
+    let css = "body { margin: 0; } .g { display: grid; grid-template-columns: 200px 200px; width: 600px; font-size: 10px; } \
+         .i { display: inline-block; width: 80px; height: 20px; margin: 0 10px; justify-self: start; } \
+         .s { width: 50px; height: 20px; }";
+    let l = layout_html(
+        r#"<div class="g"><div class="i"></div><div class="s"></div></div>"#,
+        css,
+    );
+    let g = &body(&l).children[0];
+    assert_eq!(g.children.len(), 2, "A: want item + sibling");
+    let i = &g.children[0];
+    assert_eq!(i.box_type, BoxType::Block, "A: must promote");
+    assert!(approx(i.rect.w, 80.0), "A: w={}", i.rect.w);
+    assert!(approx(i.rect.x, g.rect.x + 10.0), "A: x={}", i.rect.x);
+    let l = layout_html(r#"<div class="g">hi<div class="i"></div></div>"#, css);
+    let g = &body(&l).children[0];
+    assert_eq!(g.children.len(), 2, "B: want text item + item");
+    let i = &g.children[1];
+    assert_eq!(i.box_type, BoxType::Block, "B: must promote");
+    assert!(approx(i.rect.w, 80.0), "B: w={}", i.rect.w);
+    assert!(approx(i.rect.x, g.rect.x + 210.0), "B: x={}", i.rect.x);
+}
+
+#[test]
+fn w78_grid_inline_flex_item_blockifies() {
+    // Grid inline-flex item: Block box (flex_kind still
+    // Some(false)), own margins and justify-self honored, inner
+    // flex row intact.
+    let l = layout_html(
+        r#"<div class="g"><div class="i"><div class="a"></div><div class="b"></div></div><div class="s"></div></div>"#,
+        "body { margin: 0; } .g { display: grid; grid-template-columns: 200px 200px; width: 600px; } \
+         .i { display: inline-flex; margin: 0 10px; grid-column: 1; justify-self: start; } \
+         .a { width: 40px; height: 20px; } .b { width: 40px; height: 20px; } \
+         .s { width: 50px; height: 20px; grid-column: 2; }",
+    );
+    let g = &body(&l).children[0];
+    assert_eq!(g.children.len(), 2, "want item + sibling");
+    let i = &g.children[0];
+    assert_eq!(i.box_type, BoxType::Block);
+    assert!(approx(i.rect.w, 80.0), "item w={} != 80", i.rect.w);
+    assert!(approx(i.rect.x, g.rect.x + 10.0), "item x={}", i.rect.x);
+    assert_eq!(i.children.len(), 2, "inner flex items");
+    assert!(
+        approx(i.children[1].rect.x, i.rect.x + 40.0),
+        "inner b x={}",
+        i.children[1].rect.x
+    );
+    assert!(
+        approx(g.children[1].rect.x, g.rect.x + 200.0),
+        "sib x={}",
+        g.children[1].rect.x
+    );
+}
+
+#[test]
+fn w78_grid_inline_flex_item_stretches_to_track() {
+    // The other caller-determined-width path for a promoted
+    // inline-flex item: default `justify-self: stretch` in a 200px
+    // track must fill the track, not shrink to the 80px inner
+    // content. (Before the w78 `layout_flex` override fix, the
+    // shrink-to-fit pass discarded the stretch width.)
+    let l = layout_html(
+        r#"<div class="g"><div class="i"><div class="a"></div><div class="b"></div></div></div>"#,
+        "body { margin: 0; } .g { display: grid; grid-template-columns: 200px; width: 600px; } \
+         .i { display: inline-flex; } .a { width: 40px; height: 20px; } .b { width: 40px; height: 20px; }",
+    );
+    let g = &body(&l).children[0];
+    let i = &g.children[0];
+    assert_eq!(i.box_type, BoxType::Block);
+    assert!(approx(i.rect.w, 200.0), "item w={} != 200", i.rect.w);
+    assert_eq!(i.children.len(), 2, "inner flex items");
+    assert!(
+        approx(i.children[1].rect.x, i.rect.x + 40.0),
+        "inner b x={}",
+        i.children[1].rect.x
+    );
+}
+
+#[test]
+fn w78_grid_inline_flex_joint_both_triggers() {
+    // Clone of the w77fix joint pin, for grid inline-flex items.
+    let css = "body { margin: 0; } .g { display: grid; grid-template-columns: 200px 200px; width: 600px; font-size: 10px; } \
+         .i { display: inline-flex; margin: 0 10px; justify-self: start; } \
+         .a { width: 40px; height: 20px; } .s { width: 50px; height: 20px; }";
+    let item = r#"<div class="i"><div class="a"></div></div>"#;
+    let l = layout_html(
+        &format!(r#"<div class="g">{item}<div class="s"></div></div>"#),
+        css,
+    );
+    let g = &body(&l).children[0];
+    assert_eq!(g.children.len(), 2, "A: want item + sibling");
+    let i = &g.children[0];
+    assert_eq!(i.box_type, BoxType::Block, "A: must promote");
+    assert!(approx(i.rect.w, 40.0), "A: w={}", i.rect.w);
+    assert!(approx(i.rect.x, g.rect.x + 10.0), "A: x={}", i.rect.x);
+    let l = layout_html(&format!(r#"<div class="g">hi{item}</div>"#), css);
+    let g = &body(&l).children[0];
+    assert_eq!(g.children.len(), 2, "B: want text item + item");
+    let i = &g.children[1];
+    assert_eq!(i.box_type, BoxType::Block, "B: must promote");
+    assert!(approx(i.rect.w, 40.0), "B: w={}", i.rect.w);
+    assert!(approx(i.rect.x, g.rect.x + 210.0), "B: x={}", i.rect.x);
+}
+
+#[test]
+fn w78_grid_inline_grid_item_blockifies() {
+    // Grid inline-grid item: Grid box, own margins and
+    // justify-self honored, inner tracks intact.
+    let l = layout_html(
+        r#"<div class="g"><div class="i"><div class="a"></div><div class="b"></div></div><div class="s"></div></div>"#,
+        "body { margin: 0; } .g { display: grid; grid-template-columns: 200px 200px; width: 600px; } \
+         .i { display: inline-grid; grid-template-columns: 40px 40px; margin: 0 10px; grid-column: 1; justify-self: start; } \
+         .a { height: 20px; } .b { height: 20px; } .s { width: 50px; height: 20px; grid-column: 2; }",
+    );
+    let g = &body(&l).children[0];
+    assert_eq!(g.children.len(), 2, "want item + sibling");
+    let i = &g.children[0];
+    assert_eq!(i.box_type, BoxType::Grid);
+    assert!(approx(i.rect.w, 80.0), "item w={} != 80", i.rect.w);
+    assert!(approx(i.rect.x, g.rect.x + 10.0), "item x={}", i.rect.x);
+    assert_eq!(i.children.len(), 2, "inner grid items");
+    assert!(
+        approx(i.children[1].rect.x, i.rect.x + 40.0),
+        "inner b x={}",
+        i.children[1].rect.x
+    );
+    assert!(
+        approx(g.children[1].rect.x, g.rect.x + 200.0),
+        "sib x={}",
+        g.children[1].rect.x
+    );
+}
+
+#[test]
+fn w78_grid_inline_grid_joint_both_triggers() {
+    // Clone of the w77fix joint pin, for grid inline-grid items.
+    let css = "body { margin: 0; } .g { display: grid; grid-template-columns: 200px 200px; width: 600px; font-size: 10px; } \
+         .i { display: inline-grid; grid-template-columns: 40px 40px; margin: 0 10px; justify-self: start; } \
+         .a { height: 20px; } .s { width: 50px; height: 20px; }";
+    let item = r#"<div class="i"><div class="a"></div><div class="a"></div></div>"#;
+    let l = layout_html(
+        &format!(r#"<div class="g">{item}<div class="s"></div></div>"#),
+        css,
+    );
+    let g = &body(&l).children[0];
+    assert_eq!(g.children.len(), 2, "A: want item + sibling");
+    let i = &g.children[0];
+    assert_eq!(i.box_type, BoxType::Grid, "A: must promote");
+    assert!(approx(i.rect.w, 80.0), "A: w={}", i.rect.w);
+    assert!(approx(i.rect.x, g.rect.x + 10.0), "A: x={}", i.rect.x);
+    let l = layout_html(&format!(r#"<div class="g">hi{item}</div>"#), css);
+    let g = &body(&l).children[0];
+    assert_eq!(g.children.len(), 2, "B: want text item + item");
+    let i = &g.children[1];
+    assert_eq!(i.box_type, BoxType::Grid, "B: must promote");
+    assert!(approx(i.rect.w, 80.0), "B: w={}", i.rect.w);
+    assert!(approx(i.rect.x, g.rect.x + 210.0), "B: x={}", i.rect.x);
+}
+
+#[test]
+fn w78_grid_inline_grid_auto_track_parity_with_direct_grid() {
+    // Promoted inline-grid -> Grid auto-track sizing equals the
+    // unpromoted direct-grid result: an `auto` track sized from the
+    // item must be 80px (two 40px inner tracks) in both containers,
+    // and the item itself 80px wide, whether the item started as
+    // inline-grid or as grid. The grid container sits in a
+    // shrink-to-fit wrapper so the `auto` track sizes from content
+    // instead of stretching to fill a definite container width.
+    for display in ["inline-grid", "grid"] {
+        let l = layout_html(
+            r#"<div class="w"><div class="g"><div class="i"><div class="a"></div><div class="b"></div></div><div class="s"></div></div></div>"#,
+            &format!(
+                "body {{ margin: 0; }} .w {{ display: inline-block; }} .g {{ display: grid; grid-template-columns: auto 100px; }} \
+                 .i {{ display: {display}; grid-template-columns: 40px 40px; justify-self: start; }} \
+                 .a {{ height: 20px; }} .b {{ height: 20px; }} .s {{ height: 20px; }}"
+            ),
+        );
+        let g = &body(&l).children[0].children[0];
+        assert_eq!(g.children.len(), 2, "{display}: want item + sibling");
+        let i = &g.children[0];
+        assert_eq!(
+            i.box_type,
+            BoxType::Grid,
+            "{display}: item must be a Grid box"
+        );
+        assert!(
+            approx(i.rect.w, 80.0),
+            "{display}: item w={} != 80",
+            i.rect.w
+        );
+        assert!(
+            approx(g.children[1].rect.x, g.rect.x + 80.0),
+            "{display}: sib x={} != grid + 80",
+            g.children[1].rect.x
+        );
+    }
+}
+
+#[test]
+fn w78_inline_values_outside_flex_grid_unchanged() {
+    // Promotion is gated on a flex/grid parent only: in ordinary
+    // block flow an inline-block, inline-flex, and inline-grid all
+    // stay atomic InlineBlock boxes at their content widths.
+    let l = layout_html(
+        r#"<div class="a"><div class="i"></div></div>"#,
+        ".a { width: 400px; } .i { display: inline-block; width: 60px; height: 20px; }",
+    );
+    let i = &body(&l).children[0].children[0];
+    assert_eq!(i.box_type, BoxType::InlineBlock);
+    assert!(approx(i.rect.w, 60.0), "inline-block w={} != 60", i.rect.w);
+    let l = layout_html(
+        r#"<div class="a"><div class="i"><div class="x"></div><div class="x"></div></div></div>"#,
+        ".a { width: 400px; } .i { display: inline-flex; } .x { width: 40px; height: 20px; }",
+    );
+    let i = &body(&l).children[0].children[0];
+    assert_eq!(i.box_type, BoxType::InlineBlock);
+    assert!(approx(i.rect.w, 80.0), "inline-flex w={} != 80", i.rect.w);
+    let l = layout_html(
+        r#"<div class="a"><div class="i"><div class="x"></div><div class="x"></div></div></div>"#,
+        ".a { width: 400px; } .i { display: inline-grid; grid-template-columns: 40px 40px; } .x { height: 20px; }",
+    );
+    let i = &body(&l).children[0].children[0];
+    assert_eq!(i.box_type, BoxType::InlineBlock);
+    assert!(approx(i.rect.w, 80.0), "inline-grid w={} != 80", i.rect.w);
+}
+
+#[test]
+fn w78_grid_item_align_self_honored_for_promoted_shape() {
+    // Placement + alignment read the promoted item's own style:
+    // `align-self: end` in a 100px row puts the 20px item at the
+    // row's bottom edge, and `justify-self: center` centers the
+    // 80px item in its 200px track (60px in).
+    let l = layout_html(
+        r#"<div class="g"><div class="i"></div></div>"#,
+        "body { margin: 0; } .g { display: grid; grid-template-columns: 200px; grid-template-rows: 100px; width: 600px; } \
+         .i { display: inline-block; width: 80px; height: 20px; justify-self: center; align-self: end; }",
+    );
+    let g = &body(&l).children[0];
+    let i = &g.children[0];
+    assert_eq!(i.box_type, BoxType::Block);
+    assert!(
+        approx(i.rect.x, g.rect.x + 60.0),
+        "item x={} != grid + 60",
+        i.rect.x
+    );
+    assert!(
+        approx(i.rect.y, g.rect.y + 80.0),
+        "item y={} != grid + 80",
+        i.rect.y
     );
 }
 
@@ -9952,7 +10586,15 @@ fn styled_for(html: &str, css: &str, tag: &str) -> bowser_css::ComputedStyle {
 /// as `pseudo::attach` expects (element box built, no children yet).
 fn pseudo_forest(style: &bowser_css::ComputedStyle) -> (super::boxes::Forest, usize) {
     let display = super::style::display_of(style);
-    let data = super::style::StyleData::from_style(style, display, 16.0, 16.0, VP.w, VP.h);
+    let data = super::style::StyleData::from_style(
+        style,
+        display,
+        16.0,
+        16.0,
+        VP.w,
+        VP.h,
+        &FixedFontMetrics,
+    );
     let mut forest = super::boxes::Forest {
         nodes: Vec::new(),
         root_font_size: 16.0,
@@ -10020,6 +10662,7 @@ fn pseudo_after_appends_inline_text_box() {
             text: "c".to_owned(),
         },
         &style,
+        &FixedFontMetrics,
     );
     let kids = &forest.nodes[elem].children;
     assert_eq!(kids.len(), 2);
@@ -10060,6 +10703,7 @@ fn pseudo_before_prepends_inline_text_box() {
             text: "c".to_owned(),
         },
         &style,
+        &FixedFontMetrics,
     );
     let kids = &forest.nodes[elem].children;
     assert_eq!(kids.len(), 2);
@@ -10114,6 +10758,7 @@ fn pseudo_table_caption_display_maps_to_block() {
             text: "x".to_owned(),
         },
         &origin,
+        &FixedFontMetrics,
     );
     let kids = &forest.nodes[elem].children;
     assert_eq!(kids.len(), 1);
@@ -10143,6 +10788,7 @@ fn pseudo_display_none_suppresses_box() {
             text: "c".to_owned(),
         },
         &origin,
+        &FixedFontMetrics,
     );
     assert!(forest.nodes[elem].children.is_empty());
 }
@@ -10236,7 +10882,7 @@ fn pseudo_attach_unit(
     content: super::pseudo::PseudoContent,
 ) -> (super::boxes::Forest, usize) {
     let (mut forest, elem) = pseudo_forest(origin);
-    super::pseudo::attach(&mut forest, elem, kind, content, origin);
+    super::pseudo::attach(&mut forest, elem, kind, content, origin, &FixedFontMetrics);
     let pi = *forest.nodes[elem].children.last().expect("pseudo attached");
     (forest, pi)
 }
@@ -11265,4 +11911,544 @@ fn w77_grid_ordinary_layout_definite_width_unchanged() {
         "ordinary shrink wrap w={}",
         wrap.rect.w
     );
+}
+
+// --- w78 sticky margins / overflow-padding (fail-before, WPT mirrors) ---
+fn w78_margins_y(scroll: f32) -> f32 {
+    let html = r#"<div id="sc"><div id="contents"><div id="pre"></div><div id="container"><div id="filler"></div><div id="sticky"></div></div></div></div>"#;
+    let css = "body { margin: 0; } \
+         #sc { position: relative; width: 100px; height: 200px; overflow: hidden; } \
+         #contents { height: 500px; } #pre { height: 100px; } \
+         #container { height: 300px; } #filler { height: 100px; } \
+         #sticky { position: sticky; top: 50px; height: 100px; margin: 15px; }";
+    let (doc, _) = bowser_dom::Document::parse_html(html.as_bytes());
+    let ss = bowser_css::parse_stylesheet(css);
+    let mut offsets = HashMap::new();
+    offsets.insert(doc.get_element_by_id("sc").expect("sc"), (0.0, scroll));
+    let l = crate::layout_with_scroll_and_offsets(
+        &doc,
+        &[&ss],
+        VP,
+        &FixedFontMetrics,
+        (0.0, 0.0),
+        &offsets,
+    );
+    body(&l).children[0].children[0].children[1].children[1]
+        .rect
+        .y
+}
+#[test]
+fn w78_sticky_margins_before_sticking() {
+    let y = w78_margins_y(100.0);
+    assert!(approx(y, 215.0), "margins scroll100 y={y} != 215");
+}
+#[test]
+fn w78_sticky_margins_stuck() {
+    let y = w78_margins_y(200.0);
+    assert!(approx(y, 250.0), "margins scroll200 y={y} != 250");
+}
+#[test]
+fn w78_sticky_margins_cb_bound() {
+    let y = w78_margins_y(300.0);
+    assert!(approx(y, 285.0), "margins scroll300 y={y} != 285");
+}
+fn w78_padding_y(scroll: f32, top: &str) -> f32 {
+    let html = r#"<div id="sc"><div id="contents"><div id="pre"></div><div id="container"><div id="filler"></div><div id="sticky"></div></div></div></div>"#;
+    let css = format!(
+        "body {{ margin: 0; }} \
+         #sc {{ position: relative; width: 100px; height: 200px; overflow: hidden; padding: 20px 0; }} \
+         #contents {{ height: 500px; }} #pre {{ height: 100px; }} \
+         #container {{ height: 300px; }} #filler {{ height: 100px; }} \
+         #sticky {{ position: sticky; top: {top}; height: 100px; }}"
+    );
+    let (doc, _) = bowser_dom::Document::parse_html(html.as_bytes());
+    let ss = bowser_css::parse_stylesheet(&css);
+    let mut offsets = HashMap::new();
+    offsets.insert(doc.get_element_by_id("sc").expect("sc"), (0.0, scroll));
+    let l = crate::layout_with_scroll_and_offsets(
+        &doc,
+        &[&ss],
+        VP,
+        &FixedFontMetrics,
+        (0.0, 0.0),
+        &offsets,
+    );
+    body(&l).children[0].children[0].children[1].children[1]
+        .rect
+        .y
+}
+#[test]
+fn w78_sticky_overflow_padding_before() {
+    let y = w78_padding_y(150.0, "50px");
+    assert!(approx(y, 220.0), "padding scroll150 y={y} != 220");
+}
+#[test]
+fn w78_sticky_overflow_padding_stuck() {
+    let y = w78_padding_y(200.0, "0");
+    assert!(approx(y, 220.0), "padding scroll200 y={y} != 220");
+}
+#[test]
+fn w78_sticky_overflow_padding_cb_bound() {
+    let y = w78_padding_y(315.0, "0");
+    assert!(approx(y, 320.0), "padding scroll315 y={y} != 320");
+}
+#[test]
+fn w78_sticky_overflow_padding_stuck_past_natural() {
+    // Discriminating stuck case (pre-fix this gave 220, the natural
+    // position): scroll 210 with top:0 and 20px scroller padding puts
+    // the scrollport candidate at 20 + 210 = 230, past the natural
+    // 220, so the box sticks at 230. The padding-box scrollport
+    // (candidate 210) left it at its natural position.
+    let y = w78_padding_y(210.0, "0");
+    assert!(approx(y, 230.0), "padding scroll210 y={y} != 230");
+}
+fn w78_padded_cb_y(scroll: f32, inset: &str) -> f32 {
+    let html = r#"<div id="sc"><div id="contents"><div id="pre"></div><div id="container"><div id="filler"></div><div id="sticky"></div></div></div></div>"#;
+    let css = format!(
+        "body {{ margin: 0; }} \
+         #sc {{ position: relative; width: 100px; height: 200px; overflow: hidden; }} \
+         #contents {{ height: 500px; }} #pre {{ height: 100px; }} \
+         #container {{ height: 300px; padding: 20px; }} #filler {{ height: 100px; }} \
+         #sticky {{ position: sticky; {inset}; height: 100px; margin: 15px; }}"
+    );
+    let (doc, _) = bowser_dom::Document::parse_html(html.as_bytes());
+    let ss = bowser_css::parse_stylesheet(&css);
+    let mut offsets = HashMap::new();
+    offsets.insert(doc.get_element_by_id("sc").expect("sc"), (0.0, scroll));
+    let l = crate::layout_with_scroll_and_offsets(
+        &doc,
+        &[&ss],
+        VP,
+        &FixedFontMetrics,
+        (0.0, 0.0),
+        &offsets,
+    );
+    body(&l).children[0].children[0].children[1].children[1]
+        .rect
+        .y
+}
+#[test]
+fn w78_sticky_padded_cb_margin_counts_at_end_bound() {
+    // Containing block with 20px padding: its content box runs
+    // 120..420, so a margin-15 sticky box pinned to the CB end sits
+    // at 120 + 300 - 100 - 15 = 305. Against the padding-box origin
+    // (100) the same clamp gave 285, a full padding off, and
+    // ignoring the bottom margin would give 320.
+    let y = w78_padded_cb_y(300.0, "top: 50px");
+    assert!(approx(y, 305.0), "padded CB end bound y={y} != 305");
+}
+#[test]
+fn w78_sticky_padded_cb_margin_counts_at_start_bound() {
+    // Bottom-sticky mirror: pushed up against the scrollport, the
+    // box is clamped to the CB start by its margin box, so its
+    // border sits at the content-box top (120) + margin (15) = 135,
+    // not at the padding-box top (100) + 15 = 115.
+    let y = w78_padded_cb_y(0.0, "bottom: 0");
+    assert!(approx(y, 135.0), "padded CB start bound y={y} != 135");
+}
+
+// --- w78fix: layout review findings (H1, M2, M3, L2) ---
+/// Preferred width of the `#item` box in a freshly built box forest,
+/// plus its box type: the pref-level probe for w78fix H1. Unlike a
+/// laid-out shrink-to-fit wrapper, this reads the item's own
+/// `preferred_width` walk, so the flex item contribution clamp
+/// (`flex_item_intrinsic_contribution`) cannot mask a dispatch
+/// difference between the promoted and unpromoted shapes.
+fn w78fix_forest_item_pref(html: &str, css: &str) -> (BoxType, f32) {
+    let (doc, _) = bowser_dom::Document::parse_html(html.as_bytes());
+    let ss = bowser_css::parse_stylesheet(css);
+    let ua = crate::ua_stylesheet();
+    let mut forest = crate::boxes::build_box_tree_with_fonts(
+        &doc,
+        &[&ss],
+        ua,
+        VP.w,
+        VP.h,
+        &HashMap::new(),
+        &FixedFontMetrics,
+    )
+    .expect("box tree builds")
+    .0;
+    let item = doc.get_element_by_id("item").expect("item element");
+    let idx = forest
+        .nodes
+        .iter()
+        .position(|n| n.dom == Some(item))
+        .expect("item box");
+    let bt = forest.nodes[idx].box_type;
+    let mut cache = crate::layout::PrefWidthCache::new(forest.nodes.len());
+    let w = crate::layout::preferred_width(&mut forest, idx, &FixedFontMetrics, &mut cache);
+    (bt, w)
+}
+
+#[test]
+fn w78fix_pref_promoted_inline_items_display_keyed() {
+    // H1: the item's preferred width must not depend on which
+    // promotion trigger fired. Trigger A (boxes pass 3): a
+    // block-level sibling in the flex container promotes the item
+    // at box-build time, so its box type is `Block`. Trigger B
+    // (layout-time `wrap_flex_text_runs`): the lone item is still
+    // `InlineBlock` when the intrinsic walk runs. The assertions
+    // on box type prove both triggers actually fired; the width
+    // assertions prove the dispatch does not care.
+    //
+    // Fail-before (measured 2026-10-25, before the display-keyed
+    // fix): definite widths already agreed at 50, but the
+    // aspect-ratio cases measured promoted 100 vs lone 0, and the
+    // max-width cases measured promoted 60 vs lone 80 at the
+    // `preferred_width` level (the laid-out wrapper masked the
+    // clamp case through the flex contribution clamp, which is
+    // why this test measures the item's own preferred width).
+    // After the fix all six cases agree at the value below.
+    let inner = r#"<div class="a"></div>"#;
+    let cases: [(&str, &str, &str, f32); 6] = [
+        // (display, item css, inner html, expected pref)
+        ("inline-flex", "width: 50px;", inner, 50.0),
+        ("inline-flex", "max-width: 60px;", inner, 60.0),
+        ("inline-flex", "height: 50px; aspect-ratio: 2/1;", "", 100.0),
+        ("inline-block", "width: 50px;", inner, 50.0),
+        ("inline-block", "max-width: 60px;", inner, 60.0),
+        (
+            "inline-block",
+            "height: 50px; aspect-ratio: 2/1;",
+            "",
+            100.0,
+        ),
+    ];
+    for (display, item_css, inner_html, want) in cases {
+        let css = format!(
+            ".c {{ display: flex; }} .i {{ display: {display}; {item_css} }} \
+             .a {{ width: 80px; height: 20px; }} .s {{ width: 0px; height: 0px; }}"
+        );
+        let item = format!(r#"<div class="i" id="item">{inner_html}</div>"#);
+        let (bt_a, w_a) = w78fix_forest_item_pref(
+            &format!("<!DOCTYPE html><div class=\"c\">{item}<div class=\"s\"></div></div>"),
+            &css,
+        );
+        let (bt_b, w_b) = w78fix_forest_item_pref(
+            &format!("<!DOCTYPE html><div class=\"c\">{item}</div>"),
+            &css,
+        );
+        assert_eq!(
+            bt_a,
+            BoxType::Block,
+            "{display} {item_css}: trigger A must promote"
+        );
+        assert_eq!(
+            bt_b,
+            BoxType::InlineBlock,
+            "{display} {item_css}: trigger B must stay unpromoted at walk time"
+        );
+        assert!(
+            approx(w_a, want),
+            "{display} {item_css}: promoted pref {w_a} != {want}"
+        );
+        assert!(
+            approx(w_b, want),
+            "{display} {item_css}: unpromoted pref {w_b} != {want}"
+        );
+        assert!(
+            approx(w_a, w_b),
+            "{display} {item_css}: pref parity {w_a} vs {w_b}"
+        );
+    }
+}
+
+#[test]
+fn w78fix_pref_wrapper_geometry_aspect_agrees() {
+    // End-to-end half of H1/L1: a shrink-to-fit wrapper over a flex
+    // container carrying an aspect-ratio inline-block item. Fail-before:
+    // promoted wrapper 100, lone wrapper 0. (The definite and
+    // max-width cases agree at the wrapper level even before the
+    // fix — the flex contribution clamp masks them — which is why
+    // the forest-level test above is the primary pin.)
+    let css = "body { margin: 0; } .w { display: inline-block; } .c { display: flex; } \
+         .i { display: inline-block; height: 50px; aspect-ratio: 2/1; } \
+         .s { width: 0px; height: 0px; }";
+    let item = r#"<div class="i"></div>"#;
+    let l = layout_html(
+        &format!(r#"<div class="w"><div class="c">{item}<div class="s"></div></div></div>"#),
+        css,
+    );
+    let w_promoted = body(&l).children[0].rect.w;
+    let l = layout_html(
+        &format!(r#"<div class="w"><div class="c">{item}</div></div>"#),
+        css,
+    );
+    let w_lone = body(&l).children[0].rect.w;
+    assert!(
+        approx(w_promoted, 100.0),
+        "promoted wrapper w={w_promoted} != 100"
+    );
+    assert!(approx(w_lone, 100.0), "lone wrapper w={w_lone} != 100");
+}
+
+#[test]
+fn w78fix_sticky_bottom_padded_scroller() {
+    // M2, bottom mirror of `w78_sticky_overflow_padding_*`: a
+    // padded scroller (`padding: 20px 0`, content box 20..220) with
+    // `bottom: 0`. The sticky box's natural y is 220; the
+    // content-box scrollport's far edge puts it at
+    // 20 + 0 + 200 - 0 - 100 = 120. Reverting only the size term
+    // in `sticky_scrollport_axis` (padding-box size 240, keeping
+    // the content-box origin 20) would give 20 + 240 - 100 = 160,
+    // not 140; 140 is the full padding-box variant (origin 0 +
+    // size 240 - 100). Either way the 120 pin discriminates.
+    // This pins the content-box size term in
+    // `sticky_scrollport_axis`; the origin term is already pinned
+    // by the top-edge tests.
+    let html = r#"<div id="sc"><div id="contents"><div id="pre"></div><div id="container"><div id="filler"></div><div id="sticky"></div></div></div></div>"#;
+    let css = "body { margin: 0; } \
+         #sc { position: relative; width: 100px; height: 200px; overflow: hidden; padding: 20px 0; } \
+         #contents { height: 500px; } #pre { height: 100px; } \
+         #container { height: 300px; } #filler { height: 100px; } \
+         #sticky { position: sticky; bottom: 0; height: 100px; }";
+    let (doc, _) = bowser_dom::Document::parse_html(html.as_bytes());
+    let ss = bowser_css::parse_stylesheet(css);
+    let mut offsets = HashMap::new();
+    offsets.insert(doc.get_element_by_id("sc").expect("sc"), (0.0, 0.0));
+    let l = crate::layout_with_scroll_and_offsets(
+        &doc,
+        &[&ss],
+        VP,
+        &FixedFontMetrics,
+        (0.0, 0.0),
+        &offsets,
+    );
+    let y = body(&l).children[0].children[0].children[1].children[1]
+        .rect
+        .y;
+    assert!(approx(y, 120.0), "bottom padded y={y} != 120");
+}
+
+#[test]
+fn w78fix_sticky_right_padded_scroller() {
+    // M2, right mirror: a padded scroller (`padding: 0 20px`,
+    // content box 20..220) with `right: 0`. Natural x is 220
+    // (20 content origin + 200 filler); the content-box far edge
+    // puts the 100px box at 20 + 0 + 200 - 100 = 120.
+    // Reverting only the size term in `sticky_scrollport_axis`
+    // (padding-box size 240, keeping the content-box origin 20)
+    // would give 20 + 240 - 100 = 160, not 140; 140 is the full
+    // padding-box variant (origin 0 + size 240 - 100). Either way
+    // the 120 pin discriminates. The containing-block bound
+    // (container content box 20..520) does not interfere.
+    let html = r#"<div id="sc"><div id="container"><div id="filler"></div><div id="sticky"></div></div></div>"#;
+    let css = "body { margin: 0; } \
+         #sc { position: relative; width: 200px; height: 100px; overflow: hidden; padding: 0 20px; } \
+         #container { width: 500px; } \
+         #filler { display: inline-block; width: 200px; height: 50px; } \
+         #sticky { display: inline-block; position: sticky; right: 0; width: 100px; height: 50px; }";
+    let (doc, _) = bowser_dom::Document::parse_html(html.as_bytes());
+    let ss = bowser_css::parse_stylesheet(css);
+    let mut offsets = HashMap::new();
+    offsets.insert(doc.get_element_by_id("sc").expect("sc"), (0.0, 0.0));
+    let l = crate::layout_with_scroll_and_offsets(
+        &doc,
+        &[&ss],
+        VP,
+        &FixedFontMetrics,
+        (0.0, 0.0),
+        &offsets,
+    );
+    let x = body(&l).children[0].children[0].children[1].rect.x;
+    assert!(approx(x, 120.0), "right padded x={x} != 120");
+}
+
+#[test]
+fn w78fix_quirks_img_whitespace_sums_horizontal() {
+    // M3, horizontal: WHATWG Quirks §3.8 removes the soft wrap
+    // opportunity adjacent to `img`s, so a collapsible space or
+    // newline between two 50px imgs must not break the run: the
+    // cell's min-content is 100 + 40 padding = 140, not
+    // max(50, 50) + 40 = 90. Fail-before: the space case measured
+    // 90 (the whitespace text node broke the run); the newline
+    // case is pinned by the same assertion.
+    let css = "table { width: 50px; border-spacing: 8px; } td { padding: 20px; } img { width: 50px; height: 20px; }";
+    for inner in ["<img> <img>", "<img>\n<img>"] {
+        let l = layout_html(
+            &format!(
+                "<!DOCTYPE HTML PUBLIC \"-//W3C//DTD HTML 4.0 Transitional//EN\"><table><tr><td>{inner}</td></tr></table>"
+            ),
+            css,
+        );
+        let w = table_cell(&l, 0, 0).rect.w;
+        assert!(approx(w, 140.0), "quirks {inner:?}: cell w={w} != 140");
+    }
+}
+
+#[test]
+fn w78fix_quirks_img_whitespace_sums_vertical() {
+    // M3, vertical twin: the same run in a vertical-writing-mode
+    // table in full quirks mode, where the imgs are 50px tall on
+    // the inline axis. The vertical walk already skipped
+    // ignorable whitespace, so this is a regression pin for the
+    // horizontal fix's mirror: 100 + 40 padding = 140 along the
+    // cell's height, for both a space and a newline separator.
+    // The imgs carry intrinsic 20x50 sizes (a missing `img` has a
+    // 0x0 intrinsic, which the vertical atomic arm reads before
+    // any CSS height).
+    let css = "table { writing-mode: vertical-lr; height: 50px; border-spacing: 0; } td { padding: 20px 0; } img { width: 20px; height: 50px; }";
+    for inner in ["<img> <img>", "<img>\n<img>"] {
+        let html = format!(
+            "<!DOCTYPE HTML PUBLIC \"-//W3C//DTD HTML 4.0 Transitional//EN\"><table><tr><td>{inner}</td></tr></table>"
+        );
+        let (doc, _) = bowser_dom::Document::parse_html(html.as_bytes());
+        let imgs = doc.get_elements_by_tag_name("img");
+        let mut map = HashMap::new();
+        for i in 0..imgs.len() {
+            if let Some(n) = imgs.item(i) {
+                map.insert(n, IntrinsicDims::from_size(20.0, 50.0));
+            }
+        }
+        let l = layout_doc_with_intrinsics(&doc, css, &FixedFontMetrics, &map);
+        let h = table_cell(&l, 0, 0).rect.h;
+        assert!(
+            approx(h, 140.0),
+            "quirks vertical {inner:?}: cell h={h} != 140"
+        );
+    }
+}
+
+/// Min- and max-content of the `#item` box in a freshly built
+/// box forest, plus its box type: the intrinsic-level probe for
+/// w78fix2 MEDIUM, mirroring `w78fix_forest_item_pref` for the
+/// max-content side. Unlike a laid-out flex container, this reads
+/// the item's own dispatches, so no flex contribution clamp or
+/// real-layout multicol gate can mask a dispatch difference.
+fn w78fix2_forest_item_min_max(html: &str, css: &str) -> (BoxType, f32, f32) {
+    let (doc, _) = bowser_dom::Document::parse_html(html.as_bytes());
+    let ss = bowser_css::parse_stylesheet(css);
+    let ua = crate::ua_stylesheet();
+    let mut forest = crate::boxes::build_box_tree_with_fonts(
+        &doc,
+        &[&ss],
+        ua,
+        VP.w,
+        VP.h,
+        &HashMap::new(),
+        &FixedFontMetrics,
+    )
+    .expect("box tree builds")
+    .0;
+    let item = doc.get_element_by_id("item").expect("item element");
+    let idx = forest
+        .nodes
+        .iter()
+        .position(|n| n.dom == Some(item))
+        .expect("item box");
+    let bt = forest.nodes[idx].box_type;
+    let mut scratch = Vec::new();
+    let min = crate::layout::min_content_width(&mut forest, idx, &FixedFontMetrics, &mut scratch);
+    let mut cache = crate::layout::PrefWidthCache::new(forest.nodes.len());
+    let max = crate::layout::preferred_width(&mut forest, idx, &FixedFontMetrics, &mut cache);
+    (bt, min, max)
+}
+
+#[test]
+fn w78fix2_multicol_promoted_inline_block_min_content() {
+    // w78fix2 MEDIUM: a promoted multicol inline-block must take
+    // the multicol arm in the min-content dispatch, exactly as it
+    // already does in the max-content dispatch. The promotion
+    // trigger is the same as `w78fix_pref_promoted_inline_items_`
+    // `display_keyed`: a block-level (0-size) sibling in the flex
+    // container promotes the item to a `Block` box at box-build
+    // time, so `multicol_intrinsic_params` (which gates on
+    // `Block`/`AnonymousBlock`) applies. Two children each
+    // min-content 50, `column-count: 2`, `column-gap: 20px`:
+    // column-transformed size is 50 * 2 + 20 = 120, while the
+    // kids-max inline-block arm gives 50. Fail-before: the
+    // item's min-content measured 50 (the inline-block arm
+    // shadowed the multicol arm) while its max-content already
+    // measured 120. The lone (unpromoted) shape is NOT pinned
+    // here: it stays an `InlineBlock` box, so the multicol gate
+    // does not apply to it in either dispatch — that is the
+    // layout-gate divergence noted on the max-content arm, not
+    // an intrinsic-dispatch difference.
+    let css = ".c { display: flex; } .i { display: inline-block; column-count: 2; column-gap: 20px; } \\\n         .a { width: 50px; height: 10px; } .b { width: 50px; height: 10px; } \\\n         .s { width: 0px; height: 0px; }";
+    let item = r#"<div class="i" id="item"><div class="a"></div><div class="b"></div></div>"#;
+    let (bt, w_min, w_max) = w78fix2_forest_item_min_max(
+        &format!("<!DOCTYPE html><div class=\"c\">{item}<div class=\"s\"></div></div>"),
+        css,
+    );
+    assert_eq!(bt, BoxType::Block, "trigger must promote");
+    assert!(
+        approx(w_min, 120.0),
+        "promoted multicol min-content w={w_min} != 120"
+    );
+    assert!(
+        approx(w_max, 120.0),
+        "promoted multicol max-content w={w_max} != 120"
+    );
+}
+
+#[test]
+fn w78fix2_quirks_pre_img_whitespace_adds_space() {
+    // w78fix2 LOW: WHATWG Quirks §3.8 run-summing must not drop a
+    // preserved space. In a full-quirks cell with
+    // `white-space: pre`, `<img> <img>` (50px each) is one run of
+    // 50 + space + 50: at 10px the space advances 0.6 * 10 = 6, so
+    // the cell is 106 + 40 padding = 146, not 100 + 40 = 140.
+    // Fail-before: the walk skipped every whitespace-only node
+    // regardless of `white-space`, so the pre cell measured 140.
+    // The collapsible-space case (100 + 40 = 140) is unchanged
+    // and stays pinned by
+    // `w78fix_quirks_img_whitespace_sums_horizontal`.
+    let css = "table { width: 50px; border-spacing: 8px; } td { padding: 20px; font-size: 10px; white-space: pre; } img { width: 50px; height: 20px; }";
+    let l = layout_html(
+        "<!DOCTYPE HTML PUBLIC \"-//W3C//DTD HTML 4.0 Transitional//EN\"><table><tr><td><img> <img></td></tr></table>",
+        css,
+    );
+    let w = table_cell(&l, 0, 0).rect.w;
+    assert!(approx(w, 146.0), "quirks pre cell w={w} != 146");
+}
+
+#[test]
+fn w78fix2_quirks_pre_img_whitespace_adds_space_vertical() {
+    // w78fix2 LOW, vertical twin of the horizontal pre pin: the
+    // same run in a vertical-writing-mode table in full quirks
+    // mode, where the imgs are 50px tall on the inline axis.
+    // Preserved space at 10px advances 6 along the inline axis,
+    // so the cell height is 50 + 6 + 50 + 40 padding = 146.
+    let css = "table { writing-mode: vertical-lr; height: 50px; border-spacing: 0; } td { padding: 20px 0; font-size: 10px; white-space: pre; } img { width: 20px; height: 50px; }";
+    let html = "<!DOCTYPE HTML PUBLIC \"-//W3C//DTD HTML 4.0 Transitional//EN\"><table><tr><td><img> <img></td></tr></table>";
+    let (doc, _) = bowser_dom::Document::parse_html(html.as_bytes());
+    let imgs = doc.get_elements_by_tag_name("img");
+    let mut map = HashMap::new();
+    for i in 0..imgs.len() {
+        if let Some(n) = imgs.item(i) {
+            map.insert(n, IntrinsicDims::from_size(20.0, 50.0));
+        }
+    }
+    let l = layout_doc_with_intrinsics(&doc, css, &FixedFontMetrics, &map);
+    let h = table_cell(&l, 0, 0).rect.h;
+    assert!(approx(h, 146.0), "quirks pre vertical cell h={h} != 146");
+}
+
+#[test]
+fn w78fix_min_aspect_promoted_inline_block_parity() {
+    // L1, min-content half: a `width: min-content` flex container
+    // over an aspect-ratio inline-block item. The min-content arms
+    // already agreed (both carry the aspect-ratio fallback), so
+    // this is a regression pin, not a fail-before test: if a
+    // future min-content dispatch reintroduces a box-type branch
+    // without the aspect fallback, the lone (unpromoted) case
+    // drops to the empty generic size 0 while the promoted case
+    // stays at the aspect-derived 100.
+    let css = "body { margin: 0; } .c { display: flex; width: min-content; } \
+         .i { display: inline-block; height: 50px; aspect-ratio: 2/1; } \
+         .s { width: 0px; height: 0px; }";
+    let item = r#"<div class="i"></div>"#;
+    let l = layout_html(
+        &format!(r#"<div class="c">{item}<div class="s"></div></div>"#),
+        css,
+    );
+    let w_promoted = body(&l).children[0].rect.w;
+    let l = layout_html(&format!(r#"<div class="c">{item}</div>"#), css);
+    let w_lone = body(&l).children[0].rect.w;
+    assert!(
+        approx(w_promoted, 100.0),
+        "promoted min w={w_promoted} != 100"
+    );
+    assert!(approx(w_lone, 100.0), "lone min w={w_lone} != 100");
 }

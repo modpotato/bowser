@@ -33,10 +33,11 @@ use std::rc::Rc;
 use std::sync::Arc;
 
 use super::BoxType;
+use super::FontMetrics;
 use super::boxes::{Forest, direction_rtl, shared_text};
 use super::style::{
-    Display, StyleData, display_of, resolve_font_size, resolve_line_height, text_transform_of,
-    white_space_of,
+    Display, StyleData, display_of, font_family_name, resolve_font_size, resolve_line_height,
+    text_transform_of, white_space_of,
 };
 
 /// Which generated-content pseudo-element to query / attach.
@@ -536,6 +537,7 @@ pub(crate) fn attach(
     kind: PseudoKind,
     content: PseudoContent,
     origin_style: &ComputedStyle,
+    fonts: &dyn FontMetrics,
 ) {
     let pseudo_display = if content.style.get_str_by_index(props::DISPLAY)
         != origin_style.get_str_by_index(props::DISPLAY)
@@ -580,6 +582,8 @@ pub(crate) fn attach(
         root_fs,
         vp_w,
         vp_h,
+        fonts,
+        font_family_name(&content.style),
     );
     data.white_space = white_space_of(&content.style);
     data.text_transform = text_transform_of(&content.style);

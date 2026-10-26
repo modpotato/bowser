@@ -6552,14 +6552,20 @@ fn is_abspos_orthogonal_caption(bx: &LayoutBox, ancestors: &[&LayoutBox]) -> boo
 }
 
 /// Containing-block width for an abspos orthogonal caption's
-/// percentage margins: the nearest positioned ancestor's content
-/// width (its percentage padding against its padding-box width,
-/// the `used_auto_margins` approximation), or the viewport width
-/// when there is no positioned ancestor — or when the caption is
-/// fixed, whose containing block is the viewport (a transformed
-/// ancestor would change that; the published tree carries no
-/// transform, so this reads the viewport and the limitation stands
-/// documented, not silent). `None` unless
+/// percentage margins: for a FIXED caption, the viewport width (a
+/// transformed ancestor would change that; the published tree carries
+/// no transform, so this reads the viewport and the limitation stands
+/// documented, not silent); for an ABSOLUTE caption, the nearest
+/// positioned ancestor's content width (its percentage padding against
+/// its padding-box width, the `used_auto_margins` approximation), or
+/// the viewport width when there is no positioned ancestor. The
+/// branch is on the caption's OWN position (CSS 2.1 §10.1): a fixed
+/// ancestor is the containing block of an absolute caption, but never
+/// of a fixed one — the old loop returned the viewport on meeting a
+/// fixed ancestor and a positioned ancestor's box otherwise, which
+/// inverted both mixed cases (a fixed caption in a relative wrapper
+/// got the wrapper's width; an absolute caption under a fixed
+/// ancestor got the viewport). `None` unless
 /// [`is_abspos_orthogonal_caption`] holds.
 fn abspos_caption_cb_width(
     bx: &LayoutBox,
@@ -6573,7 +6579,15 @@ fn abspos_caption_cb_width(
         Some(CssValue::Keyword(k)) => k.eq_ignore_ascii_case(kw),
         _ => false,
     };
+    // The caption's own position decides first.
+    if let Some(style) = bx.style.as_deref()
+        && kw_is(style, "position", "fixed")
+    {
+        return Some(viewport_w);
+    }
     // Ancestors are outermost-first: search from the nearest out.
+    // Any non-static ancestor — relative, absolute, sticky, or fixed
+    // — is an absolute caption's containing block.
     for (i, anc) in ancestors.iter().enumerate().rev() {
         let astyle = match anc.style.as_deref() {
             Some(s) => s,
@@ -6581,9 +6595,6 @@ fn abspos_caption_cb_width(
         };
         if kw_is(astyle, "position", "static") {
             continue;
-        }
-        if kw_is(astyle, "position", "fixed") {
-            return Some(viewport_w);
         }
         // Relative, absolute, or sticky: the padding box of this
         // ancestor is the containing block.
@@ -16987,10 +16998,22 @@ const STYLE_PROPS: &[&str] = &[
     "margin-right",
     "margin-bottom",
     "margin-left",
+    // CSS Logical Properties 1: the flow-relative margin longhands
+    // (the `margin-inline`/`margin-block` shorthands serialize from
+    // these, like the physical pairs above).
+    "margin-inline-start",
+    "margin-inline-end",
+    "margin-block-start",
+    "margin-block-end",
     "padding-top",
     "padding-right",
     "padding-bottom",
     "padding-left",
+    // CSS Logical Properties 1: the flow-relative padding longhands.
+    "padding-inline-start",
+    "padding-inline-end",
+    "padding-block-start",
+    "padding-block-end",
     "border-top-width",
     "border-right-width",
     "border-bottom-width",
@@ -17014,9 +17037,17 @@ const STYLE_PROPS: &[&str] = &[
     "empty-cells",
     "color",
     "background-color",
+    // w78fix M4 (cascade slots landed by F-cascade): the color
+    // longhands `outline-color` and `text-decoration-color` have
+    // computed slots, so the live surface exposes them (like
+    // `color` above); their specified-style accessors were already
+    // in the curated table.
+    "outline-color",
+    "text-decoration-color",
     "font-family",
     "font-size",
     "font-style",
+    "font-variant",
     "font-weight",
     "line-height",
     "text-align",
@@ -17050,6 +17081,14 @@ const STYLE_PROPS: &[&str] = &[
     "scroll-padding-left",
     "scroll-snap-type",
     "scroll-snap-align",
+    // CSS Box Alignment 3 / CSS Flexible Box 1: `gap` serializes
+    // from `row-gap`/`column-gap`, and `flex` from its three
+    // longhands (each has its own computed slot in `bowser_css`).
+    "row-gap",
+    "column-gap",
+    "flex-grow",
+    "flex-shrink",
+    "flex-basis",
     "cursor",
 ];
 
@@ -18234,6 +18273,13 @@ fn n_get_computed_style(
         adjust_computed_props(&mut props, &adjust_ctx);
         reresolve_math_border_spacing(&mut props, style_attr, &adjust_ctx);
         synthesize_border_shorthands(&mut props);
+        // Every other computed shorthand serializes from its
+        // (already auto/percentage-resolved) longhands through the
+        // shared helper: `margin`/`padding`, their logical pairs,
+        // `gap`, `border`, `font`, and `flex` (w78fix H2). Without
+        // this the computed declaration answered those names with
+        // `""` even though every longhand was present.
+        synthesize_computed_shorthands(&mut props);
         props
     };
     let mut g = rc.borrow_mut();
@@ -21752,6 +21798,53 @@ fn style_decls_from_text(style: &str) -> Vec<(String, String)> {
         .collect()
 }
 
+/// Serialize a parsed declaration's value for the computed-value
+/// path: the canonical serializer, except that a math-bearing value
+/// keeps its raw specified text (the same `calc()` readability fix
+/// as [`decl_value_preserving_math`]). Crucially, named colors and
+/// `transparent` are NOT recovered as keywords here: computed values
+/// serialize colors canonically as rgb()/rgba() per CSSOM, so the
+/// detached-element computed fallback must use this, never
+/// [`style_decls_from_text`]. (w78fix3: the fallback previously
+/// shared the specified serializer, so `color: red` leaked the
+/// keyword `red` into computed `color` and, via the `currentcolor`
+/// substitution in [`adjust_computed_props`], into every
+/// `border-*-color`.)
+fn decl_value_canonical_preserving_math(
+    prop: &str,
+    value: &CssValue,
+    raw: &[(String, String)],
+    used: &mut [bool],
+) -> String {
+    if value_contains_math(value) {
+        for (i, (p, v)) in raw.iter().enumerate() {
+            if !used[i] && p == prop {
+                used[i] = true;
+                return v.clone();
+            }
+        }
+    }
+    css_value_to_string(value)
+}
+
+/// The computed-value counterpart of [`style_decls_from_text`]:
+/// parse a `style` attribute's declaration block into (property,
+/// value) pairs with canonical color serialization. Used only by
+/// the detached-element computed fallback ([`parse_computed_prop`]);
+/// the specified-style path keeps keyword preservation.
+fn computed_style_decls_from_text(style: &str) -> Vec<(String, String)> {
+    let raw = raw_decl_pairs(style);
+    let mut used = vec![false; raw.len()];
+    bowser_css::parse_declarations(style)
+        .into_iter()
+        .map(|d| {
+            let prop = d.property.as_str().to_string();
+            let val = decl_value_canonical_preserving_math(&prop, &d.value, &raw, &mut used);
+            (prop, val)
+        })
+        .collect()
+}
+
 fn serialize_style_decls(decls: &[(String, String)]) -> String {
     decls
         .iter()
@@ -21937,6 +22030,12 @@ fn value_contains_math(v: &CssValue) -> bool {
 /// written through `el.style` / `cssText` (e.g.
 /// `border-spacing: calc(10px + 0.5em) calc(10px - 0.5em)` read back
 /// as `0px`); the raw text reparses and resolves normally.
+///
+/// A named color or `transparent` gets the same raw-text treatment,
+/// but verified rather than verbatim (see
+/// [`specified_color_keyword`]): the keyword is returned only when
+/// it re-parses to exactly the parsed color, so hex and functional
+/// authorship keep the rgb()/rgba() form.
 fn decl_value_preserving_math(
     prop: &str,
     value: &CssValue,
@@ -21952,7 +22051,80 @@ fn decl_value_preserving_math(
             }
         }
     }
+    // Named colors / `transparent`: scan the unused raw entries for
+    // this property for one whose keyword(s) re-parse to the parsed
+    // color(s). Scanning (rather than taking the first unused entry)
+    // survives duplicate properties, where the first unused raw entry
+    // may belong to another declaration; a non-matching entry is left
+    // unused and the canonical serializer runs instead.
+    if matches!(value, CssValue::Color(_) | CssValue::List(_)) {
+        for (i, (p, v)) in raw.iter().enumerate() {
+            if !used[i]
+                && p == prop
+                && let Some(keyword) = specified_color_keyword(value, v)
+            {
+                used[i] = true;
+                return keyword;
+            }
+        }
+    }
     canonical(prop, value)
+}
+
+/// Recover a keyword-authored color for the specified-style
+/// declaration store. `CssValue::Color` has already folded named
+/// colors and `transparent` to RGBA at parse time, so the serializer
+/// alone cannot tell `aqua` from `cyan` or `#00ffff`: a reverse RGB
+/// lookup would misreport both. The raw declaration text can, but
+/// only when verified: a bare ident that re-parses (via
+/// `bowser_css::parse_css_color`) to exactly the parsed color is the
+/// authored keyword, lowercased per CSSOM. A hex or functional raw
+/// form fails the bare-ident gate and keeps rgb()/rgba(); a
+/// mismatched ident returns `None` and the caller falls through to
+/// the canonical serializer. This runs only on the specified-style
+/// path; the computed paths (`cssom_computed_value` to
+/// `css_value_to_string`, and the detached fallback via
+/// [`computed_style_decls_from_text`]) never call it and keep
+/// rgb()/rgba().
+fn specified_color_keyword(value: &CssValue, raw_text: &str) -> Option<String> {
+    fn keyword_for(color: &bowser_css::Color, token: &str) -> Option<String> {
+        let lower = token.to_ascii_lowercase();
+        if lower.is_empty() || !lower.bytes().all(|b| b.is_ascii_alphabetic()) {
+            return None;
+        }
+        if bowser_css::parse_css_color(&lower).as_ref() == Some(color) {
+            Some(lower)
+        } else {
+            None
+        }
+    }
+    match value {
+        CssValue::Color(c) => {
+            let tokens: Vec<&str> = raw_text.split_whitespace().collect();
+            match tokens.as_slice() {
+                [token] => keyword_for(c, token),
+                [token, important] if important.eq_ignore_ascii_case("!important") => {
+                    keyword_for(c, token)
+                }
+                _ => None,
+            }
+        }
+        CssValue::List(items) => {
+            let tokens: Vec<&str> = raw_text.split_whitespace().collect();
+            if tokens.len() != items.len() {
+                return None;
+            }
+            let mut out = Vec::with_capacity(items.len());
+            for (item, token) in items.iter().zip(tokens) {
+                match item {
+                    CssValue::Color(c) => out.push(keyword_for(c, token)?),
+                    _ => return None,
+                }
+            }
+            Some(out.join(" "))
+        }
+        _ => None,
+    }
 }
 
 fn parse_valid_style_decls(text: &str) -> Vec<(String, String)> {
@@ -22071,10 +22243,16 @@ parse_style_props! {
     ("max-width", n_parse_sp_get_max_width, n_parse_sp_set_max_width),
     ("min-height", n_parse_sp_get_min_height, n_parse_sp_set_min_height),
     ("max-height", n_parse_sp_get_max_height, n_parse_sp_set_max_height),
+    ("margin", n_parse_sp_get_margin, n_parse_sp_set_margin),
+    ("margin-inline", n_parse_sp_get_margin_inline, n_parse_sp_set_margin_inline),
+    ("margin-block", n_parse_sp_get_margin_block, n_parse_sp_set_margin_block),
     ("margin-top", n_parse_sp_get_margin_top, n_parse_sp_set_margin_top),
     ("margin-right", n_parse_sp_get_margin_right, n_parse_sp_set_margin_right),
     ("margin-bottom", n_parse_sp_get_margin_bottom, n_parse_sp_set_margin_bottom),
     ("margin-left", n_parse_sp_get_margin_left, n_parse_sp_set_margin_left),
+    ("padding", n_parse_sp_get_padding, n_parse_sp_set_padding),
+    ("padding-inline", n_parse_sp_get_padding_inline, n_parse_sp_set_padding_inline),
+    ("padding-block", n_parse_sp_get_padding_block, n_parse_sp_set_padding_block),
     ("padding-top", n_parse_sp_get_padding_top, n_parse_sp_set_padding_top),
     ("padding-right", n_parse_sp_get_padding_right, n_parse_sp_set_padding_right),
     ("padding-bottom", n_parse_sp_get_padding_bottom, n_parse_sp_set_padding_bottom),
@@ -22084,6 +22262,7 @@ parse_style_props! {
     ("caption-side", n_parse_sp_get_caption_side, n_parse_sp_set_caption_side),
     ("empty-cells", n_parse_sp_get_empty_cells, n_parse_sp_set_empty_cells),
     ("table-layout", n_parse_sp_get_table_layout, n_parse_sp_set_table_layout),
+    ("border", n_parse_sp_get_border, n_parse_sp_set_border),
     ("border-style", n_parse_sp_get_border_style, n_parse_sp_set_border_style),
     ("border-width", n_parse_sp_get_border_width, n_parse_sp_set_border_width),
     ("border-color", n_parse_sp_get_border_color, n_parse_sp_set_border_color),
@@ -22095,9 +22274,16 @@ parse_style_props! {
     ("border-right-width", n_parse_sp_get_border_right_width, n_parse_sp_set_border_right_width),
     ("border-bottom-width", n_parse_sp_get_border_bottom_width, n_parse_sp_set_border_bottom_width),
     ("border-left-width", n_parse_sp_get_border_left_width, n_parse_sp_set_border_left_width),
+    ("border-top-color", n_parse_sp_get_border_top_color, n_parse_sp_set_border_top_color),
+    ("border-right-color", n_parse_sp_get_border_right_color, n_parse_sp_set_border_right_color),
+    ("border-bottom-color", n_parse_sp_get_border_bottom_color, n_parse_sp_set_border_bottom_color),
+    ("border-left-color", n_parse_sp_get_border_left_color, n_parse_sp_set_border_left_color),
+    ("outline-color", n_parse_sp_get_outline_color, n_parse_sp_set_outline_color),
+    ("text-decoration-color", n_parse_sp_get_text_decoration_color, n_parse_sp_set_text_decoration_color),
     ("color", n_parse_sp_get_color, n_parse_sp_set_color),
     ("background-color", n_parse_sp_get_background_color, n_parse_sp_set_background_color),
     ("opacity", n_parse_sp_get_opacity, n_parse_sp_set_opacity),
+    ("font", n_parse_sp_get_font, n_parse_sp_set_font),
     ("font-size", n_parse_sp_get_font_size, n_parse_sp_set_font_size),
     ("font-style", n_parse_sp_get_font_style, n_parse_sp_set_font_style),
     ("font-weight", n_parse_sp_get_font_weight, n_parse_sp_set_font_weight),
@@ -22116,9 +22302,11 @@ parse_style_props! {
     ("overflow-y", n_parse_sp_get_overflow_y, n_parse_sp_set_overflow_y),
     ("cursor", n_parse_sp_get_cursor, n_parse_sp_set_cursor),
     ("z-index", n_parse_sp_get_z_index, n_parse_sp_set_z_index),
+    ("flex", n_parse_sp_get_flex, n_parse_sp_set_flex),
     ("flex-direction", n_parse_sp_get_flex_direction, n_parse_sp_set_flex_direction),
     ("justify-content", n_parse_sp_get_justify_content, n_parse_sp_set_justify_content),
     ("align-items", n_parse_sp_get_align_items, n_parse_sp_set_align_items),
+    ("gap", n_parse_sp_get_gap, n_parse_sp_set_gap),
     ("columns", n_parse_sp_get_columns, n_parse_sp_set_columns),
     ("column-count", n_parse_sp_get_column_count, n_parse_sp_set_column_count),
     ("scroll-snap-type", n_parse_sp_get_scroll_snap_type, n_parse_sp_set_scroll_snap_type),
@@ -22237,6 +22425,8 @@ fn el_style_get_named(heap: &mut Heap, this: Value, prop: &str) -> Result<Value,
         .find(|(n, _)| n == prop)
         .map(|(_, v)| v.clone())
         .or_else(|| synthesize_scroll_shorthand(&decls, prop))
+        .or_else(|| synthesize_compound_shorthand(&decls, prop))
+        .or_else(|| synthesize_extended_shorthand(&decls, prop))
         .unwrap_or_default();
     heap.alloc_str(&val)
         .map(Value::Str)
@@ -22331,10 +22521,16 @@ el_style_props! {
     ("max-width", n_el_sp_get_max_width, n_el_sp_set_max_width),
     ("min-height", n_el_sp_get_min_height, n_el_sp_set_min_height),
     ("max-height", n_el_sp_get_max_height, n_el_sp_set_max_height),
+    ("margin", n_el_sp_get_margin, n_el_sp_set_margin),
+    ("margin-inline", n_el_sp_get_margin_inline, n_el_sp_set_margin_inline),
+    ("margin-block", n_el_sp_get_margin_block, n_el_sp_set_margin_block),
     ("margin-top", n_el_sp_get_margin_top, n_el_sp_set_margin_top),
     ("margin-right", n_el_sp_get_margin_right, n_el_sp_set_margin_right),
     ("margin-bottom", n_el_sp_get_margin_bottom, n_el_sp_set_margin_bottom),
     ("margin-left", n_el_sp_get_margin_left, n_el_sp_set_margin_left),
+    ("padding", n_el_sp_get_padding, n_el_sp_set_padding),
+    ("padding-inline", n_el_sp_get_padding_inline, n_el_sp_set_padding_inline),
+    ("padding-block", n_el_sp_get_padding_block, n_el_sp_set_padding_block),
     ("padding-top", n_el_sp_get_padding_top, n_el_sp_set_padding_top),
     ("padding-right", n_el_sp_get_padding_right, n_el_sp_set_padding_right),
     ("padding-bottom", n_el_sp_get_padding_bottom, n_el_sp_set_padding_bottom),
@@ -22344,6 +22540,7 @@ el_style_props! {
     ("caption-side", n_el_sp_get_caption_side, n_el_sp_set_caption_side),
     ("empty-cells", n_el_sp_get_empty_cells, n_el_sp_set_empty_cells),
     ("table-layout", n_el_sp_get_table_layout, n_el_sp_set_table_layout),
+    ("border", n_el_sp_get_border, n_el_sp_set_border),
     ("border-style", n_el_sp_get_border_style, n_el_sp_set_border_style),
     ("border-width", n_el_sp_get_border_width, n_el_sp_set_border_width),
     ("border-color", n_el_sp_get_border_color, n_el_sp_set_border_color),
@@ -22355,9 +22552,16 @@ el_style_props! {
     ("border-right-width", n_el_sp_get_border_right_width, n_el_sp_set_border_right_width),
     ("border-bottom-width", n_el_sp_get_border_bottom_width, n_el_sp_set_border_bottom_width),
     ("border-left-width", n_el_sp_get_border_left_width, n_el_sp_set_border_left_width),
+    ("border-top-color", n_el_sp_get_border_top_color, n_el_sp_set_border_top_color),
+    ("border-right-color", n_el_sp_get_border_right_color, n_el_sp_set_border_right_color),
+    ("border-bottom-color", n_el_sp_get_border_bottom_color, n_el_sp_set_border_bottom_color),
+    ("border-left-color", n_el_sp_get_border_left_color, n_el_sp_set_border_left_color),
+    ("outline-color", n_el_sp_get_outline_color, n_el_sp_set_outline_color),
+    ("text-decoration-color", n_el_sp_get_text_decoration_color, n_el_sp_set_text_decoration_color),
     ("color", n_el_sp_get_color, n_el_sp_set_color),
     ("background-color", n_el_sp_get_background_color, n_el_sp_set_background_color),
     ("opacity", n_el_sp_get_opacity, n_el_sp_set_opacity),
+    ("font", n_el_sp_get_font, n_el_sp_set_font),
     ("font-size", n_el_sp_get_font_size, n_el_sp_set_font_size),
     ("font-style", n_el_sp_get_font_style, n_el_sp_set_font_style),
     ("font-weight", n_el_sp_get_font_weight, n_el_sp_set_font_weight),
@@ -22376,9 +22580,11 @@ el_style_props! {
     ("overflow-y", n_el_sp_get_overflow_y, n_el_sp_set_overflow_y),
     ("cursor", n_el_sp_get_cursor, n_el_sp_set_cursor),
     ("z-index", n_el_sp_get_z_index, n_el_sp_set_z_index),
+    ("flex", n_el_sp_get_flex, n_el_sp_set_flex),
     ("flex-direction", n_el_sp_get_flex_direction, n_el_sp_set_flex_direction),
     ("justify-content", n_el_sp_get_justify_content, n_el_sp_set_justify_content),
     ("align-items", n_el_sp_get_align_items, n_el_sp_set_align_items),
+    ("gap", n_el_sp_get_gap, n_el_sp_set_gap),
     ("columns", n_el_sp_get_columns, n_el_sp_set_columns),
     ("column-count", n_el_sp_get_column_count, n_el_sp_set_column_count),
     ("scroll-snap-type", n_el_sp_get_scroll_snap_type, n_el_sp_set_scroll_snap_type),
@@ -22535,13 +22741,19 @@ fn n_el_style_remove_property(
     args: &[Value],
 ) -> Result<Value, NativeError> {
     let name = el_style_prop_arg(heap, args)?;
+    // w78fix M1: the removed value is the SYNTHESIZED value, not
+    // just a directly stored declaration — mirroring the parse
+    // path (`n_parse_style_remove_property`, which reads through
+    // `parse_style_get_named`). The old direct lookup returned `""`
+    // for every shorthand (they are stored expanded), so
+    // `removeProperty('border-width')` after a `2px` set reported
+    // `""` instead of `2px`.
+    let old = match el_style_get_named(heap, this, &name)? {
+        Value::Str(s) => s.as_wtf8().to_string(),
+        _ => String::new(),
+    };
     let (rc, node, style) = el_style_attr(heap, this)?;
     let mut decls = el_style_decls(&style);
-    let old = decls
-        .iter()
-        .find(|(n, _)| n == &name)
-        .map(|(_, v)| v.clone())
-        .unwrap_or_default();
     // An empty apply is a pure removal: it drops the named property and
     // any longhands of a shorthand, mirroring the set path (so
     // `removeProperty('scroll-margin')` also clears the four
@@ -22652,7 +22864,12 @@ fn parse_style_get_named(heap: &mut Heap, this: Value, prop: &str) -> Result<Val
         .iter()
         .find(|(n, _)| n == prop)
         .map(|(_, v)| v.clone())
-        .unwrap_or_else(|| synthesize_scroll_shorthand(&decls, prop).unwrap_or_default());
+        .unwrap_or_else(|| {
+            synthesize_scroll_shorthand(&decls, prop)
+                .or_else(|| synthesize_compound_shorthand(&decls, prop))
+                .or_else(|| synthesize_extended_shorthand(&decls, prop))
+                .unwrap_or_default()
+        });
     heap.alloc_str(&val)
         .map(Value::Str)
         .map_err(|_| NativeError::OutOfMemory)
@@ -22671,24 +22888,392 @@ fn inset_shorthand_longhands(prop: &str) -> Option<&'static [&'static str]> {
     })
 }
 
+/// Longhands for the box shorthands added in wave 78, in CSS
+/// serialization order: the physical `margin`/`padding` (top, right,
+/// bottom, left), their logical pairs (`start`, `end`), and `gap`
+/// (`row-gap` first, then `column-gap` — the `gap` serialization
+/// order). The parser expands each of these at parse time (see
+/// `expand_box` / `expand_logical_sides` / `expand_gap` in
+/// `bowser_css`), so a shorthand set through the curated table is
+/// stored as these longhands and must be synthesized back on read.
+fn box_shorthand_longhands(prop: &str) -> Option<&'static [&'static str]> {
+    Some(match prop {
+        "margin" => &["margin-top", "margin-right", "margin-bottom", "margin-left"],
+        "padding" => &[
+            "padding-top",
+            "padding-right",
+            "padding-bottom",
+            "padding-left",
+        ],
+        "margin-inline" => &["margin-inline-start", "margin-inline-end"],
+        "margin-block" => &["margin-block-start", "margin-block-end"],
+        "padding-inline" => &["padding-inline-start", "padding-inline-end"],
+        "padding-block" => &["padding-block-start", "padding-block-end"],
+        "gap" => &["row-gap", "column-gap"],
+        _ => return None,
+    })
+}
+
+/// The twelve longhands `border` expands to (four sides times
+/// width/style/color), in side order. Used both to synthesize the
+/// shorthand on read and to clear it on an empty set.
+const BORDER_SHORTHAND_LONGHANDS: &[&str] = &[
+    "border-top-width",
+    "border-top-style",
+    "border-top-color",
+    "border-right-width",
+    "border-right-style",
+    "border-right-color",
+    "border-bottom-width",
+    "border-bottom-style",
+    "border-bottom-color",
+    "border-left-width",
+    "border-left-style",
+    "border-left-color",
+];
+
+/// The six longhands `font` expands to, in CSS Fonts 3 §3.2
+/// serialization order (style, variant, weight, size, line-height,
+/// family). The parser emits every longhand, resetting omitted ones
+/// to `normal`, so a shorthand-set `font` always has all six.
+const FONT_SHORTHAND_LONGHANDS: &[&str] = &[
+    "font-style",
+    "font-variant",
+    "font-weight",
+    "font-size",
+    "line-height",
+    "font-family",
+];
+
+/// The three longhands `flex` expands to, in serialization order.
+const FLEX_SHORTHAND_LONGHANDS: &[&str] = &["flex-grow", "flex-shrink", "flex-basis"];
+
+fn decl_value<'a>(decls: &'a [(String, String)], prop: &str) -> Option<&'a str> {
+    decls
+        .iter()
+        .find(|(n, _)| n == prop)
+        .map(|(_, v)| v.as_str())
+}
+
 /// Synthesize a box shorthand from its longhands for `getPropertyValue`
 /// (CSSOM: shorthands serialize from longhands; they are never stored
 /// as declarations). Covers the `scroll-margin`/`scroll-padding`
-/// family and the `inset` family (`inset`, `inset-block`,
-/// `inset-inline`). Returns `None` when the name is not a synthesized
-/// shorthand or any longhand is unset.
+/// family, the `inset` family (`inset`, `inset-block`,
+/// `inset-inline`), and the wave-78 box family (`margin`, `padding`,
+/// their logical pairs, and `gap`). Returns `None` when the name is
+/// not a synthesized shorthand or any longhand is unset. (The name is
+/// historical: the scroll family was the first synthesis here.)
 fn synthesize_scroll_shorthand(decls: &[(String, String)], prop: &str) -> Option<String> {
-    let longhands = scroll_shorthand_longhands(prop).or_else(|| inset_shorthand_longhands(prop))?;
+    let longhands = scroll_shorthand_longhands(prop)
+        .or_else(|| inset_shorthand_longhands(prop))
+        .or_else(|| box_shorthand_longhands(prop))?;
     let values: Vec<&str> = longhands
         .iter()
-        .map(|lh| {
-            decls
-                .iter()
-                .find(|(n, _)| n == *lh)
-                .map(|(_, v)| v.as_str())
-        })
+        .map(|lh| decl_value(decls, lh))
         .collect::<Option<Vec<_>>>()?;
     compress_box_shorthand(&values)
+}
+
+/// Whether `s` is a CSS-wide keyword (`inherit`, `initial`,
+/// `unset`, `revert`, `revert-layer`): the string form of
+/// `bowser_css`'s `is_css_wide_keyword`, for serialized values.
+fn is_css_wide_keyword_str(s: &str) -> bool {
+    matches!(
+        s.trim().to_ascii_lowercase().as_str(),
+        "inherit" | "initial" | "unset" | "revert" | "revert-layer"
+    )
+}
+
+/// The three `border` components agreed across all four sides
+/// (`width`, `style`, `color`), or `None` when a side differs or a
+/// longhand is missing — the one shape a single `border` value can
+/// represent.
+fn border_agreed_parts(decls: &[(String, String)]) -> Option<Vec<&str>> {
+    let mut parts = Vec::new();
+    for kind in ["width", "style", "color"] {
+        let mut values = Vec::new();
+        for side in ["top", "right", "bottom", "left"] {
+            values.push(decl_value(decls, &format!("border-{side}-{kind}"))?);
+        }
+        if values.iter().any(|v| v != &values[0]) {
+            return None;
+        }
+        parts.push(values[0]);
+    }
+    Some(parts)
+}
+
+/// Synthesize `border` from its twelve longhands: only when every
+/// side agrees on width, style, and color — the one shape a single
+/// `border` value can represent. Differing sides (or a missing
+/// longhand) yield `None`, per CSSOM (the shorthand is empty then).
+/// Components serialize as stored, in width/style/color order, in
+/// full: this is the COMPUTED-style form, where the longhands are
+/// always complete (a computed `border` reads `0px none rgb(...)`,
+/// not `none`). A lone CSS-wide keyword on every longhand reads
+/// back as that single keyword. The specified-style form is
+/// [`synthesize_border_shorthand_specified`], which drops
+/// initial-valued components.
+fn synthesize_border_shorthand(decls: &[(String, String)], prop: &str) -> Option<String> {
+    if prop != "border" {
+        return None;
+    }
+    let parts = border_agreed_parts(decls)?;
+    // A lone CSS-wide keyword on every longhand reads back as that
+    // single keyword; differing wide keywords (or a wide keyword
+    // mixed with a normal value) cannot combine, so the shorthand
+    // is empty (w78fix2 LOW1).
+    if parts.iter().any(|v| is_css_wide_keyword_str(v)) {
+        return if parts.iter().all(|v| *v == parts[0]) {
+            Some(parts[0].to_string())
+        } else {
+            None
+        };
+    }
+    Some(parts.join(" "))
+}
+
+/// Specified-style `border` synthesis (w78fix M2): like
+/// [`synthesize_border_shorthand`], but initial-valued components
+/// are dropped, per CSSOM shorthand serialization — `border: solid`
+/// expands at parse time to `medium`/`solid`/`currentcolor`, and
+/// reading it back must give `solid`, not the parser-injected
+/// defaults (likewise `red` for a color-only set, `2px` for a
+/// width-only set). An all-initial set reads `none`.
+fn synthesize_border_shorthand_specified(decls: &[(String, String)], prop: &str) -> Option<String> {
+    if prop != "border" {
+        return None;
+    }
+    let parts = border_agreed_parts(decls)?;
+    // A lone CSS-wide keyword on every longhand reads back as that
+    // single keyword; differing wide keywords (or a wide keyword
+    // mixed with a normal value) cannot combine, so the shorthand
+    // is empty (w78fix2 LOW1).
+    if parts.iter().any(|v| is_css_wide_keyword_str(v)) {
+        return if parts.iter().all(|v| *v == parts[0]) {
+            Some(parts[0].to_string())
+        } else {
+            None
+        };
+    }
+    let initials = ["medium", "none", "currentcolor"];
+    let kept: Vec<&str> = parts
+        .iter()
+        .zip(initials)
+        .filter(|(v, init)| *v != init)
+        .map(|(v, _)| *v)
+        .collect();
+    if kept.is_empty() {
+        Some("none".to_string())
+    } else {
+        Some(kept.join(" "))
+    }
+}
+
+/// Specified-style `border-<side>` synthesis (w78fix H3): the side's
+/// three longhands, with initial-valued components dropped like the
+/// full `border` form above.
+fn synthesize_border_side_shorthand(decls: &[(String, String)], prop: &str) -> Option<String> {
+    let side = match prop {
+        "border-top" => "top",
+        "border-right" => "right",
+        "border-bottom" => "bottom",
+        "border-left" => "left",
+        _ => return None,
+    };
+    let vals: Vec<&str> = ["width", "style", "color"]
+        .iter()
+        .map(|kind| decl_value(decls, &format!("border-{side}-{kind}")))
+        .collect::<Option<Vec<_>>>()?;
+    // Same wide-keyword rule as the full `border` form (w78fix2
+    // LOW1): differing wide keywords cannot combine.
+    if vals.iter().any(|v| is_css_wide_keyword_str(v)) {
+        return if vals.iter().all(|v| *v == vals[0]) {
+            Some(vals[0].to_string())
+        } else {
+            None
+        };
+    }
+    let initials = ["medium", "none", "currentcolor"];
+    let kept: Vec<&str> = vals
+        .iter()
+        .zip(initials)
+        .filter(|(v, init)| *v != init)
+        .map(|(v, _)| *v)
+        .collect();
+    if kept.is_empty() {
+        Some("none".to_string())
+    } else {
+        Some(kept.join(" "))
+    }
+}
+
+/// Specified-style `border-width`/`border-style`/`border-color`
+/// synthesis (w78fix H3): the four per-side longhands, compressed
+/// with the 1-4-value rule.
+fn synthesize_border_component_shorthand(decls: &[(String, String)], prop: &str) -> Option<String> {
+    let kind = match prop {
+        "border-width" => "width",
+        "border-style" => "style",
+        "border-color" => "color",
+        _ => return None,
+    };
+    let longs: Vec<String> = ["top", "right", "bottom", "left"]
+        .iter()
+        .map(|side| format!("border-{side}-{kind}"))
+        .collect();
+    let vals: Vec<&str> = longs
+        .iter()
+        .map(|lh| decl_value(decls, lh))
+        .collect::<Option<Vec<_>>>()?;
+    compress_box_shorthand(&vals)
+}
+
+/// Specified-style `overflow` synthesis (w78fix H3): from the two
+/// axes, a single value when they agree.
+fn synthesize_overflow_shorthand(decls: &[(String, String)], prop: &str) -> Option<String> {
+    if prop != "overflow" {
+        return None;
+    }
+    let x = decl_value(decls, "overflow-x")?;
+    let y = decl_value(decls, "overflow-y")?;
+    Some(if x == y {
+        x.to_string()
+    } else {
+        format!("{x} {y}")
+    })
+}
+
+/// Specified-style `columns` synthesis (w78fix H3): `<column-width>
+/// <column-count>`, with `auto` components dropped (`columns: 3`
+/// reads `3`, `columns: 200px` reads `200px`, both `auto` reads
+/// `auto`). A lone CSS-wide keyword reads back as itself.
+fn synthesize_columns_shorthand(decls: &[(String, String)], prop: &str) -> Option<String> {
+    if prop != "columns" {
+        return None;
+    }
+    let width = decl_value(decls, "column-width")?;
+    let count = decl_value(decls, "column-count")?;
+    // A lone CSS-wide keyword reads back as itself; a wide keyword
+    // on only one component (or differing wide keywords) cannot
+    // combine, so the shorthand is empty (w78fix2 LOW1).
+    if is_css_wide_keyword_str(width) || is_css_wide_keyword_str(count) {
+        return if width == count {
+            Some(width.to_string())
+        } else {
+            None
+        };
+    }
+    let mut parts = Vec::new();
+    if width != "auto" {
+        parts.push(width);
+    }
+    if count != "auto" {
+        parts.push(count);
+    }
+    if parts.is_empty() {
+        return Some("auto".to_string());
+    }
+    Some(parts.join(" "))
+}
+
+/// Specified-style shorthands beyond the scroll/box/compound
+/// families (w78fix H3): `border-width`/`border-style`/
+/// `border-color`, `overflow`, `border-<side>`, and `columns`.
+/// `None` for every other name.
+fn synthesize_extended_shorthand(decls: &[(String, String)], prop: &str) -> Option<String> {
+    synthesize_border_component_shorthand(decls, prop)
+        .or_else(|| synthesize_overflow_shorthand(decls, prop))
+        .or_else(|| synthesize_border_side_shorthand(decls, prop))
+        .or_else(|| synthesize_columns_shorthand(decls, prop))
+}
+
+/// Synthesize `font` from its six longhands, in CSS Fonts 3 §3.2
+/// order: optional style/variant/weight (dropped when `normal`),
+/// then `size[/line-height]` (line-height dropped when `normal`),
+/// then family. Requires all six longhands: a shorthand set always
+/// emits all six, while longhand-only sets leave the shorthand empty
+/// (conservative: never invent a font value from a partial set).
+fn synthesize_font_shorthand(decls: &[(String, String)], prop: &str) -> Option<String> {
+    if prop != "font" {
+        return None;
+    }
+    let vals: Vec<&str> = FONT_SHORTHAND_LONGHANDS
+        .iter()
+        .map(|lh| decl_value(decls, lh))
+        .collect::<Option<Vec<_>>>()?;
+    if vals.len() != FONT_SHORTHAND_LONGHANDS.len() {
+        return None;
+    }
+    // A lone CSS-wide keyword on every longhand reads back as that
+    // single keyword (the parser expands `font: inherit` per
+    // longhand; joining them would give six copies). Differing wide
+    // keywords (or a wide keyword mixed with normal values) cannot
+    // combine, so the shorthand is empty (w78fix2 LOW1).
+    if vals.iter().any(|v| is_css_wide_keyword_str(v)) {
+        return if vals.iter().all(|v| *v == vals[0]) {
+            Some(vals[0].to_string())
+        } else {
+            None
+        };
+    }
+    let (style, variant, weight, size, line_height, family) =
+        (vals[0], vals[1], vals[2], vals[3], vals[4], vals[5]);
+    let mut parts: Vec<&str> = Vec::new();
+    for v in [style, variant, weight] {
+        if v != "normal" {
+            parts.push(v);
+        }
+    }
+    if line_height == "normal" {
+        parts.push(size);
+    } else {
+        // `size/line-height` is one token in the shorthand grammar, so
+        // it is built as a single owned string below rather than two
+        // parts; keep the borrow alive via the joined string.
+        let sized = format!("{size}/{line_height}");
+        let mut out: Vec<String> = parts.iter().map(|s| s.to_string()).collect();
+        out.push(sized);
+        out.push(family.to_string());
+        return Some(out.join(" "));
+    }
+    parts.push(family);
+    Some(parts.join(" "))
+}
+
+/// Synthesize `flex` from its three longhands (`grow shrink basis`).
+/// The parser always emits all three for a shorthand set, so a
+/// missing longhand yields `None`.
+fn synthesize_flex_shorthand(decls: &[(String, String)], prop: &str) -> Option<String> {
+    if prop != "flex" {
+        return None;
+    }
+    let vals: Vec<&str> = FLEX_SHORTHAND_LONGHANDS
+        .iter()
+        .map(|lh| decl_value(decls, lh))
+        .collect::<Option<Vec<_>>>()?;
+    // A lone CSS-wide keyword on every longhand reads back as that
+    // single keyword, not three copies. Differing wide keywords (or
+    // a wide keyword mixed with normal values) cannot combine, so
+    // the shorthand is empty (w78fix2 LOW1).
+    if vals.iter().any(|v| is_css_wide_keyword_str(v)) {
+        return if vals.iter().all(|v| *v == vals[0]) {
+            Some(vals[0].to_string())
+        } else {
+            None
+        };
+    }
+    Some(vals.join(" "))
+}
+
+/// Synthesize any of the non-box shorthands (`border`, `font`,
+/// `flex`) from their longhands; `None` for every other name.
+/// Specified-style surface: `border` uses the initial-dropping form
+/// (see [`synthesize_border_shorthand_specified`]).
+fn synthesize_compound_shorthand(decls: &[(String, String)], prop: &str) -> Option<String> {
+    synthesize_border_shorthand_specified(decls, prop)
+        .or_else(|| synthesize_font_shorthand(decls, prop))
+        .or_else(|| synthesize_flex_shorthand(decls, prop))
 }
 
 /// CSSOM shortest serialization of a box shorthand from its longhand
@@ -22709,32 +23294,156 @@ fn compress_box_shorthand(values: &[&str]) -> Option<String> {
 
 /// Longhands for every shorthand the computed-style surfaces
 /// synthesize from longhands: the scroll-margin/scroll-padding family
-/// (see [`scroll_shorthand_longhands`]) plus the border box
-/// shorthands, in CSS 1-4-value order (top, right, bottom, left).
+/// (see [`scroll_shorthand_longhands`]), the box family (see
+/// [`box_shorthand_longhands`]: `margin`, `padding`, their logical
+/// pairs, `gap`), the border box shorthands, and the compound
+/// `border`/`font`/`flex` shorthands — in CSS serialization order.
+/// This is also the skip predicate for the computed maps: a name
+/// listed here never occupies a slot of its own, so the computed
+/// loops skip it and the synthesis below fills it in.
 fn computed_shorthand_longhands(prop: &str) -> Option<&'static [&'static str]> {
-    scroll_shorthand_longhands(prop).or_else(|| {
-        Some(match prop {
-            "border-width" => &[
-                "border-top-width",
-                "border-right-width",
-                "border-bottom-width",
-                "border-left-width",
-            ],
-            "border-style" => &[
-                "border-top-style",
-                "border-right-style",
-                "border-bottom-style",
-                "border-left-style",
-            ],
-            "border-color" => &[
-                "border-top-color",
-                "border-right-color",
-                "border-bottom-color",
-                "border-left-color",
-            ],
-            _ => return None,
+    scroll_shorthand_longhands(prop)
+        .or_else(|| box_shorthand_longhands(prop))
+        .or_else(|| {
+            Some(match prop {
+                "border-width" => &[
+                    "border-top-width",
+                    "border-right-width",
+                    "border-bottom-width",
+                    "border-left-width",
+                ],
+                "border-style" => &[
+                    "border-top-style",
+                    "border-right-style",
+                    "border-bottom-style",
+                    "border-left-style",
+                ],
+                "border-color" => &[
+                    "border-top-color",
+                    "border-right-color",
+                    "border-bottom-color",
+                    "border-left-color",
+                ],
+                "border" => BORDER_SHORTHAND_LONGHANDS,
+                "font" => FONT_SHORTHAND_LONGHANDS,
+                "flex" => FLEX_SHORTHAND_LONGHANDS,
+                _ => return None,
+            })
         })
-    })
+}
+
+/// Longhands for the `border-<side>` shorthands, in
+/// width/style/color order, for specified-style clearing.
+const BORDER_TOP_LONGHANDS: &[&str] = &["border-top-width", "border-top-style", "border-top-color"];
+const BORDER_RIGHT_LONGHANDS: &[&str] = &[
+    "border-right-width",
+    "border-right-style",
+    "border-right-color",
+];
+const BORDER_BOTTOM_LONGHANDS: &[&str] = &[
+    "border-bottom-width",
+    "border-bottom-style",
+    "border-bottom-color",
+];
+const BORDER_LEFT_LONGHANDS: &[&str] = &[
+    "border-left-width",
+    "border-left-style",
+    "border-left-color",
+];
+const OVERFLOW_LONGHANDS: &[&str] = &["overflow-x", "overflow-y"];
+const COLUMNS_LONGHANDS: &[&str] = &["column-width", "column-count"];
+
+/// Longhands for every shorthand the specified-style surface
+/// synthesizes or clears (w78fix H3/H4): the scroll, inset, and box
+/// families, the computed families above, plus `overflow`,
+/// `border-<side>`, and `columns`. The single source for both the
+/// empty-set clearing in [`style_apply_set`] and the deferred/wide
+/// clearing there, so synthesis and clearing cannot drift apart.
+fn specified_shorthand_longhands(prop: &str) -> Option<&'static [&'static str]> {
+    scroll_shorthand_longhands(prop)
+        .or_else(|| inset_shorthand_longhands(prop))
+        .or_else(|| box_shorthand_longhands(prop))
+        .or_else(|| computed_shorthand_longhands(prop))
+        .or(match prop {
+            "overflow" => Some(OVERFLOW_LONGHANDS),
+            "border-top" => Some(BORDER_TOP_LONGHANDS),
+            "border-right" => Some(BORDER_RIGHT_LONGHANDS),
+            "border-bottom" => Some(BORDER_BOTTOM_LONGHANDS),
+            "border-left" => Some(BORDER_LEFT_LONGHANDS),
+            "columns" => Some(COLUMNS_LONGHANDS),
+            _ => None,
+        })
+}
+
+/// Synthesize every computed-style shorthand from the longhands in
+/// `props`, shared by the live surface, the shim cascade path, and
+/// the shim fallback, so the three surfaces cannot drift (w78fix
+/// H1/H2): the box family (`margin`, `padding`, their logical
+/// pairs, `gap`), the scroll family, `border-width`/`border-style`/
+/// `border-color`, `overflow` from its axes, and the compound
+/// `border`/`font`/`flex` in full form (computed longhands are
+/// always complete, so no initial component is dropped here —
+/// unlike the specified-style synthesis).
+fn synthesize_computed_shorthands(props: &mut HashMap<String, String>) {
+    for shorthand in [
+        "scroll-margin",
+        "scroll-padding",
+        "scroll-margin-block",
+        "scroll-margin-inline",
+        "scroll-padding-block",
+        "scroll-padding-inline",
+        "margin",
+        "padding",
+        "margin-inline",
+        "margin-block",
+        "padding-inline",
+        "padding-block",
+        "gap",
+    ] {
+        let Some(longs) = computed_shorthand_longhands(shorthand) else {
+            continue;
+        };
+        let vals: Option<Vec<&str>> = longs
+            .iter()
+            .map(|lh| props.get(*lh).map(String::as_str))
+            .collect();
+        if let Some(vals) = vals
+            && let Some(short) = compress_box_shorthand(&vals)
+        {
+            props.insert(shorthand.to_string(), short);
+        }
+    }
+    synthesize_border_shorthands(props);
+    if let (Some(x), Some(y)) = (
+        props.get("overflow-x").cloned(),
+        props.get("overflow-y").cloned(),
+    ) {
+        props.insert(
+            "overflow".to_string(),
+            if x == y { x } else { format!("{x} {y}") },
+        );
+    }
+    for (shorthand, longs) in [
+        ("border", BORDER_SHORTHAND_LONGHANDS),
+        ("font", FONT_SHORTHAND_LONGHANDS),
+        ("flex", FLEX_SHORTHAND_LONGHANDS),
+    ] {
+        let decls: Vec<(String, String)> = longs
+            .iter()
+            .filter_map(|lh| props.get(*lh).map(|v| (lh.to_string(), v.clone())))
+            .collect();
+        if decls.len() != longs.len() {
+            continue;
+        }
+        let short = match shorthand {
+            "border" => synthesize_border_shorthand(&decls, shorthand),
+            "font" => synthesize_font_shorthand(&decls, shorthand),
+            _ => synthesize_flex_shorthand(&decls, shorthand),
+        };
+        if let Some(short) = short {
+            props.insert(shorthand.to_string(), short);
+        }
+    }
 }
 
 /// Longhands for the scroll-margin/scroll-padding shorthands, in
@@ -22774,16 +23483,50 @@ fn style_apply_set(decls: &mut Vec<(String, String)>, prop: &str, val: &str) {
     if val.trim().is_empty() {
         decls.retain(|(n, _)| n != prop);
         // Clearing a shorthand also clears the longhands it would set
-        // (WPT shorthand-testcommon round-trips through `length`).
-        if let Some(longhands) =
-            scroll_shorthand_longhands(prop).or_else(|| inset_shorthand_longhands(prop))
-        {
+        // (WPT shorthand-testcommon round-trips through `length`):
+        // the scroll/inset/box families, the compound `border`/
+        // `font`/`flex`, `border-width`/`border-style`/`border-color`,
+        // `overflow`, `border-<side>`, and `columns` (w78fix H3).
+        if let Some(longhands) = specified_shorthand_longhands(prop) {
             decls.retain(|(n, _)| !longhands.contains(&n.as_str()));
         }
     } else {
         // Validate the value against the property grammar.
         let checked = parse_valid_style_decls(&format!("{prop}: {val}"));
-        if !checked.is_empty() {
+        if checked.is_empty() {
+            // Defense (w78fix H4, kept by w78fix2 LOW2): a CSS-wide
+            // keyword on a shorthand whose parser expansion returned
+            // nothing must still clear the stale longhands rather
+            // than silently keeping the old value. (After the
+            // parser's wide-keyword expansions for
+            // `border`/`font`/`flex`/`columns`, this arm is only
+            // reached by shorthands the parser does not expand; an
+            // invalid non-wide value is still a no-op.) The set
+            // itself is stored as a deferred shorthand declaration
+            // (w78fix2 LOW2): clearing without storing would silently
+            // lose it, and the getters read a stored shorthand decl
+            // before synthesizing, so it reads back as the keyword.
+            if is_css_wide_keyword_str(val)
+                && let Some(longhands) = specified_shorthand_longhands(prop)
+            {
+                decls.retain(|(n, _)| !longhands.contains(&n.as_str()));
+                decls.retain(|(n, _)| n != prop);
+                decls.push((prop.to_string(), val.trim().to_ascii_lowercase()));
+            }
+        } else {
+            // A deferred set (a single declaration still named for
+            // the shorthand itself, e.g. `margin: var(--x)` — the
+            // parser keeps `var()`-containing shorthands unexpanded
+            // for the cascade) must clear the stale expanded
+            // longhands first (w78fix H4): otherwise the old
+            // longhands survive alongside the deferred shorthand
+            // declaration and read back as the old value.
+            if checked.len() == 1
+                && checked[0].0 == prop
+                && let Some(longhands) = specified_shorthand_longhands(prop)
+            {
+                decls.retain(|(n, _)| !longhands.contains(&n.as_str()));
+            }
             decls.retain(|(n, _)| n != prop);
             for (name, valid_val) in checked {
                 if let Some(slot) = decls.iter_mut().find(|(n, _)| n == &name) {
@@ -25333,28 +26076,13 @@ impl ParseLayoutHook {
         let style_attr = data.doc.get_attribute(node, "style");
         reresolve_math_border_spacing(&mut props, style_attr, &ctx);
         synthesize_border_shorthands(&mut props);
-        // The scroll shorthands serialize from their (adjusted)
-        // longhands too.
-        for shorthand in [
-            "scroll-margin",
-            "scroll-padding",
-            "scroll-margin-block",
-            "scroll-margin-inline",
-            "scroll-padding-block",
-            "scroll-padding-inline",
-        ] {
-            if let Some(longs) = scroll_shorthand_longhands(shorthand) {
-                let decls: Vec<(String, String)> = longs
-                    .iter()
-                    .filter_map(|lh| props.get(*lh).map(|v| (lh.to_string(), v.clone())))
-                    .collect();
-                if decls.len() == longs.len()
-                    && let Some(short) = synthesize_scroll_shorthand(&decls, shorthand)
-                {
-                    props.insert(shorthand.to_string(), short);
-                }
-            }
-        }
+        // Every other computed shorthand serializes from its
+        // (adjusted) longhands through the shared helper (w78fix
+        // H1): the scroll family, the box family, `gap`, `border`,
+        // `font`, and `flex`. The helper runs again at the end of
+        // this function, after the percentage/auto margin resolution
+        // below mutates the `margin-*` longhands.
+        synthesize_computed_shorthands(&mut props);
         // Used-value resolution for `height`/`width`: a computed `auto`
         // resolves to the used content-box dimension (CSSOM resolved
         // values). `ensure_layout` flushes the partial layout after any
@@ -25511,60 +26239,64 @@ impl ParseLayoutHook {
                 // Abspos orthogonal captions resolve against their
                 // own containing block, not the table span — the
                 // production `abspos_caption_cb_width` rule, adapted
-                // to the shim's ancestor chain: the nearest positioned
-                // ancestor's content width, else the shim viewport
-                // width (a fixed caption's block is the viewport).
-                // An ancestor without geometry is skipped outward:
-                // the pass that produced this element's geometry
+                // to the shim's ancestor chain. The branch is on the
+                // caption's OWN position (CSS 2.1 §10.1): a fixed
+                // caption's block is the viewport, whatever
+                // positioned ancestors intervene; an absolute
+                // caption's is its nearest positioned ancestor's
+                // content width, fixed ancestors included. An
+                // ancestor without geometry is skipped outward: the
+                // pass that produced this element's geometry
                 // normally covers its ancestors too.
                 let is_abspos =
                     kw(&computed, "position", "absolute") || kw(&computed, "position", "fixed");
                 let abspos_base = if is_orth && is_abspos {
-                    let mut found: Option<f32> = None;
-                    for &anc_el in chain.iter().skip(1) {
-                        let Some(anc_node) = data.arena_node.get(&anc_el.arena_index()).copied()
-                        else {
-                            continue;
-                        };
-                        let anc_computed = compute_style(
-                            &data.doc,
-                            anc_node,
-                            &sheet_refs,
-                            parse_ua_stylesheet(),
-                            &viewport,
-                        );
-                        if kw(&anc_computed, "position", "static") {
-                            continue;
-                        }
-                        if kw(&anc_computed, "position", "fixed") {
-                            found = Some(self.viewport.0 as f32);
-                            break;
-                        }
-                        if let Some(anc_geom) = self.ensure_layout(&mut *host, anc_el) {
-                            let pad_base =
-                                (anc_geom.rect.w - anc_geom.borders[1] - anc_geom.borders[3])
-                                    .max(0.0);
-                            let anc_font_px = computed_font_px_of(&anc_computed);
-                            let pad = |prop: &str| {
-                                resolve_pad_css_value(
-                                    anc_computed.get(prop),
-                                    pad_base,
-                                    anc_font_px,
-                                    &ctx,
-                                )
+                    if kw(&computed, "position", "fixed") {
+                        Some(self.viewport.0 as f32)
+                    } else {
+                        let mut found: Option<f32> = None;
+                        for &anc_el in chain.iter().skip(1) {
+                            let Some(anc_node) =
+                                data.arena_node.get(&anc_el.arena_index()).copied()
+                            else {
+                                continue;
                             };
-                            found = Some(
-                                (anc_geom.rect.w
-                                    - anc_geom.borders[1]
-                                    - anc_geom.borders[3]
-                                    - pad("padding-left")
-                                    - pad("padding-right"))
-                                .max(0.0),
+                            let anc_computed = compute_style(
+                                &data.doc,
+                                anc_node,
+                                &sheet_refs,
+                                parse_ua_stylesheet(),
+                                &viewport,
                             );
-                            break;
+                            if kw(&anc_computed, "position", "static") {
+                                continue;
+                            }
+                            if let Some(anc_geom) = self.ensure_layout(&mut *host, anc_el) {
+                                let pad_base =
+                                    (anc_geom.rect.w - anc_geom.borders[1] - anc_geom.borders[3])
+                                        .max(0.0);
+                                let anc_font_px = computed_font_px_of(&anc_computed);
+                                let pad = |prop: &str| {
+                                    resolve_pad_css_value(
+                                        anc_computed.get(prop),
+                                        pad_base,
+                                        anc_font_px,
+                                        &ctx,
+                                    )
+                                };
+                                found = Some(
+                                    (anc_geom.rect.w
+                                        - anc_geom.borders[1]
+                                        - anc_geom.borders[3]
+                                        - pad("padding-left")
+                                        - pad("padding-right"))
+                                    .max(0.0),
+                                );
+                                break;
+                            }
                         }
+                        Some(found.unwrap_or(self.viewport.0 as f32))
                     }
-                    Some(found.unwrap_or(self.viewport.0 as f32))
                 } else {
                     None
                 };
@@ -25633,6 +26365,10 @@ impl ParseLayoutHook {
                 }
             }
         }
+        // Re-synthesize after the margin resolution above: it
+        // rewrote the `margin-*` longhands, so the `margin`
+        // shorthand synthesized earlier would otherwise read stale.
+        synthesize_computed_shorthands(&mut props);
         Some(props)
     }
 
@@ -28147,10 +28883,32 @@ const PARSE_COMPUTED_PROPS: &[(&str, &str, bool)] = &[
     ("margin-right", "0px", false),
     ("margin-bottom", "0px", false),
     ("margin-left", "0px", false),
+    // w78fix H1: the box shorthands and their logical pairs (and
+    // `gap`/`border`/`font`/`flex` below) are synthesized from the
+    // longhands by `synthesize_computed_shorthands`, like
+    // `border-width`/`border-style`/`border-color` already were —
+    // without a row here the shim's computed object never exposes
+    // them (`margin in getComputedStyle` is false, and the value
+    // reads as `undefined`/`""`). The initial is the synthesis of
+    // the initial longhands, used only when synthesis cannot run.
+    ("margin", "0px", false),
+    ("margin-inline-start", "0px", false),
+    ("margin-inline-end", "0px", false),
+    ("margin-block-start", "0px", false),
+    ("margin-block-end", "0px", false),
+    ("margin-inline", "0px", false),
+    ("margin-block", "0px", false),
     ("padding-top", "0px", false),
     ("padding-right", "0px", false),
     ("padding-bottom", "0px", false),
     ("padding-left", "0px", false),
+    ("padding", "0px", false),
+    ("padding-inline-start", "0px", false),
+    ("padding-inline-end", "0px", false),
+    ("padding-block-start", "0px", false),
+    ("padding-block-end", "0px", false),
+    ("padding-inline", "0px", false),
+    ("padding-block", "0px", false),
     ("border-top-width", "0px", false),
     ("border-right-width", "0px", false),
     ("border-bottom-width", "0px", false),
@@ -28166,11 +28924,28 @@ const PARSE_COMPUTED_PROPS: &[(&str, &str, bool)] = &[
     ("border-width", "0px", false),
     ("border-style", "none", false),
     ("border-color", "currentcolor", false),
+    // The full `border` shorthand: synthesized in full form; the
+    // initial is `""` so a differing-sides element (where synthesis
+    // correctly yields nothing) does not fall back to a bogus value.
+    ("border", "", false),
     ("font-size", "16px", true),
     ("font-style", "normal", true),
+    ("font-variant", "normal", true),
     ("font-weight", "400", true),
     ("line-height", "normal", true),
     ("font-family", "sans-serif", true),
+    // `font` synthesis of the initial longhands (weight `400` is
+    // kept by the font synthesis, like any non-`normal` weight).
+    ("font", "400 16px sans-serif", true),
+    // `gap` from `row-gap`/`column-gap` (`normal`/`normal`), and
+    // `flex` from its initial longhands.
+    ("row-gap", "normal", false),
+    ("column-gap", "normal", false),
+    ("gap", "normal", false),
+    ("flex-grow", "0", false),
+    ("flex-shrink", "1", false),
+    ("flex-basis", "auto", false),
+    ("flex", "0 1 auto", false),
     ("text-align", "start", true),
     ("text-decoration", "none", false),
     ("text-transform", "none", true),
@@ -28257,13 +29032,24 @@ fn parse_computed_info(prop: &str) -> (&'static str, bool) {
     ("", false)
 }
 
-/// Inline specified value for `prop`, if any.
-fn parse_inline_decl(
+/// Inline value for `prop` on the computed-value path, if any.
+/// Deliberately NOT [`parse_style_decls`]: that is the specified
+/// style store, which preserves authored color keywords (`red`,
+/// `transparent`) per CSSOM, while computed values must serialize
+/// colors canonically (rgb()/rgba()). The computed fallback reads
+/// through [`computed_style_decls_from_text`] instead (w78fix3).
+fn parse_computed_inline_decl(
     host: &ScriptHost<'static, 'static, 'static>,
     el: ScriptElement,
     prop: &str,
 ) -> Option<String> {
-    parse_style_decls(host, el)
+    let style = host
+        .get_attributes(el)
+        .into_iter()
+        .find(|(n, _)| n.eq_ignore_ascii_case("style"))
+        .map(|(_, v)| v)
+        .unwrap_or_default();
+    computed_style_decls_from_text(&style)
         .into_iter()
         .find(|(n, _)| n == prop)
         .map(|(_, v)| v)
@@ -28289,7 +29075,7 @@ fn parse_computed_prop(
             None => initial.to_string(),
         }
     };
-    match parse_inline_decl(host, el, prop).as_deref() {
+    match parse_computed_inline_decl(host, el, prop).as_deref() {
         None | Some("") => {
             if inherited {
                 parent_computed(host)
@@ -28361,7 +29147,9 @@ fn parse_computed_fallback(
         if computed_shorthand_longhands(prop).is_some() {
             continue; // synthesized from the longhands below
         }
-        let val = if *prop == "display" && parse_inline_decl(host_ref, el, "display").is_none() {
+        let val = if *prop == "display"
+            && parse_computed_inline_decl(host_ref, el, "display").is_none()
+        {
             // No cascade on this path: the UA default stands in.
             parse_ua_display(&tag).to_string()
         } else {
@@ -28391,19 +29179,9 @@ fn parse_computed_fallback(
     };
     adjust_computed_props(&mut props, &ctx);
     synthesize_border_shorthands(&mut props);
-    for (prop, _initial, _inherited) in PARSE_COMPUTED_PROPS {
-        if let Some(longhands) = scroll_shorthand_longhands(prop) {
-            let decls: Vec<(String, String)> = longhands
-                .iter()
-                .filter_map(|lh| props.get(*lh).map(|v| (lh.to_string(), v.clone())))
-                .collect();
-            if decls.len() == longhands.len()
-                && let Some(short) = synthesize_scroll_shorthand(&decls, prop)
-            {
-                props.insert(prop.to_string(), short);
-            }
-        }
-    }
+    // Every other computed shorthand through the shared helper
+    // (w78fix H1), like the cascade path above.
+    synthesize_computed_shorthands(&mut props);
     props
 }
 
@@ -30962,6 +31740,96 @@ mod tests {
     }
 
     #[test]
+    fn computed_style_abspos_caption_cb_branches_on_own_position() {
+        // w78fix H1 (whole-codebase): CSS 2.1 §10.1 branches on the
+        // CAPTION's own position, not the ancestor's. A FIXED
+        // caption's containing block is the viewport even inside a
+        // relative wrapper (20% of 800 = 160, not 20% of the 400
+        // wrapper = 80); an ABSOLUTE caption's is its nearest
+        // positioned ancestor's padding box even when that ancestor
+        // is fixed (20% of the 300 fixed header = 60, not 20% of
+        // the 800 viewport = 160). The old loop returned the
+        // viewport on meeting a fixed ANCESTOR and a positioned
+        // ancestor's box otherwise, inverting both mixed cases.
+        let read = |html: &[u8]| -> String {
+            let (mut vm, _doc, ctx) = geometry_vm(html, "");
+            let r = node_list_str(
+                &mut vm,
+                "getComputedStyle(document.getElementById(\"c\")).marginLeft;",
+            );
+            remove_context(ContextId(ctx));
+            r
+        };
+        assert_eq!(
+            read(b"<html><head></head><body style=\"margin:0\"><div style=\"position:relative;width:400px\"><table style=\"writing-mode:vertical-lr;width:300px;height:200px\"><caption id=\"c\" style=\"writing-mode:horizontal-tb;height:50px;width:120px;position:fixed;left:0;top:0;margin-left:20%\">caption</caption></table></div></body></html>"),
+            "160px",
+            "fixed caption in a relative wrapper resolves against the viewport"
+        );
+        assert_eq!(
+            read(b"<html><head></head><body style=\"margin:0\"><div style=\"position:fixed;width:300px\"><table style=\"writing-mode:vertical-lr;width:300px;height:200px\"><caption id=\"c\" style=\"writing-mode:horizontal-tb;height:50px;width:120px;position:absolute;left:0;top:0;margin-left:20%\">caption</caption></table></div></body></html>"),
+            "60px",
+            "absolute caption under a fixed ancestor resolves against that ancestor"
+        );
+    }
+
+    #[test]
+    fn parse_gcs_abspos_caption_cb_branches_on_own_position() {
+        // Shim mirror of the production test above: the same two
+        // mixed cases through the parse shim's adapted rule.
+        let read = |html: &[u8]| -> String { shim_result(html) };
+        assert_eq!(
+            read(b"<html><body style=\"margin:0\">\
+              <div style=\"position:relative;width:400px\"><table style=\"writing-mode:vertical-lr;width:300px;height:200px\"><caption id=c style=\"writing-mode:horizontal-tb;height:50px;width:120px;position:fixed;left:0;top:0;margin-left:20%\">caption</caption></table></div>\
+              <script>globalThis.__result = getComputedStyle(document.getElementById('c')).marginLeft;</script>\
+              </body></html>"),
+            "160px",
+            "shim fixed caption in a relative wrapper resolves against the viewport"
+        );
+        assert_eq!(
+            read(b"<html><body style=\"margin:0\">\
+              <div style=\"position:fixed;width:300px\"><table style=\"writing-mode:vertical-lr;width:300px;height:200px\"><caption id=c style=\"writing-mode:horizontal-tb;height:50px;width:120px;position:absolute;left:0;top:0;margin-left:20%\">caption</caption></table></div>\
+              <script>globalThis.__result = getComputedStyle(document.getElementById('c')).marginLeft;</script>\
+              </body></html>"),
+            "60px",
+            "shim absolute caption under a fixed ancestor resolves against that ancestor"
+        );
+    }
+
+    #[test]
+    fn parse_gcs_new_shorthands_reach_computed_style() {
+        // w78fix H1/M3: the shim computed surface exposes the same
+        // new shorthands as the live surface. The margin/padding
+        // tests previously used only the live surface despite
+        // claiming the shim held too; this pins the shim directly,
+        // from inline style and from a script-set style (the
+        // concrete H1 case: `el.style.margin = '15px'` left
+        // `getComputedStyle(el).margin` undefined and
+        // `getPropertyValue('margin')` empty on the shim).
+        let r = shim_result(
+            b"<html><body><div id=t style=\"margin:15px; padding:2px 4px; margin-inline:3px 9px; gap:6px 8px; border:2px solid red; font:italic bold 12px serif; flex:2 3 10px\">x</div>\
+              <script>var g = getComputedStyle(document.getElementById('t'));\
+              globalThis.__result = [g.margin, g.padding, g.marginInline, g.gap, g.rowGap, g.border, g.font, g.flex, g.flexGrow].join('|');</script>\
+              </body></html>",
+        );
+        assert_eq!(
+            r,
+            // The later `margin-inline` overrides the physical
+            // sides (inline-start is the left side in ltr), so the
+            // physical `margin` reads `15px 9px 15px 3px`, not the
+            // `15px` the `margin` shorthand alone set.
+            "15px 9px 15px 3px|2px 4px|3px 9px|6px 8px|6px|2px solid rgb(255, 0, 0)|italic bold 12px serif|2 3 10px|2"
+        );
+        let r = shim_result(
+            b"<html><body><div id=t></div>\
+              <script>var t = document.getElementById('t'); t.style.margin = '15px';\
+              var g = getComputedStyle(t);\
+              globalThis.__result = [g.margin, g.getPropertyValue('margin')].join('|');</script>\
+              </body></html>",
+        );
+        assert_eq!(r, "15px|15px");
+    }
+
+    #[test]
     fn computed_style_pct_margin_ordinary_box_cb_width() {
         // Ordinary percentage margins resolve against the
         // containing-block width on the production path: 20% of the
@@ -32991,21 +33859,15 @@ mod tests {
         // unshifted flow footprint (bottom ~704) must not fold in —
         // only the shifted content (bottom ~404) counts.
         // The WPT point is the EQUALITY (nested contributes the same
-        // overflow as sibling), so that is asserted — but not
-        // vacuously: both extents must also land in a sane range.
-        // The numbers around this test have drifted apart and are
-        // reconciled here rather than collapsed: the measured value
-        // today is 403|403; the assertion this replaced was 404|404
-        // (already stale by 1px when it was weakened); the spec
-        // value with real font metrics would be 405; the ~404 in
-        // the comment above is the shifted content's geometric
-        // bottom, not a scroll extent. The 390..=420 band covers
-        // all three extent values (403 measured, 404 old, 405
-        // spec) while failing symmetric breakage: both 0, or both
-        // ~704 from the unshifted footprint folding back in. The
-        // normal->font-metrics fix is deferred to its own wave, so
-        // neither 403|403 (enshrines the wrong descent) nor 405|405
-        // (fails until the metrics fix lands) is asserted exactly.
+        // overflow as sibling), so that is asserted — and exactly:
+        // since the w78 line-height fix routes `normal` through the
+        // face's real typo metrics instead of the hardcoded 1.2em
+        // strut, the measured value is 405|405 (the spec value; the
+        // pre-fix 403|403 enshrined the wrong descent, and the ~404
+        // in the comment above is the shifted content's geometric
+        // bottom, not a scroll extent). 0 or ~704 would mean
+        // symmetric breakage (empty extents, or the unshifted
+        // footprint folding back in).
         let r = shim_result(
             b"<html><head><style>\
               .container { width: 10px; height: 10px; }\
@@ -33020,16 +33882,9 @@ mod tests {
               globalThis.__result = [n.scrollHeight, s.scrollHeight].join('|');</script>\
               </body></html>",
         );
+        assert_eq!(r, "405|405");
         let (nested, sibling) = r.split_once('|').expect("nested|sibling extents");
         assert_eq!(nested, sibling);
-        let nested_px: f32 = nested.parse().expect("nested extent parses");
-        let sibling_px: f32 = sibling.parse().expect("sibling extent parses");
-        for (label, px) in [("nested", nested_px), ("sibling", sibling_px)] {
-            assert!(
-                (390.0..=420.0).contains(&px),
-                "{label} scroll extent must be non-zero and near the 403 measured / 405 spec values, got {px} (0 or ~704 would mean symmetric breakage)"
-            );
-        }
     }
 
     #[test]
@@ -35372,6 +36227,1006 @@ mod tests {
         assert_eq!(computed_prop(&mut fx, el, "inset-block"), "5px");
         assert_eq!(computed_prop(&mut fx, el, "inset-inline"), "5px");
         assert_eq!(computed_prop(&mut fx, el, "inset"), "5px");
+    }
+
+    #[test]
+    fn style_margin_padding_shorthands_reach_computed_style() {
+        // Wave-78 sticky driver probe: `sticky.style.margin = '15px'`
+        // left `getComputedStyle(sticky).marginTop` at `"0px"` — the
+        // `margin`/`padding` shorthands were not in the curated
+        // `el_style_props!` table, so the assignment became a plain JS
+        // expando on the style object and never reached the `style`
+        // attribute / layout. The same holds for the parse shim.
+        let (mut vm, _doc) = computed_style_vm(
+            b"<html><body><div id=\"d\" style=\"position: sticky; top: 0;\">x</div></body></html>",
+        );
+        vm.eval("document.getElementById(\"d\").style.margin = \"15px\";")
+            .unwrap();
+        vm.eval("document.getElementById(\"d\").style.padding = \"2px 4px\";")
+            .unwrap();
+        assert_eq!(
+            node_list_str(
+                &mut vm,
+                "getComputedStyle(document.getElementById(\"d\")).marginTop;"
+            ),
+            "15px"
+        );
+        assert_eq!(
+            node_list_str(
+                &mut vm,
+                "getComputedStyle(document.getElementById(\"d\")).marginLeft;"
+            ),
+            "15px"
+        );
+        assert_eq!(
+            node_list_str(
+                &mut vm,
+                "getComputedStyle(document.getElementById(\"d\")).paddingTop;"
+            ),
+            "2px"
+        );
+        assert_eq!(
+            node_list_str(
+                &mut vm,
+                "getComputedStyle(document.getElementById(\"d\")).paddingRight;"
+            ),
+            "4px"
+        );
+        // Specified-style read-back synthesizes from the expanded
+        // longhands (1-4-value compression, like `inset`).
+        assert_eq!(
+            node_list_str(&mut vm, "document.getElementById(\"d\").style.margin;"),
+            "15px"
+        );
+        assert_eq!(
+            node_list_str(&mut vm, "document.getElementById(\"d\").style.padding;"),
+            "2px 4px"
+        );
+        // Computed shorthand synthesizes from the resolved longhands.
+        assert_eq!(
+            node_list_str(
+                &mut vm,
+                "getComputedStyle(document.getElementById(\"d\")).margin;"
+            ),
+            "15px"
+        );
+        // 4-value form: top/right/bottom/left in CSS order.
+        vm.eval("document.getElementById(\"d\").style.margin = \"1px 2px 3px 4px\";")
+            .unwrap();
+        assert_eq!(
+            node_list_str(
+                &mut vm,
+                "getComputedStyle(document.getElementById(\"d\")).marginBottom;"
+            ),
+            "3px"
+        );
+        assert_eq!(
+            node_list_str(&mut vm, "document.getElementById(\"d\").style.margin;"),
+            "1px 2px 3px 4px"
+        );
+        // Clearing the shorthand clears the longhands it set.
+        vm.eval("document.getElementById(\"d\").style.margin = \"\";")
+            .unwrap();
+        assert_eq!(
+            node_list_str(
+                &mut vm,
+                "getComputedStyle(document.getElementById(\"d\")).marginTop;"
+            ),
+            "0px"
+        );
+    }
+
+    #[test]
+    fn style_audited_shorthands_reach_specified_style() {
+        // Same drop-silently failure as `margin`/`padding`, found by
+        // the wave-78 audit: the logical margin/padding pairs, `gap`,
+        // `border`, `font`, and `flex` were all absent from the
+        // curated tables, so assignments became JS expandos and never
+        // reached the `style` attribute. Each expands at parse time
+        // (bowser_css) and synthesizes back on read.
+        let (mut vm, _doc) = computed_style_vm(b"<html><body><div id=\"d\">x</div></body></html>");
+        let el = "document.getElementById(\"d\")";
+        // Logical box shorthands: 1-2-value compression on read.
+        vm.eval(&format!("{el}.style.marginInline = \"3px 9px\";"))
+            .unwrap();
+        assert_eq!(
+            node_list_str(&mut vm, &format!("{el}.style.marginInline;")),
+            "3px 9px"
+        );
+        vm.eval(&format!("{el}.style.paddingBlock = \"5px\";"))
+            .unwrap();
+        assert_eq!(
+            node_list_str(&mut vm, &format!("{el}.style.paddingBlock;")),
+            "5px"
+        );
+        // `gap`: row first, column second.
+        vm.eval(&format!("{el}.style.gap = \"6px 8px\";")).unwrap();
+        assert_eq!(
+            node_list_str(&mut vm, &format!("{el}.style.gap;")),
+            "6px 8px"
+        );
+        // `border`: reaches the computed border longhands, and reads
+        // back when all sides agree.
+        vm.eval(&format!("{el}.style.border = \"2px solid red\";"))
+            .unwrap();
+        assert_eq!(
+            node_list_str(&mut vm, &format!("getComputedStyle({el}).borderTopWidth;")),
+            "2px"
+        );
+        assert_eq!(
+            node_list_str(&mut vm, &format!("{el}.style.border;")),
+            "2px solid rgb(255, 0, 0)"
+        );
+        // `font`: reaches the computed font size; specified read-back
+        // drops `normal` components and joins size/line-height.
+        vm.eval(&format!("{el}.style.font = \"italic bold 12px serif\";"))
+            .unwrap();
+        assert_eq!(
+            node_list_str(&mut vm, &format!("getComputedStyle({el}).fontSize;")),
+            "12px"
+        );
+        assert_eq!(
+            node_list_str(&mut vm, &format!("{el}.style.font;")),
+            "italic bold 12px serif"
+        );
+        vm.eval(&format!("{el}.style.font = \"12px/1.5 serif\";"))
+            .unwrap();
+        assert_eq!(
+            node_list_str(&mut vm, &format!("{el}.style.font;")),
+            "12px/1.5 serif"
+        );
+        // `flex`: grow/shrink/basis, with `none` expanding to `0 0 auto`.
+        vm.eval(&format!("{el}.style.flex = \"2 3 10px\";"))
+            .unwrap();
+        assert_eq!(
+            node_list_str(&mut vm, &format!("{el}.style.flex;")),
+            "2 3 10px"
+        );
+        vm.eval(&format!("{el}.style.flex = \"none\";")).unwrap();
+        assert_eq!(
+            node_list_str(&mut vm, &format!("{el}.style.flex;")),
+            "0 0 auto"
+        );
+        // Clearing a compound shorthand clears its longhands.
+        vm.eval(&format!("{el}.style.border = \"\";")).unwrap();
+        assert_eq!(node_list_str(&mut vm, &format!("{el}.style.border;")), "");
+    }
+
+    #[test]
+    fn get_computed_style_synthesizes_new_shorthands_and_m4_colors() {
+        // w78fix H2 + M4: the live computed surface exposes the
+        // newly curated shorthands and their longhands, and the
+        // outline/text-decoration color longhands whose cascade
+        // slots F-cascade landed. Specified `aqua` serializes to
+        // rgb() through `css_value_to_string`.
+        let (mut vm, _doc) = computed_style_vm(
+            b"<html><body><div id=\"d\" style=\"gap: 6px 8px; flex: 2 3 10px; font: italic bold 12px serif; margin-inline: 3px 9px; padding-block: 5px 7px; border: 2px solid red; outline-color: aqua; text-decoration-color: aqua;\">x</div></body></html>",
+        );
+        let gcs = "getComputedStyle(document.getElementById(\"d\"))";
+        assert_eq!(node_list_str(&mut vm, &format!("{gcs}.gap;")), "6px 8px");
+        assert_eq!(node_list_str(&mut vm, &format!("{gcs}.rowGap;")), "6px");
+        assert_eq!(node_list_str(&mut vm, &format!("{gcs}.columnGap;")), "8px");
+        assert_eq!(node_list_str(&mut vm, &format!("{gcs}.flex;")), "2 3 10px");
+        assert_eq!(node_list_str(&mut vm, &format!("{gcs}.flexGrow;")), "2");
+        assert_eq!(node_list_str(&mut vm, &format!("{gcs}.flexShrink;")), "3");
+        assert_eq!(node_list_str(&mut vm, &format!("{gcs}.flexBasis;")), "10px");
+        assert_eq!(
+            node_list_str(&mut vm, &format!("{gcs}.font;")),
+            "italic bold 12px serif"
+        );
+        assert_eq!(
+            node_list_str(&mut vm, &format!("{gcs}.marginInline;")),
+            "3px 9px"
+        );
+        assert_eq!(
+            node_list_str(&mut vm, &format!("{gcs}.marginInlineStart;")),
+            "3px"
+        );
+        assert_eq!(
+            node_list_str(&mut vm, &format!("{gcs}.marginInlineEnd;")),
+            "9px"
+        );
+        assert_eq!(
+            node_list_str(&mut vm, &format!("{gcs}.paddingBlock;")),
+            "5px 7px"
+        );
+        assert_eq!(
+            node_list_str(&mut vm, &format!("{gcs}.paddingBlockStart;")),
+            "5px"
+        );
+        assert_eq!(
+            node_list_str(&mut vm, &format!("{gcs}.paddingBlockEnd;")),
+            "7px"
+        );
+        assert_eq!(
+            node_list_str(&mut vm, &format!("{gcs}.border;")),
+            "2px solid rgb(255, 0, 0)"
+        );
+        assert_eq!(
+            node_list_str(&mut vm, &format!("{gcs}.borderWidth;")),
+            "2px"
+        );
+        assert_eq!(
+            node_list_str(&mut vm, &format!("{gcs}.outlineColor;")),
+            "rgb(0, 255, 255)"
+        );
+        assert_eq!(
+            node_list_str(&mut vm, &format!("{gcs}.textDecorationColor;")),
+            "rgb(0, 255, 255)"
+        );
+    }
+
+    #[test]
+    fn style_sibling_shorthands_synthesize_and_clear() {
+        // w78fix H3 (live): `border-width`/`border-style`/
+        // `border-color`, `overflow`, `border-<side>`, and
+        // `columns` were in the curated table but had no specified
+        // synthesis and no clearing: a set expanded at parse time
+        // and then read back `""`, and clearing left the expanded
+        // longhands in `cssText`/`length`.
+        let (mut vm, _doc) = computed_style_vm(b"<html><body><div id=\"d\">x</div></body></html>");
+        let el = "document.getElementById(\"d\")";
+        vm.eval(&format!("{el}.style.borderWidth = \"2px\";"))
+            .unwrap();
+        assert_eq!(
+            node_list_str(&mut vm, &format!("{el}.style.borderWidth;")),
+            "2px"
+        );
+        assert_eq!(node_list_str(&mut vm, &format!("{el}.style.length;")), "4");
+        vm.eval(&format!("{el}.style.borderWidth = \"\";")).unwrap();
+        assert_eq!(
+            node_list_str(&mut vm, &format!("{el}.style.borderWidth;")),
+            ""
+        );
+        assert_eq!(node_list_str(&mut vm, &format!("{el}.style.length;")), "0");
+        vm.eval(&format!("{el}.style.overflow = \"hidden auto\";"))
+            .unwrap();
+        assert_eq!(
+            node_list_str(&mut vm, &format!("{el}.style.overflow;")),
+            "hidden auto"
+        );
+        vm.eval(&format!("{el}.style.removeProperty('overflow');"))
+            .unwrap();
+        assert_eq!(node_list_str(&mut vm, &format!("{el}.style.length;")), "0");
+        vm.eval(&format!("{el}.style.borderTop = \"1px dotted blue\";"))
+            .unwrap();
+        assert_eq!(
+            node_list_str(&mut vm, &format!("{el}.style.borderTop;")),
+            "1px dotted rgb(0, 0, 255)"
+        );
+        vm.eval(&format!("{el}.style.borderTop = \"\";")).unwrap();
+        assert_eq!(node_list_str(&mut vm, &format!("{el}.style.length;")), "0");
+        vm.eval(&format!("{el}.style.columns = \"200px 3\";"))
+            .unwrap();
+        assert_eq!(
+            node_list_str(&mut vm, &format!("{el}.style.columns;")),
+            "200px 3"
+        );
+        vm.eval(&format!("{el}.style.columns = \"3\";")).unwrap();
+        assert_eq!(node_list_str(&mut vm, &format!("{el}.style.columns;")), "3");
+        vm.eval(&format!("{el}.style.columns = \"\";")).unwrap();
+        assert_eq!(node_list_str(&mut vm, &format!("{el}.style.length;")), "0");
+    }
+
+    #[test]
+    fn style_sibling_shorthands_synthesize_and_clear_shim() {
+        // Shim mirror of the live test above, through the shared
+        // `style_apply_set` path.
+        let r = shim_result(
+            b"<html><body><div id=t></div>\
+              <script>var t = document.getElementById('t'); var out = [];\
+              t.style.borderWidth = '2px';\
+              out.push(t.style.borderWidth === '2px' ? 'ok' : 'borderWidth->' + t.style.borderWidth);\
+              out.push(t.style.length === 4 ? 'ok' : 'len->' + t.style.length);\
+              t.style.borderWidth = '';\
+              out.push(t.style.length === 0 ? 'ok' : 'clear-len->' + t.style.length);\
+              t.style.overflow = 'hidden auto';\
+              out.push(t.style.overflow === 'hidden auto' ? 'ok' : 'overflow->' + t.style.overflow);\
+              t.style.removeProperty('overflow');\
+              out.push(t.style.length === 0 ? 'ok' : 'overflow-clear->' + t.style.length);\
+              t.style.borderTop = '1px dotted blue';\
+              out.push(t.style.borderTop === '1px dotted rgb(0, 0, 255)' ? 'ok' : 'borderTop->' + t.style.borderTop);\
+              t.style.borderTop = '';\
+              out.push(t.style.length === 0 ? 'ok' : 'borderTop-clear->' + t.style.length);\
+              t.style.columns = '200px 3';\
+              out.push(t.style.columns === '200px 3' ? 'ok' : 'columns->' + t.style.columns);\
+              t.style.columns = '';\
+              out.push(t.style.length === 0 ? 'ok' : 'columns-clear->' + t.style.length);\
+              globalThis.__result = out.join('|');</script>\
+              </body></html>",
+        );
+        let failures: Vec<&str> = r.split('|').filter(|s| *s != "ok").collect();
+        assert!(
+            failures.is_empty(),
+            "shim sibling-shorthand failures: {failures:?}"
+        );
+    }
+
+    #[test]
+    fn style_var_and_wide_keyword_shorthands_replace_stale() {
+        // w78fix H4 (live): a `var()` set must not leave stale
+        // expanded longhands behind, and a CSS-wide-keyword set on
+        // `border`/`font`/`flex` must replace the old value, not
+        // silently no-op.
+        let (mut vm, _doc) = computed_style_vm(b"<html><body><div id=\"d\">x</div></body></html>");
+        let el = "document.getElementById(\"d\")";
+        vm.eval(&format!("{el}.style.border = \"2px solid red\";"))
+            .unwrap();
+        vm.eval(&format!("{el}.style.border = \"inherit\";"))
+            .unwrap();
+        assert_eq!(
+            node_list_str(&mut vm, &format!("{el}.style.borderTopWidth;")),
+            "inherit"
+        );
+        assert_eq!(
+            node_list_str(&mut vm, &format!("{el}.style.border;")),
+            "inherit"
+        );
+        assert!(
+            !node_list_str(&mut vm, &format!("{el}.style.cssText;")).contains("red"),
+            "old red border survives a border: inherit set"
+        );
+        vm.eval(&format!("{el}.style.margin = \"15px\";")).unwrap();
+        vm.eval(&format!("{el}.style.margin = \"var(--x)\";"))
+            .unwrap();
+        assert_eq!(
+            node_list_str(&mut vm, &format!("{el}.style.marginTop;")),
+            ""
+        );
+        assert_eq!(
+            node_list_str(&mut vm, &format!("{el}.style.margin;")),
+            "var(--x)"
+        );
+        assert!(
+            !node_list_str(&mut vm, &format!("{el}.style.cssText;")).contains("margin-top: 15px"),
+            "stale margin-top survives a margin: var(--x) set"
+        );
+        vm.eval(&format!("{el}.style.font = \"italic 12px serif\";"))
+            .unwrap();
+        vm.eval(&format!("{el}.style.font = \"inherit\";")).unwrap();
+        assert_eq!(
+            node_list_str(&mut vm, &format!("{el}.style.font;")),
+            "inherit"
+        );
+        assert_eq!(
+            node_list_str(&mut vm, &format!("{el}.style.fontSize;")),
+            "inherit"
+        );
+        vm.eval(&format!("{el}.style.flex = \"2 3 10px\";"))
+            .unwrap();
+        vm.eval(&format!("{el}.style.flex = \"unset\";")).unwrap();
+        assert_eq!(
+            node_list_str(&mut vm, &format!("{el}.style.flex;")),
+            "unset"
+        );
+        // `flex-grow` is not a curated accessor (it is not in the
+        // 116-property table), so it is read via `getPropertyValue`,
+        // which still goes through the synthesized-aware getter.
+        assert_eq!(
+            node_list_str(
+                &mut vm,
+                &format!("{el}.style.getPropertyValue('flex-grow');")
+            ),
+            "unset"
+        );
+    }
+
+    #[test]
+    fn style_var_and_wide_keyword_shorthands_replace_stale_shim() {
+        // Shim mirror of the live test above.
+        let r = shim_result(
+            b"<html><body><div id=t></div>\
+              <script>var t = document.getElementById('t'); var out = [];\
+              t.style.border = '2px solid red'; t.style.border = 'inherit';\
+              out.push(t.style.borderTopWidth === 'inherit' ? 'ok' : 'border-wide-long->' + t.style.borderTopWidth);\
+              out.push(t.style.border === 'inherit' ? 'ok' : 'border-wide->' + t.style.border);\
+              out.push(t.style.cssText.indexOf('red') === -1 ? 'ok' : 'red-survives');\
+              t.style.margin = '15px'; t.style.margin = 'var(--x)';\
+              out.push(t.style.marginTop === '' ? 'ok' : 'marginTop-stale->' + t.style.marginTop);\
+              out.push(t.style.margin === 'var(--x)' ? 'ok' : 'margin-var->' + t.style.margin);\
+              t.style.font = 'italic 12px serif'; t.style.font = 'inherit';\
+              out.push(t.style.font === 'inherit' ? 'ok' : 'font-wide->' + t.style.font);\
+              t.style.flex = '2 3 10px'; t.style.flex = 'unset';\
+              out.push(t.style.flex === 'unset' ? 'ok' : 'flex-wide->' + t.style.flex);\
+              globalThis.__result = out.join('|');</script>\
+              </body></html>",
+        );
+        let failures: Vec<&str> = r.split('|').filter(|s| *s != "ok").collect();
+        assert!(failures.is_empty(), "shim var/wide failures: {failures:?}");
+    }
+
+    #[test]
+    fn style_remove_property_returns_synthesized_shorthand() {
+        // w78fix M1 (live): `removeProperty` returns the synthesized
+        // shorthand value, mirroring the shim; the old direct
+        // lookup returned `""` for every shorthand.
+        let (mut vm, _doc) = computed_style_vm(b"<html><body><div id=\"d\">x</div></body></html>");
+        let el = "document.getElementById(\"d\")";
+        vm.eval(&format!("{el}.style.borderWidth = \"2px\";"))
+            .unwrap();
+        assert_eq!(
+            node_list_str(
+                &mut vm,
+                &format!("{el}.style.removeProperty('border-width');")
+            ),
+            "2px"
+        );
+        vm.eval(&format!("{el}.style.margin = \"15px\";")).unwrap();
+        assert_eq!(
+            node_list_str(&mut vm, &format!("{el}.style.removeProperty('margin');")),
+            "15px"
+        );
+        vm.eval(&format!("{el}.style.overflow = \"hidden\";"))
+            .unwrap();
+        assert_eq!(
+            node_list_str(&mut vm, &format!("{el}.style.removeProperty('overflow');")),
+            "hidden"
+        );
+    }
+
+    #[test]
+    fn style_border_partial_forms_drop_initials() {
+        // w78fix M2 (live): a partial `border` set reads back
+        // without the parser-injected initial components (`medium`/
+        // `none`/`currentcolor`), and a full set is unchanged.
+        let (mut vm, _doc) = computed_style_vm(b"<html><body><div id=\"d\">x</div></body></html>");
+        let el = "document.getElementById(\"d\")";
+        for (set, expected) in [
+            ("solid", "solid"),
+            ("red", "rgb(255, 0, 0)"),
+            ("2px", "2px"),
+            ("none", "none"),
+            ("2px solid red", "2px solid rgb(255, 0, 0)"),
+        ] {
+            vm.eval(&format!("{el}.style.border = \"{set}\";")).unwrap();
+            assert_eq!(
+                node_list_str(&mut vm, &format!("{el}.style.border;")),
+                expected,
+                "border: {set}"
+            );
+        }
+        vm.eval(&format!("{el}.style.borderTop = \"solid\";"))
+            .unwrap();
+        assert_eq!(
+            node_list_str(&mut vm, &format!("{el}.style.borderTop;")),
+            "solid"
+        );
+    }
+
+    #[test]
+    fn curated_style_table_exposed_on_both_surfaces() {
+        // w78fix L1 (drift guard): every entry of the curated
+        // 116-property table must be a defined style accessor (not
+        // `undefined`) on BOTH the production and the parse-shim
+        // surfaces. The list is a copy of the table: if a macro
+        // entry is dropped from one surface, or the table grows
+        // without updating this guard, the test fails and forces
+        // the two lists back in sync.
+        let names = [
+            "display",
+            "visibility",
+            "position",
+            "top",
+            "right",
+            "bottom",
+            "left",
+            "inset",
+            "inset-block",
+            "inset-inline",
+            "inset-block-start",
+            "inset-block-end",
+            "inset-inline-start",
+            "inset-inline-end",
+            "float",
+            "clear",
+            "width",
+            "height",
+            "min-width",
+            "max-width",
+            "min-height",
+            "max-height",
+            "margin",
+            "margin-inline",
+            "margin-block",
+            "margin-top",
+            "margin-right",
+            "margin-bottom",
+            "margin-left",
+            "padding",
+            "padding-inline",
+            "padding-block",
+            "padding-top",
+            "padding-right",
+            "padding-bottom",
+            "padding-left",
+            "border-collapse",
+            "border-spacing",
+            "caption-side",
+            "empty-cells",
+            "table-layout",
+            "border",
+            "border-style",
+            "border-width",
+            "border-color",
+            "border-top",
+            "border-right",
+            "border-bottom",
+            "border-left",
+            "border-top-width",
+            "border-right-width",
+            "border-bottom-width",
+            "border-left-width",
+            "border-top-color",
+            "border-right-color",
+            "border-bottom-color",
+            "border-left-color",
+            "outline-color",
+            "text-decoration-color",
+            "color",
+            "background-color",
+            "opacity",
+            "font",
+            "font-size",
+            "font-style",
+            "font-weight",
+            "line-height",
+            "font-family",
+            "text-align",
+            "text-decoration",
+            "text-transform",
+            "white-space",
+            "vertical-align",
+            "letter-spacing",
+            "writing-mode",
+            "direction",
+            "overflow",
+            "overflow-x",
+            "overflow-y",
+            "cursor",
+            "z-index",
+            "flex",
+            "flex-direction",
+            "justify-content",
+            "align-items",
+            "gap",
+            "columns",
+            "column-count",
+            "scroll-snap-type",
+            "scroll-snap-align",
+            "scroll-snap-stop",
+            "scroll-margin",
+            "scroll-margin-top",
+            "scroll-margin-right",
+            "scroll-margin-bottom",
+            "scroll-margin-left",
+            "scroll-margin-block",
+            "scroll-margin-inline",
+            "scroll-margin-block-start",
+            "scroll-margin-block-end",
+            "scroll-margin-inline-start",
+            "scroll-margin-inline-end",
+            "scroll-padding",
+            "scroll-padding-top",
+            "scroll-padding-right",
+            "scroll-padding-bottom",
+            "scroll-padding-left",
+            "scroll-padding-block",
+            "scroll-padding-inline",
+            "scroll-padding-block-start",
+            "scroll-padding-block-end",
+            "scroll-padding-inline-start",
+            "scroll-padding-inline-end",
+            "scroll-initial-target",
+            "scrollbar-gutter",
+            "overflow-clip-margin",
+        ];
+        assert_eq!(names.len(), 116);
+        let (mut vm, _doc) = computed_style_vm(b"<html><body><div id=\"d\">x</div></body></html>");
+        let joined = names.join(",");
+        let missing = node_list_str(
+            &mut vm,
+            &format!(
+                "var s = document.getElementById(\"d\").style; \
+                 '{joined}'.split(',').filter(function(n) {{ return typeof s[n] === 'undefined'; }}).join(',');"
+            ),
+        );
+        assert_eq!(missing, "", "live surface missing style accessors");
+        let html = format!(
+            "<html><body><div id=t></div>\
+              <script>var s = document.getElementById('t').style; var names = '{joined}'.split(','); \
+              var bad = []; for (var i = 0; i < names.length; i++) {{ if (typeof s[names[i]] === 'undefined') bad.push(names[i]); }} \
+              globalThis.__result = bad.join(',');</script>\
+              </body></html>"
+        );
+        assert_eq!(
+            shim_result(html.as_bytes()),
+            "",
+            "shim surface missing style accessors"
+        );
+    }
+
+    #[test]
+    fn style_color_longhands_reach_specified_style() {
+        // colors-007 Family A: the six color longhands
+        // (`border-*-color`, `outline-color`,
+        // `text-decoration-color`) had no curated style accessor, so
+        // an assignment became a silent sloppy-mode expando and
+        // `getPropertyValue` read back `""` for every valid value
+        // (even `inherit`, which bypasses grammar validation). The
+        // parse shim is the surface the WPT driver exercises.
+        let r = shim_result(
+            b"<html><body><div id=t></div>\
+              <script>var t = document.getElementById('t'); var out = [];\
+              function check(prop, val, exp) {\
+                t.style[prop] = ''; t.style[prop] = val;\
+                var read = t.style.getPropertyValue(prop);\
+                out.push(read === exp ? 'ok' : prop + '=' + val + '->' + read + '!=' + exp);\
+              }\
+              check('border-top-color', '#ff0000', 'rgb(255, 0, 0)');\
+              check('border-right-color', 'rgb(0, 128, 0)', 'rgb(0, 128, 0)');\
+              check('border-bottom-color', '#00f', 'rgb(0, 0, 255)');\
+              check('border-left-color', '#1000', 'rgba(17, 0, 0, 0)');\
+              check('outline-color', '#000', 'rgb(0, 0, 0)');\
+              check('text-decoration-color', '#fff', 'rgb(255, 255, 255)');\
+              t.style.borderTopColor = '#00ff00';\
+              out.push(t.style.getPropertyValue('border-top-color') === 'rgb(0, 255, 0)' ? 'ok' : 'camel borderTopColor->' + t.style.getPropertyValue('border-top-color'));\
+              t.style.outlineColor = '#0000ff';\
+              out.push(t.style.outlineColor === 'rgb(0, 0, 255)' ? 'ok' : 'camel outlineColor->' + t.style.outlineColor);\
+              t.style.textDecorationColor = 'inherit';\
+              out.push(t.style.getPropertyValue('text-decoration-color') === 'inherit' ? 'ok' : 'inherit->' + t.style.getPropertyValue('text-decoration-color'));\
+              t.style['outline-color'] = '10px';\
+              out.push(t.style.getPropertyValue('outline-color') === 'rgb(0, 0, 255)' ? 'ok' : 'invalid kept->' + t.style.getPropertyValue('outline-color'));\
+              t.style['text-decoration-color'] = 'invalidValue';\
+              out.push(t.style.getPropertyValue('text-decoration-color') === 'inherit' ? 'ok' : 'invalid kept->' + t.style.getPropertyValue('text-decoration-color'));\
+              globalThis.__result = out.join('|');</script>\
+              </body></html>",
+        );
+        let failures: Vec<&str> = r.split('|').filter(|s| *s != "ok").collect();
+        assert!(failures.is_empty(), "color longhand failures: {failures:?}");
+    }
+
+    #[test]
+    fn style_color_longhands_live_surface() {
+        // Same six longhands through the production
+        // `Element.style` object: the live surface must agree with
+        // the parse shim (representative three; the shim test above
+        // covers all six).
+        let (mut vm, _doc) = computed_style_vm(b"<html><body><div id=\"d\">x</div></body></html>");
+        let el = "document.getElementById(\"d\")";
+        vm.eval(&format!("{el}.style.borderTopColor = \"#ff0000\";"))
+            .unwrap();
+        assert_eq!(
+            node_list_str(
+                &mut vm,
+                &format!("{el}.style.getPropertyValue(\"border-top-color\");")
+            ),
+            "rgb(255, 0, 0)"
+        );
+        vm.eval(&format!("{el}.style.outlineColor = \"#0000ff\";"))
+            .unwrap();
+        assert_eq!(
+            node_list_str(&mut vm, &format!("{el}.style.outlineColor;")),
+            "rgb(0, 0, 255)"
+        );
+        vm.eval(&format!("{el}.style.textDecorationColor = \"inherit\";"))
+            .unwrap();
+        assert_eq!(
+            node_list_str(
+                &mut vm,
+                &format!("{el}.style.getPropertyValue(\"text-decoration-color\");")
+            ),
+            "inherit"
+        );
+    }
+
+    #[test]
+    fn style_named_color_and_transparent_specified_vs_computed() {
+        // colors-007 Family B: a named color or `transparent` set on
+        // any of the 8 color props must read back as the keyword
+        // from specified style (`el.style`), while computed style
+        // keeps the rgb()/rgba() form. Fail-before: specified reads
+        // back `rgb(0, 255, 255)` / `rgba(0, 0, 0, 0)`.
+        let r = shim_result(
+            b"<html><body><div id=t></div>\
+              <script>var t = document.getElementById('t'); var out = [];\
+              function check(prop, val, exp) {\
+                t.style[prop] = ''; t.style[prop] = val;\
+                var read = t.style.getPropertyValue(prop);\
+                out.push(read === exp ? 'ok' : prop + '=' + val + '->' + read + '!=' + exp);\
+              }\
+              var props = ['color', 'background-color', 'border-top-color', 'border-right-color', 'border-bottom-color', 'border-left-color', 'outline-color', 'text-decoration-color'];\
+              for (var i = 0; i < props.length; i++) {\
+                check(props[i], 'aqua', 'aqua');\
+                check(props[i], 'transparent', 'transparent');\
+              }\
+              check('color', '#00ffff', 'rgb(0, 255, 255)');\
+              check('color', 'rgb(0, 255, 255)', 'rgb(0, 255, 255)');\
+              check('color', 'cyan', 'cyan');\
+              check('color', 'AQUA', 'aqua');\
+              t.style.color = ''; t.style.color = 'aqua';\
+              var read = t.style.getPropertyValue('color');\
+              t.style.color = read;\
+              out.push(t.style.getPropertyValue('color') === 'aqua' ? 'ok' : 'roundtrip->' + t.style.getPropertyValue('color'));\
+              globalThis.__result = out.join('|');</script>\
+              </body></html>",
+        );
+        let failures: Vec<&str> = r.split('|').filter(|s| *s != "ok").collect();
+        assert!(
+            failures.is_empty(),
+            "named-color specified failures: {failures:?}"
+        );
+    }
+
+    #[test]
+    fn computed_style_named_color_and_transparent_stay_rgb() {
+        // Companion to the specified-style test above: the computed
+        // path must NOT pick up the keyword form.
+        let (mut vm, _doc) = computed_style_vm(
+            b"<html><body><div id=\"d\" style=\"color:aqua;background-color:transparent;border-top-color:red\">x</div></body></html>",
+        );
+        assert_eq!(
+            node_list_str(
+                &mut vm,
+                "getComputedStyle(document.getElementById(\"d\")).color;"
+            ),
+            "rgb(0, 255, 255)"
+        );
+        assert_eq!(
+            node_list_str(
+                &mut vm,
+                "getComputedStyle(document.getElementById(\"d\")).backgroundColor;"
+            ),
+            "rgba(0, 0, 0, 0)"
+        );
+        assert_eq!(
+            node_list_str(
+                &mut vm,
+                "getComputedStyle(document.getElementById(\"d\")).borderTopColor;"
+            ),
+            "rgb(255, 0, 0)"
+        );
+    }
+
+    #[test]
+    fn specified_color_keyword_verifies_against_raw_text() {
+        // The keyword comes from the raw token only when it re-parses
+        // to exactly the parsed color: no reverse RGB lookup, so
+        // `aqua`/`cyan` collisions and hex authorship cannot leak.
+        let aqua = CssValue::Color(bowser_css::Color {
+            r: 0,
+            g: 255,
+            b: 255,
+            a: 255,
+        });
+        assert_eq!(
+            specified_color_keyword(&aqua, "aqua"),
+            Some("aqua".to_string())
+        );
+        assert_eq!(
+            specified_color_keyword(&aqua, "cyan"),
+            Some("cyan".to_string())
+        );
+        assert_eq!(
+            specified_color_keyword(&aqua, "AQUA"),
+            Some("aqua".to_string())
+        );
+        assert_eq!(specified_color_keyword(&aqua, "#00ffff"), None);
+        assert_eq!(specified_color_keyword(&aqua, "rgb(0, 255, 255)"), None);
+        assert_eq!(specified_color_keyword(&aqua, "red"), None);
+        let transparent = CssValue::Color(bowser_css::Color {
+            r: 0,
+            g: 0,
+            b: 0,
+            a: 0,
+        });
+        assert_eq!(
+            specified_color_keyword(&transparent, "transparent"),
+            Some("transparent".to_string())
+        );
+        assert_eq!(specified_color_keyword(&transparent, "black"), None);
+        let list = CssValue::List(vec![
+            aqua.clone(),
+            CssValue::Color(bowser_css::Color {
+                r: 255,
+                g: 0,
+                b: 0,
+                a: 255,
+            }),
+        ]);
+        assert_eq!(
+            specified_color_keyword(&list, "aqua red"),
+            Some("aqua red".to_string())
+        );
+        assert_eq!(specified_color_keyword(&list, "aqua"), None);
+        assert_eq!(specified_color_keyword(&list, "cyan blue"), None);
+    }
+
+    #[test]
+    fn computed_style_decls_serialize_colors_canonically() {
+        // w78fix3: the detached computed fallback must not inherit
+        // specified-style keyword preservation — `color: red` reads
+        // back as rgb() on the computed path while the specified
+        // store still keeps the keyword.
+        let style = "color: red; background-color: transparent; border-top-color: aqua";
+        assert_eq!(
+            computed_style_decls_from_text(style),
+            vec![
+                ("color".to_string(), "rgb(255, 0, 0)".to_string()),
+                (
+                    "background-color".to_string(),
+                    "rgba(0, 0, 0, 0)".to_string()
+                ),
+                (
+                    "border-top-color".to_string(),
+                    "rgb(0, 255, 255)".to_string()
+                ),
+            ]
+        );
+        assert_eq!(
+            style_decls_from_text(style),
+            vec![
+                ("color".to_string(), "red".to_string()),
+                ("background-color".to_string(), "transparent".to_string()),
+                ("border-top-color".to_string(), "aqua".to_string()),
+            ]
+        );
+    }
+
+    #[test]
+    fn shorthand_synthesis_edge_cases() {
+        // `border` synthesizes only when all sides agree.
+        let decls = |w: &str| {
+            let mut d = Vec::new();
+            for side in ["top", "right", "bottom", "left"] {
+                d.push((format!("border-{side}-width"), w.to_string()));
+                d.push((format!("border-{side}-style"), "solid".to_string()));
+                d.push((format!("border-{side}-color"), "red".to_string()));
+            }
+            d
+        };
+        assert_eq!(
+            synthesize_compound_shorthand(&decls("2px"), "border"),
+            Some("2px solid red".to_string())
+        );
+        let mut differing = decls("2px");
+        differing[0].1 = "3px".to_string();
+        assert_eq!(synthesize_compound_shorthand(&differing, "border"), None);
+        // `font` needs all six longhands; a partial set stays empty.
+        let mut font_decls = vec![
+            ("font-size".to_string(), "12px".to_string()),
+            ("font-family".to_string(), "serif".to_string()),
+        ];
+        assert_eq!(synthesize_compound_shorthand(&font_decls, "font"), None);
+        for (n, v) in [
+            ("font-style", "normal"),
+            ("font-variant", "normal"),
+            ("font-weight", "normal"),
+            ("line-height", "normal"),
+        ] {
+            font_decls.push((n.to_string(), v.to_string()));
+        }
+        assert_eq!(
+            synthesize_compound_shorthand(&font_decls, "font"),
+            Some("12px serif".to_string())
+        );
+        // `style_apply_set` expands and clears the new shorthands.
+        let mut decls = Vec::new();
+        style_apply_set(&mut decls, "margin-inline", "3px 9px");
+        assert!(decls.contains(&("margin-inline-start".to_string(), "3px".to_string())));
+        assert!(decls.contains(&("margin-inline-end".to_string(), "9px".to_string())));
+        style_apply_set(&mut decls, "margin-inline", "");
+        assert!(decls.is_empty());
+        let mut decls = Vec::new();
+        style_apply_set(&mut decls, "gap", "6px 8px");
+        assert!(decls.contains(&("row-gap".to_string(), "6px".to_string())));
+        assert!(decls.contains(&("column-gap".to_string(), "8px".to_string())));
+        style_apply_set(&mut decls, "gap", "");
+        assert!(decls.is_empty());
+    }
+
+    #[test]
+    fn mixed_wide_keywords_synthesize_empty() {
+        // LOW1: wide keywords cannot combine, so a shorthand whose
+        // longhands carry differing wide keywords must serialize as
+        // empty (None), never as a joined invalid value.
+        let border_mixed = |w: &str, s: &str, c: &str| {
+            let mut d = Vec::new();
+            for side in ["top", "right", "bottom", "left"] {
+                d.push((format!("border-{side}-width"), w.to_string()));
+                d.push((format!("border-{side}-style"), s.to_string()));
+                d.push((format!("border-{side}-color"), c.to_string()));
+            }
+            d
+        };
+        assert_eq!(
+            synthesize_compound_shorthand(&border_mixed("inherit", "initial", "unset"), "border"),
+            None
+        );
+        assert_eq!(
+            synthesize_compound_shorthand(&border_mixed("inherit", "inherit", "inherit"), "border"),
+            Some("inherit".to_string())
+        );
+        assert_eq!(
+            synthesize_border_shorthand(&border_mixed("inherit", "initial", "unset"), "border"),
+            None
+        );
+        let border_top_mixed = vec![
+            ("border-top-width".to_string(), "inherit".to_string()),
+            ("border-top-style".to_string(), "initial".to_string()),
+            ("border-top-color".to_string(), "unset".to_string()),
+        ];
+        assert_eq!(
+            synthesize_extended_shorthand(&border_top_mixed, "border-top"),
+            None
+        );
+        let columns_mixed = vec![
+            ("column-width".to_string(), "inherit".to_string()),
+            ("column-count".to_string(), "initial".to_string()),
+        ];
+        assert_eq!(
+            synthesize_extended_shorthand(&columns_mixed, "columns"),
+            None
+        );
+        let columns_same = vec![
+            ("column-width".to_string(), "unset".to_string()),
+            ("column-count".to_string(), "unset".to_string()),
+        ];
+        assert_eq!(
+            synthesize_extended_shorthand(&columns_same, "columns"),
+            Some("unset".to_string())
+        );
+        let font_mixed = vec![
+            ("font-style".to_string(), "inherit".to_string()),
+            ("font-variant".to_string(), "normal".to_string()),
+            ("font-weight".to_string(), "normal".to_string()),
+            ("font-size".to_string(), "12px".to_string()),
+            ("line-height".to_string(), "normal".to_string()),
+            ("font-family".to_string(), "serif".to_string()),
+        ];
+        assert_eq!(synthesize_compound_shorthand(&font_mixed, "font"), None);
+        let font_same: Vec<(String, String)> = FONT_SHORTHAND_LONGHANDS
+            .iter()
+            .map(|lh| (lh.to_string(), "inherit".to_string()))
+            .collect();
+        assert_eq!(
+            synthesize_compound_shorthand(&font_same, "font"),
+            Some("inherit".to_string())
+        );
+        let flex_mixed = vec![
+            ("flex-grow".to_string(), "inherit".to_string()),
+            ("flex-shrink".to_string(), "initial".to_string()),
+            ("flex-basis".to_string(), "unset".to_string()),
+        ];
+        assert_eq!(synthesize_compound_shorthand(&flex_mixed, "flex"), None);
+        let flex_same: Vec<(String, String)> = FLEX_SHORTHAND_LONGHANDS
+            .iter()
+            .map(|lh| (lh.to_string(), "revert".to_string()))
+            .collect();
+        assert_eq!(
+            synthesize_compound_shorthand(&flex_same, "flex"),
+            Some("revert".to_string())
+        );
+    }
+
+    #[test]
+    fn wide_keyword_shorthand_set_is_not_lost() {
+        // LOW2: setting a shorthand to a lone wide keyword must never
+        // silently drop the set. Today the parser expands it to the
+        // longhands, so this pins the observable property; if a
+        // future shorthand stops expanding, the wide-defense arm in
+        // `style_apply_set` stores it as a deferred declaration
+        // instead of clearing the stale longhands and losing it.
+        let mut decls = vec![("border-top-width".to_string(), "2px".to_string())];
+        style_apply_set(&mut decls, "border", "inherit");
+        assert!(
+            decls.contains(&("border".to_string(), "inherit".to_string()))
+                || decls
+                    .iter()
+                    .filter(|(n, v)| n.starts_with("border-") && v == "inherit")
+                    .count()
+                    >= 12,
+            "wide border set lost: {decls:?}"
+        );
     }
 
     #[test]
@@ -38852,7 +40707,10 @@ mod tests {
         let (mut vm, doc, ctx) = production_vm();
         // The scrollbar-gutter-dynamic-004 handshake shape: assigning an
         // unknown-to-JS property through the curated accessor writes
-        // the `style` attribute and reads back.
+        // the `style` attribute and reads back. (The `color` read
+        // below expects the keyword: colors-007 Family B fixed
+        // specified style to keep named colors instead of folding
+        // them to rgb(); hex authorship still reads back rgb().)
         vm.eval(
             "var de = document.documentElement; \
              de.style.scrollbarGutter = 'initial'; \
@@ -38860,7 +40718,7 @@ mod tests {
              if (de.style.getPropertyValue('scrollbar-gutter') !== 'initial') \
                  throw new Error('getPropertyValue'); \
              de.style.setProperty('color', 'red'); \
-             if (de.style.color !== 'rgb(255, 0, 0)') throw new Error('setProperty'); \
+             if (de.style.color !== 'red') throw new Error('setProperty'); \
              if (de.style.length !== 2) throw new Error('length: ' + de.style.length); \
              de.style.removeProperty('color'); \
              if (de.style.length !== 1) throw new Error('removeProperty'); \

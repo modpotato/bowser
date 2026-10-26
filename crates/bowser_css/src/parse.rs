@@ -1606,6 +1606,11 @@ fn expand_gap(value: CssValue, important: bool) -> Vec<Declaration> {
     if items.len() > 2 {
         return Vec::new(); // invalid: drop the declaration
     }
+    // A CSS-wide keyword cannot be combined with another value (the
+    // lone-keyword case below already copies it to both longhands).
+    if items.len() > 1 && items.iter().any(is_css_wide_keyword) {
+        return Vec::new(); // invalid: drop the declaration
+    }
     let row = items
         .first()
         .cloned()
@@ -1657,6 +1662,15 @@ fn expand_columns(value: CssValue, important: bool) -> Vec<Declaration> {
     let items = as_list(&value);
     if items.is_empty() || items.len() > 2 {
         return Vec::new(); // invalid: drop the declaration
+    }
+    // w78fix H4: a lone CSS-wide keyword expands per longhand, so
+    // `columns: inherit` is not a silent no-op.
+    if items.len() == 1 && is_css_wide_keyword(&items[0]) {
+        let kw = items[0].clone();
+        return vec![
+            decl(PropertyName::intern("column-width"), kw.clone(), important),
+            decl(PropertyName::intern("column-count"), kw, important),
+        ];
     }
     let auto = || CssValue::Keyword("auto".into());
     let mut width: Option<CssValue> = None;
@@ -1886,6 +1900,44 @@ fn expand_border_sides(prefixes: &[&str], value: CssValue, important: bool) -> V
     let mut width = None;
     let mut style = None;
     let mut color = None;
+    // w78fix H4: a lone CSS-wide keyword expands per longhand (as
+    // `expand_box` does), so `border: inherit` sets every border
+    // longhand to `inherit` instead of silently dropping the whole
+    // declaration. A wide keyword combined with other components is
+    // still invalid and drops, via the loop below.
+    if let [item] = as_list(&value).as_slice()
+        && is_css_wide_keyword(item)
+    {
+        let kw = item.clone();
+        let mut out = Vec::new();
+        let push_side = |prefix: &str, out: &mut Vec<Declaration>| {
+            out.push(decl(
+                PropertyName::from(format!("{prefix}-width")),
+                kw.clone(),
+                important,
+            ));
+            out.push(decl(
+                PropertyName::from(format!("{prefix}-style")),
+                kw.clone(),
+                important,
+            ));
+            out.push(decl(
+                PropertyName::from(format!("{prefix}-color")),
+                kw.clone(),
+                important,
+            ));
+        };
+        for prefix in prefixes {
+            if *prefix == "border" {
+                for side in ["top", "right", "bottom", "left"] {
+                    push_side(&format!("border-{side}"), &mut out);
+                }
+            } else {
+                push_side(prefix, &mut out);
+            }
+        }
+        return out;
+    }
     for item in as_list(&value) {
         match item {
             // Unitless zero is a valid `<length>` (CSS-wide rule), and a
@@ -2121,6 +2173,30 @@ fn parse_font_shorthand(toks: &[Token], important: bool) -> Option<Vec<Declarati
             decl(PropertyName::intern("font-size"), size, important),
             decl(PropertyName::intern("line-height"), line_height, important),
             decl(PropertyName::intern("font-family"), family, important),
+        ]);
+    }
+    // w78fix H4: a lone CSS-wide keyword expands per longhand (as
+    // `expand_box` does), so `font: inherit` sets every font
+    // longhand to `inherit` instead of silently dropping.
+    if t.len() == 1
+        && let Token::Ident(kw) = t[0]
+        && matches!(
+            kw.to_ascii_lowercase().as_str(),
+            "inherit" | "initial" | "unset" | "revert" | "revert-layer"
+        )
+    {
+        let wide = CssValue::Keyword(kw.to_ascii_lowercase().into());
+        return Some(vec![
+            decl(PropertyName::intern("font-style"), wide.clone(), important),
+            decl(
+                PropertyName::intern("font-variant"),
+                wide.clone(),
+                important,
+            ),
+            decl(PropertyName::intern("font-weight"), wide.clone(), important),
+            decl(PropertyName::intern("font-size"), wide.clone(), important),
+            decl(PropertyName::intern("line-height"), wide.clone(), important),
+            decl(PropertyName::intern("font-family"), wide, important),
         ]);
     }
     let mut i = 0;
@@ -2498,6 +2574,16 @@ fn expand_list_style(value: CssValue, important: bool) -> Vec<Declaration> {
 /// `expand_shorthand`).
 fn expand_flex(value: CssValue, important: bool) -> Vec<Declaration> {
     let items = as_list(&value);
+    // w78fix H4: a lone CSS-wide keyword expands per longhand, so
+    // `flex: inherit` is not a silent no-op.
+    if items.len() == 1 && is_css_wide_keyword(&items[0]) {
+        let kw = items[0].clone();
+        return vec![
+            decl(PropertyName::intern("flex-grow"), kw.clone(), important),
+            decl(PropertyName::intern("flex-shrink"), kw.clone(), important),
+            decl(PropertyName::intern("flex-basis"), kw, important),
+        ];
+    }
     // `flex: none` -> `0 0 auto`.
     if items.len() == 1
         && let CssValue::Keyword(k) = &items[0]
@@ -3946,6 +4032,39 @@ mod tests {
         );
         // An unknown function in size position still drops the shorthand.
         assert!(decls("p { font: frobnicate(12px) serif; }").is_empty());
+    }
+
+    #[test]
+    fn shorthand_wide_keyword_expansions() {
+        // w78fix H4: a lone CSS-wide keyword expands per longhand
+        // for `border`/`border-<side>`/`font`/`flex`/`columns` (and
+        // `gap`, which already copied it), instead of silently
+        // dropping the declaration. A wide keyword combined with
+        // other components is still invalid and drops.
+        let inherit = CssValue::Keyword("inherit".into());
+        let d = decls("p { border: inherit; }");
+        assert_eq!(d.len(), 12);
+        assert!(d.iter().all(|decl| decl.value == inherit));
+        let d = decls("p { border-top: inherit; }");
+        assert_eq!(d.len(), 3);
+        assert!(d.iter().all(|decl| decl.value == inherit));
+        let d = decls("p { font: inherit; }");
+        assert_eq!(d.len(), 6);
+        assert!(d.iter().all(|decl| decl.value == inherit));
+        let d = decls("p { flex: inherit; }");
+        assert_eq!(d.len(), 3);
+        assert!(d.iter().all(|decl| decl.value == inherit));
+        let d = decls("p { columns: inherit; }");
+        assert_eq!(d.len(), 2);
+        assert!(d.iter().all(|decl| decl.value == inherit));
+        let d = decls("p { gap: inherit; }");
+        assert_eq!(d.len(), 2);
+        assert!(d.iter().all(|decl| decl.value == inherit));
+        assert!(decls("p { border: inherit solid; }").is_empty());
+        assert!(decls("p { flex: inherit 1; }").is_empty());
+        assert!(decls("p { font: inherit 12px serif; }").is_empty());
+        assert!(decls("p { gap: inherit 10px; }").is_empty());
+        assert!(decls("p { columns: inherit 3; }").is_empty());
     }
 
     #[test]

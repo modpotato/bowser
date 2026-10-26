@@ -25,7 +25,7 @@ use super::style::{
     Clear, DEFAULT_ROOT_FONT_SIZE, Display, Float, Position, SpecLen, SpecMargin, StyleData,
     TextTransform, compute_element_style, display_of, resolve_font_size, sane_len,
 };
-use super::{BoxType, IntrinsicDims, Rect};
+use super::{BoxType, FontMetrics, IntrinsicDims, Rect};
 use bowser_css::{ComputedStyle, Styler, Stylesheet, Viewport, props};
 use bowser_dom::{Document, NodeId, NodeKind, QuirksMode};
 use std::borrow::Cow;
@@ -1563,6 +1563,12 @@ fn collect_children(doc: &Document, node: NodeId, buf: &mut Vec<NodeId>) {
 ///
 /// `intrinsics` maps DOM nodes of replaced elements (`<img>` etc.) to
 /// their intrinsic sizes; see [`is_replaced_tag`].
+///
+/// Test-only entry: the placeholder metrics return exactly 1.2em for
+/// `line-height: normal`, so box-tree tests keep their exact
+/// historical values. Production entries pass the real backend
+/// through `build_box_tree_with_fonts` instead.
+#[cfg(test)]
 pub(crate) fn build_box_tree(
     doc: &Document,
     author: &[&Stylesheet],
@@ -1571,16 +1577,40 @@ pub(crate) fn build_box_tree(
     vp_h: f32,
     intrinsics: &HashMap<NodeId, IntrinsicDims>,
 ) -> Option<(Forest, usize)> {
-    build_box_tree_rooted(doc, author, ua, vp_w, vp_h, intrinsics, None)
+    build_box_tree_rooted(
+        doc,
+        author,
+        ua,
+        vp_w,
+        vp_h,
+        intrinsics,
+        None,
+        &crate::FixedFontMetrics,
+    )
+}
+
+/// Like [`build_box_tree`], but `line-height: normal` resolves
+/// through `fonts` (see [`super::style::resolve_line_height`]).
+pub(crate) fn build_box_tree_with_fonts(
+    doc: &Document,
+    author: &[&Stylesheet],
+    ua: &Stylesheet,
+    vp_w: f32,
+    vp_h: f32,
+    intrinsics: &HashMap<NodeId, IntrinsicDims>,
+    fonts: &dyn FontMetrics,
+) -> Option<(Forest, usize)> {
+    build_box_tree_rooted(doc, author, ua, vp_w, vp_h, intrinsics, None, fonts)
 }
 
 /// Build the box tree for the subtree rooted at `subtree_root` only
-/// (wave 51 incremental layout): the same passes as [`build_box_tree`],
-/// but the forest root is `subtree_root`'s box and only its descendants
-/// are built. Returns `None` when the subtree has no rendered root
-/// (not an element, a `<template>`, detached, `display: none` on the
-/// root or on any ancestor — an ancestor's `display: none` suppresses
-/// the whole subtree in a whole-document pass too).
+/// (wave 51 incremental layout): the same passes as
+/// [`build_box_tree_with_fonts`], but the forest root is
+/// `subtree_root`'s box and only its descendants are built. Returns
+/// `None` when the subtree has no rendered root (not an element, a
+/// `<template>`, detached, `display: none` on the root or on any
+/// ancestor — an ancestor's `display: none` suppresses the whole
+/// subtree in a whole-document pass too).
 ///
 /// Inherited style context is *not* approximated: the ancestor chain
 /// from the document element down to `subtree_root`'s parent is styled
@@ -1590,7 +1620,14 @@ pub(crate) fn build_box_tree(
 /// comes from the document element (so `rem` inside the subtree means
 /// what it means in the full tree). Everything below the root is
 /// byte-for-byte the whole-document construction.
-pub(crate) fn build_box_tree_subtree(
+///
+/// `line-height: normal` resolves through `fonts` (see
+/// [`super::style::resolve_line_height`]).
+// Mirrors the whole-document entry's argument set plus the subtree
+// root and the font backend: the established shape for this crate's
+// box-tree entries, hence the argument count.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn build_box_tree_subtree_with_fonts(
     doc: &Document,
     author: &[&Stylesheet],
     ua: &Stylesheet,
@@ -1598,8 +1635,18 @@ pub(crate) fn build_box_tree_subtree(
     vp_h: f32,
     intrinsics: &HashMap<NodeId, IntrinsicDims>,
     subtree_root: NodeId,
+    fonts: &dyn FontMetrics,
 ) -> Option<(Forest, usize)> {
-    build_box_tree_rooted(doc, author, ua, vp_w, vp_h, intrinsics, Some(subtree_root))
+    build_box_tree_rooted(
+        doc,
+        author,
+        ua,
+        vp_w,
+        vp_h,
+        intrinsics,
+        Some(subtree_root),
+        fonts,
+    )
 }
 
 /// Count the DOM nodes under `root` (inclusive) for arena pre-sizing.
@@ -1630,6 +1677,10 @@ fn count_dom_nodes(doc: &Document, root: NodeId) -> usize {
     count
 }
 
+// Mirrors the whole-document entry's argument set plus the subtree
+// root and the font backend: the established shape for this crate's
+// box-tree entries, hence the argument count.
+#[allow(clippy::too_many_arguments)]
 fn build_box_tree_rooted(
     doc: &Document,
     author: &[&Stylesheet],
@@ -1638,6 +1689,7 @@ fn build_box_tree_rooted(
     vp_h: f32,
     intrinsics: &HashMap<NodeId, IntrinsicDims>,
     subtree_root: Option<NodeId>,
+    fonts: &dyn FontMetrics,
 ) -> Option<(Forest, usize)> {
     let doc_root_el = doc.document_element()?;
     let root_el = match subtree_root {
@@ -1707,8 +1759,9 @@ fn build_box_tree_rooted(
             if ancestor == doc_root_el {
                 parent_fs = root_fs;
             } else {
-                parent_fs = StyleData::from_style(&style, display, parent_fs, root_fs, vp_w, vp_h)
-                    .font_size;
+                parent_fs =
+                    StyleData::from_style(&style, display, parent_fs, root_fs, vp_w, vp_h, fonts)
+                        .font_size;
             }
             parent_rtl = direction_rtl(&style, parent_rtl);
             parent_bidi = bidi_plaintext(&style, parent_bidi, display);
@@ -1747,8 +1800,15 @@ fn build_box_tree_rooted(
         union_frag_visits: 0,
     };
 
-    let mut root_data =
-        StyleData::from_style(&root_style, root_display, parent_fs, root_fs, vp_w, vp_h);
+    let mut root_data = StyleData::from_style(
+        &root_style,
+        root_display,
+        parent_fs,
+        root_fs,
+        vp_w,
+        vp_h,
+        fonts,
+    );
     root_data.rtl = direction_rtl(&root_style, parent_rtl);
     root_data.bidi_plaintext = bidi_plaintext(&root_style, parent_bidi, root_display);
     let root_box_type = match root_data.display {
@@ -1905,6 +1965,7 @@ fn build_box_tree_rooted(
                         root_fs,
                         vp_w,
                         vp_h,
+                        fonts,
                     );
                     let (fs, ws, tt) = (data.font_size, data.white_space, data.text_transform);
                     let rtl = direction_rtl(&style, item.rtl);
@@ -1926,8 +1987,15 @@ fn build_box_tree_rooted(
                     }
                     continue;
                 }
-                let mut data =
-                    StyleData::from_style(&style, display, item.inherit_fs, root_fs, vp_w, vp_h);
+                let mut data = StyleData::from_style(
+                    &style,
+                    display,
+                    item.inherit_fs,
+                    root_fs,
+                    vp_w,
+                    vp_h,
+                    fonts,
+                );
                 data.rtl = direction_rtl(&style, item.rtl);
                 // A block container derives this from its own computed
                 // `unicode-bidi` alone; an inline box shares its
@@ -2018,7 +2086,15 @@ fn build_box_tree_rooted(
                             super::marker::spec_for(doc, &styler, item.dom, s)
                         };
                         if let Some(spec) = spec {
-                            super::marker::attach(&mut forest, idx, spec, root_fs, vp_w, vp_h);
+                            super::marker::attach(
+                                &mut forest,
+                                idx,
+                                spec,
+                                root_fs,
+                                vp_w,
+                                vp_h,
+                                fonts,
+                            );
                         }
                     }
                 }
@@ -2217,7 +2293,7 @@ fn build_box_tree_rooted(
             .as_ref()
             .expect("style just set")
             .clone();
-        super::pseudo::attach(&mut forest, idx, kind, content, &origin_style);
+        super::pseudo::attach(&mut forest, idx, kind, content, &origin_style, fonts);
     }
 
     // Pass 2: an inline box containing block-level children becomes a block
@@ -2269,18 +2345,27 @@ fn build_box_tree_rooted(
             .any(|&c| is_block_level(forest.nodes[c].box_type));
         if needs_wrap {
             let parent_data = forest.nodes[i].data.clone();
-            // w77g: a flex container's inline-table children blockify
-            // (css-flexbox-1 §4) instead of being swept into the
-            // anonymous wrapper below: the wrapper is style-less, so
-            // the table's `flex-basis`/margins would never reach the
-            // item. This is trigger one of two (see the joint note
-            // on `wrap_flex_text_runs` in `layout.rs` for trigger
-            // two and for why only inline-table promotes). The gate is the parent's raw `display` (the
-            // bucketed `Display` collapses `flex` to `Block`, so the
-            // raw keyword is what identifies a flex container here,
-            // as in `layout::flex_kind`). Non-flex parents keep the
-            // old wrapping: an inline-table in block flow stays an
-            // inline-level `InlineBlock` box.
+            // w78: a flex or grid container's inline-level children
+            // blockify (css-flexbox-1 §4, css-grid-1 §5.1) instead
+            // of being swept into the anonymous wrapper below: the
+            // wrapper is style-less, so the item's `flex-basis` /
+            // placement / margins would never reach the item. This
+            // is trigger one of two (see the joint notes on
+            // `wrap_flex_text_runs` in `layout.rs` and
+            // `wrap_grid_text_runs` in `layout_grid.rs` for trigger
+            // two). The flex gate is the parent's raw `display`
+            // (the bucketed `Display` collapses `flex` to `Block`,
+            // so the raw keyword is what identifies a flex container
+            // here, as in `layout::flex_kind`); the grid gate is the
+            // raw keyword or the bucketed `Display`, which keeps
+            // `Grid` / `InlineGrid` distinct. Non-flex/grid parents
+            // keep the old wrapping: an inline-* box in block flow
+            // stays an inline-level `InlineBlock` box. Only the box
+            // type is mutated, never the style or `display`: the
+            // display-keyed inner dispatch in `layout_block` (flex
+            // via `flex_kind`, grid, table) still sees the original
+            // display, so a promoted inline-flex still lays out as
+            // flex and a promoted inline-grid still as grid.
             let parent_is_flex = forest.nodes[i]
                 .style
                 .as_ref()
@@ -2288,6 +2373,17 @@ fn build_box_tree_rooted(
                 .is_some_and(|d| {
                     d.eq_ignore_ascii_case("flex") || d.eq_ignore_ascii_case("inline-flex")
                 });
+            let parent_is_grid = forest.nodes[i]
+                .style
+                .as_ref()
+                .and_then(|s| s.get_str_by_index(props::DISPLAY))
+                .is_some_and(|d| {
+                    d.eq_ignore_ascii_case("grid") || d.eq_ignore_ascii_case("inline-grid")
+                })
+                || matches!(
+                    forest.nodes[i].data.display,
+                    Display::Grid | Display::InlineGrid
+                );
             let kids = std::mem::take(&mut forest.nodes[i].children);
             let mut new_children: Vec<usize> = Vec::with_capacity(kids.len());
             let mut run: Vec<usize> = Vec::new();
@@ -2310,21 +2406,35 @@ fn build_box_tree_rooted(
             for c in kids {
                 if is_out_of_flow(&forest, c) {
                     new_children.push(c);
-                } else if parent_is_flex
+                } else if (parent_is_flex || parent_is_grid)
                     && forest.nodes[c].box_type == BoxType::InlineBlock
-                    && forest.nodes[c].data.display == Display::InlineTable
+                    && matches!(
+                        forest.nodes[c].data.display,
+                        Display::InlineBlock
+                            | Display::InlineFlex
+                            | Display::InlineGrid
+                            | Display::InlineTable
+                    )
                 {
-                    // w77g blockification (see above): flush any
-                    // pending run, then promote the table to a direct
-                    // child carrying its own style. Its table dispatch
-                    // arms key off `display` as well as `box_type`, so
-                    // it still sizes as an inline-table.
+                    // w78 blockification (see above): flush any
+                    // pending run, then promote the item to a direct
+                    // child carrying its own style. The mapping is
+                    // the spec's blockification table, with one
+                    // Bowser-shaped entry: there is no `Flex` box
+                    // type, so inline-flex blockifies to `Block`
+                    // (its raw display still yields
+                    // `flex_kind() == Some(false)`, so `layout_block`
+                    // still dispatches it to `layout_flex`).
                     if !run.is_empty() {
                         let a =
                             forest.make_anonymous(&parent_data, std::mem::take(&mut run), i, false);
                         new_children.push(a);
                     }
-                    forest.nodes[c].box_type = BoxType::Table;
+                    forest.nodes[c].box_type = match forest.nodes[c].data.display {
+                        Display::InlineGrid => BoxType::Grid,
+                        Display::InlineTable => BoxType::Table,
+                        _ => BoxType::Block,
+                    };
                     new_children.push(c);
                 } else if breaks_run(forest.nodes[c].box_type) {
                     if !run.is_empty() {
@@ -2507,7 +2617,7 @@ mod tests {
             let (doc, _) = Document::parse_html(html);
             assert_eq!(doc.quirks_mode(), expected);
             let ua = crate::ua_stylesheet();
-            let (forest, _) = build_box_tree(&doc, &[], ua, 800.0, 600.0, &HashMap::new())
+            let (forest, _) = build_box_tree_with_fonts(&doc, &[], ua, 800.0, 600.0, &HashMap::new(), &crate::FixedFontMetrics)
                 .expect("box tree builds");
             assert_eq!(forest.quirks_mode, expected);
         }
@@ -2521,8 +2631,16 @@ mod tests {
             b"<html><body><div style=\"display: table-header-group\"></div></body></html>",
         );
         let ua = crate::ua_stylesheet();
-        let (forest, _) =
-            build_box_tree(&doc, &[], ua, 800.0, 600.0, &HashMap::new()).expect("box tree builds");
+        let (forest, _) = build_box_tree_with_fonts(
+            &doc,
+            &[],
+            ua,
+            800.0,
+            600.0,
+            &HashMap::new(),
+            &crate::FixedFontMetrics,
+        )
+        .expect("box tree builds");
         let group = forest
             .nodes
             .iter()
@@ -2540,8 +2658,16 @@ mod tests {
             b"<html><body><table><thead style=\"display: table-footer-group\"><tr><td>x</td></tr></thead></table></body></html>",
         );
         let ua = crate::ua_stylesheet();
-        let (forest, _) =
-            build_box_tree(&doc, &[], ua, 800.0, 600.0, &HashMap::new()).expect("box tree builds");
+        let (forest, _) = build_box_tree_with_fonts(
+            &doc,
+            &[],
+            ua,
+            800.0,
+            600.0,
+            &HashMap::new(),
+            &crate::FixedFontMetrics,
+        )
+        .expect("box tree builds");
         let group = forest
             .nodes
             .iter()
@@ -2559,8 +2685,16 @@ mod tests {
             b"<html><body><table><tfoot style=\"display: table-header-group\"><tr><td>x</td></tr></tfoot></table></body></html>",
         );
         let ua = crate::ua_stylesheet();
-        let (forest, _) =
-            build_box_tree(&doc, &[], ua, 800.0, 600.0, &HashMap::new()).expect("box tree builds");
+        let (forest, _) = build_box_tree_with_fonts(
+            &doc,
+            &[],
+            ua,
+            800.0,
+            600.0,
+            &HashMap::new(),
+            &crate::FixedFontMetrics,
+        )
+        .expect("box tree builds");
         let group = forest
             .nodes
             .iter()
@@ -2865,8 +2999,16 @@ mod tests {
             })
             .expect("DOM text node");
         let ua = crate::ua_stylesheet();
-        let (forest, _) =
-            build_box_tree(&doc, &[], ua, 800.0, 600.0, &HashMap::new()).expect("box tree builds");
+        let (forest, _) = build_box_tree_with_fonts(
+            &doc,
+            &[],
+            ua,
+            800.0,
+            600.0,
+            &HashMap::new(),
+            &crate::FixedFontMetrics,
+        )
+        .expect("box tree builds");
         let layout_text = forest
             .nodes
             .iter()
@@ -2888,8 +3030,16 @@ mod tests {
         let (doc, _) = Document::parse_html(b"<div class=\"t\">x</div>");
         let ss = bowser_css::parse_stylesheet(".t { display: table; unicode-bidi: plaintext; }");
         let ua = crate::ua_stylesheet();
-        let (mut forest, _) = build_box_tree(&doc, &[&ss], ua, 800.0, 600.0, &HashMap::new())
-            .expect("box tree builds");
+        let (mut forest, _) = build_box_tree_with_fonts(
+            &doc,
+            &[&ss],
+            ua,
+            800.0,
+            600.0,
+            &HashMap::new(),
+            &crate::FixedFontMetrics,
+        )
+        .expect("box tree builds");
         let table = forest
             .nodes
             .iter()
@@ -2947,8 +3097,16 @@ mod tests {
              ol::after { content: \"total=\" counter(n); }",
         );
         let author = [&ss];
-        let (forest, _) =
-            build_box_tree(&doc, &author, &ua, 800.0, 600.0, &HashMap::new()).expect("box tree");
+        let (forest, _) = build_box_tree_with_fonts(
+            &doc,
+            &author,
+            &ua,
+            800.0,
+            600.0,
+            &HashMap::new(),
+            &crate::FixedFontMetrics,
+        )
+        .expect("box tree");
         let ol = box_for_tag(&forest, &doc, "ol");
         fn texts_under(forest: &Forest, idx: usize, out: &mut Vec<String>) {
             let n = &forest.nodes[idx];
@@ -2978,8 +3136,16 @@ mod tests {
              li::before { content: counter(n) \". \"; }",
         );
         let author = [&ss];
-        let (forest, _) =
-            build_box_tree(&doc, &author, &ua, 800.0, 600.0, &HashMap::new()).expect("box tree");
+        let (forest, _) = build_box_tree_with_fonts(
+            &doc,
+            &author,
+            &ua,
+            800.0,
+            600.0,
+            &HashMap::new(),
+            &crate::FixedFontMetrics,
+        )
+        .expect("box tree");
         // Only the visible `li` generates a box …
         let visible_lis: Vec<usize> = forest
             .nodes

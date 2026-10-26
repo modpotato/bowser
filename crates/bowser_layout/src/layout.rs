@@ -7177,7 +7177,10 @@ pub(crate) struct PrefWidthCache {
 }
 
 impl PrefWidthCache {
-    fn new(node_count: usize) -> PrefWidthCache {
+    // pub(crate) so `tests.rs` can measure a single node's preferred
+    // width directly (w78fix H1 pref-level pin); production callers
+    // already construct it this way.
+    pub(crate) fn new(node_count: usize) -> PrefWidthCache {
         PrefWidthCache {
             stamps: vec![0; node_count],
             cur: 1,
@@ -7379,13 +7382,14 @@ mod intrinsic_extras_tests {
              td { font-size: 10px; margin: 20px; padding: 4px; border: none; }",
         );
         let ua = bowser_css::default_ua_stylesheet();
-        let Some((mut forest, root)) = crate::boxes::build_box_tree(
+        let Some((mut forest, root)) = crate::boxes::build_box_tree_with_fonts(
             &doc,
             &[&ss],
             &ua,
             800.0,
             600.0,
             &std::collections::HashMap::new(),
+            &crate::FixedFontMetrics,
         ) else {
             panic!("no root box");
         };
@@ -7454,13 +7458,14 @@ mod intrinsic_extras_tests {
              td { font-size: 10px; padding: 0; }",
         );
         let ua = bowser_css::default_ua_stylesheet();
-        let Some((forest, root)) = crate::boxes::build_box_tree(
+        let Some((forest, root)) = crate::boxes::build_box_tree_with_fonts(
             &doc,
             &[&ss],
             &ua,
             800.0,
             600.0,
             &std::collections::HashMap::new(),
+            &crate::FixedFontMetrics,
         ) else {
             panic!("no root box");
         };
@@ -7552,13 +7557,14 @@ mod intrinsic_extras_tests {
              col.w { width: 80px; } td.mw { min-width: 70px; }",
         );
         let ua = bowser_css::default_ua_stylesheet();
-        let Some((mut forest, root)) = crate::boxes::build_box_tree(
+        let Some((mut forest, root)) = crate::boxes::build_box_tree_with_fonts(
             &doc,
             &[&ss],
             &ua,
             800.0,
             600.0,
             &std::collections::HashMap::new(),
+            &crate::FixedFontMetrics,
         ) else {
             panic!("no root box");
         };
@@ -7753,15 +7759,15 @@ pub(crate) fn content_based_width(
 ///   definite-ignoring variant. A grid's min-content basis needs
 ///   no arm: `grid_min_width` has no definite fast path, so the
 ///   dispatched min-content value is already track-based.
-///   Inline-tables as flex items are blockified (w77g,
-///   css-flexbox-1 §4): an in-flow inline-table child of a flex
-///   container is promoted to a `Table` box carrying its own style,
-///   so it IS the item, its own `flex-basis` applies, and it reaches
-///   the table column arm above like a block-level table.
-///   (Inline-grids still take the anonymous-wrapper path as flex
-///   items, so an end-to-end inline-grid basis is still masked by
-///   the wrapper; the inline-grid arm is pinned by a direct variant
-///   call in `layout_grid.rs`, like the table direct pins below.)
+///   Inline-* boxes as flex items are blockified (w77g for tables,
+///   w78 for block/flex/grid, css-flexbox-1 §4): an in-flow inline-*
+///   child of a flex container is promoted to a `Block` / `Grid` /
+///   `Table` box carrying its own style, so it IS the item, its own
+///   `flex-basis` applies, and it reaches the table column arm above
+///   (inline-table) or the grid track arm above (inline-grid, via
+///   its unchanged `InlineGrid` display) like a block-level box of
+///   that shape. A promoted inline-flex reaches the flex arm via
+///   `flex_kind`, which still reads its raw display.
 ///
 /// Known limitation (w76fix L7), fixed in w77: a replaced box (an
 /// intrinsic size is present) used to keep the dispatched
@@ -8803,16 +8809,24 @@ fn flex_intrinsic_width(
             continue;
         }
         let w = child_w(forest, c);
-        // w77g: mirror `wrap_flex_text_runs`' blockification — an
-        // in-flow inline-table is a single styled item, not part of a
-        // coalesced run, so its contribution goes through
+        // w78: mirror `wrap_flex_text_runs`' blockification — an
+        // in-flow inline-* box is a single styled item, not part of
+        // a coalesced run, so its contribution goes through
         // `flex_item_intrinsic_contribution` (basis/margins) instead
         // of the run's unstyled sum/max. (This runs before layout
         // promotes the node, so the `display` check, not the
-        // post-promotion `box_type`, is what identifies it here.)
-        let is_inline_table_item = forest.nodes[c].box_type == BoxType::InlineBlock
-            && forest.nodes[c].data.display == Display::InlineTable;
-        if is_block_level(forest.nodes[c].box_type) || is_inline_table_item {
+        // post-promotion `box_type`, is what identifies it here;
+        // nodes boxes pass 3 already promoted are block-level and
+        // take the same arm via the first disjunct.)
+        let is_blockified_item = forest.nodes[c].box_type == BoxType::InlineBlock
+            && matches!(
+                forest.nodes[c].data.display,
+                Display::InlineBlock
+                    | Display::InlineFlex
+                    | Display::InlineGrid
+                    | Display::InlineTable
+            );
+        if is_block_level(forest.nodes[c].box_type) || is_blockified_item {
             run_open = false;
             items.push(RawItem {
                 rep: c,
@@ -9981,7 +9995,17 @@ fn vertical_flow_content(
         if layout_position::is_out_of_flow(forest, c) {
             continue;
         }
-        if is_ignorable_whitespace(forest, c) {
+        // w78fix2: the vertical twin of the horizontal §3.8
+        // white-space fix — in quirks Min mode a preserved
+        // whitespace child must reach `vertical_quirks_run_step`
+        // (which joins it to the run) instead of being skipped.
+        // Every other case (non-quirks, Max mode, collapsible
+        // whitespace) keeps the old skip.
+        if is_ignorable_whitespace(forest, c)
+            && !(quirks
+                && mode == VerticalIntrinsicMode::Min
+                && !quirks_ws_is_collapsible(forest, c))
+        {
             continue;
         }
         if is_block_level(forest.nodes[c].box_type) {
@@ -10068,6 +10092,40 @@ fn vertical_quirks_run_step(
         return None;
     }
     let n = &forest.nodes[idx];
+    if is_ignorable_whitespace(forest, idx) {
+        // Vertical twin of the horizontal w78fix2 preserved-space
+        // handling: collapsible whitespace is skipped (no effect
+        // on the run), preserved whitespace joins the run at its
+        // measured advance (newlines force-break between
+        // segments), and an anonymous block recurses transparently.
+        // Measured directly with `fonts`, not via
+        // `vertical_inline_min` (which splits `pre-wrap` /
+        // `break-spaces` text on spaces and gives 0 for a lone
+        // space — right for a breakable run, wrong here).
+        if quirks_ws_is_collapsible(forest, idx) {
+            return Some(());
+        }
+        if n.box_type == BoxType::AnonymousBlock {
+            for &c in &n.children {
+                if layout_position::is_out_of_flow(forest, c) {
+                    continue;
+                }
+                vertical_quirks_run_step(forest, c, fonts, depth + 1, acc, run)?;
+            }
+        } else {
+            let text = n.text.as_deref().unwrap_or("");
+            let fs = n.data.font_size;
+            let family = family_id_for(forest, idx, fonts);
+            for (seg_i, seg) in text.split('\n').enumerate() {
+                if seg_i > 0 {
+                    *acc = acc.max(*run);
+                    *run = 0.0;
+                }
+                *run += fonts.advance(seg, fs, family);
+            }
+        }
+        return Some(());
+    }
     if is_float(forest, idx) {
         *acc = acc.max(*run);
         *run = 0.0;
@@ -10079,7 +10137,7 @@ fn vertical_quirks_run_step(
             if layout_position::is_out_of_flow(forest, c) {
                 continue;
             }
-            if is_ignorable_whitespace(forest, c) {
+            if is_ignorable_whitespace(forest, c) && quirks_ws_is_collapsible(forest, c) {
                 continue;
             }
             vertical_quirks_run_step(forest, c, fonts, depth + 1, acc, run)?;
@@ -10621,10 +10679,21 @@ fn preferred_width_mcw(
             // container measured by a shrink-to-fit ancestor fell to
             // the generic widest-item sizing. Definite widths keep
             // the same precedence as the arms below: `width:
-            // min-content` contributes the min-content size, an
-            // atomic inline-flex's definite width contributes exactly,
-            // and a block-level flex container's definite width goes
-            // through [`definite_width_floor`] like any block.
+            // min-content` contributes the min-content size, and a
+            // definite width contributes exactly (content overflowing
+            // it does not grow the contribution). The inline-flex
+            // arm is keyed off `display`, not `box_type` (w78fix H1):
+            // a promoted inline-flex item is a `Block` box, an
+            // unpromoted one an `InlineBlock` box, and keying off the
+            // box type gave the two different fallbacks (no
+            // aspect-ratio fallback and no min/max clamp on the
+            // intrinsic side for the unpromoted shape, the
+            // [`definite_width_floor`] formula for the promoted one).
+            // The display-keyed arm below uses the
+            // [`definite_width_floor`] formula for both, so promotion
+            // cannot change the preferred width; a plain `flex`
+            // container reaches the same formula through
+            // [`definite_width_floor`] itself.
             _ if flex_kind(forest, i).is_some() => {
                 // The clamp adjustment's nested content-keyword
                 // measurements run while this walk's `bufs.order` is
@@ -10654,27 +10723,20 @@ fn preferred_width_mcw(
                 );
                 if matches!(forest.nodes[i].data.width, SpecLen::MinContent) {
                     min_content_width_pooled(forest, i, fonts, mcw, inner)
-                } else if forest.nodes[i].box_type == BoxType::InlineBlock {
+                } else if forest.nodes[i].data.display == Display::InlineFlex {
+                    // w78fix H1 (see the arm comment above): the
+                    // promoted and unpromoted shapes share this
+                    // formula — definite, then replaced intrinsic,
+                    // then aspect-ratio transfer, then the
+                    // min/max-clamped flex intrinsic.
                     definite_specified_content_width(forest, i)
                         .or_else(|| intrinsic_content_width(forest, i))
-                        .unwrap_or(intrinsic)
+                        .or_else(|| aspect_ratio_intrinsic_width(forest, i))
+                        .unwrap_or_else(|| clamp_content_width_by_minmax(forest, i, intrinsic))
                 } else {
                     definite_width_floor(forest, i, intrinsic, fonts, mcw, inner)
                 }
             }
-            // Atomic inline-level boxes (inline-block, inline-flex,
-            // replaced inline elements): a definite specified width
-            // contributes exactly its content width to the max-content
-            // size (css-sizing-3 §5.2), symmetric with the min-content
-            // arm. `inline-table` and `inline-grid` are caught by the
-            // guards above and keep their column/track sizing. When the
-            // width is `auto` (or cyclic), the contribution is the
-            // generic max-of-runs sizing below.
-            //
-            // F7: `width: min-content` sizes the box to its min-content
-            // size, so that — not the generic max-content — is its
-            // intrinsic contribution to its parent.
-            //
             // Multicol containers size by column, not by the generic
             // max-of-runs: per the css-multicol intrinsic sizing rules
             // (csswg css-multicol#4952) the max-content size is built
@@ -10686,6 +10748,16 @@ fn preferred_width_mcw(
             // contributes the min-content size, a definite specified
             // width contributes exactly (content overflowing it does
             // not grow the contribution — css-sizing-3 §5.2).
+            // NOTE (w78fix): this arm is left in its pre-existing
+            // position ahead of the display-keyed atomic arm below.
+            // `multicol_intrinsic_params` itself gates on
+            // `Block`/`AnonymousBlock` (mirroring `layout_block`'s
+            // multicol gate), so a multicol inline-block still
+            // differs by promotion state — but that is a layout-gate
+            // divergence, not an intrinsic-dispatch one, and widening
+            // only the intrinsic gate would size a box as multicol
+            // that real layout lays out as a plain block. Left for a
+            // follow-up that moves both gates together.
             _ if let Some(cols) = multicol_intrinsic_params(forest, i) => {
                 if matches!(forest.nodes[i].data.width, SpecLen::MinContent) {
                     min_content_width_pooled(forest, i, fonts, mcw, inner)
@@ -10702,17 +10774,62 @@ fn preferred_width_mcw(
                         .unwrap_or(intrinsic)
                 }
             }
-            BoxType::InlineBlock if matches!(forest.nodes[i].data.width, SpecLen::MinContent) => {
+            // Atomic inline-level boxes (inline-block, and replaced
+            // inline elements, which share the `InlineBlock` box
+            // type): a definite specified width contributes exactly
+            // its content width to the max-content size (css-sizing-3
+            // §5.2), symmetric with the min-content arm.
+            // `inline-table` and `inline-grid` are caught by the
+            // guards above and keep their column/track sizing, and
+            // `inline-flex` by the flex arm above. When the width is
+            // `auto` (or cyclic), the contribution is the generic
+            // max-of-runs sizing below.
+            //
+            // F7: `width: min-content` sizes the box to its min-content
+            // size, so that — not the generic max-content — is its
+            // intrinsic contribution to its parent.
+            //
+            // w78fix H1: these arms are keyed off `display` as well
+            // as `box_type`, so a promoted inline-block (a `Block`
+            // box carrying `display: inline-block`, from boxes pass 3
+            // or `wrap_flex_text_runs` / `wrap_grid_text_runs`) takes
+            // the same arm as an unpromoted one instead of falling
+            // through to [`definite_width_floor`]. The formula is
+            // [`definite_width_floor`]'s `Block` formula — definite,
+            // then replaced intrinsic, then aspect-ratio transfer,
+            // then the min/max-clamped generic size — so the two
+            // promotion triggers agree on every fallback, not just on
+            // the definite width (the old `InlineBlock` arm had no
+            // aspect-ratio fallback and no min/max clamp on the
+            // generic size, so a promoted aspect-ratio box measured
+            // 100 where the unpromoted shape measured 0, and a
+            // max-width-bounded auto box measured clamped where the
+            // unpromoted shape measured raw).
+            _ if (forest.nodes[i].box_type == BoxType::InlineBlock
+                || forest.nodes[i].data.display == Display::InlineBlock)
+                && matches!(forest.nodes[i].data.width, SpecLen::MinContent) =>
+            {
                 min_content_width_pooled(forest, i, fonts, mcw, inner)
             }
-            BoxType::InlineBlock => match definite_specified_content_width(forest, i) {
-                Some(definite) => definite,
-                // A replaced box with `width: auto` (or cyclic)
-                // contributes its intrinsic width (css-sizing-3 §5.2),
-                // not its (empty) generic content size.
-                None => intrinsic_content_width(forest, i)
-                    .unwrap_or_else(|| generic_preferred_width(forest, i)),
-            },
+            _ if forest.nodes[i].box_type == BoxType::InlineBlock
+                || forest.nodes[i].data.display == Display::InlineBlock =>
+            {
+                match definite_specified_content_width(forest, i) {
+                    Some(definite) => definite,
+                    // A replaced box with `width: auto` (or cyclic)
+                    // contributes its intrinsic width (css-sizing-3 §5.2),
+                    // not its (empty) generic content size.
+                    None => intrinsic_content_width(forest, i)
+                        .or_else(|| aspect_ratio_intrinsic_width(forest, i))
+                        .unwrap_or_else(|| {
+                            clamp_content_width_by_minmax(
+                                forest,
+                                i,
+                                generic_preferred_width(forest, i),
+                            )
+                        }),
+                }
+            }
             _ => definite_width_floor(
                 forest,
                 i,
@@ -11700,9 +11817,11 @@ fn cell_in_table_context(forest: &Forest, i: usize) -> bool {
 }
 
 /// [`min_content_width_pooled`] for callers without a reusable walk
-/// buffer (tests): a fresh [`WalkBufs`] per call.
+/// buffer (tests): a fresh [`WalkBufs`] per call. `pub(crate)` for
+/// the w78fix2 forest-level min-content pin in `tests.rs` (like
+/// `PrefWidthCache::new` for the w78fix H1 pref-level test).
 #[cfg(test)]
-fn min_content_width(
+pub(crate) fn min_content_width(
     forest: &mut Forest,
     idx: usize,
     fonts: &dyn FontMetrics,
@@ -11796,21 +11915,106 @@ fn min_content_width_pooled_raw(
 ///   (`object`, `video`, `input`, …) breaks the run and contributes
 ///   its own width. `is_img` is stamped at box construction (see
 ///   [`Node::is_img`]); the forest carries no tag names.
-fn quirks_cell_inline_min_content(forest: &Forest, idx: usize, out: &[f32]) -> f32 {
+fn quirks_cell_inline_min_content(
+    forest: &Forest,
+    idx: usize,
+    out: &[f32],
+    fonts: &dyn FontMetrics,
+) -> f32 {
     let mut best = 0.0f32;
     let mut run = 0.0f32;
-    quirks_run_walk(forest, idx, out, &mut best, &mut run);
+    quirks_run_walk(forest, idx, out, &mut best, &mut run, fonts);
     best.max(run)
+}
+
+/// Whether an ignorable-whitespace node (see
+/// [`is_ignorable_whitespace`]) collapses away, so the §3.8 walk
+/// may skip it without changing the run: `normal`, `nowrap` and
+/// `pre-line` spaces collapse (the same set
+/// [`seam_collapsible_ws`] treats as collapsible), while `pre`,
+/// `pre-wrap` and `break-spaces` spaces are preserved and keep
+/// their width. An anonymous block wrapping only whitespace text
+/// collapses exactly when every such text child collapses (its
+/// definition admits no other child kinds).
+fn quirks_ws_is_collapsible(forest: &Forest, idx: usize) -> bool {
+    let n = &forest.nodes[idx];
+    match n.box_type {
+        BoxType::Text => seam_collapsible_ws(n.data.white_space),
+        BoxType::AnonymousBlock => n.children.iter().all(|&c| {
+            let cn = &forest.nodes[c];
+            cn.box_type == BoxType::Text && seam_collapsible_ws(cn.data.white_space)
+        }),
+        _ => false,
+    }
 }
 
 /// One level of the §3.8 walk (see
 /// [`quirks_cell_inline_min_content`]): `best` is the widest
 /// closed run or breaker so far, `run` the open run. `Inline`
 /// containers (other than `<br>`, which breaks the run) recurse
-/// transparently, sharing both accumulators.
-fn quirks_run_walk(forest: &Forest, idx: usize, out: &[f32], best: &mut f32, run: &mut f32) {
+/// transparently, sharing both accumulators. Collapsible
+/// whitespace nodes are skipped at the loop head (w78fix M3):
+/// §3.8 removes the soft wrap opportunity adjacent to `img`s, so
+/// an intervening space or newline must not break the run in
+/// either axis — the vertical twin
+/// [`vertical_quirks_run_step`] plus `vertical_flow_content`'s
+/// loop-head skip already summed across it, while this walk used
+/// to treat the whitespace text node as a breaker and measure
+/// `<img> <img>` as max(50, 50) instead of 100. The loop-head skip
+/// also covers `Inline` recursion: a nested container's whitespace
+/// children are skipped by the recursive call's own loop head.
+///
+/// w78fix2: the skip is white-space-aware (see
+/// [`quirks_ws_is_collapsible`]). Skipping unconditionally was
+/// white-space-blind: a preserved space in a `pre` cell was
+/// dropped, so `<img> <img>` measured 100 instead of
+/// 100 + space. A preserved whitespace text node instead joins
+/// the open run at its measured advance — it cannot be skipped
+/// (its width is real) and it cannot break the run (that would
+/// give max(50, 50) again). A preserved newline is a forced
+/// break, so a newline-containing node splits at each `\n`:
+/// each segment's advance joins the run on its own line, and
+/// the run closes between segments. The advance is measured
+/// directly with `fonts` rather than read from `out`: the
+/// generic min-content text arm splits `pre-wrap` /
+/// `break-spaces` text on spaces (giving 0 for a lone space),
+/// which is right for a breakable run but wrong here, where
+/// §3.8 has removed the break opportunity. An anonymous block
+/// wrapping preserved whitespace recurses transparently, like
+/// an `Inline` container, so its text children take the same
+/// path through the recursive call's loop head.
+fn quirks_run_walk(
+    forest: &Forest,
+    idx: usize,
+    out: &[f32],
+    best: &mut f32,
+    run: &mut f32,
+    fonts: &dyn FontMetrics,
+) {
     for &c in forest.nodes[idx].children.iter() {
         if layout_position::is_out_of_flow(forest, c) {
+            continue;
+        }
+        if is_ignorable_whitespace(forest, c) {
+            if quirks_ws_is_collapsible(forest, c) {
+                continue;
+            }
+            if forest.nodes[c].box_type == BoxType::AnonymousBlock {
+                quirks_run_walk(forest, c, out, best, run, fonts);
+            } else {
+                let n = &forest.nodes[c];
+                let text = n.text.as_deref().unwrap_or("");
+                let fs = n.data.font_size;
+                let family = family_id_for(forest, c, fonts);
+                for (seg_i, seg) in text.split('\n').enumerate() {
+                    if seg_i > 0 {
+                        *best = best.max(*run);
+                        *run = 0.0;
+                    }
+                    *run += fonts.advance(seg, fs, family);
+                }
+                *run += intrinsic_h_extras(forest, c);
+            }
             continue;
         }
         let n = &forest.nodes[c];
@@ -11821,7 +12025,7 @@ fn quirks_run_walk(forest: &Forest, idx: usize, out: &[f32], best: &mut f32, run
         } else if n.box_type == BoxType::InlineBlock && n.is_img && n.intrinsic.is_some() {
             *run += out[c] + intrinsic_h_extras(forest, c);
         } else if n.box_type == BoxType::Inline && !n.is_br {
-            quirks_run_walk(forest, c, out, best, run);
+            quirks_run_walk(forest, c, out, best, run, fonts);
         } else {
             *best = best.max(*run);
             *run = 0.0;
@@ -11960,34 +12164,26 @@ fn min_content_width_pooled_impl(
                     .or_else(|| intrinsic_content_width(forest, i))
                     .unwrap_or(intrinsic)
             }
-            // Atomic inline-level boxes (inline-block, inline-flex, and
-            // replaced inline elements; `inline-table` and `inline-grid`
-            // are caught by the guards above and keep their column/track
-            // sizing): a definite specified width contributes exactly its
-            // content width to the min-content size (css-sizing-3 §5.2) —
-            // content overflowing that width does not grow the
-            // contribution. When the width is `auto` (or cyclic), the
-            // contribution is the max of the children's intrinsic
-            // contributions — except for replaced boxes, which
-            // contribute their intrinsic width (css-sizing-3 §5.2).
-            BoxType::InlineBlock => {
-                let kids = forest.nodes[i]
-                    .children
-                    .iter()
-                    .filter(|&&c| !layout_position::is_out_of_flow(forest, c))
-                    .map(|&c| out[c] + intrinsic_h_extras(forest, c))
-                    .fold(0.0, f32::max);
-                definite_specified_content_width(forest, i)
-                    .or_else(|| intrinsic_content_width(forest, i))
-                    .or_else(|| aspect_ratio_intrinsic_width(forest, i))
-                    .unwrap_or(kids)
-            }
             // Multicol containers size by column (see the
             // `preferred_width_mcw` arm): the min-content size is the
             // single-column content measure — the largest min-content
             // contribution of the in-flow children — transformed by the
             // column-width / column-count / column-gap rules (csswg
             // css-multicol#4952). Out-of-flow children are skipped.
+            // w78fix2: this arm sits ABOVE the display-keyed
+            // inline-block arm below, mirroring
+            // `preferred_width_mcw` (multicol, then inline-block).
+            // Before 1214788 the min-content inline-block arm was
+            // box-type-only, so a promoted multicol inline-block (a
+            // `Block` box carrying `display: inline-block`) fell
+            // through to this arm; the display-keyed arm captured
+            // it instead and measured kids-max instead of the
+            // column-transformed size, while max-content still
+            // measured the column transform. An unpromoted
+            // multicol inline-block is unaffected: it is an
+            // `InlineBlock` box, so `multicol_intrinsic_params`
+            // (which gates on `Block`/`AnonymousBlock`) returns
+            // `None` here and it still reaches the arm below.
             _ if let Some(cols) = multicol_intrinsic_params(forest, i) => {
                 let content = forest.nodes[i]
                     .children
@@ -12002,6 +12198,38 @@ fn min_content_width_pooled_impl(
                     .or_else(|| intrinsic_content_width(forest, i))
                     .or_else(|| aspect_ratio_intrinsic_width(forest, i))
                     .unwrap_or(content_based)
+            }
+            // Atomic inline-level boxes (inline-block, inline-flex, and
+            // replaced inline elements; `inline-table` and `inline-grid`
+            // are caught by the guards above and keep their column/track
+            // sizing): a definite specified width contributes exactly its
+            // content width to the min-content size (css-sizing-3 §5.2) —
+            // content overflowing that width does not grow the
+            // contribution. When the width is `auto` (or cyclic), the
+            // contribution is the max of the children's intrinsic
+            // contributions — except for replaced boxes, which
+            // contribute their intrinsic width (css-sizing-3 §5.2).
+            // w78fix H1/L1: keyed off `display` as well as `box_type`,
+            // like the max-content arm, so a promoted inline-block
+            // takes this arm instead of the generic `Block` arm below.
+            // The two formulas already agreed (definite, intrinsic,
+            // aspect, kids), so this changes no value — it only keeps
+            // the dispatch from drifting apart again. The multicol
+            // arm above takes precedence for promoted multicol
+            // boxes (see its comment); this arm covers the rest.
+            _ if forest.nodes[i].box_type == BoxType::InlineBlock
+                || forest.nodes[i].data.display == Display::InlineBlock =>
+            {
+                let kids = forest.nodes[i]
+                    .children
+                    .iter()
+                    .filter(|&&c| !layout_position::is_out_of_flow(forest, c))
+                    .map(|&c| out[c] + intrinsic_h_extras(forest, c))
+                    .fold(0.0, f32::max);
+                definite_specified_content_width(forest, i)
+                    .or_else(|| intrinsic_content_width(forest, i))
+                    .or_else(|| aspect_ratio_intrinsic_width(forest, i))
+                    .unwrap_or(kids)
             }
             // Block-level boxes with a definite specified width contribute
             // exactly that width to the min-content size (css-sizing-3
@@ -12042,7 +12270,7 @@ fn min_content_width_pooled_impl(
                                     && matches!(forest.nodes[p].data.width, SpecLen::Auto)
                             }));
                 let kids = if quirks_cell_run {
-                    quirks_cell_inline_min_content(forest, i, out)
+                    quirks_cell_inline_min_content(forest, i, out, fonts)
                 } else {
                     forest.nodes[i]
                         .children
@@ -12111,45 +12339,49 @@ fn min_content_width_pooled_impl(
 /// container's child list. Each contiguous run of text and inline boxes
 /// becomes one anonymous flex item instead of N separate items.
 ///
-/// Exception (w77g, css-flexbox-1 §4 blockification): an in-flow
-/// `display: inline-table` child is NOT wrapped — it blockifies to a
-/// real `Table` box carrying its own style, so its `flex-basis`,
-/// `flex-grow`/`flex-shrink`, and margins reach the item instead of
-/// being lost on a style-less wrapper (the wrapper's basis is `auto`,
-/// its grow 0). The promotion is idempotent: a promoted node is
-/// block-level, so a second pass (e.g. the inline-flex shrink-to-fit
-/// estimate running before the real pass) takes the early return or
-/// the block-level arm and leaves it alone. Other inline-level
-/// children (text runs, inline-block, inline-flex, inline-grid) keep
-/// the wrapper path, which they rely on: text has no style of its own
-/// to carry, and the wrapper is the item those shapes lay out through.
-/// Out-of-flow inline-tables are not flex items at all, so they are
-/// left as `InlineBlock` boxes for the absolute-positioning path.
+/// Exception (w77g, extended w78, css-flexbox-1 §4 blockification):
+/// an in-flow `display: inline-block | inline-flex | inline-grid |
+/// inline-table` child is NOT wrapped — it blockifies to a real
+/// `Block` / `Block` / `Grid` / `Table` box carrying its own style,
+/// so its `flex-basis`, `flex-grow`/`flex-shrink`, and margins reach
+/// the item instead of being lost on a style-less wrapper (the
+/// wrapper's basis is `auto`, its grow 0). Only the box type is
+/// mutated: the display-keyed inner dispatch still sees the original
+/// display, so a promoted inline-flex (`flex_kind() == Some(false)`)
+/// still lays out as flex and a promoted inline-grid still as grid.
+/// The promotion is idempotent: a promoted node is block-level, so a
+/// second pass (e.g. the inline-flex shrink-to-fit estimate running
+/// before the real pass) takes the early return or the block-level
+/// arm and leaves it alone. Other inline-level children (text runs,
+/// plain inline boxes) keep the wrapper path, which they rely on:
+/// text has no style of its own to carry, and the wrapper is the item
+/// those shapes lay out through. Out-of-flow inline-* boxes are not
+/// flex items at all, so they are left as `InlineBlock` boxes for the
+/// absolute-positioning path.
 fn wrap_flex_text_runs(forest: &mut Forest, idx: usize) {
-    // Inline-table blockification, joint note (w77fix finding 12):
-    // this is the SECOND of two promotion triggers for
-    // `display: inline-table` flex items — the first is the
-    // `needs_wrap` branch in `boxes.rs` pass 3, which fires when
-    // the flex container has a block-level child. This one fires
-    // when it does not (a text run or a lone inline-table means
-    // not all children are block-level). Both promote the table
-    // to a direct `Table` item carrying its own style, so
-    // `flex-basis`/margins survive; the w77fix joint test pins
-    // both paths to identical item geometry.
+    // Blockification, joint note (w77fix finding 12, extended w78):
+    // this is the SECOND of two promotion triggers for inline-*
+    // flex items — the first is the `needs_wrap` branch in
+    // `boxes.rs` pass 3, which fires when the flex container has a
+    // block-level child. This one fires when it does not (a text run
+    // or a lone inline-* item means not all children are
+    // block-level). Both promote the item to a direct box carrying
+    // its own style, so `flex-basis`/margins survive; the w77fix
+    // joint test and the w78 joint tests pin both paths to identical
+    // item geometry per value.
     //
-    // Only inline-table promotes. `inline-block`, `inline-grid`,
-    // and `inline-flex` still take the wrapper path, deliberately
-    // but incompletely: promoting them needs `BoxType` changes
-    // (`Block`/`Grid`/flex) whose interaction with the
-    // display-keyed inner layout in `layout_block` is unverified,
-    // and the inline-block wrapper shape is pinned by
-    // `w77g_flex_inline_block_item_still_wrapped`. The cost is
-    // real and known: the style-less wrapper swallows their
-    // flex-item properties (probed: an inline-block with
-    // `flex: 0 0 200px` and 10px side margins lays out as a 20px
-    // wrapper holding a 0px inner box — basis lost entirely).
-    // Extending promotion to them is follow-up work, not a
-    // spec stance: css-flexbox-1 §4 blockifies all of them.
+    // All four inline outer displays promote (css-flexbox-1 §4):
+    // inline-block and inline-flex to `Block`, inline-grid to
+    // `Grid`, inline-table to `Table`. The w77g/w77fix comments
+    // that only inline-table promoted are superseded: promoting the
+    // others was deferred then because the `BoxType` changes' contact
+    // with display-keyed inner layout in `layout_block` was
+    // unverified, and the inline-block wrapper shape was pinned by
+    // `w77g_flex_inline_block_item_still_wrapped` (inverted in w78).
+    // Verified now: `layout_block` dispatches flex/grid/table off
+    // `display` (and `flex_kind` off the raw keyword), not off the
+    // box type, so mutating only the box type keeps inner layout
+    // identical while the item itself carries its flex properties.
     // Index iteration instead of `children.clone()`: nothing in the loop
     // below mutates `nodes[idx].children` itself (the anonymous wrappers
     // are appended as fresh nodes and wired in by the final assignment),
@@ -12180,14 +12412,22 @@ fn wrap_flex_text_runs(forest: &mut Forest, idx: usize) {
             }
             roots.push(c);
         } else if forest.nodes[c].box_type == BoxType::InlineBlock
-            && forest.nodes[c].data.display == Display::InlineTable
+            && matches!(
+                forest.nodes[c].data.display,
+                Display::InlineBlock
+                    | Display::InlineFlex
+                    | Display::InlineGrid
+                    | Display::InlineTable
+            )
         {
-            // w77g blockification (see the fn docs): flush any pending
-            // run, then promote this node to a table item of its own.
+            // w78 blockification (see the fn docs): flush any pending
+            // run, then promote this node to an item of its own.
             // Its style is untouched, so `flex-basis` etc. survive;
-            // the table dispatch arms key off `display` as well as
-            // `box_type`, so the promoted node still sizes as an
-            // inline-table (caption floor, column sizing).
+            // the inner-layout dispatch arms key off `display` as
+            // well as `box_type`, so the promoted node still sizes
+            // and lays out as its original inner shape (flex, grid,
+            // or table). Inline-flex has no `Flex` box type, so it
+            // blockifies to `Block` like inline-block.
             if !run.is_empty() {
                 roots.push(forest.make_anonymous(
                     &parent_data,
@@ -12196,7 +12436,11 @@ fn wrap_flex_text_runs(forest: &mut Forest, idx: usize) {
                     true,
                 ));
             }
-            forest.nodes[c].box_type = BoxType::Table;
+            forest.nodes[c].box_type = match forest.nodes[c].data.display {
+                Display::InlineGrid => BoxType::Grid,
+                Display::InlineTable => BoxType::Table,
+                _ => BoxType::Block,
+            };
             roots.push(c);
         } else {
             run.push(c);
@@ -13306,54 +13550,71 @@ fn layout_flex(
         flex_gaps(style, horizontal, (fs, rfs, vpw, vph), main_pct, cross_pct)
     };
     if !block_level {
-        // Pooled across containers (see `LayoutScratch::flex_items`):
-        // the estimate pass restores the buffer right after the
-        // longest-line computation, before the real pass below
-        // re-takes it.
-        let mut items = std::mem::take(&mut scratch.flex_items);
-        flex_build_items(
-            forest,
-            idx,
-            input.cb_w,
-            hspec,
-            horizontal,
-            align_items,
-            fonts,
-            pw_cache,
-            scratch,
-            &mut items,
-        );
-        let wrap_main = if matches!(wrap, FlexWrap::NoWrap) {
-            None
-        } else {
-            Some(input.cb_w)
-        };
-        let longest_line: f32 = layout_flex_wrap::collect_lines(&items, wrap_main, main_gap)
-            .iter()
-            .map(|&(s, e)| {
-                let items_sum: f32 = items[s..e]
-                    .iter()
-                    .map(|it| it.base + it.main_bp + it.m_ms + it.m_me)
-                    .sum();
-                // Inter-item gaps are part of the line's extent (§9.3).
-                items_sum + main_gap * (e.saturating_sub(s).saturating_sub(1)) as f32
-            })
-            .fold(0.0f32, f32::max);
-        // The estimate is done with the items: hand the buffer back to
-        // the scratch so the real pass below (and later containers)
-        // reuse its capacity.
-        scratch.flex_items = items;
-        let shrink_w = longest_line.min(input.cb_w).max(0.0);
-        resolve_metrics(
-            forest,
-            idx,
-            input.cb_x,
-            input.cb_w,
-            false,
-            Some(shrink_w),
-            false,
-        );
-        content_w = forest.nodes[idx].metrics.content_w;
+        // w78: a caller-determined content width wins over
+        // shrink-to-fit. This is the blockified-inline-flex case:
+        // a promoted inline-flex flex item arrives here with a
+        // final flex §9.7 main size (`width_override_final`), and a
+        // promoted inline-flex grid item with a stretch area (or a
+        // column-flex measure width) arrives with a plain override.
+        // The prologue already resolved `metrics.content_w` from
+        // that override; re-running the estimate below would discard
+        // it and size the container from its inner items instead
+        // (a `flex: 0 0 200px` inline-flex item laid out at its 80px
+        // content width, basis and grow lost). Unpromoted
+        // inline-flex containers (line layout, floats, abspos) carry
+        // no override and still shrink-to-fit below, as before.
+        // The gap re-resolution and gutter narrowing after this
+        // block still run: they only need the final `content_w`.
+        if input.width_override.is_none() {
+            // Pooled across containers (see `LayoutScratch::flex_items`):
+            // the estimate pass restores the buffer right after the
+            // longest-line computation, before the real pass below
+            // re-takes it.
+            let mut items = std::mem::take(&mut scratch.flex_items);
+            flex_build_items(
+                forest,
+                idx,
+                input.cb_w,
+                hspec,
+                horizontal,
+                align_items,
+                fonts,
+                pw_cache,
+                scratch,
+                &mut items,
+            );
+            let wrap_main = if matches!(wrap, FlexWrap::NoWrap) {
+                None
+            } else {
+                Some(input.cb_w)
+            };
+            let longest_line: f32 = layout_flex_wrap::collect_lines(&items, wrap_main, main_gap)
+                .iter()
+                .map(|&(s, e)| {
+                    let items_sum: f32 = items[s..e]
+                        .iter()
+                        .map(|it| it.base + it.main_bp + it.m_ms + it.m_me)
+                        .sum();
+                    // Inter-item gaps are part of the line's extent (§9.3).
+                    items_sum + main_gap * (e.saturating_sub(s).saturating_sub(1)) as f32
+                })
+                .fold(0.0f32, f32::max);
+            // The estimate is done with the items: hand the buffer back to
+            // the scratch so the real pass below (and later containers)
+            // reuse its capacity.
+            scratch.flex_items = items;
+            let shrink_w = longest_line.min(input.cb_w).max(0.0);
+            resolve_metrics(
+                forest,
+                idx,
+                input.cb_x,
+                input.cb_w,
+                false,
+                Some(shrink_w),
+                false,
+            );
+            content_w = forest.nodes[idx].metrics.content_w;
+        }
         // Re-resolve the gaps against the final content-box width: the
         // estimate pass above zeroed width-dependent percentage gaps
         // (css-sizing-3), and the stale prologue width must not leak
@@ -14079,13 +14340,14 @@ mod flex_tests {
         let (doc, _) = bowser_dom::Document::parse_html(html.as_bytes());
         let ss = bowser_css::parse_stylesheet(css);
         let ua = bowser_css::default_ua_stylesheet();
-        let Some((mut forest, root)) = crate::boxes::build_box_tree(
+        let Some((mut forest, root)) = crate::boxes::build_box_tree_with_fonts(
             &doc,
             &[&ss],
             &ua,
             800.0,
             600.0,
             &std::collections::HashMap::new(),
+            &crate::FixedFontMetrics,
         ) else {
             panic!("no root box");
         };
@@ -14653,13 +14915,14 @@ mod flex_tests {
             let (doc, _) = bowser_dom::Document::parse_html(html.as_bytes());
             let ss = bowser_css::parse_stylesheet(css);
             let ua = bowser_css::default_ua_stylesheet();
-            let Some((mut forest, root)) = crate::boxes::build_box_tree(
+            let Some((mut forest, root)) = crate::boxes::build_box_tree_with_fonts(
                 &doc,
                 &[&ss],
                 &ua,
                 800.0,
                 600.0,
                 &std::collections::HashMap::new(),
+                &crate::FixedFontMetrics,
             ) else {
                 panic!("no root box");
             };
@@ -14866,13 +15129,14 @@ mod flex_tests {
         let (doc, _) = bowser_dom::Document::parse_html(html.as_bytes());
         let ss = bowser_css::parse_stylesheet(css);
         let ua = bowser_css::default_ua_stylesheet();
-        let Some((mut forest, root)) = crate::boxes::build_box_tree(
+        let Some((mut forest, root)) = crate::boxes::build_box_tree_with_fonts(
             &doc,
             &[&ss],
             &ua,
             800.0,
             600.0,
             &std::collections::HashMap::new(),
+            &crate::FixedFontMetrics,
         ) else {
             panic!("no root box");
         };
@@ -16779,13 +17043,14 @@ mod flex_tests {
         let (doc, _) = bowser_dom::Document::parse_html(html.as_bytes());
         let ss = bowser_css::parse_stylesheet(css);
         let ua = bowser_css::default_ua_stylesheet();
-        let Some((mut forest, root)) = crate::boxes::build_box_tree(
+        let Some((mut forest, root)) = crate::boxes::build_box_tree_with_fonts(
             &doc,
             &[&ss],
             &ua,
             800.0,
             600.0,
             &std::collections::HashMap::new(),
+            &crate::FixedFontMetrics,
         ) else {
             panic!("no root box");
         };
@@ -17250,9 +17515,17 @@ mod inline_forced_break_tests {
         let (doc, _) = bowser_dom::Document::parse_html(html.as_bytes());
         let ss = bowser_css::parse_stylesheet(css);
         let ua = crate::ua_stylesheet();
-        crate::boxes::build_box_tree(&doc, &[&ss], ua, VP.w, VP.h, &HashMap::new())
-            .expect("box tree builds")
-            .0
+        crate::boxes::build_box_tree_with_fonts(
+            &doc,
+            &[&ss],
+            ua,
+            VP.w,
+            VP.h,
+            &HashMap::new(),
+            &crate::FixedFontMetrics,
+        )
+        .expect("box tree builds")
+        .0
     }
 
     /// The `.mc` block container's arena index.
@@ -17376,9 +17649,17 @@ mod br_tests {
         let (doc, _) = bowser_dom::Document::parse_html(html.as_bytes());
         let ss = bowser_css::parse_stylesheet(css);
         let ua = crate::ua_stylesheet();
-        crate::boxes::build_box_tree(&doc, &[&ss], ua, VP.w, VP.h, &HashMap::new())
-            .expect("box tree builds")
-            .0
+        crate::boxes::build_box_tree_with_fonts(
+            &doc,
+            &[&ss],
+            ua,
+            VP.w,
+            VP.h,
+            &HashMap::new(),
+            &crate::FixedFontMetrics,
+        )
+        .expect("box tree builds")
+        .0
     }
 
     fn find_div(forest: &Forest) -> usize {
@@ -17528,9 +17809,17 @@ mod line_layout_tests {
         let (doc, _) = bowser_dom::Document::parse_html(html.as_bytes());
         let ss = bowser_css::parse_stylesheet(css);
         let ua = crate::ua_stylesheet();
-        crate::boxes::build_box_tree(&doc, &[&ss], ua, VP.w, VP.h, &HashMap::new())
-            .expect("box tree builds")
-            .0
+        crate::boxes::build_box_tree_with_fonts(
+            &doc,
+            &[&ss],
+            ua,
+            VP.w,
+            VP.h,
+            &HashMap::new(),
+            &crate::FixedFontMetrics,
+        )
+        .expect("box tree builds")
+        .0
     }
 
     /// Arena index of the test `<div>`: the block carrying the given
@@ -17987,13 +18276,14 @@ mod box_sizing_override_tests {
               padding: 0; border: none; }",
         );
         let ua = bowser_css::default_ua_stylesheet();
-        let Some((mut forest, root)) = crate::boxes::build_box_tree(
+        let Some((mut forest, root)) = crate::boxes::build_box_tree_with_fonts(
             &doc,
             &[&ss],
             &ua,
             800.0,
             600.0,
             &std::collections::HashMap::new(),
+            &crate::FixedFontMetrics,
         ) else {
             panic!("no root box");
         };
@@ -18026,13 +18316,14 @@ mod box_sizing_override_tests {
               font-size: 10px; padding: 10px; border: none; }",
         );
         let ua = bowser_css::default_ua_stylesheet();
-        let Some((mut forest, root)) = crate::boxes::build_box_tree(
+        let Some((mut forest, root)) = crate::boxes::build_box_tree_with_fonts(
             &doc,
             &[&ss],
             &ua,
             800.0,
             600.0,
             &std::collections::HashMap::new(),
+            &crate::FixedFontMetrics,
         ) else {
             panic!("no root box");
         };
@@ -18062,13 +18353,14 @@ mod box_sizing_override_tests {
             ".ib { display: inline-block; font-size: 10px; padding: 0; border: none; }",
         );
         let ua = bowser_css::default_ua_stylesheet();
-        let Some((mut forest, root)) = crate::boxes::build_box_tree(
+        let Some((mut forest, root)) = crate::boxes::build_box_tree_with_fonts(
             &doc,
             &[&ss],
             &ua,
             800.0,
             600.0,
             &std::collections::HashMap::new(),
+            &crate::FixedFontMetrics,
         ) else {
             panic!("no root box");
         };
@@ -18103,13 +18395,14 @@ mod box_sizing_override_tests {
               padding: 0; border: none; }",
         );
         let ua = bowser_css::default_ua_stylesheet();
-        let Some((mut forest, root)) = crate::boxes::build_box_tree(
+        let Some((mut forest, root)) = crate::boxes::build_box_tree_with_fonts(
             &doc,
             &[&ss],
             &ua,
             800.0,
             600.0,
             &std::collections::HashMap::new(),
+            &crate::FixedFontMetrics,
         ) else {
             panic!("no root box");
         };
@@ -18157,9 +18450,15 @@ mod box_sizing_override_tests {
         let ua = bowser_css::default_ua_stylesheet();
         let mut intrinsics = std::collections::HashMap::new();
         intrinsics.insert(img, IntrinsicDims::from_size(100.0, 50.0));
-        let Some((mut forest, root)) =
-            crate::boxes::build_box_tree(&doc, &[&ss], &ua, 800.0, 600.0, &intrinsics)
-        else {
+        let Some((mut forest, root)) = crate::boxes::build_box_tree_with_fonts(
+            &doc,
+            &[&ss],
+            &ua,
+            800.0,
+            600.0,
+            &intrinsics,
+            &crate::FixedFontMetrics,
+        ) else {
             panic!("no root box");
         };
         let mut ib = None;
@@ -18192,13 +18491,14 @@ mod box_sizing_override_tests {
               padding: 0; border: none; }",
         );
         let ua = bowser_css::default_ua_stylesheet();
-        let Some((mut forest, root)) = crate::boxes::build_box_tree(
+        let Some((mut forest, root)) = crate::boxes::build_box_tree_with_fonts(
             &doc,
             &[&ss],
             &ua,
             800.0,
             600.0,
             &std::collections::HashMap::new(),
+            &crate::FixedFontMetrics,
         ) else {
             panic!("no root box");
         };
@@ -18225,13 +18525,14 @@ mod box_sizing_override_tests {
         let (doc, _) = bowser_dom::Document::parse_html(html.as_bytes());
         let ss = bowser_css::parse_stylesheet(css);
         let ua = bowser_css::default_ua_stylesheet();
-        let Some((forest, root)) = crate::boxes::build_box_tree(
+        let Some((forest, root)) = crate::boxes::build_box_tree_with_fonts(
             &doc,
             &[&ss],
             &ua,
             800.0,
             600.0,
             &std::collections::HashMap::new(),
+            &crate::FixedFontMetrics,
         ) else {
             panic!("no root box");
         };
@@ -18284,13 +18585,14 @@ mod box_sizing_override_tests {
         let (doc, _) = bowser_dom::Document::parse_html(html.as_bytes());
         let ss = bowser_css::parse_stylesheet(css);
         let ua = bowser_css::default_ua_stylesheet();
-        let Some((forest, root)) = crate::boxes::build_box_tree(
+        let Some((forest, root)) = crate::boxes::build_box_tree_with_fonts(
             &doc,
             &[&ss],
             &ua,
             800.0,
             600.0,
             &std::collections::HashMap::new(),
+            &crate::FixedFontMetrics,
         ) else {
             panic!("no root box");
         };
@@ -18357,13 +18659,14 @@ mod box_sizing_override_tests {
             ".cell { width: 200px; font-size: 10px; padding: 0; border: none; }",
         );
         let ua = bowser_css::default_ua_stylesheet();
-        let Some((mut forest, root)) = crate::boxes::build_box_tree(
+        let Some((mut forest, root)) = crate::boxes::build_box_tree_with_fonts(
             &doc,
             &[&ss],
             &ua,
             800.0,
             600.0,
             &std::collections::HashMap::new(),
+            &crate::FixedFontMetrics,
         ) else {
             panic!("no root box");
         };
@@ -18402,13 +18705,14 @@ mod box_sizing_override_tests {
              td { font-size: 10px; padding: 0; border: none; }",
         );
         let ua = bowser_css::default_ua_stylesheet();
-        let Some((mut forest, root)) = crate::boxes::build_box_tree(
+        let Some((mut forest, root)) = crate::boxes::build_box_tree_with_fonts(
             &doc,
             &[&ss],
             &ua,
             800.0,
             600.0,
             &std::collections::HashMap::new(),
+            &crate::FixedFontMetrics,
         ) else {
             panic!("no root box");
         };
@@ -18449,13 +18753,14 @@ mod box_sizing_override_tests {
             ".cell { width: 200px; font-size: 10px; padding: 0; border: none; }",
         );
         let ua = bowser_css::default_ua_stylesheet();
-        let Some((mut forest, root)) = crate::boxes::build_box_tree(
+        let Some((mut forest, root)) = crate::boxes::build_box_tree_with_fonts(
             &doc,
             &[&ss],
             &ua,
             800.0,
             600.0,
             &std::collections::HashMap::new(),
+            &crate::FixedFontMetrics,
         ) else {
             panic!("no root box");
         };
@@ -18481,13 +18786,14 @@ mod box_sizing_override_tests {
         let (doc, _) = bowser_dom::Document::parse_html(html);
         let ss = bowser_css::parse_stylesheet(css);
         let ua = bowser_css::default_ua_stylesheet();
-        let Some((forest, root)) = crate::boxes::build_box_tree(
+        let Some((forest, root)) = crate::boxes::build_box_tree_with_fonts(
             &doc,
             &[&ss],
             &ua,
             800.0,
             600.0,
             &std::collections::HashMap::new(),
+            &crate::FixedFontMetrics,
         ) else {
             panic!("no root box");
         };
@@ -18983,13 +19289,14 @@ mod grid_min_content_tests {
         let (doc, _) = bowser_dom::Document::parse_html(html.as_bytes());
         let ss = bowser_css::parse_stylesheet(css);
         let ua = bowser_css::default_ua_stylesheet();
-        let Some((forest, root)) = crate::boxes::build_box_tree(
+        let Some((forest, root)) = crate::boxes::build_box_tree_with_fonts(
             &doc,
             &[&ss],
             &ua,
             800.0,
             600.0,
             &std::collections::HashMap::new(),
+            &crate::FixedFontMetrics,
         ) else {
             panic!("no root box");
         };
@@ -19128,13 +19435,14 @@ mod w65_f_vintr_tests {
         let (doc, _) = bowser_dom::Document::parse_html(html.as_bytes());
         let ss = bowser_css::parse_stylesheet(css);
         let ua = bowser_css::default_ua_stylesheet();
-        let Some((forest, root)) = crate::boxes::build_box_tree(
+        let Some((forest, root)) = crate::boxes::build_box_tree_with_fonts(
             &doc,
             &[&ss],
             &ua,
             800.0,
             600.0,
             &std::collections::HashMap::new(),
+            &crate::FixedFontMetrics,
         ) else {
             panic!("no root box");
         };

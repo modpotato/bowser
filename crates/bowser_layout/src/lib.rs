@@ -1843,7 +1843,7 @@ pub fn snap_areas_for_container(
 /// full pass would use).
 ///
 /// Returns `None` when the subtree has no rendered root (see
-/// `boxes::build_box_tree_subtree`).
+/// `boxes::build_box_tree_subtree_with_fonts`).
 ///
 /// Coordinate frame: the returned tree is laid out as if the subtree
 /// root's containing block origin were `(0, 0)` — its `rect`s are
@@ -1896,7 +1896,7 @@ pub fn layout_subtree_with_intrinsics_and_scroll_and_offsets(
         w: style::sane_len(viewport.w).max(0.0),
         h: style::sane_len(viewport.h).max(0.0),
     };
-    let (mut forest, root) = boxes::build_box_tree_subtree(
+    let (mut forest, root) = boxes::build_box_tree_subtree_with_fonts(
         doc,
         author,
         ua,
@@ -1904,9 +1904,10 @@ pub fn layout_subtree_with_intrinsics_and_scroll_and_offsets(
         viewport.h,
         intrinsics,
         subtree_root,
+        fonts,
     )?;
     // The forest's viewport fields already hold the true viewport
-    // (from `build_box_tree_subtree` above): do NOT overwrite them
+    // (from `build_box_tree_subtree_with_fonts` above): do NOT overwrite them
     // with the containing width. The root's containing-block width
     // goes to the layout entry as its own quantity instead.
     let containing_width = style::sane_len(containing_width).max(0.0);
@@ -1992,9 +1993,9 @@ fn layout_impl_with_markers_inner(
         w: style::sane_len(viewport.w).max(0.0),
         h: style::sane_len(viewport.h).max(0.0),
     };
-    let Some((mut forest, root)) =
-        boxes::build_box_tree(doc, author, ua, viewport.w, viewport.h, intrinsics)
-    else {
+    let Some((mut forest, root)) = boxes::build_box_tree_with_fonts(
+        doc, author, ua, viewport.w, viewport.h, intrinsics, fonts,
+    ) else {
         return (
             LayoutBox {
                 rect: Rect {

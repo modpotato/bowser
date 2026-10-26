@@ -1049,10 +1049,31 @@ fn sticky_cb(forest: &Forest, i: usize) -> (Option<usize>, f32, f32, f32, f32, b
         if is_sticky_cb_candidate(forest, p) {
             let pn = &forest.nodes[p];
             let m = &pn.metrics;
+            // The containing block is the content box: the origin is
+            // the border-box origin plus border *and* padding, matching
+            // the content size (`content_w`/`content_h`) returned
+            // alongside it. Using only the border (the padding-box
+            // origin) shifts the whole bound interval by the CB's
+            // padding, so a sticky box pinned to a padded CB's end
+            // (or start) lands a padding-width off, and the position
+            // box's margin-edge distances are measured against the
+            // wrong edge.
+            // w78fix L2: the width/height pair below mixes sources
+            // deliberately, and the mix is safe — it is structural,
+            // not two different measurements. `BoxMetrics` carries
+            // only a `content_w` (the width is resolved with the
+            // containing-block width in `resolve_metrics`, once, up
+            // front); there is no `content_h` field on it, because
+            // the used content height resolves only after content
+            // layout, in `finish_content_height`, which stamps it on
+            // the node itself. `apply_sticky_constraints` runs after
+            // `layout_forest`, when rects are final, so both fields
+            // are the node's final used content-box size in their
+            // axis. No behavior change is intended here.
             return (
                 Some(p),
-                pn.rect.x + m.bl,
-                pn.rect.y + m.bt,
+                pn.rect.x + m.bl + m.pl,
+                pn.rect.y + m.bt + m.pt,
                 m.content_w,
                 pn.content_h,
                 pn.height_definite,
@@ -1118,9 +1139,16 @@ fn cb_scrollable_size(
 }
 
 /// Scrollport `(origin, size, live scroll offset)` for one axis of the
-/// sticky box `i`: the padding box of the nearest scroll container with
+/// sticky box `i`: the content box of the nearest scroll container with
 /// a matching scrollable axis (see [`sticky_scroller`]), or the
 /// viewport's when the box scrolls with the viewport on that axis. The
+/// scroll offset is measured from the content origin, so the view
+/// rectangle's origin in document coordinates is the content-box
+/// origin, not the padding-box origin: a scroller's padding offsets
+/// the stuck position by that padding (WPT
+/// `position-sticky-overflow-padding`: with 20px top padding a
+/// `top: 0` box sticks at scroll + 20, and at scroll 315 the
+/// containing-block bound, not the scrollport, pins it at 320). The
 /// nested scroller's offset comes from `nested_offsets` (see
 /// [`nested_scroll_offset`]); inside a `fixed` subtree with no scroll
 /// container of its own the viewport frame constrains at a zero offset
@@ -1142,9 +1170,17 @@ fn sticky_scrollport_axis(
             let (sx, sy) = nested_scroll_offset(forest, p, nested_offsets);
             let s = if horizontal { sx } else { sy };
             if horizontal {
-                (n.rect.x + m.bl, (n.rect.w - m.bl - m.br).max(0.0), s)
+                (
+                    n.rect.x + m.bl + m.pl,
+                    (n.rect.w - m.bl - m.br - m.pl - m.pr).max(0.0),
+                    s,
+                )
             } else {
-                (n.rect.y + m.bt, (n.rect.h - m.bt - m.bb).max(0.0), s)
+                (
+                    n.rect.y + m.bt + m.pt,
+                    (n.rect.h - m.bt - m.bb - m.pt - m.pb).max(0.0),
+                    s,
+                )
             }
         }
         None if fixed_limit.is_some() => (0.0, vp_size, 0.0),

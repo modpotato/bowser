@@ -3536,26 +3536,46 @@ pub(crate) fn auto_column_maxima(
 /// min-content width in the automatic table layout algorithm were
 /// `max(computed width, outer min-content width)`. Returns `None`
 /// when the quirk does not apply (not full quirks, no `nowrap`
-/// attribute, no nonzero length width, fixed layout, vertical
-/// table — the quirk is defined for the automatic layout
+/// attribute, no nonzero length width, fixed layout,
+/// vertical table — the quirk is defined for the automatic layout
 /// algorithm's horizontal inline axis).
+///
+/// w78fix: the gate is quirks-only again (the wave-78 admission of
+/// limited-quirks is REMOVED). Limited-quirks nowrap cells no
+/// longer need this arm: the cascade now implements the HTML
+/// rendering presentational hint (`td[nowrap], th[nowrap]
+/// { white-space: nowrap }`, see `table_presentational_hints` in
+/// `bowser_css`), gated to quirks / limited-quirks documents, so a
+/// limited-quirks nowrap cell measures its unwrapped line through
+/// its computed `white-space` — including auto, percentage, and
+/// zero widths, which this floor arm (nonzero length width only)
+/// could never cover — and WPT `table-limited-quirks.html` table 3
+/// passes via the hint path, not via a floor. What remains here is
+/// only the genuine §3.9 floor: in full quirks, a nowrap cell
+/// whose specified width exceeds its nowrap measure floors at the
+/// width (the 200px short-text case, which the hint alone would
+/// leave at its 64px content measure). Standards mode is
+/// deliberately untouched by this floor, and the hint itself is
+/// gated off there too, so the w77 standards control still wraps.
 ///
 /// A bare floor on the §3.8.3 minimum is not enough: the WPT
 /// `table-quirks` case measures the full unwrapped line (580 =
 /// full line + padding, not max(50, 160)), so the cell's
 /// min-content for this computation is its nowrap measure — its
-/// max-content width, exactly what the missing presentational hint
+/// max-content width, exactly what the presentational hint
 /// (`td[nowrap], th[nowrap] { white-space: nowrap }` from the
-/// HTML rendering UA stylesheet) would have produced. The floor
+/// HTML rendering UA stylesheet) produces. The floor
 /// is on the *outer* width: a border-box length floors it
 /// directly, a content-box length floors it after padding/border
 /// (`pad`).
 ///
-/// LIMITATION: the layout-level route cannot distinguish an
-/// author `white-space: normal` rule (which should beat the hint)
-/// from the missing hint — both yield computed `Normal` — so the
-/// arm applies whenever the attribute is present. Percentages are
-/// not lengths: no quirk.
+/// w78fix: the arm is additionally gated on the cell's resolved
+/// `white-space` being `nowrap` (read from the forest node's
+/// computed style, which already reflects the hint and any author
+/// override): an author `white-space: normal` specified on the
+/// cell outranks the presentational hint, so it now correctly
+/// disables the floor, where the old arm applied whenever the
+/// attribute was present. Percentages are not lengths: no quirk.
 fn quirks_nowrap_min_floor(
     forest: &mut Forest,
     node: usize,
@@ -3564,7 +3584,10 @@ fn quirks_nowrap_min_floor(
     int_bufs: &mut WalkBufs,
     pad: f32,
 ) -> Option<f32> {
-    if forest.quirks_mode != QuirksMode::Quirks || !forest.nodes[node].nowrap_attr {
+    if forest.quirks_mode != QuirksMode::Quirks
+        || !forest.nodes[node].nowrap_attr
+        || forest.nodes[node].data.white_space != WhiteSpace::NoWrap
+    {
         return None;
     }
     let spec = table_col_spec(forest.nodes[node].data.width);
@@ -10456,13 +10479,14 @@ mod table_tests {
         let (doc, _) = bowser_dom::Document::parse_html(html.as_bytes());
         let ss = bowser_css::parse_stylesheet("");
         let ua = bowser_css::default_ua_stylesheet();
-        let Some((forest, root)) = crate::boxes::build_box_tree(
+        let Some((forest, root)) = crate::boxes::build_box_tree_with_fonts(
             &doc,
             &[&ss],
             &ua,
             800.0,
             600.0,
             &std::collections::HashMap::new(),
+            &crate::FixedFontMetrics,
         ) else {
             panic!("no root box");
         };
@@ -10590,13 +10614,14 @@ mod table_tests {
         let (doc, _) = bowser_dom::Document::parse_html(html.as_bytes());
         let ss = bowser_css::parse_stylesheet(&[TABLE_TEST_RESET_CSS, css].concat());
         let ua = bowser_css::default_ua_stylesheet();
-        let Some((forest, root)) = crate::boxes::build_box_tree(
+        let Some((forest, root)) = crate::boxes::build_box_tree_with_fonts(
             &doc,
             &[&ss],
             &ua,
             800.0,
             600.0,
             &std::collections::HashMap::new(),
+            &crate::FixedFontMetrics,
         ) else {
             panic!("no root box");
         };
@@ -15707,26 +15732,29 @@ mod table_tests {
             "standards nowrap table w {}, want 112 (no quirk)",
             table.rect.w
         );
-        // Percentage width is not a length: no quirk.
+        // Percentage width is not a length: no §3.9 floor — but the
+        // cascade `nowrap` hint still unwraps the cell, so the
+        // measure is the full line (364), not the wrapping
+        // min-content (112). Same for zero width below.
         let l = lay(
             quirks_doctype,
             "<td nowrap style=\"width: 50%\">nowrap nowrap nowrap nowrap</td>",
         );
         let table = &l.children[0].children[0];
         assert!(
-            approx(table.rect.w, 112.0),
-            "quirks nowrap % width table w {}, want 112 (no quirk)",
+            approx(table.rect.w, 364.0),
+            "quirks nowrap % width table w {}, want 364 (hint unwraps, no floor)",
             table.rect.w
         );
-        // Zero width is not nonzero: no quirk.
+        // Zero width is not nonzero: no §3.9 floor, hint unwraps.
         let l = lay(
             quirks_doctype,
             "<td nowrap style=\"width: 0\">nowrap nowrap nowrap nowrap</td>",
         );
         let table = &l.children[0].children[0];
         assert!(
-            approx(table.rect.w, 112.0),
-            "quirks nowrap 0 width table w {}, want 112 (no quirk)",
+            approx(table.rect.w, 364.0),
+            "quirks nowrap 0 width table w {}, want 364 (hint unwraps, no floor)",
             table.rect.w
         );
         // Spanning arm: the nowrap floor distributes over the
@@ -15742,6 +15770,163 @@ mod table_tests {
         assert!(
             approx(table.rect.w, 364.0),
             "quirks nowrap spanning table w {}, want 364",
+            table.rect.w
+        );
+    }
+
+    #[test]
+    fn w78fix_limited_quirks_nowrap_width_floors_min_content() {
+        // WPT `table-limited-quirks.html` table 3 (fail-before):
+        // same fixture as `w77fix_quirks_nowrap_width_floors_min_content`
+        // but under the WPT limited-quirks doctype (HTML 4.01
+        // Transitional with the loose.dtd system id). Under Ahem
+        // 20px the expected cell width is 580 (full line 540 + 40
+        // padding); under FixedFontMetrics (0.6em advances) the
+        // analogue is 364 (full line 324 + 40 padding). Pre-fix the
+        // limited-quirks gate in `quirks_nowrap_min_floor` returns
+        // None, so the column minimum is the wrapping min-content
+        // (longest word 72 + 40 = 112) — the FixedFont analogue of
+        // the WPT 160 (longest word 120 + 40 under Ahem).
+        // w78fix: the limited-quirks arm is removed; the main case
+        // below now passes via the cascade `nowrap` hint instead of
+        // a floor, and the width / percentage / zero cases below
+        // are updated to the hint-only results (no §3.9 floor in
+        // limited-quirks).
+        let css =
+            "table { width: 50px; border-spacing: 0; } td { padding: 20px; font-size: 20px; }";
+        let limited_doctype = "<!DOCTYPE HTML PUBLIC \"-//W3C//DTD HTML 4.01 Transitional//EN\" \"http://www.w3.org/TR/html4/loose.dtd\">";
+        let lay = |inner: &str| {
+            layout_table_html(
+                &format!("{limited_doctype}<table><tr>{inner}</tr></table>"),
+                css,
+            )
+        };
+        // Main case: nowrap + 50px width + multi-word text.
+        let l = lay("<td nowrap style=\"width: 50px\">nowrap nowrap nowrap nowrap</td>");
+        let table = &l.children[0].children[0];
+        assert!(
+            approx(table.rect.w, 364.0),
+            "limited-quirks nowrap table w {}, want 364 (full line 324 + 40 padding)",
+            table.rect.w
+        );
+        // Width case (w78fix: the §3.9 floor does NOT apply in
+        // limited-quirks — that was the old, removed arm — so the
+        // 200px specified width does not floor the minimum; the
+        // column minimum is the hint-driven content measure, 24 +
+        // 40 = 64, and the 50px table grows to it).
+        let l = lay("<td nowrap style=\"width: 200px\">hi</td>");
+        let table = &l.children[0].children[0];
+        assert!(
+            approx(table.rect.w, 64.0),
+            "limited-quirks nowrap width table w {}, want 64 (hint content measure, no floor)",
+            table.rect.w
+        );
+        // Percentage width is not a length: no floor — but the hint
+        // unwraps, so the measure is the full line, not 112.
+        let l = lay("<td nowrap style=\"width: 50%\">nowrap nowrap nowrap nowrap</td>");
+        let table = &l.children[0].children[0];
+        assert!(
+            approx(table.rect.w, 364.0),
+            "limited-quirks nowrap % width table w {}, want 364 (hint unwraps, no floor)",
+            table.rect.w
+        );
+        // Zero width is not nonzero: no floor, hint unwraps.
+        let l = lay("<td nowrap style=\"width: 0\">nowrap nowrap nowrap nowrap</td>");
+        let table = &l.children[0].children[0];
+        assert!(
+            approx(table.rect.w, 364.0),
+            "limited-quirks nowrap 0 width table w {}, want 364 (hint unwraps, no floor)",
+            table.rect.w
+        );
+        // Spanning arm: same hint-driven measure, distributed over
+        // spanned columns.
+        let l = layout_table_html(
+            &format!(
+                "{limited_doctype}<table><tr><td colspan=\"2\" nowrap style=\"width: 50px\">nowrap nowrap nowrap nowrap</td></tr><tr><td>a</td><td>b</td></tr></table>"
+            ),
+            css,
+        );
+        let table = &l.children[0].children[0];
+        assert!(
+            approx(table.rect.w, 364.0),
+            "limited-quirks nowrap spanning table w {}, want 364",
+            table.rect.w
+        );
+    }
+
+    #[test]
+    fn w78fix_limited_quirks_nowrap_author_override_and_hint() {
+        // w78fix item 1 (fail-before: the author-override case
+        // measures 364 and the auto-width case measures 112, both
+        // wrong): with the cascade `nowrap` hint in place and the
+        // limited-quirks admission removed from
+        // `quirks_nowrap_min_floor`, an author `white-space: normal`
+        // beats the hint and the cell wraps (112), while a nowrap
+        // cell with no specified width at all unwraps via the hint
+        // (364) — the reverse gap the floor arm could never close.
+        let css =
+            "table { width: 50px; border-spacing: 0; } td { padding: 20px; font-size: 20px; }";
+        let limited_doctype = "<!DOCTYPE HTML PUBLIC \"-//W3C//DTD HTML 4.01 Transitional//EN\" \"http://www.w3.org/TR/html4/loose.dtd\">";
+        let lay = |inner: &str| {
+            layout_table_html(
+                &format!("{limited_doctype}<table><tr>{inner}</tr></table>"),
+                css,
+            )
+        };
+        let l = lay(
+            "<td nowrap style=\"width: 50px; white-space: normal\">nowrap nowrap nowrap nowrap</td>",
+        );
+        let table = &l.children[0].children[0];
+        assert!(
+            approx(table.rect.w, 112.0),
+            "limited-quirks author-normal nowrap table w {}, want 112 (wrapping min-content)",
+            table.rect.w
+        );
+        let l = lay("<td nowrap>nowrap nowrap nowrap nowrap</td>");
+        let table = &l.children[0].children[0];
+        assert!(
+            approx(table.rect.w, 364.0),
+            "limited-quirks auto-width nowrap table w {}, want 364 (hint unwraps)",
+            table.rect.w
+        );
+        // The hint also unwraps the percentage / zero-width cases
+        // that the old floor arm left wrapping.
+        let l = lay("<td nowrap style=\"width: 50%\">nowrap nowrap nowrap nowrap</td>");
+        let table = &l.children[0].children[0];
+        assert!(
+            approx(table.rect.w, 364.0),
+            "limited-quirks %-width nowrap table w {}, want 364 (hint unwraps)",
+            table.rect.w
+        );
+        let l = lay("<td nowrap style=\"width: 0\">nowrap nowrap nowrap nowrap</td>");
+        let table = &l.children[0].children[0];
+        assert!(
+            approx(table.rect.w, 364.0),
+            "limited-quirks 0-width nowrap table w {}, want 364 (hint unwraps)",
+            table.rect.w
+        );
+    }
+
+    #[test]
+    fn w78fix_full_quirks_nowrap_author_override() {
+        // w78fix item 1, quirks arm: the remaining §3.9 floor is
+        // gated on the cell's resolved `white-space` being `nowrap`,
+        // so an author `white-space: normal` on a full-quirks nowrap
+        // cell also wraps (112) instead of being floored to the
+        // unwrapped line (364, the pre-fix result).
+        let css =
+            "table { width: 50px; border-spacing: 0; } td { padding: 20px; font-size: 20px; }";
+        let quirks_doctype = "<!DOCTYPE HTML PUBLIC \"-//W3C//DTD HTML 4.0 Transitional//EN\">";
+        let l = layout_table_html(
+            &format!(
+                "{quirks_doctype}<table><tr><td nowrap style=\"width: 50px; white-space: normal\">nowrap nowrap nowrap nowrap</td></tr></table>"
+            ),
+            css,
+        );
+        let table = &l.children[0].children[0];
+        assert!(
+            approx(table.rect.w, 112.0),
+            "full-quirks author-normal nowrap table w {}, want 112 (wrapping min-content)",
             table.rect.w
         );
     }
@@ -16368,13 +16553,14 @@ mod table_tests {
         let (doc, _) = bowser_dom::Document::parse_html(html.as_bytes());
         let ss = bowser_css::parse_stylesheet("");
         let ua = bowser_css::default_ua_stylesheet();
-        let Some((forest, root)) = crate::boxes::build_box_tree(
+        let Some((forest, root)) = crate::boxes::build_box_tree_with_fonts(
             &doc,
             &[&ss],
             &ua,
             800.0,
             600.0,
             &std::collections::HashMap::new(),
+            &crate::FixedFontMetrics,
         ) else {
             panic!("no root box");
         };
@@ -17299,13 +17485,14 @@ mod table_tests {
             ".t { display: table; } .f { float: left; margin-top: 20px; width: 50px; }",
         );
         let ua = bowser_css::default_ua_stylesheet();
-        let Some((mut forest, root)) = crate::boxes::build_box_tree(
+        let Some((mut forest, root)) = crate::boxes::build_box_tree_with_fonts(
             &doc,
             &[&ss],
             &ua,
             800.0,
             600.0,
             &std::collections::HashMap::new(),
+            &crate::FixedFontMetrics,
         ) else {
             panic!("no root box");
         };
@@ -17352,13 +17539,14 @@ mod table_tests {
              .b { float: left; clear: left; margin-top: 20px; width: 50px; height: 10px; }",
         );
         let ua = bowser_css::default_ua_stylesheet();
-        let Some((mut forest, root)) = crate::boxes::build_box_tree(
+        let Some((mut forest, root)) = crate::boxes::build_box_tree_with_fonts(
             &doc,
             &[&ss],
             &ua,
             800.0,
             600.0,
             &std::collections::HashMap::new(),
+            &crate::FixedFontMetrics,
         ) else {
             panic!("no root box");
         };
@@ -17971,13 +18159,14 @@ mod table_tests {
         let (doc, _) = bowser_dom::Document::parse_html(html.as_bytes());
         let ss = bowser_css::parse_stylesheet("");
         let ua = bowser_css::default_ua_stylesheet();
-        let Some((forest, root)) = crate::boxes::build_box_tree(
+        let Some((forest, root)) = crate::boxes::build_box_tree_with_fonts(
             &doc,
             &[&ss],
             &ua,
             800.0,
             600.0,
             &std::collections::HashMap::new(),
+            &crate::FixedFontMetrics,
         ) else {
             panic!("no root box");
         };
@@ -19030,9 +19219,15 @@ mod w65_d_pctpad_tests {
         let (doc, _) = bowser_dom::Document::parse_html(html.as_bytes());
         let ss = bowser_css::parse_stylesheet(&[TABLE_TEST_RESET_CSS, css].concat());
         let ua = bowser_css::default_ua_stylesheet();
-        let Some((forest, root)) =
-            crate::boxes::build_box_tree(&doc, &[&ss], &ua, 800.0, 600.0, &HashMap::new())
-        else {
+        let Some((forest, root)) = crate::boxes::build_box_tree_with_fonts(
+            &doc,
+            &[&ss],
+            &ua,
+            800.0,
+            600.0,
+            &HashMap::new(),
+            &crate::FixedFontMetrics,
+        ) else {
             panic!("no root box");
         };
         let mut stack = vec![root];
@@ -19305,13 +19500,14 @@ mod w65_e_capvwm_tests {
         let (doc, _) = bowser_dom::Document::parse_html(html.as_bytes());
         let ss = bowser_css::parse_stylesheet(&[TABLE_TEST_RESET_CSS, css].concat());
         let ua = bowser_css::default_ua_stylesheet();
-        let Some((forest, root)) = crate::boxes::build_box_tree(
+        let Some((forest, root)) = crate::boxes::build_box_tree_with_fonts(
             &doc,
             &[&ss],
             &ua,
             800.0,
             600.0,
             &std::collections::HashMap::new(),
+            &crate::FixedFontMetrics,
         ) else {
             panic!("no root box");
         };

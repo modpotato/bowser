@@ -1263,6 +1263,21 @@ fn layout_track_positions(
 /// child becomes a grid item, and a run of text/inline children forms
 /// one anonymous item). Idempotent: wrappers are block-level, so a
 /// second call finds no raw runs.
+///
+/// Exception (w78, css-grid-1 §5.1 blockification, mirroring the
+/// flex trigger in [`crate::layout::wrap_flex_text_runs`]): an
+/// in-flow `display: inline-block | inline-flex | inline-grid |
+/// inline-table` child is NOT wrapped — it blockifies to a real
+/// `Block` / `Block` / `Grid` / `Table` box carrying its own style,
+/// so its placement, `justify-self` / `align-self`, and margins
+/// reach the item instead of being lost on a style-less wrapper.
+/// This is trigger two of two: boxes pass 3 promotes the item when
+/// the grid container has a block-level child, this one when it does
+/// not (a text run or a lone inline-* item). Only the box type is
+/// mutated: the display-keyed inner dispatch still sees the
+/// original display, so a promoted inline-flex still lays out as
+/// flex and a promoted inline-grid still as grid. Out-of-flow
+/// inline-* boxes are not grid items and are left alone.
 fn wrap_grid_text_runs(forest: &mut Forest, idx: usize) {
     // Scan before allocating: when every child is block-level the
     // wrapping is a no-op, and that is the common case (idempotence
@@ -1293,6 +1308,35 @@ fn wrap_grid_text_runs(forest: &mut Forest, idx: usize) {
                     true,
                 ));
             }
+            roots.push(c);
+        } else if forest.nodes[c].box_type == BoxType::InlineBlock
+            && matches!(
+                forest.nodes[c].data.display,
+                crate::style::Display::InlineBlock
+                    | crate::style::Display::InlineFlex
+                    | crate::style::Display::InlineGrid
+                    | crate::style::Display::InlineTable
+            )
+        {
+            // w78 blockification (see the fn docs): flush any pending
+            // run, then promote this node to an item of its own.
+            // Its style is untouched, so placement and self-alignment
+            // survive; track sizing and item alignment read the
+            // item's own style (see `place_items` / item layout,
+            // which key off the item node, not a wrapper).
+            if !run.is_empty() {
+                roots.push(forest.make_anonymous(
+                    &parent_data,
+                    std::mem::take(&mut run),
+                    idx,
+                    true,
+                ));
+            }
+            forest.nodes[c].box_type = match forest.nodes[c].data.display {
+                crate::style::Display::InlineGrid => BoxType::Grid,
+                crate::style::Display::InlineTable => BoxType::Table,
+                _ => BoxType::Block,
+            };
             roots.push(c);
         } else {
             run.push(c);
@@ -4107,13 +4151,14 @@ mod grid_tests {
         let (doc, _) = bowser_dom::Document::parse_html(html.as_bytes());
         let ss = bowser_css::parse_stylesheet(css);
         let ua = bowser_css::default_ua_stylesheet();
-        let Some((forest, root)) = crate::boxes::build_box_tree(
+        let Some((forest, root)) = crate::boxes::build_box_tree_with_fonts(
             &doc,
             &[&ss],
             &ua,
             800.0,
             600.0,
             &std::collections::HashMap::new(),
+            &crate::FixedFontMetrics,
         ) else {
             panic!("no root box");
         };
@@ -4678,13 +4723,14 @@ mod grid_tests {
              .i { height: 20px; }",
         );
         let ua = bowser_css::default_ua_stylesheet();
-        let Some((mut forest, root)) = crate::boxes::build_box_tree(
+        let Some((mut forest, root)) = crate::boxes::build_box_tree_with_fonts(
             &doc,
             &[&ss],
             &ua,
             800.0,
             600.0,
             &std::collections::HashMap::new(),
+            &crate::FixedFontMetrics,
         ) else {
             panic!("no root box");
         };

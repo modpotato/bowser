@@ -3413,6 +3413,15 @@ fn parse_item(tokens: &[Token], depth: u32, preserve_case: bool) -> Result<CssVa
             if lower == "currentcolor" {
                 return Ok(CssValue::Keyword(lower.into()));
             }
+            // Named colors and `transparent` fold to RGBA here on
+            // purpose: the cascade and computed style consume plain
+            // `Color` (see `is_valid_for_property`), so the keyword
+            // is not carried in the value. Specified-style
+            // serialization recovers it from the raw declaration
+            // text instead (see `specified_color_keyword` in
+            // `bowser_js`, used by `decl_value_preserving_math`):
+            // that keeps `el.style` keyword-faithful while computed
+            // style keeps the rgb()/rgba() form.
             if lower == "transparent" {
                 return Ok(CssValue::Color(Color {
                     r: 0,
