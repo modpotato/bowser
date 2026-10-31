@@ -1660,6 +1660,7 @@ fn matches_pseudo(
         PseudoClass::Link => is_html_link(doc, node) && !state.visited,
         PseudoClass::Visited => is_html_link(doc, node) && state.visited,
         PseudoClass::Checked => is_checked(doc, node),
+        PseudoClass::PopoverOpen => doc.is_popover_open(node),
         PseudoClass::Disabled => is_disabled(doc, node),
         PseudoClass::Enabled => is_enabled(doc, node),
         PseudoClass::Not(args) => !args
@@ -4467,8 +4468,9 @@ mod tests {
         let root = doc.root();
         let parent = doc.create_element("div");
         doc.append_child(root, parent);
-        // HTML, mixed case via `create_element_ns` (kept as-is): "DIV"
-        // and "Div" must group with "div".
+        // HTML, mixed case via `create_element_ns` (lowercased at
+        // creation since w80fix F1, so "DIV" and "Div" are stored
+        // as "div"): "DIV" and "Div" must group with "div".
         let d1 = doc.create_element("div");
         let d2 = doc.create_element_ns(Namespace::Html, "DIV");
         let d3 = doc.create_element_ns(Namespace::Html, "Div");
@@ -4637,8 +4639,10 @@ mod tests {
         assert!(m("my-widget:first-of-type", &doc, a));
         assert!(m("my-widget:last-of-type", &doc, b));
 
-        // Non-canonical HTML names (createElementNS keeps case) still
-        // group case-insensitively via the spill fallback.
+        // HTML names from `createElementNS` are lowercased at
+        // creation (w80fix F1), so "DIV" is stored as "div" and
+        // groups with "div" directly, without needing the
+        // case-insensitive spill fallback.
         let c = doc.create_element_ns(Namespace::Html, "DIV");
         doc.append_child(wrap, c);
         let d = doc.create_element("div");

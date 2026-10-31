@@ -12468,6 +12468,233 @@ fn w79_multicol_unpromoted_inline_block_shrink_container() {
 }
 
 #[test]
+fn w80_multicol_laid_out_flex_container_square_kids() {
+    // w80 (deferred w79 follow-up, already fixed by the w79 joint
+    // gate — pinned, not fixed, here): the laid-out variant of the
+    // w79 shrink-container test, with square 50x50 children, so a
+    // kids-max regression would read as a 50x50 container rect.
+    // That 50x50 appearance is a WIDTH-ONLY failure, not a
+    // both-axes fallback: the height is the children's height (50)
+    // in both the correct layout (container 120x50, item 120x50)
+    // and the regressed one (container 50 wide, item still laid
+    // out 120 wide overflowing it, height 50 either way). Only
+    // the width distinguishes them, so this test asserts width
+    // and height separately for both `min-content` and
+    // `max-content` container widths, plus the item width and the
+    // second child's column position (item x + 50 + 20 gap).
+    // Scope note (w80fix): this test pins the FLEX shape only.
+    // Under a flex parent the item is promoted before
+    // `layout_block`, so it never exercises the gate's
+    // `InlineBlock` branch; the genuinely unpromoted laid-out pin
+    // is `w80fix_multicol_unpromoted_block_parent_laid_out`
+    // (plain block parent, no promotion trigger). The w79 joint
+    // gate (`multicol_intrinsic_params` accepting an
+    // `InlineBlock` box carrying `display: inline-block`, moving
+    // with `layout_block`'s multicol gate) already covers both
+    // shapes, so there is no separate laid-out fix to make.
+    for keyword in ["min-content", "max-content"] {
+        let css = format!(
+            "body {{ margin: 0; }} .c {{ display: flex; width: {keyword}; }} \
+             .i {{ display: inline-block; column-count: 2; column-gap: 20px; }} \
+             .a {{ width: 50px; height: 50px; }} .b {{ width: 50px; height: 50px; }}"
+        );
+        let l = layout_html(
+            r#"<div class="c"><div class="i"><div class="a"></div><div class="b"></div></div></div>"#,
+            &css,
+        );
+        let container = &body(&l).children[0];
+        let item = &container.children[0];
+        assert!(
+            approx(container.rect.w, 120.0),
+            "{keyword}: container w={} != 120",
+            container.rect.w
+        );
+        assert!(
+            approx(container.rect.h, 50.0),
+            "{keyword}: container h={} != 50 (children height, not a width symptom)",
+            container.rect.h
+        );
+        assert!(
+            approx(item.rect.w, 120.0),
+            "{keyword}: item w={} != 120",
+            item.rect.w
+        );
+        assert_eq!(
+            item.children.len(),
+            2,
+            "{keyword}: item must have 2 children"
+        );
+        assert!(
+            approx(item.children[1].rect.x, item.rect.x + 70.0),
+            "{keyword}: second child x={} != item x + 70",
+            item.children[1].rect.x
+        );
+    }
+}
+
+#[test]
+fn w80fix_popover_content_sized_centers_in_viewport() {
+    // w80fix R2-F3 / R1-M4: the UA `[popover]` rule claimed a fixed,
+    // viewport-centered box while open, but without `width` /
+    // `height: fit-content` a content-sized open popover stretched
+    // to the full viewport: the abspos solver fills auto sizes
+    // when both insets are set, and the auto-margin solve is then
+    // a no-op. Fail-before: the popover rect is 800x600 at (0, 0).
+    // After the UA fix it is the content size (100x40, from the
+    // inner block) centered in the 800x600 viewport, at (350, 280).
+    let (mut doc, _) = bowser_dom::Document::parse_html(
+        b"<!DOCTYPE html><html><body><div popover id=\"p\"><div class=\"inner\"></div></div></body></html>"
+            .as_slice(),
+    );
+    let pop = doc.get_element_by_id("p").expect("popover");
+    doc.show_popover(pop).expect("show popover");
+    let ss = bowser_css::parse_stylesheet(
+        &[
+            TABLE_TEST_RESET_CSS,
+            "body { margin: 0; } .inner { width: 100px; height: 40px; }",
+        ]
+        .concat(),
+    );
+    let l = layout(&doc, &[&ss], VP, &FixedFontMetrics);
+    let pop_box = find_box(&l, pop).expect("popover box");
+    assert!(
+        approx(pop_box.rect.w, 100.0),
+        "popover w={} != 100 (viewport-filling stretch)",
+        pop_box.rect.w
+    );
+    assert!(
+        approx(pop_box.rect.h, 40.0),
+        "popover h={} != 40 (viewport-filling stretch)",
+        pop_box.rect.h
+    );
+    assert!(
+        approx(pop_box.rect.x, 350.0),
+        "popover x={} != 350 (not centered)",
+        pop_box.rect.x
+    );
+    assert!(
+        approx(pop_box.rect.y, 280.0),
+        "popover y={} != 280 (not centered)",
+        pop_box.rect.y
+    );
+}
+
+#[test]
+fn w80fix_multicol_unpromoted_block_parent_laid_out() {
+    // w80fix R2-F2 / R1-L6: a genuinely unpromoted laid-out pin.
+    // The w80 flex-parent test never reaches `layout_block`'s
+    // multicol gate via its `InlineBlock` branch: under a flex
+    // parent the item is promoted (boxes pass 3, and
+    // `wrap_flex_text_runs`), so that test exercises the intrinsic
+    // `InlineBlock` branch plus the post-promotion `Block` branch.
+    // Under a plain BLOCK parent no promotion trigger fires: line
+    // layout hands the box to `layout_block` via the shrink
+    // `Task::Block` path (`ib_out`), still an `InlineBlock` box, so
+    // only the gate's `InlineBlock` branch (layout.rs:3893-3894)
+    // can give it multicol layout. Without that branch the item
+    // measures/lays out kids-max (50 wide, children stacked to
+    // 100 tall, second child at item x); with it, it is 120x50
+    // with the second child in column 2 (item x + 50 + 20 gap).
+    // Mutation check: neutralizing the `InlineBlock` branch makes
+    // this test fail (item 50x100, second child at item x).
+    let l = layout_html(
+        r#"<div class="p"><div class="i"><div class="a"></div><div class="b"></div></div></div>"#,
+        "body { margin: 0; } .i { display: inline-block; column-count: 2; column-gap: 20px; } \
+         .a { width: 50px; height: 50px; } .b { width: 50px; height: 50px; }",
+    );
+    let item = &body(&l).children[0].children[0];
+    assert_eq!(
+        item.box_type,
+        BoxType::InlineBlock,
+        "item must stay unpromoted under a block parent"
+    );
+    assert!(approx(item.rect.w, 120.0), "item w={} != 120", item.rect.w);
+    assert!(
+        approx(item.rect.h, 50.0),
+        "item h={} != 50 (stacked children would be 100)",
+        item.rect.h
+    );
+    assert_eq!(item.children.len(), 2, "item must have 2 children");
+    assert!(
+        approx(item.children[0].rect.x, item.rect.x),
+        "first child x={} != item x={}",
+        item.children[0].rect.x,
+        item.rect.x
+    );
+    assert!(
+        approx(item.children[1].rect.x, item.rect.x + 70.0),
+        "second child x={} != item x + 70",
+        item.children[1].rect.x
+    );
+    assert!(
+        approx(item.children[1].rect.y, item.children[0].rect.y),
+        "second child y={} != first child y={} (must share the column row)",
+        item.children[1].rect.y,
+        item.children[0].rect.y
+    );
+}
+
+#[test]
+fn w80fix_blockification_probe_replaced_table_cell_float_abspos() {
+    // w80fix R2-F6, probe only (no code change): CSS 2.1 §9.7
+    // blockification escape for remapped boxes. `display_of`'s
+    // float blockification runs before the table-model fixup
+    // remap and its list excludes table values, and abspos
+    // blockification is missing from `display_of` entirely, so a
+    // floated/abspos replaced `table-cell` remaps to `Inline` and
+    // becomes an `InlineBlock` box, where §9.7 would blockify it
+    // to `Block`. The box types therefore differ from the
+    // blockified comparisons (floated `inline` -> `Block`,
+    // abspos `block` -> `Block`), but the rendered geometry is
+    // what matters here, and it is identical: both shapes size
+    // shrink-to-fit / from intrinsics under float/abspos. This
+    // test pins that geometric equivalence (60x40 intrinsics, no
+    // author size); if it ever diverges, the §9.7 escape is a
+    // real bug and the fix belongs in `display_of` / the remap,
+    // not in this probe.
+    let probe = |css: &str| {
+        let (doc, _) = bowser_dom::Document::parse_html(
+            b"<!DOCTYPE html><html><body><img id=\"x\"></body></html>".as_slice(),
+        );
+        let img = doc.get_element_by_id("x").expect("img");
+        let mut intrinsics = HashMap::new();
+        intrinsics.insert(img, IntrinsicDims::from_size(60.0, 40.0));
+        let ss = bowser_css::parse_stylesheet(&[TABLE_TEST_RESET_CSS, css].concat());
+        let l = layout_with_intrinsics(&doc, &[&ss], VP, &FixedFontMetrics, &intrinsics);
+        let b = find_box(&l, img).expect("img box");
+        (b.rect.x, b.rect.y, b.rect.w, b.rect.h)
+    };
+    let float_cell = probe("body { margin: 0; } #x { float: left; display: table-cell; }");
+    let float_inline = probe("body { margin: 0; } #x { float: left; display: inline; }");
+    assert!(
+        approx(float_cell.2, 60.0)
+            && approx(float_cell.3, 40.0)
+            && approx(float_cell.0, float_inline.0)
+            && approx(float_cell.1, float_inline.1)
+            && approx(float_cell.2, float_inline.2)
+            && approx(float_cell.3, float_inline.3),
+        "floated table-cell {float_cell:?} != floated inline {float_inline:?}"
+    );
+    let abs_cell = probe(
+        "body { margin: 0; } #x { position: absolute; top: 10px; left: 20px; display: table-cell; }",
+    );
+    let abs_block = probe(
+        "body { margin: 0; } #x { position: absolute; top: 10px; left: 20px; display: block; }",
+    );
+    assert!(
+        approx(abs_cell.0, 20.0)
+            && approx(abs_cell.1, 10.0)
+            && approx(abs_cell.2, 60.0)
+            && approx(abs_cell.3, 40.0)
+            && approx(abs_cell.0, abs_block.0)
+            && approx(abs_cell.1, abs_block.1)
+            && approx(abs_cell.2, abs_block.2)
+            && approx(abs_cell.3, abs_block.3),
+        "abspos table-cell {abs_cell:?} != abspos block {abs_block:?}"
+    );
+}
+
+#[test]
 fn w79_multicol_inline_flex_grid_table_keep_own_arms() {
     // w79 regression: widening the multicol gates to
     // `InlineBlock` boxes must not sweep in inline-flex, inline-
@@ -12596,4 +12823,53 @@ fn w78fix_min_aspect_promoted_inline_block_parity() {
         "promoted min w={w_promoted} != 100"
     );
     assert!(approx(w_lone, 100.0), "lone min w={w_lone} != 100");
+}
+
+#[test]
+fn replaced_table_caption_inputs_share_a_line_when_sized() {
+    // w80fix R2-F1: the WPT `table-model-fixup-2` caption cases
+    // (equal tops) passed vacuously before the fix: a replaced
+    // caption became a `Block` box with zero height (no form-control
+    // intrinsic), so stacked zero-height blocks shared a top for the
+    // wrong reason. Give the pair a real height: as `inline` boxes
+    // they must share one line (equal tops, nonzero height), while
+    // the `display: table` control pair — genuinely `block` — stacks
+    // with different tops. If the caption pair ever regresses to
+    // `Block`, the equal-tops assertion fails by exactly the height.
+    let html = r#"<div class="wrap"><input><input></div>"#;
+    let l = layout_html(
+        html,
+        ".wrap input { width: 100px; height: 20px; margin: 0; \
+         display: table-caption; }",
+    );
+    let wrap = &body(&l).children[0];
+    assert_eq!(wrap.children.len(), 2, "two caption inputs");
+    let (a, b) = (&wrap.children[0], &wrap.children[1]);
+    assert_eq!(a.box_type, BoxType::InlineBlock);
+    assert_eq!(b.box_type, BoxType::InlineBlock);
+    assert!(approx(a.rect.h, 20.0), "caption a h={} != 20", a.rect.h);
+    assert!(approx(b.rect.h, 20.0), "caption b h={} != 20", b.rect.h);
+    assert!(
+        approx(a.rect.y, b.rect.y),
+        "caption pair tops differ: a.y={} b.y={}",
+        a.rect.y,
+        b.rect.y
+    );
+    // Control: the `display: table` pair really is block-level, so
+    // the same geometry stacks instead of sharing a line.
+    let l = layout_html(
+        html,
+        ".wrap input { width: 100px; height: 20px; margin: 0; \
+         display: table; }",
+    );
+    let wrap = &body(&l).children[0];
+    assert_eq!(wrap.children.len(), 2, "two table inputs");
+    let (a, b) = (&wrap.children[0], &wrap.children[1]);
+    assert_eq!(a.box_type, BoxType::Block);
+    assert!(
+        approx(b.rect.y, a.rect.y + 20.0),
+        "table pair must stack: a.y={} b.y={}",
+        a.rect.y,
+        b.rect.y
+    );
 }

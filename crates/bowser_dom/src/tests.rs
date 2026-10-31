@@ -256,9 +256,9 @@ fn get_elements_by_tag_name() {
 
 #[test]
 fn get_elements_by_tag_name_matches_non_canonical_html_tag() {
-    // `createElementNS(Html, "DIV")` keeps the tag's case (the name
-    // spills off the atom table); the DOM spec still matches ASCII
-    // case-insensitively in HTML documents, so "div" must find it.
+    // `createElementNS(Html, "DIV")` lowercases the stored tag (w80fix
+    // F1), so "div" and "DIV" both find it, ASCII case-insensitively
+    // as the DOM spec requires for HTML documents.
     let mut doc = Document::new();
     let root = doc.root();
     let html = doc.create_element("html");
@@ -274,6 +274,32 @@ fn get_elements_by_tag_name_matches_non_canonical_html_tag() {
     doc.append_child(html, svg_div);
     assert_eq!(doc.get_elements_by_tag_name("div").len(), 1);
     assert_eq!(doc.get_elements_by_tag_name("DIV").len(), 2);
+}
+
+#[test]
+fn create_element_ns_html_lowercases_and_foreign_preserves_case() {
+    // w80fix F1: like `createElement` and like the parse shim, the
+    // HTML namespace ASCII-lowercases the tag; foreign namespaces
+    // keep the name exactly as written (DOM "validate and extract").
+    let mut doc = Document::new();
+    let html_div = doc.create_element_ns(Namespace::Html, "DIV");
+    assert_eq!(tag(&doc, html_div), "div");
+    assert!(matches!(
+        doc.kind(html_div),
+        NodeKind::Element(d) if d.namespace == Namespace::Html
+    ));
+    let widget = doc.create_element_ns(Namespace::Html, "My-Widget");
+    assert_eq!(tag(&doc, widget), "my-widget");
+    let foreign = doc.create_element_ns(Namespace::Svg, "foreignObject");
+    assert_eq!(tag(&doc, foreign), "foreignObject");
+    assert!(matches!(
+        doc.kind(foreign),
+        NodeKind::Element(d) if d.namespace == Namespace::Svg
+    ));
+    let svg_div = doc.create_element_ns(Namespace::Svg, "DIV");
+    assert_eq!(tag(&doc, svg_div), "DIV");
+    let other = doc.create_element_ns(Namespace::Other("http://example.com/ns".into()), "DIV");
+    assert_eq!(tag(&doc, other), "DIV");
 }
 
 // -- selectors ----------------------------------------------------------------
@@ -4372,4 +4398,142 @@ fn document_insert_rejects_live_shadow_root_fragment() {
     let kid2 = doc.create_element("i");
     doc.append_child(frag, kid2);
     assert_eq!(doc.children(frag), vec![kid, kid2]);
+}
+
+// -- top-layer demotion on subtree clears (w80fix) --------------------------
+
+fn open_popover_in_container() -> (Document, NodeId, NodeId) {
+    let mut doc = Document::new();
+    let container = doc.create_element("div");
+    let wrapper = doc.create_element("div");
+    let pop = doc.create_element("div");
+    doc.set_attribute(pop, "popover", "auto");
+    doc.append_child(doc.root(), container);
+    doc.append_child(container, wrapper);
+    doc.append_child(wrapper, pop);
+    doc.show_popover(pop).expect("show popover");
+    assert!(doc.is_in_top_layer(pop));
+    assert!(doc.is_popover_open(pop));
+    assert!(doc.matches(pop, ":popover-open").expect("parse"));
+    (doc, container, pop)
+}
+
+#[test]
+fn matches_popover_open_pseudo_is_ascii_case_insensitive() {
+    // w80fix F2: the production selector engine lowercases pseudo
+    // names, so the DOM mini-parser must too — `:POPOVER-OPEN`
+    // matches a shown popover, while every other pseudo still
+    // errors, `::backdrop` (empty name on the second `:`) still
+    // errors, and `:not(...)` still errors.
+    let (doc, _container, pop) = open_popover_in_container();
+    assert!(doc.matches(pop, ":popover-open").expect("parse"));
+    assert!(doc.matches(pop, ":POPOVER-OPEN").expect("parse"));
+    assert!(doc.matches(pop, ":Popover-Open").expect("parse"));
+    assert!(doc.matches(pop, ":hover").is_err());
+    assert!(doc.matches(pop, ":HOVER").is_err());
+    assert!(doc.matches(pop, "::backdrop").is_err());
+    assert!(doc.matches(pop, ":not(div)").is_err());
+}
+
+#[test]
+fn clearing_container_inner_html_demotes_nested_popover() {
+    let (mut doc, container, pop) = open_popover_in_container();
+    doc.set_inner_html(container, "");
+    assert!(doc.children(container).is_empty());
+    assert!(
+        !doc.is_in_top_layer(pop),
+        "ghost top-layer member after innerHTML clear"
+    );
+    assert!(!doc.is_popover_open(pop));
+    assert!(!doc.matches(pop, ":popover-open").expect("parse"));
+    // Detached, so a re-show must fail rather than coexist with a match.
+    assert!(doc.show_popover(pop).is_err());
+}
+
+#[test]
+fn clearing_container_text_content_demotes_nested_popover() {
+    let (mut doc, container, pop) = open_popover_in_container();
+    doc.set_text_content(container, "");
+    assert!(doc.children(container).is_empty());
+    assert!(
+        !doc.is_in_top_layer(pop),
+        "ghost top-layer member after textContent clear"
+    );
+    assert!(!doc.is_popover_open(pop));
+    assert!(!doc.matches(pop, ":popover-open").expect("parse"));
+    assert!(doc.show_popover(pop).is_err());
+}
+
+#[test]
+fn moving_open_popover_keeps_top_layer_membership() {
+    let (mut doc, _container, pop) = open_popover_in_container();
+    let other = doc.create_element("div");
+    doc.append_child(doc.root(), other);
+    doc.append_child(other, pop);
+    assert!(doc.is_in_top_layer(pop), "move must not demote");
+    assert!(doc.is_popover_open(pop));
+    assert!(doc.matches(pop, ":popover-open").expect("parse"));
+}
+
+#[test]
+fn popover_show_hide_toggle_and_set_ops_dirty_the_document() {
+    let mut doc = Document::new();
+    // One element child of the document root (validity rule), with the
+    // popovers nested under it so every append below actually links.
+    let host = doc.create_element("div");
+    doc.append_child(doc.root(), host);
+    let pop = doc.create_element("div");
+    doc.set_attribute(pop, "popover", "auto");
+    doc.append_child(host, pop);
+    let _ = doc.take_dirty();
+
+    doc.show_popover(pop).expect("show");
+    let report = doc.take_dirty();
+    assert!(!report.is_empty(), "showPopover must dirty the document");
+    assert!(report.style, "showPopover changes :popover-open matching");
+    assert!(report.subtrees.contains(&pop));
+
+    doc.hide_popover(pop).expect("hide");
+    let report = doc.take_dirty();
+    assert!(!report.is_empty(), "hidePopover must dirty the document");
+    assert!(report.style);
+    assert!(report.subtrees.contains(&pop));
+
+    assert!(doc.toggle_popover(pop, None).expect("toggle"));
+    assert!(
+        !doc.take_dirty().is_empty(),
+        "togglePopover must dirty the document"
+    );
+
+    // Raw set ops, for uniformity: promote and remove both dirty.
+    let plain = doc.create_element("div");
+    doc.append_child(host, plain);
+    let _ = doc.take_dirty();
+    doc.promote_to_top_layer(plain);
+    assert!(
+        !doc.take_dirty().is_empty(),
+        "promote_to_top_layer must dirty"
+    );
+    doc.remove_from_top_layer(plain);
+    assert!(
+        !doc.take_dirty().is_empty(),
+        "remove_from_top_layer must dirty"
+    );
+
+    // Auto-close: showing a second auto popover dirties the closed one too.
+    let pop2 = doc.create_element("div");
+    doc.set_attribute(pop2, "popover", "auto");
+    doc.append_child(host, pop2);
+    let _ = doc.take_dirty();
+    doc.show_popover(pop2).expect("show second auto popover");
+    assert!(!doc.is_popover_open(pop), "first auto popover auto-closed");
+    let report = doc.take_dirty();
+    assert!(
+        report.subtrees.contains(&pop),
+        "auto-closed popover must be dirtied"
+    );
+    assert!(
+        report.subtrees.contains(&pop2),
+        "newly shown popover must be dirtied"
+    );
 }

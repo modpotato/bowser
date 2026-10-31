@@ -25,6 +25,40 @@ use crate::cbprops::Filter;
 use crate::kwatom::Keyword;
 use crate::token::Token;
 
+/// A functional `<easing-function>` (CSS Easing Functions 2):
+/// `steps()` / `cubic-bezier()`. Named easing functions (`linear`,
+/// `ease`, `ease-in`, `ease-out`, `ease-in-out`, `step-start`,
+/// `step-end`) stay plain [`CssValue::Keyword`]s; only the functional
+/// forms need structure (the transition engine evaluates them, and
+/// CSSOM serializes them back to functional form).
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum TimingFunction {
+    /// `steps(<count>, <position>)`: `count >= 1` (`jump-none`
+    /// additionally requires `count >= 2`); `position` defaults to
+    /// [`StepPosition::End`] when the second argument is omitted.
+    Steps { count: u32, position: StepPosition },
+    /// `cubic-bezier(<x1>, <y1>, <x2>, <y2>)`: `x1`/`x2` in `[0, 1]`
+    /// (enforced at parse time); `y1`/`y2` are unrestricted.
+    CubicBezier { x1: f32, y1: f32, x2: f32, y2: f32 },
+}
+
+/// The `<step-position>` of a `steps()` timing function (CSS Easing
+/// Functions 2 §3.2).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum StepPosition {
+    /// `start` / `jump-start`: the first jump happens at the start.
+    Start,
+    /// `end` / `jump-end` (the default): the last jump happens at
+    /// the end.
+    End,
+    /// `jump-none`: no jump at either end (the value holds the
+    /// previous step through the whole interval, then jumps at the
+    /// very end — only meaningful with `count >= 2`).
+    JumpNone,
+    /// `jump-both`: jumps at both the start and the end.
+    JumpBoth,
+}
+
 /// A parsed CSS property value.
 #[derive(Clone, Debug)]
 pub enum CssValue {
@@ -263,6 +297,15 @@ pub enum CssValue {
     /// `pseudo::resolve_content_text`). Boxed so the variant does not
     /// grow [`CssValue`] (see [`CssValue::MinMax`]).
     Counter(Box<CounterData>),
+    /// A `<time>` value (CSS Values 4 §6.2), in seconds, normalized
+    /// at parse time (`100ms` → `0.1`). Used by
+    /// `transition-duration` / `transition-delay` (CSS Transitions
+    /// 2). A bare `Number(0.0)` is also accepted as zero time by
+    /// those properties' validators, but the parser only produces
+    /// this variant, from `s`/`ms` dimensions.
+    Time(f32),
+    /// A functional `<easing-function>` (see [`TimingFunction`]).
+    TimingFunction(TimingFunction),
 }
 
 /// Manual `PartialEq` for [`CssValue`]: identical to the derived
@@ -355,6 +398,8 @@ impl PartialEq for CssValue {
             ) => an == bn && asn == bsn,
             (Attr(a), Attr(b)) => a == b,
             (Counter(a), Counter(b)) => a == b,
+            (Time(a), Time(b)) => a == b,
+            (TimingFunction(a), TimingFunction(b)) => a == b,
             _ => false,
         }
     }
@@ -3655,6 +3700,14 @@ fn parse_item(tokens: &[Token], depth: u32, preserve_case: bool) -> Result<CssVa
             // A non-finite `fr` (e.g. `1e999fr`) would poison track sizing
             // with NaN (`free * inf / inf`).
             "fr" if *n >= 0.0 && n.is_finite() => Ok(CssValue::Fr(*n)),
+            // CSS Values 4 §6.2 `<time>`: seconds, normalized here so
+            // every consumer sees one unit (`100ms` → `0.1s`). A
+            // non-finite time is invalid; negativity is a property
+            // grammar matter (a negative duration is invalid at
+            // computed-value time, a negative delay is valid), so it
+            // is NOT rejected here.
+            "s" if n.is_finite() => Ok(CssValue::Time(*n)),
+            "ms" if n.is_finite() => Ok(CssValue::Time(*n / 1000.0)),
             _ => Err(ValueError),
         },
         [Token::Percentage(p)] => Ok(CssValue::Percentage(*p)),
@@ -3912,8 +3965,102 @@ fn parse_function(
         "inset" | "circle" | "ellipse" | "polygon" => {
             parse_basic_shape(name, body).map(CssValue::ClipPath)
         }
+        // CSS Easing Functions 2 `<timing-function>`s: `steps()` /
+        // `cubic-bezier()`. Named timing functions never reach here
+        // (they parse as plain idents); only the functional forms
+        // need structure.
+        "steps" => parse_steps_body(body).map(CssValue::TimingFunction),
+        "cubic-bezier" => parse_cubic_bezier_body(body).map(CssValue::TimingFunction),
         _ => Err(ValueError),
     }
+}
+
+/// Split a function body on top-level commas (commas inside nested
+/// functions do not split; easing arguments never nest, but the
+/// depth tracking keeps a smuggled nested function from silently
+/// merging arguments).
+fn split_easing_args(body: &[Token]) -> Vec<&[Token]> {
+    let mut args: Vec<&[Token]> = Vec::new();
+    let mut start = 0;
+    let mut depth: u32 = 0;
+    for (i, t) in body.iter().enumerate() {
+        match t {
+            Token::LParen | Token::Function(_) | Token::LBracket => depth += 1,
+            Token::RParen | Token::RBracket => depth = depth.saturating_sub(1),
+            Token::Comma if depth == 0 => {
+                args.push(&body[start..i]);
+                start = i + 1;
+            }
+            _ => {}
+        }
+    }
+    args.push(&body[start..]);
+    args
+}
+
+/// One non-whitespace token from an easing argument, or `Err` when
+/// the argument is empty or holds more than one token.
+fn easing_arg_token(arg: &[Token]) -> Result<&Token, ValueError> {
+    let mut toks = arg.iter().filter(|t| !matches!(t, Token::Whitespace));
+    match (toks.next(), toks.next()) {
+        (Some(t), None) => Ok(t),
+        _ => Err(ValueError),
+    }
+}
+
+/// Parse `steps(<count>[, <position>])` (CSS Easing Functions 2
+/// §3.2): `count` is a positive integer, `position` one of
+/// `start` / `end` / `jump-start` / `jump-end` / `jump-none` /
+/// `jump-both` (default `end`). `jump-none` requires `count >= 2`
+/// (with one step there is no interior interval for it to hold).
+fn parse_steps_body(body: &[Token]) -> Result<TimingFunction, ValueError> {
+    let args = split_easing_args(body);
+    if args.len() > 2 {
+        return Err(ValueError);
+    }
+    let count = match easing_arg_token(args[0])? {
+        Token::Number { value: n, .. } if n.is_finite() && *n >= 1.0 && n.fract() == 0.0 => {
+            *n as u32
+        }
+        _ => return Err(ValueError),
+    };
+    let position = match args.get(1) {
+        None => StepPosition::End,
+        Some(arg) => match easing_arg_token(arg)? {
+            Token::Ident(name) => match name.to_ascii_lowercase().as_str() {
+                "start" | "jump-start" => StepPosition::Start,
+                "end" | "jump-end" => StepPosition::End,
+                "jump-none" if count >= 2 => StepPosition::JumpNone,
+                "jump-both" => StepPosition::JumpBoth,
+                _ => return Err(ValueError),
+            },
+            _ => return Err(ValueError),
+        },
+    };
+    Ok(TimingFunction::Steps { count, position })
+}
+
+/// Parse `cubic-bezier(<x1>, <y1>, <x2>, <y2>)` (CSS Easing
+/// Functions 2 §3.1): exactly four finite numbers, with the x
+/// control points in `[0, 1]` (out-of-range x makes the declaration
+/// invalid); y values are unrestricted.
+fn parse_cubic_bezier_body(body: &[Token]) -> Result<TimingFunction, ValueError> {
+    let args = split_easing_args(body);
+    if args.len() != 4 {
+        return Err(ValueError);
+    }
+    let mut nums = [0.0f32; 4];
+    for (i, arg) in args.iter().enumerate() {
+        match easing_arg_token(arg)? {
+            Token::Number { value: n, .. } if n.is_finite() => nums[i] = *n,
+            _ => return Err(ValueError),
+        }
+    }
+    let [x1, y1, x2, y2] = nums;
+    if !(0.0..=1.0).contains(&x1) || !(0.0..=1.0).contains(&x2) {
+        return Err(ValueError);
+    }
+    Ok(TimingFunction::CubicBezier { x1, y1, x2, y2 })
 }
 
 /// Parse a `transform` function from its raw body tokens (see

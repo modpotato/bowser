@@ -429,13 +429,38 @@ head, script, style, title, meta, link { display: none; }
 img { display: inline-block; }
 button, input, select, textarea { display: inline-block; }
 pre { white-space: pre; }
-/* CSS Position 4 (w79 phase 1): every element computes `overlay: none`
-   unless it is in the top layer. The `!important` UA rule beats author
-   normal AND author `!important` declarations (UA important is the top
-   cascade rank), so author `overlay: auto` on a non-top-layer element
-   computes to `none` (see overlay-computed.html). Top-layer promotion
-   (phase 2) must exempt elements actually in the top layer; until then
-   this rule is unconditional. */
+/* HTML rendering (popover): a popover is a fixed, viewport-centered
+   box while open, and hidden until opened. `width` / `height:
+   fit-content` is what makes the centering real for a content-sized
+   popover: without it the abspos solver stretches auto sizes when
+   both insets are set, the auto margins solve to zero, and a bare
+   popover fills the viewport instead of centering. The author rule in
+   overlay-transition.html (`display: block` on both popovers) beats
+   the hidden rule below (author origin beats UA origin), which is
+   exactly why that test forces `display: block` instead of relying
+   on this rule. */
+[popover] { position: fixed; top: 0; right: 0; bottom: 0; left: 0; width: fit-content; height: fit-content; margin: auto; }
+[popover]:not(:popover-open) { display: none; }
+/* CSS Position 4 (w80 phase 2): a shown popover computes
+   `overlay: auto`. This UA `!important` rule beats the `*` rule
+   below on specificity (attribute + pseudo-class vs universal),
+   and it beats any author declaration (UA important is the top
+   cascade rank), so author styles cannot change a shown popover's
+   overlay — matching the spec's "overlay can only be set by the
+   browser" note. */
+[popover]:popover-open { overlay: auto !important; }
+/* CSS Position 4 (w79 phase 1, w80 phase 2): every element computes
+   `overlay: none` unless it is in the top layer. The `!important`
+   UA rule beats author normal AND author `!important` declarations
+   (UA important is the top cascade rank), so author `overlay: auto`
+   on a non-top-layer element computes to `none` (see
+   overlay-computed.html). Phase 2 exempts elements actually in the
+   top layer: [`Styler::candidates`] drops this declaration for
+   top-layer nodes (it cannot be another stylesheet rule — no rule
+   can beat a UA `!important` declaration except a more specific
+   UA `!important` one, and the exemption must cover top-layer
+   elements that are not popovers too), so a top-layer element's
+   specified overlay computes through. */
 * { overlay: none !important; }
 "#;
 
@@ -1505,6 +1530,19 @@ computed_props! {
     // `overlay: auto` was dropped. Appended at the END, never
     // inserted mid-list (see the w78fix note above).
     OVERLAY = "overlay",
+    // w80: CSS Transitions 2 longhands. Same append-at-END rule:
+    // `transition` itself is a shorthand and never occupies a slot
+    // (it expands at parse time into property / duration / delay /
+    // timing-function; `transition-behavior` is a standalone
+    // longhand, not a shorthand component — the shorthand grammar
+    // has no behavior slot, so the shorthand never emits it).
+    // Previously slot-less, so `ComputedStyle::get` returned `None`
+    // for all of them and `getComputedStyle` had nothing to project.
+    TRANSITION_PROPERTY = "transition-property",
+    TRANSITION_DURATION = "transition-duration",
+    TRANSITION_DELAY = "transition-delay",
+    TRANSITION_TIMING_FUNCTION = "transition-timing-function",
+    TRANSITION_BEHAVIOR = "transition-behavior",
 }
 
 // `Styler` keys its resolved-value memo by `COMPUTED_PROPS` index as `u8`.
@@ -1864,6 +1902,24 @@ enum ResolveWork<'a> {
     /// as a comma group (e.g. `font: 12px/var(--x, 1.5 Times) New Roman`
     /// split "Times" and "New Roman" into two families).
     FallbackTail,
+}
+
+/// Top-level provenance of a [`Styler::resolve_inner`] result: whether
+/// the whole substituted value came from a `var()` substitution whose
+/// token stream held a top-level `/` or a top-level comma. Both
+/// readings encode as the same nested `List` shape in the returned
+/// value (see [`ResolveResult::into_option`]), so this is the only
+/// channel by which a consumer can tell them apart. It is top-level
+/// only: a slash/comma spliced inside an enclosing list, or nested
+/// inside another substituted stream, is not reported here (that needs
+/// provenance at every `List` nesting level, a separate follow-up).
+/// `Neither` covers every other shape, including a value that never
+/// went through a slash/comma substitution at all.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum TopLevelProvenance {
+    Neither,
+    Slash,
+    Comma,
 }
 
 /// One resolved stack item in [`Styler::resolve`].
@@ -3272,6 +3328,13 @@ impl<'a> Styler<'a> {
             return;
         }
         self.states.borrow_mut().insert_untagged(node, state);
+        self.bump_epoch();
+    }
+
+    /// Retire every memoized cascade result by advancing the
+    /// style-pass epoch (the shared tail of
+    /// [`Styler::set_element_state`]).
+    fn bump_epoch(&self) {
         let next = self.epoch.get().wrapping_add(1);
         if next == 0 {
             // The epoch counter wrapped (2^64 state changes on one
@@ -3315,6 +3378,22 @@ impl<'a> Styler<'a> {
         // failures recorded under the old states can never shadow the
         // new pass.
         self.match_scratch.borrow_mut().clear_has_memo();
+    }
+
+    /// Invalidate this styler after a top-layer promotion or
+    /// demotion: same epoch bump as
+    /// [`Styler::set_element_state`], so no memoized style,
+    /// candidate vec, or shared style from before the change can
+    /// survive (an open popover re-styled from a closed popover's
+    /// memo would still read `overlay: none`, and vice versa).
+    /// Production paths normally rebuild the styler per style pass
+    /// (fresh epoch, current top-layer set), so this is the hook for
+    /// embedders that hold a long-lived styler across a mutation
+    /// made through a shared document handle; the share-key
+    /// top-layer bit covers the within-pass hazard, this covers the
+    /// across-pass one.
+    pub fn invalidate_top_layer(&self) {
+        self.bump_epoch();
     }
 
     /// The computed style of `node`'s `::marker` pseudo-element, or
@@ -3986,6 +4065,15 @@ impl<'a> Styler<'a> {
     /// the parent key plus a kind discriminant.
     fn share_key_one(&self, node: NodeId, parent_key: u64, epoch: u64, flags: ShareFlags) -> u64 {
         let mut h = 0xcbf2_9ce4_8422_2325u64;
+        // w80 phase 2: top-layer membership is match-relevant (it
+        // drives `:popover-open` and the UA `overlay: none`
+        // exemption), so it joins the key unconditionally — a closed
+        // popover must never adopt an open popover's shared style
+        // (or its shared candidate vec) within one style pass, and
+        // vice versa. The parent-key chain carries ancestors' bits
+        // into descendants, so `:popover-open > div` style sharing
+        // stays sound too.
+        h = share_mix(h, self.doc.is_in_top_layer(node) as u64);
         match self.doc.kind(node) {
             NodeKind::Element(d) => {
                 h = share_mix(h, 1);
@@ -4491,6 +4579,27 @@ impl<'a> Styler<'a> {
             (a.rank, a.spec, a.sheet, a.order, a.decl_idx)
                 .cmp(&(b.rank, b.spec, b.sheet, b.order, b.decl_idx))
         });
+        // w80 phase 2 (top-layer exemption, shape (a): Document-set
+        // consulted in `Styler::compute`'s candidate stage): a node
+        // actually in the top layer does not get the UA
+        // `* { overlay: none !important }` declaration at all, so its
+        // specified overlay computes through — author `auto`
+        // included. This cannot be another stylesheet rule: no author
+        // rule beats UA `!important`, and a UA rule would have to
+        // enumerate every top-layer source (popover, dialog,
+        // fullscreen) instead of reading the set. Only the `none`
+        // declaration is dropped: the UA `:popover-open`
+        // `overlay: auto !important` declaration (same rank, value
+        // `auto`) survives, so a shown popover with no author rule
+        // still computes `auto` from the UA sheet rather than
+        // falling back to the initial `none`.
+        if self.doc.is_in_top_layer(node) {
+            cands.retain(|c| {
+                !(c.rank == rank(Origin::Ua, true)
+                    && c.property.atom() == PropertyAtom::OVERLAY
+                    && matches!(&*c.value, CssValue::Keyword(k) if k.eq_ignore_ascii_case("none")))
+            });
+        }
         let cands = Rc::new(cands);
         let epoch = self.epoch.get();
         self.cands
@@ -4569,7 +4678,7 @@ impl<'a> Styler<'a> {
                 // keeps the lowercasing parse its expansion was written
                 // for.
                 let preserve_case = cand.property.atom() == PropertyAtom::FONT;
-                if let Some(substituted) =
+                if let (Some(substituted), provenance) =
                     self.resolve_inner(node, &cand.value, &env, preserve_case)
                 {
                     // The `font` expansion parses comma groups itself
@@ -4588,7 +4697,8 @@ impl<'a> Styler<'a> {
                     } else {
                         normalize_comma_groups(substituted)
                     };
-                    for (property, value) in expand_deferred_shorthand(&cand.property, substituted)
+                    for (property, value) in
+                        expand_deferred_shorthand(&cand.property, substituted, provenance)
                     {
                         let atom = property.atom();
                         if atom.is_computed() {
@@ -4868,7 +4978,7 @@ impl<'a> Styler<'a> {
         value: &'r CssValue,
         env: &'r FxHashMap<String, CssValue>,
     ) -> Option<CssValue> {
-        self.resolve_inner(node, value, env, false)
+        self.resolve_inner(node, value, env, false).0
     }
 
     /// [`resolve`](Self::resolve) with identifier-case control. With
@@ -4880,19 +4990,25 @@ impl<'a> Styler<'a> {
     /// matched case-insensitively against the lowercased form, and the
     /// memo key includes the flag so the two parses never share cache
     /// entries).
+    /// [`resolve`](Self::resolve) with identifier-case control, plus
+    /// the result's [`TopLevelProvenance`]. The lossy [`resolve`]
+    /// wrapper above keeps the old return type for every other
+    /// consumer; only the deferred-shorthand path in
+    /// [`cascade_expanded`](Styler::cascade_expanded) reads the
+    /// provenance, and only for `background`.
     fn resolve_inner<'r>(
         &self,
         node: NodeId,
         value: &'r CssValue,
         env: &'r FxHashMap<String, CssValue>,
         preserve_case: bool,
-    ) -> Option<CssValue> {
+    ) -> (Option<CssValue>, TopLevelProvenance) {
         // The guaranteed-invalid marker is invalid at computed-value
         // time wherever it is substituted (including `var()` inside
         // math via `substitute_math_vars`): fail closed before the
         // work stack can return it literally.
         if is_guaranteed_invalid(value) {
-            return None;
+            return (None, TopLevelProvenance::Neither);
         }
         let mut work = vec![ResolveWork::ValueRef(value)];
         // Result stack: every `Value` work item pushes exactly one
@@ -5328,10 +5444,21 @@ impl<'a> Styler<'a> {
             }
         }
         debug_assert_eq!(results.len(), 1, "resolve left stray results");
-        results
-            .pop()
-            .map(ResolveResult::into_option)
-            .unwrap_or(None)
+        // Read the provenance off the final stack item before
+        // `into_option` erases the slash/comma distinction into the
+        // shared nested-`List` shape.
+        let provenance = match results.last() {
+            Some(ResolveResult::Slash(_)) => TopLevelProvenance::Slash,
+            Some(ResolveResult::Comma(_)) => TopLevelProvenance::Comma,
+            _ => TopLevelProvenance::Neither,
+        };
+        (
+            results
+                .pop()
+                .map(ResolveResult::into_option)
+                .unwrap_or(None),
+            provenance,
+        )
     }
 }
 
@@ -5825,6 +5952,15 @@ fn initial_value(property: &str) -> Option<CssValue> {
         "contain" => kw("none"),
         // CSS Position 4: `overlay` is `none | auto`, not inherited.
         "overlay" => kw("none"),
+        // CSS Transitions 2: initial `all` / `0s` / `0s` / `ease` /
+        // `normal`, none inherited. (`transition-property: all` is
+        // the spec initial even though the transition engine
+        // excludes `overlay` from `all` — see the engine's
+        // explicit-list rule.)
+        "transition-property" => kw("all"),
+        "transition-duration" | "transition-delay" => CssValue::Time(0.0),
+        "transition-timing-function" => kw("ease"),
+        "transition-behavior" => kw("normal"),
         // CSS Transforms 1 §14: initial `50% 50%` (matches
         // `TransformOrigin::initial`).
         "transform-origin" => {
@@ -6666,6 +6802,61 @@ pub fn is_valid_for_property(property: &str, value: &CssValue) -> bool {
         // are accepted by the callers' CSS-wide gate, as for every
         // other single-keyword arm here).
         "overlay" => is_kw(value, &["none", "auto"]),
+        // CSS Transitions 2: `transition-property` is `none | all |
+        // <ident>#` (any property name, including custom properties,
+        // reads as an ident here; unknown idents are accepted —
+        // the transition simply never matches a real property).
+        // A comma list arrives as `List` of keywords.
+        "transition-property" => {
+            is_kw(value, &["none", "all"])
+                || matches!(value, CssValue::Keyword(_))
+                || matches!(value, CssValue::List(items) if !items.is_empty() && items.iter().all(|i| matches!(i, CssValue::Keyword(_))))
+        }
+        // CSS Transitions 2: `<time>#` — a non-negative time for
+        // duration, any finite time for delay (negative delays
+        // fast-forward the transition). A unitless zero counts as
+        // `0s`, matching the length convention elsewhere.
+        "transition-duration" => {
+            let is_time = |v: &CssValue| {
+                matches!(v, CssValue::Time(t) if t.is_finite() && *t >= 0.0)
+                    || matches!(v, CssValue::Number(n) if *n == 0.0)
+            };
+            is_time(value)
+                || matches!(value, CssValue::List(items) if !items.is_empty() && items.iter().all(is_time))
+        }
+        "transition-delay" => {
+            let is_time = |v: &CssValue| {
+                matches!(v, CssValue::Time(t) if t.is_finite())
+                    || matches!(v, CssValue::Number(n) if *n == 0.0)
+            };
+            is_time(value)
+                || matches!(value, CssValue::List(items) if !items.is_empty() && items.iter().all(is_time))
+        }
+        // CSS Easing Functions 2: named functions stay keywords,
+        // functional forms arrive as `TimingFunction`; a list
+        // holds one function per transition layer.
+        "transition-timing-function" => {
+            let is_fn = |v: &CssValue| {
+                matches!(v, CssValue::TimingFunction(_))
+                    || is_kw(
+                        v,
+                        &[
+                            "linear",
+                            "ease",
+                            "ease-in",
+                            "ease-out",
+                            "ease-in-out",
+                            "step-start",
+                            "step-end",
+                        ],
+                    )
+            };
+            is_fn(value)
+                || matches!(value, CssValue::List(items) if !items.is_empty() && items.iter().all(is_fn))
+        }
+        // CSS Transitions 2: `transition-behavior` is a single
+        // keyword, never a list.
+        "transition-behavior" => is_kw(value, &["normal", "allow-discrete"]),
         "float" => is_kw(value, &["left", "right", "none"]),
         "clear" => is_kw(value, &["none", "left", "right", "both"]),
         "overflow" => {
@@ -7015,7 +7206,21 @@ pub fn is_valid_for_property(property: &str, value: &CssValue) -> bool {
                     || matches!(v, CssValue::List(items) if (1..=2).contains(&items.len()) && items.iter().all(is_size_item) && !(items.len() == 2 && items.iter().any(|i| is_kw(i, &["cover", "contain"]))))
             };
             is_size_value(value)
-                || matches!(value, CssValue::List(items) if items.iter().all(is_size_value))
+                || matches!(value, CssValue::List(items) if items.iter().all(|i| {
+                    is_size_value(i)
+                        // w80fix M2: per-layer wrap (`emit_bg_layers`)
+                        // puts a layer's size value inside one more
+                        // list, so a two-item size reads as
+                        // `List[List[auto, auto]]` per layer. The other
+                        // layered longhands already admit this
+                        // single-item nesting; size did not, so every
+                        // multi-layer background failed validation and
+                        // collapsed to the flat initial. Widening the
+                        // validator (rather than reworking the wrap,
+                        // which would change every layered longhand's
+                        // readback shape) admits exactly that nesting.
+                        || matches!(i, CssValue::List(inner) if inner.len() == 1 && is_size_value(&inner[0]))
+                }))
         }
         "background-origin" => {
             is_kw(value, &["padding-box", "border-box", "content-box"])
@@ -7291,6 +7496,7 @@ fn is_shorthand_property(property: &PropertyName) -> bool {
             | PropertyAtom::BORDER_BLOCK_WIDTH
             | PropertyAtom::BORDER_BLOCK_STYLE
             | PropertyAtom::BORDER_BLOCK_COLOR
+            | PropertyAtom::TRANSITION
     )
     // w79: the compound logical border shorthands have no
     // `PropertyAtom` (adding one needs `build.rs` `SHORTHAND_NAMES`,
@@ -7584,10 +7790,15 @@ fn value_contains_var(value: &CssValue) -> bool {
 
 /// Run the parser's expansion for a substituted deferred shorthand,
 /// returning `(longhand, value)` pairs. `important` is already encoded in
-/// the candidate's cascade rank.
+/// the candidate's cascade rank. `provenance` is the top-level
+/// slash/comma provenance of the substituted value (see
+/// [`TopLevelProvenance`]); only the `background` expansion reads it,
+/// to skip its slash-first arm for a proven top-level comma list — every
+/// other expansion keeps its existing shape-based reading unchanged.
 fn expand_deferred_shorthand(
     property: &PropertyName,
     value: CssValue,
+    provenance: TopLevelProvenance,
 ) -> Vec<(PropertyName, CssValue)> {
     // w79: compound logical border shorthands have no `PropertyAtom`
     // (see `is_shorthand_property`); dispatch them by name before the
@@ -7650,7 +7861,11 @@ fn expand_deferred_shorthand(
         | PropertyAtom::BORDER_BOTTOM
         | PropertyAtom::BORDER_LEFT => expand_border_sides(&[property.as_str()], value),
         PropertyAtom::BORDER_RADIUS => expand_border_radius(value),
-        PropertyAtom::BACKGROUND => expand_background(value),
+        PropertyAtom::BACKGROUND => expand_background(value, provenance),
+        // w80: the `transition` shorthand expands through the shared
+        // value-level expander in `parse.rs` (same shapes as the
+        // eager path, after `var()` substitution).
+        PropertyAtom::TRANSITION => crate::parse::expand_transition_value(value),
         PropertyAtom::LIST_STYLE => expand_list_style(value),
         PropertyAtom::FONT => expand_font_value(&value),
         PropertyAtom::FLEX => expand_flex_value(&value),
@@ -9172,24 +9387,30 @@ fn emit_bg_layers(layers: &[BgLayer]) -> Option<Vec<(String, CssValue)>> {
 /// (position/size split); a list of lists is the layer list from a
 /// substituted comma-separated value. The `/` marker and a
 /// two-layer list share the two-nested-list shape, so the slash
-/// reading is tried first (like `expand_font_value`).
+/// reading is tried first (like `expand_font_value`) — except when
+/// `provenance` proves the whole substituted value was a top-level
+/// comma list, in which case the slash arm is skipped and the value
+/// reads as layers straight away. A top-level slash keeps the
+/// slash-first behavior, and `Neither` (no top-level slash/comma
+/// substitution, e.g. a direct call) keeps the historical order.
 ///
-/// KNOWN-WRONG (w79fix 2, pinned by
-/// `w79fix_background_slash_vs_two_layers_known_wrong`): when layer
-/// 1 contains a position item and layer 2 is 1-2
+/// Formerly KNOWN-WRONG (w79fix 2, pinned by
+/// `w79fix_background_slash_vs_two_layers_known_wrong`, now fixed
+/// and re-pinned as `w80fix_background_comma_two_layers_not_slash`):
+/// when layer 1 contains a position item and layer 2 is 1-2
 /// `<length-percentage>` items (e.g. `--bg: url(a.png) center, 50%`),
-/// the slash reading wins and the value computes as a single layer
-/// (`center` / `50%`), losing layer 2 entirely. The two readings are
-/// indistinguishable at this level: a genuine slash size of 1-2
-/// lengths/percentages (`url(a.png) center/50%`) produces the exact
-/// same `List([List, List])`. Fixing it properly needs comma-group
-/// provenance through substitution — the slash-vs-comma distinction
-/// is lost when `resolve_inner` converts both a `Slash` and a
-/// `Comma` result to `List([List, List])` — so it is deferred, not
-/// papered over with a heuristic that would flip the genuine slash
-/// case. It still yields a valid background, never a drop.
+/// the slash reading used to win and lose layer 2 entirely. That
+/// case is now distinguished by top-level comma provenance.
+/// Author-level comma lists with `var()`s (w80fix M1) are
+/// distinguished differently: the parser wraps each layer once
+/// more (see `parse_background`), so the wrapped shape always
+/// defeats the slash-first arm and the layer-list arm below
+/// unwraps it. Mixed cases (a slash/comma spliced inside an
+/// enclosing list, rather than at the author level) still share
+/// shapes at this level and remain out of scope: they need
+/// tree-shaped provenance (see [`TopLevelProvenance`]).
 /// A lone CSS-wide keyword expands per longhand, like `expand_box`.
-fn expand_background(value: CssValue) -> Vec<(String, CssValue)> {
+fn expand_background(value: CssValue, provenance: TopLevelProvenance) -> Vec<(String, CssValue)> {
     let items = as_list(&value);
     if items.len() == 1 && is_css_wide_keyword(&items[0]) {
         let kw = items[0].clone();
@@ -9208,7 +9429,10 @@ fn expand_background(value: CssValue) -> Vec<(String, CssValue)> {
         .collect();
     }
     // `/` marker: exactly two nested lists, second group a size.
-    if let CssValue::List(groups) = &value
+    // Skipped for a proven top-level comma list: there the two
+    // nested lists are layers, not a position/size split.
+    if provenance != TopLevelProvenance::Comma
+        && let CssValue::List(groups) = &value
         && groups.len() == 2
         && let (CssValue::List(before), CssValue::List(after)) = (&groups[0], &groups[1])
         && let Some(layer) = classify_bg_slash_layer(before, after)
@@ -9217,7 +9441,22 @@ fn expand_background(value: CssValue) -> Vec<(String, CssValue)> {
     }
     // Layer list: every item a list (a substituted comma-separated
     // value, or the parse-side layer-list store). Each item is a
-    // slash marker or a plain item list.
+    // slash marker or a plain item list — or, for an author-level
+    // comma list stored with `var()`s (see `parse_background`),
+    // a single-item list holding the layer content (a multi-item
+    // layer, a slash marker, or a substituted item list), which
+    // unwraps one level before classifying. The wrapped shape is
+    // what defeats the slash-first arm above for two author-level
+    // layers: its `before` side is a single list, never a position
+    // item. A group that is exactly two lists with a failing slash
+    // reading splits into two layers: that is how a `var()` holding
+    // its own comma list splices through a wrapped layer (and how a
+    // nested comma list flattens). The cost is narrow: a genuinely
+    // invalid slash layer (no size after the `/`, or position items
+    // after the size) inside a `var()`-mediated multi-layer value
+    // may read as two layers instead of dropping; the eager path
+    // still drops it, and a failing half still drops the whole
+    // declaration here.
     if let CssValue::List(groups) = &value
         && !groups.is_empty()
         && groups.iter().all(|g| matches!(g, CssValue::List(_)))
@@ -9227,17 +9466,34 @@ fn expand_background(value: CssValue) -> Vec<(String, CssValue)> {
             let CssValue::List(group) = group else {
                 unreachable!("all items are lists")
             };
-            let layer = match group.as_slice() {
+            let group_items: &[CssValue] = match group.as_slice() {
+                [CssValue::List(inner)] => inner,
+                _ => group,
+            };
+            match group_items {
                 [CssValue::List(before), CssValue::List(after)]
                     if classify_bg_slash_layer(before, after).is_some() =>
                 {
-                    classify_bg_slash_layer(before, after)
+                    layers.push(
+                        classify_bg_slash_layer(before, after).expect("slash reading checked"),
+                    );
                 }
-                _ => classify_bg_layer(group, None),
-            };
-            match layer {
-                Some(layer) => layers.push(layer),
-                None => return Vec::new(),
+                [CssValue::List(before), CssValue::List(after)] => {
+                    match (
+                        classify_bg_layer(before, None),
+                        classify_bg_layer(after, None),
+                    ) {
+                        (Some(first), Some(second)) => {
+                            layers.push(first);
+                            layers.push(second);
+                        }
+                        _ => return Vec::new(),
+                    }
+                }
+                _ => match classify_bg_layer(group_items, None) {
+                    Some(layer) => layers.push(layer),
+                    None => return Vec::new(),
+                },
             }
         }
         return emit_bg_layers(&layers).unwrap_or_default();
@@ -11851,37 +12107,67 @@ mod tests {
         let n = COMPUTED_PROPS.len();
         assert_eq!(
             COMPUTED_PROPS.iter().position(|p| *p == "outline-color"),
-            Some(n - 6),
+            Some(n - 11),
             "outline-color must stay second among the appended tail"
         );
         assert_eq!(
             COMPUTED_PROPS
                 .iter()
                 .position(|p| *p == "text-decoration-color"),
-            Some(n - 5),
+            Some(n - 10),
             "text-decoration-color must follow outline-color"
         );
         // w79 appended the three background longhands after them.
         assert_eq!(
             COMPUTED_PROPS.iter().position(|p| *p == "background-size"),
-            Some(n - 4)
+            Some(n - 9)
         );
         assert_eq!(
             COMPUTED_PROPS
                 .iter()
                 .position(|p| *p == "background-origin"),
-            Some(n - 3)
+            Some(n - 8)
         );
         assert_eq!(
             COMPUTED_PROPS.iter().position(|p| *p == "background-clip"),
-            Some(n - 2),
+            Some(n - 7),
             "background-clip must precede overlay"
         );
         // w79 overlay phase 1 appended `overlay` after them.
         assert_eq!(
             COMPUTED_PROPS.iter().position(|p| *p == "overlay"),
+            Some(n - 6),
+            "overlay must precede the transition longhands"
+        );
+        // w80 appended the five transition longhands after overlay.
+        assert_eq!(
+            COMPUTED_PROPS
+                .iter()
+                .position(|p| *p == "transition-property"),
+            Some(n - 5)
+        );
+        assert_eq!(
+            COMPUTED_PROPS
+                .iter()
+                .position(|p| *p == "transition-duration"),
+            Some(n - 4)
+        );
+        assert_eq!(
+            COMPUTED_PROPS.iter().position(|p| *p == "transition-delay"),
+            Some(n - 3)
+        );
+        assert_eq!(
+            COMPUTED_PROPS
+                .iter()
+                .position(|p| *p == "transition-timing-function"),
+            Some(n - 2)
+        );
+        assert_eq!(
+            COMPUTED_PROPS
+                .iter()
+                .position(|p| *p == "transition-behavior"),
             Some(n - 1),
-            "overlay must be appended last"
+            "transition-behavior must be appended last"
         );
         let aqua = CssValue::Color(Color {
             r: 0,
@@ -13194,12 +13480,15 @@ mod tests {
         // old 1464 heap bytes per style and 2928 heap bytes per memo
         // (187 slots * 8 / 16 bytes), now paid only per deviating
         // slot at 16 bytes each. w79 added three background slots
-        // (190 slots total) plus one overlay slot (191 total).
+        // (190 slots total) plus one overlay slot (191 total). w80
+        // adds five transition slots (196 total), crossing the 192
+        // boundary: the memo bitset grows from 3 to 4 words, so the
+        // bound moves from 48 to 56.
         assert_eq!(std::mem::size_of::<ComputedStyle>(), 24);
-        assert!(std::mem::size_of::<MemoSet>() <= 48);
+        assert!(std::mem::size_of::<MemoSet>() <= 56);
         assert_eq!(
             PROP_COUNT * std::mem::size_of::<Option<Arc<CssValue>>>(),
-            1528
+            1568
         );
     }
 
@@ -14427,27 +14716,328 @@ mod tests {
     }
 
     #[test]
-    fn w79fix_background_slash_vs_two_layers_known_wrong() {
-        // w79fix 2, KNOWN-WRONG behavior, pinned deliberately: the
+    fn w80fix_background_comma_two_layers_not_slash() {
+        // w80fix: formerly pinned as known-wrong by
+        // `w79fix_background_slash_vs_two_layers_known_wrong`. The
         // slash marker `List([List(before), List(after)])` and a
-        // two-layer value have identical shapes, and the slash
-        // reading wins whenever layer 1 contains a position item and
+        // two-layer value share a shape, and the slash reading used
+        // to win whenever layer 1 contains a position item and
         // layer 2 is 1-2 `<length-percentage>` items. Here layer 2
-        // (`50%`) is a valid position-only layer, but it computes as
-        // the size of a single layer and layer 2 is lost entirely.
-        // The correct reading would be two layers (image
-        // `List[List[Url(a)], List[none]]`, position
-        // `List[List[center], List[50%]]`). Fixing it properly needs
-        // comma-group provenance through substitution (the slash vs
-        // comma distinction is lost when `resolve_inner` converts
-        // both to `List([List, List])`), which is larger than this
-        // fix; this test pins the misreading so it cannot silently
-        // change shape (e.g. into a drop) without updating the test.
+        // (`50%`) is a valid position-only layer, so the correct
+        // reading is two layers: image `List[List[Url(a)],
+        // List[none]]`, position `List[List[center], List[50%]]`,
+        // size at its initial (`auto auto` per layer), not `50%`.
+        // The top-level comma provenance carried through
+        // `resolve_inner` is what distinguishes this from the
+        // genuine-slash case below.
         let (doc, div, _) = sample();
         let s = style(
             &doc,
             div,
             "div { --bg: url(a.png) center, 50%; background: var(--bg); }",
+            &vp(),
+        );
+        assert_eq!(
+            s.get("background-image"),
+            Some(&CssValue::List(vec![
+                CssValue::List(vec![CssValue::Url("a.png".into())]),
+                CssValue::List(vec![kw("none")]),
+            ]))
+        );
+        assert_eq!(
+            s.get("background-position"),
+            Some(&CssValue::List(vec![
+                CssValue::List(vec![kw("center")]),
+                CssValue::List(vec![CssValue::Percentage(50.0)]),
+            ]))
+        );
+        assert_eq!(
+            s.get("background-size"),
+            // Size is at its initial per layer (`auto auto` each):
+            // the per-layer wrapped form `List[List[auto, auto]]`
+            // per layer, admitted by the validator since w80fix M2
+            // (before that it collapsed to the flat initial
+            // `List[auto, auto]`, contradicting the two layers
+            // proven by image and position above).
+            Some(&CssValue::List(vec![
+                CssValue::List(vec![CssValue::List(vec![kw("auto"), kw("auto")])]),
+                CssValue::List(vec![CssValue::List(vec![kw("auto"), kw("auto")])]),
+            ]))
+        );
+        assert_eq!(
+            s.get("background-repeat"),
+            Some(&CssValue::List(vec![
+                CssValue::List(vec![kw("repeat")]),
+                CssValue::List(vec![kw("repeat")]),
+            ]))
+        );
+    }
+
+    #[test]
+    fn w80fix_background_author_level_two_vars_merge() {
+        // w80fix M1 (R3-M1): author-level multi-`var()` comma list.
+        // `--a` holds an image plus a position, `--b` a lone position,
+        // so `background: var(--a), var(--b)` is two layers, not one
+        // merged layer with position `center 50%` (the base behavior:
+        // the parse flattened both substitutions into one list).
+        let (doc, div, _) = sample();
+        let s = style(
+            &doc,
+            div,
+            "div { --a: url(a.png) center; --b: 50%; background: var(--a), var(--b); }",
+            &vp(),
+        );
+        assert_eq!(
+            s.get("background-image"),
+            Some(&CssValue::List(vec![
+                CssValue::List(vec![CssValue::Url("a.png".into())]),
+                CssValue::List(vec![kw("none")]),
+            ]))
+        );
+        assert_eq!(
+            s.get("background-position"),
+            Some(&CssValue::List(vec![
+                CssValue::List(vec![kw("center")]),
+                CssValue::List(vec![CssValue::Percentage(50.0)]),
+            ]))
+        );
+        assert_eq!(
+            s.get("background-size"),
+            Some(&CssValue::List(vec![
+                CssValue::List(vec![CssValue::List(vec![kw("auto"), kw("auto")])]),
+                CssValue::List(vec![CssValue::List(vec![kw("auto"), kw("auto")])]),
+            ]))
+        );
+    }
+
+    #[test]
+    fn w80fix_background_author_level_two_vars_drop() {
+        // w80fix M1 (R3-M1): same author-level shape, but `--b` holds
+        // two position items, so the base flat merge produced a
+        // three-item position and dropped the whole declaration (no
+        // background at all). Correct reading: two layers, layer 2
+        // positioned `50% 50%`.
+        let (doc, div, _) = sample();
+        let s = style(
+            &doc,
+            div,
+            "div { --a: url(a.png) center; --b: 50% 50%; background: var(--a), var(--b); }",
+            &vp(),
+        );
+        assert_eq!(
+            s.get("background-image"),
+            Some(&CssValue::List(vec![
+                CssValue::List(vec![CssValue::Url("a.png".into())]),
+                CssValue::List(vec![kw("none")]),
+            ]))
+        );
+        assert_eq!(
+            s.get("background-position"),
+            Some(&CssValue::List(vec![
+                CssValue::List(vec![kw("center")]),
+                CssValue::List(vec![CssValue::List(vec![
+                    CssValue::Percentage(50.0),
+                    CssValue::Percentage(50.0),
+                ]),]),
+            ]))
+        );
+        assert_eq!(
+            s.get("background-size"),
+            Some(&CssValue::List(vec![
+                CssValue::List(vec![CssValue::List(vec![kw("auto"), kw("auto")])]),
+                CssValue::List(vec![CssValue::List(vec![kw("auto"), kw("auto")])]),
+            ]))
+        );
+    }
+
+    #[test]
+    fn w80fix_background_author_level_three_vars() {
+        // w80fix M1: three author-level `var()` layers stay three
+        // layers (base flattened them into one list, whose second
+        // image read as a duplicate and dropped the declaration).
+        let (doc, div, _) = sample();
+        let s = style(
+            &doc,
+            div,
+            "div { --a: url(a.png); --b: url(b.png); --c: url(c.png); background: var(--a), var(--b), var(--c); }",
+            &vp(),
+        );
+        assert_eq!(
+            s.get("background-image"),
+            Some(&CssValue::List(vec![
+                CssValue::List(vec![CssValue::Url("a.png".into())]),
+                CssValue::List(vec![CssValue::Url("b.png".into())]),
+                CssValue::List(vec![CssValue::Url("c.png".into())]),
+            ]))
+        );
+        let default_pos =
+            CssValue::List(vec![CssValue::Percentage(0.0), CssValue::Percentage(0.0)]);
+        assert_eq!(
+            s.get("background-position"),
+            Some(&CssValue::List(vec![
+                CssValue::List(vec![default_pos.clone()]),
+                CssValue::List(vec![default_pos.clone()]),
+                CssValue::List(vec![default_pos]),
+            ]))
+        );
+    }
+
+    #[test]
+    fn w80fix_background_author_level_mixed_literal_and_var() {
+        // w80fix M1: a literal layer plus a `var()` layer is two
+        // layers, not one merged layer (base flattened the `var()`
+        // substitution into the literal layer's items).
+        let (doc, div, _) = sample();
+        let s = style(
+            &doc,
+            div,
+            "div { --b: 50%; background: url(a.png), var(--b); }",
+            &vp(),
+        );
+        assert_eq!(
+            s.get("background-image"),
+            Some(&CssValue::List(vec![
+                CssValue::List(vec![CssValue::Url("a.png".into())]),
+                CssValue::List(vec![kw("none")]),
+            ]))
+        );
+        assert_eq!(
+            s.get("background-position"),
+            Some(&CssValue::List(vec![
+                CssValue::List(vec![CssValue::List(vec![
+                    CssValue::Percentage(0.0),
+                    CssValue::Percentage(0.0),
+                ])]),
+                CssValue::List(vec![CssValue::Percentage(50.0)]),
+            ]))
+        );
+    }
+
+    #[test]
+    fn w80fix_background_author_level_var_comma_nested() {
+        // w80fix M1: a `var()` whose own value is comma-separated
+        // contributes its layers, plus the following author-level
+        // layer: three layers total. (This shape survived at base via
+        // the `Comma` arm; the wrap must not trap it inside one
+        // layer group.)
+        let (doc, div, _) = sample();
+        let s = style(
+            &doc,
+            div,
+            "div { --x: url(a.png), url(b.png); --y: 50%; background: var(--x), var(--y); }",
+            &vp(),
+        );
+        assert_eq!(
+            s.get("background-image"),
+            Some(&CssValue::List(vec![
+                CssValue::List(vec![CssValue::Url("a.png".into())]),
+                CssValue::List(vec![CssValue::Url("b.png".into())]),
+                CssValue::List(vec![kw("none")]),
+            ]))
+        );
+        assert_eq!(
+            s.get("background-position"),
+            Some(&CssValue::List(vec![
+                CssValue::List(vec![CssValue::List(vec![
+                    CssValue::Percentage(0.0),
+                    CssValue::Percentage(0.0),
+                ])]),
+                CssValue::List(vec![CssValue::List(vec![
+                    CssValue::Percentage(0.0),
+                    CssValue::Percentage(0.0),
+                ])]),
+                CssValue::List(vec![CssValue::Percentage(50.0)]),
+            ]))
+        );
+    }
+
+    #[test]
+    fn w80fix_background_author_level_slash_layer_and_var() {
+        // w80fix M1: a slash layer plus a literal layer, one side
+        // `var()`-mediated, stays two layers with the slash layer's
+        // size intact (the wrap must not disturb slash markers).
+        let (doc, div, _) = sample();
+        let s = style(
+            &doc,
+            div,
+            "div { --a: url(a.png); background: var(--a) center/cover, url(b.png); }",
+            &vp(),
+        );
+        assert_eq!(
+            s.get("background-image"),
+            Some(&CssValue::List(vec![
+                CssValue::List(vec![CssValue::Url("a.png".into())]),
+                CssValue::List(vec![CssValue::Url("b.png".into())]),
+            ]))
+        );
+        assert_eq!(
+            s.get("background-position"),
+            Some(&CssValue::List(vec![
+                CssValue::List(vec![kw("center")]),
+                CssValue::List(vec![CssValue::List(vec![
+                    CssValue::Percentage(0.0),
+                    CssValue::Percentage(0.0),
+                ])]),
+            ]))
+        );
+        assert_eq!(
+            s.get("background-size"),
+            Some(&CssValue::List(vec![
+                CssValue::List(vec![kw("cover")]),
+                CssValue::List(vec![CssValue::List(vec![kw("auto"), kw("auto")])]),
+            ]))
+        );
+    }
+
+    #[test]
+    fn w80fix_background_literal_two_layers_size() {
+        // w80fix M2: the size collapse is pre-existing and not
+        // `var()`-specific: a literal two-layer background reads its
+        // size back per layer (`auto auto` each), not as the flat
+        // initial `List[auto, auto]`.
+        let (doc, div, _) = sample();
+        let s = style(
+            &doc,
+            div,
+            "div { background: url(a.png) center, 50%; }",
+            &vp(),
+        );
+        assert_eq!(
+            s.get("background-image"),
+            Some(&CssValue::List(vec![
+                CssValue::List(vec![CssValue::Url("a.png".into())]),
+                CssValue::List(vec![kw("none")]),
+            ]))
+        );
+        assert_eq!(
+            s.get("background-position"),
+            Some(&CssValue::List(vec![
+                CssValue::List(vec![kw("center")]),
+                CssValue::List(vec![CssValue::Percentage(50.0)]),
+            ]))
+        );
+        assert_eq!(
+            s.get("background-size"),
+            Some(&CssValue::List(vec![
+                CssValue::List(vec![CssValue::List(vec![kw("auto"), kw("auto")])]),
+                CssValue::List(vec![CssValue::List(vec![kw("auto"), kw("auto")])]),
+            ]))
+        );
+    }
+
+    #[test]
+    fn w80fix_background_genuine_slash_unchanged() {
+        // Must-not-change counterpart of the comma case above: the
+        // same two-nested-list shape, but from a genuine `/` in the
+        // substituted value, stays one layer with position `center`
+        // and size `50%`. A heuristic preferring the comma reading
+        // unconditionally would flip this; only top-level comma
+        // provenance skips the slash arm.
+        let (doc, div, _) = sample();
+        let s = style(
+            &doc,
+            div,
+            "div { --bg: url(a.png) center/50%; background: var(--bg); }",
             &vp(),
         );
         assert_eq!(
@@ -14790,6 +15380,7 @@ mod tests {
         let pairs = expand_deferred_shorthand(
             &PropertyName::from("border-block"),
             CssValue::Keyword("inherit".into()),
+            TopLevelProvenance::Neither,
         );
         assert_eq!(pairs.len(), 6);
         assert!(
@@ -21119,6 +21710,229 @@ mod tests {
             "overlay",
             &CssValue::Length(10.0, LengthUnit::Px)
         ));
+    }
+
+    #[test]
+    fn w80_transition_longhands_compute_and_validate() {
+        let (doc, div, p) = sample();
+        // Initials: `all` / `0s` / `0s` / `ease` / `normal`.
+        let s = style(&doc, div, "", &vp());
+        assert_eq!(s.get("transition-property"), Some(&kw("all")));
+        assert_eq!(s.get("transition-duration"), Some(&CssValue::Time(0.0)));
+        assert_eq!(s.get("transition-delay"), Some(&CssValue::Time(0.0)));
+        assert_eq!(s.get("transition-timing-function"), Some(&kw("ease")));
+        assert_eq!(s.get("transition-behavior"), Some(&kw("normal")));
+        // The overlay-transition stylesheet shape: shorthand expands
+        // to all four longhands; behavior stays a separate longhand.
+        let s = style(
+            &doc,
+            div,
+            "div { transition: overlay 60s step-end; transition-behavior: allow-discrete; }",
+            &vp(),
+        );
+        assert_eq!(s.get("transition-property"), Some(&kw("overlay")));
+        assert_eq!(s.get("transition-duration"), Some(&CssValue::Time(60.0)));
+        assert_eq!(s.get("transition-delay"), Some(&CssValue::Time(0.0)));
+        assert_eq!(s.get("transition-timing-function"), Some(&kw("step-end")));
+        assert_eq!(s.get("transition-behavior"), Some(&kw("allow-discrete")));
+        // Negative duration is invalid at computed-value time: the
+        // longhand set directly still drops to its initial.
+        let s = style(&doc, div, "div { transition-duration: -1s; }", &vp());
+        assert_eq!(s.get("transition-duration"), Some(&CssValue::Time(0.0)));
+        // A negative delay is valid and survives (the interpolation
+        // harness drives progress with `delay: -50s`).
+        let s = style(&doc, div, "div { transition-delay: -50s; }", &vp());
+        assert_eq!(s.get("transition-delay"), Some(&CssValue::Time(-50.0)));
+        // Validation arms directly.
+        assert!(is_valid_for_property("transition-property", &kw("overlay")));
+        assert!(is_valid_for_property("transition-property", &kw("all")));
+        assert!(is_valid_for_property("transition-property", &kw("none")));
+        assert!(is_valid_for_property(
+            "transition-property",
+            &CssValue::List(vec![kw("opacity"), kw("color")])
+        ));
+        assert!(!is_valid_for_property(
+            "transition-property",
+            &CssValue::Time(1.0)
+        ));
+        assert!(is_valid_for_property(
+            "transition-duration",
+            &CssValue::Time(2.0)
+        ));
+        assert!(!is_valid_for_property(
+            "transition-duration",
+            &CssValue::Time(-1.0)
+        ));
+        assert!(!is_valid_for_property(
+            "transition-duration",
+            &CssValue::Length(2.0, LengthUnit::Px)
+        ));
+        assert!(is_valid_for_property(
+            "transition-delay",
+            &CssValue::Time(-50.0)
+        ));
+        assert!(is_valid_for_property(
+            "transition-timing-function",
+            &kw("step-end")
+        ));
+        assert!(!is_valid_for_property(
+            "transition-timing-function",
+            &kw("allow-discrete")
+        ));
+        assert!(is_valid_for_property(
+            "transition-behavior",
+            &kw("allow-discrete")
+        ));
+        assert!(!is_valid_for_property("transition-behavior", &kw("ease")));
+        // Not inherited: the child keeps the initials even when the
+        // parent rule sets the property.
+        let s = style(
+            &doc,
+            p,
+            "div { transition-property: overlay; transition-duration: 2s; }",
+            &vp(),
+        );
+        assert_eq!(s.get("transition-property"), Some(&kw("all")));
+        assert_eq!(s.get("transition-duration"), Some(&CssValue::Time(0.0)));
+    }
+
+    // w80 phase 2: the top-layer exemption, `:popover-open`, and
+    // the popover state machine, through the real cascade.
+    #[test]
+    fn overlay_top_layer_exemption_and_popover_open() {
+        let mut doc = Document::new();
+        let root = doc.root();
+        // A `Document` node takes a single element child, like a real
+        // parsed document: hang everything under html > body.
+        let html = doc.create_element("html");
+        doc.append_child(root, html);
+        let body = doc.create_element("body");
+        doc.append_child(html, body);
+        let pop = doc.create_element("div");
+        doc.append_child(body, pop);
+        doc.set_attribute(pop, "id", "p");
+        doc.set_attribute(pop, "popover", "");
+        let plain = doc.create_element("div");
+        doc.append_child(body, plain);
+        doc.set_attribute(plain, "id", "q");
+        // Closed: the UA `none !important` rule beats author `auto`,
+        // and `:popover-open` does not match.
+        assert!(!doc.matches(pop, ":popover-open").unwrap());
+        let s = style(&doc, pop, "#p { overlay: auto; }", &vp());
+        assert_eq!(s.get_str("overlay"), Some("none"));
+        // Open: `:popover-open` matches, and the UA popover-open
+        // `auto !important` rule yields `auto` — with an author rule
+        // and without one.
+        doc.show_popover(pop).unwrap();
+        assert!(doc.matches(pop, ":popover-open").unwrap());
+        let s = style(&doc, pop, "#p { overlay: auto; }", &vp());
+        assert_eq!(s.get_str("overlay"), Some("auto"));
+        let s = style(&doc, pop, "#q { color: red; }", &vp());
+        assert_eq!(s.get_str("overlay"), Some("auto"));
+        // Author `none !important` still loses to the UA popover-open
+        // `!important` rule: authors cannot change a shown popover's
+        // overlay.
+        let s = style(&doc, pop, "#p { overlay: none !important; }", &vp());
+        assert_eq!(s.get_str("overlay"), Some("auto"));
+        // A non-popover element never benefits from the exemption.
+        let s = style(&doc, plain, "#q { overlay: auto; }", &vp());
+        assert_eq!(s.get_str("overlay"), Some("none"));
+        // Close: back to `none`, `:popover-open` unmatches; reopen:
+        // `auto` again (the open -> auto, close -> none, reopen ->
+        // auto sequence, through fresh one-shot stylers).
+        doc.hide_popover(pop).unwrap();
+        assert!(!doc.matches(pop, ":popover-open").unwrap());
+        let s = style(&doc, pop, "#p { overlay: auto; }", &vp());
+        assert_eq!(s.get_str("overlay"), Some("none"));
+        doc.show_popover(pop).unwrap();
+        let s = style(&doc, pop, "#p { overlay: auto; }", &vp());
+        assert_eq!(s.get_str("overlay"), Some("auto"));
+        // Errors: double-show, show/hide without the attribute.
+        assert!(doc.show_popover(pop).is_err());
+        assert!(doc.show_popover(plain).is_err());
+        assert!(doc.hide_popover(plain).is_err());
+        // Hiding a closed popover is a no-op, not an error.
+        doc.hide_popover(pop).unwrap();
+        assert!(doc.hide_popover(pop).is_ok());
+        // Toggle: plain, then forced in both directions.
+        assert!(doc.toggle_popover(pop, None).unwrap());
+        assert!(!doc.toggle_popover(pop, None).unwrap());
+        assert!(doc.toggle_popover(pop, Some(true)).unwrap());
+        assert!(doc.toggle_popover(pop, Some(true)).unwrap());
+        assert!(!doc.toggle_popover(pop, Some(false)).unwrap());
+        assert!(!doc.toggle_popover(pop, Some(false)).unwrap());
+        assert!(doc.toggle_popover(plain, None).is_err());
+        // Auto-close: showing a second `auto` popover closes the
+        // first; a `manual` popover is never auto-closed.
+        let pop2 = doc.create_element("div");
+        doc.append_child(body, pop2);
+        doc.set_attribute(pop2, "id", "p2");
+        doc.set_attribute(pop2, "popover", "");
+        let manual = doc.create_element("div");
+        doc.append_child(body, manual);
+        doc.set_attribute(manual, "popover", "manual");
+        doc.show_popover(pop).unwrap();
+        doc.show_popover(manual).unwrap();
+        assert!(doc.is_popover_open(pop));
+        assert!(doc.is_popover_open(manual));
+        doc.show_popover(pop2).unwrap();
+        assert!(!doc.is_popover_open(pop));
+        assert!(doc.is_popover_open(manual));
+        assert!(doc.is_popover_open(pop2));
+        // Ancestor exception: an `auto` popover nested inside another
+        // open `auto` popover stays open when the inner one shows.
+        doc.hide_popover(pop2).unwrap();
+        doc.hide_popover(manual).unwrap();
+        let outer = doc.create_element("div");
+        doc.append_child(body, outer);
+        doc.set_attribute(outer, "popover", "");
+        let inner = doc.create_element("div");
+        doc.append_child(outer, inner);
+        doc.set_attribute(inner, "popover", "");
+        doc.show_popover(outer).unwrap();
+        doc.show_popover(inner).unwrap();
+        assert!(doc.is_popover_open(outer));
+        assert!(doc.is_popover_open(inner));
+        // Removal demotes: a removed open popover leaves the set.
+        doc.remove(inner);
+        assert!(!doc.is_in_top_layer(inner));
+        assert!(!doc.is_popover_open(inner));
+        // Attribute removal demotes too.
+        doc.remove_attribute(outer, "popover");
+        assert!(!doc.is_in_top_layer(outer));
+    }
+
+    // w80 phase 2: within one style pass, an open popover twin must
+    // not adopt its closed twin's shared style (the share key folds
+    // top-layer membership), and the epoch hook re-styles cleanly.
+    #[test]
+    fn overlay_share_key_distinguishes_top_layer() {
+        let mut doc = Document::new();
+        let root = doc.root();
+        let html = doc.create_element("html");
+        doc.append_child(root, html);
+        let body = doc.create_element("body");
+        doc.append_child(html, body);
+        let closed = doc.create_element("div");
+        doc.append_child(body, closed);
+        doc.set_attribute(closed, "class", "t");
+        doc.set_attribute(closed, "popover", "");
+        let open = doc.create_element("div");
+        doc.append_child(body, open);
+        doc.set_attribute(open, "class", "t");
+        doc.set_attribute(open, "popover", "");
+        doc.show_popover(open).unwrap();
+        let author = parse_stylesheet(".t { overlay: auto; }");
+        let ua_sheet = ua();
+        let author_refs = [&author];
+        let styler = Styler::new(&doc, &author_refs, &ua_sheet, vp());
+        // Closed styled first (publishes the share entry); the open
+        // twin must still compute `auto`, not adopt `none`.
+        assert_eq!(styler.style_for(closed).get_str("overlay"), Some("none"));
+        assert_eq!(styler.style_for(open).get_str("overlay"), Some("auto"));
+        styler.invalidate_top_layer();
+        assert_eq!(styler.style_for(open).get_str("overlay"), Some("auto"));
+        assert_eq!(styler.style_for(closed).get_str("overlay"), Some("none"));
     }
 
     #[test]

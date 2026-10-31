@@ -188,10 +188,12 @@ pub struct DocumentTypeData {
 /// Payload of an element node.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ElementData {
-    /// Interned tag name (lowercased for HTML elements by the parser and
-    /// by [`Document::create_element`]; case-adjusted for SVG/MathML,
-    /// e.g. `foreignObject`; kept as written by
-    /// [`Document::create_element_ns`]). Well-known names are pure atoms
+    /// Interned tag name (lowercased for HTML elements by the parser,
+    /// by [`Document::create_element`], and by
+    /// [`Document::create_element_ns`] in the HTML namespace;
+    /// case-adjusted for SVG/MathML, e.g. `foreignObject`; kept as
+    /// written by [`Document::create_element_ns`] in other
+    /// namespaces). Well-known names are pure atoms
     /// — no per-element heap allocation; anything else spills onto the
     /// name's heap sidecar and round-trips exactly.
     pub tag_name: TagName,
@@ -514,6 +516,43 @@ impl DirtyReport {
 // Document
 // ---------------------------------------------------------------------------
 
+/// The state of an element's `popover` content attribute (HTML
+/// §6.12): `auto` (light-dismiss, auto-closed by other `auto`
+/// popovers), `manual` (explicit dismiss only), `hint` (transient).
+/// Invalid and empty values map to `Auto` at the
+/// [`Document::popover_state`] boundary, never here.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum PopoverState {
+    Auto,
+    Manual,
+    Hint,
+}
+
+/// Failure of a popover show/hide/toggle call, named after the
+/// `DOMException` the JS bindings surface it as (the engine has no
+/// `DOMException` type, so bindings report these as `TypeError`s
+/// whose message carries the DOM name, per the existing convention).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum PopoverError {
+    /// No `popover` attribute on the element.
+    NotSupported,
+    /// Not connected, or already in the target state for `show`.
+    InvalidState,
+}
+
+impl fmt::Display for PopoverError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            PopoverError::NotSupported => {
+                f.write_str("NotSupportedError: element has no popover attribute")
+            }
+            PopoverError::InvalidState => {
+                f.write_str("InvalidStateError: popover is not connected or already showing")
+            }
+        }
+    }
+}
+
 /// An HTML document: the arena that owns every node.
 #[derive(Clone, Debug)]
 pub struct Document {
@@ -581,6 +620,18 @@ pub struct Document {
     /// mutates. Nodes are arena-allocated and never freed, so the map
     /// only grows with the arena — bounded by the document's node count.
     shadow_hosts: HashMap<NodeId, NodeId>,
+    /// The top layer (CSS Position 4 / HTML popover): elements
+    /// promoted by `showPopover`/`showModal`/fullscreen, in promotion
+    /// order (later entries paint above earlier ones). Membership is
+    /// what exempts an element from the UA `* { overlay: none
+    /// !important }` rule and what makes `:popover-open` match (see
+    /// [`Document::is_popover_open`]). Promotion appends (deduped);
+    /// demotion removes; detaching a subtree drops every member in
+    /// it (see the removal methods). The set is deliberately
+    /// independent of any attribute: an element with a `popover`
+    /// attribute that was never shown is not in it, and an element
+    /// whose `popover` attribute is removed while open is demoted.
+    top_layer: Vec<NodeId>,
     /// Scratch walk stack for [`Document::set_subtree_flags`], cleared
     /// and reused on every call so the flag walk never allocates. A
     /// plain `Vec` keeps [`Document`] `Send + Sync`.
@@ -682,6 +733,7 @@ impl Document {
             dirty_style: false,
             dirty_style_subtrees: HashSet::new(),
             shadow_hosts: HashMap::new(),
+            top_layer: Vec::new(),
             flag_stack: Vec::new(),
             clone_stack: Vec::new(),
             text_cache: HashSet::new(),
@@ -807,10 +859,19 @@ impl Document {
         }))
     }
 
-    /// Create an element in the given namespace; the tag name is kept as-is.
+    /// Create an element in the given namespace. The tag name is
+    /// ASCII-lowercased for the HTML namespace (per DOM for HTML
+    /// documents, matching `document.createElement` and the parse
+    /// shim's `createElementNS`); other namespaces keep the name
+    /// as-is, so foreign names like `foreignObject` survive.
     pub fn create_element_ns(&mut self, ns: Namespace, tag: &str) -> NodeId {
+        let tag_name = if ns == Namespace::Html {
+            TagName::intern_lowered(tag)
+        } else {
+            TagName::from(tag)
+        };
         self.alloc(NodeKind::Element(ElementData {
-            tag_name: TagName::from(tag),
+            tag_name,
             namespace: ns,
             attributes: Attributes::new(),
             shadow_root: None,
@@ -968,6 +1029,7 @@ impl Document {
         if self.node(child).parent == Some(parent) {
             self.unlink(child);
             self.note_detach(child);
+            self.demote_top_layer_subtree(child);
             self.mark_dirty_and_shadow_host(parent, true);
         }
     }
@@ -1087,6 +1149,7 @@ impl Document {
         }
         self.unlink(old_child);
         self.note_detach(old_child);
+        self.demote_top_layer_subtree(old_child);
         self.insert_nodes(parent, nodes, reference);
         self.mark_dirty_and_shadow_host(parent, true);
     }
@@ -1106,6 +1169,7 @@ impl Document {
         if parent.is_some() {
             self.unlink(node);
             self.note_detach(node);
+            self.demote_top_layer_subtree(node);
         }
         if let Some(p) = parent {
             self.mark_dirty_and_shadow_host(p, true);
@@ -1238,6 +1302,7 @@ impl Document {
                 cursor = self.node(k).next_sibling;
                 self.unlink(k);
                 self.note_detach(k);
+                self.demote_top_layer_subtree(k);
             }
             if !text.is_empty() {
                 let t = self.create_text_node(text);
@@ -1358,6 +1423,7 @@ impl Document {
             cursor = self.node(k).next_sibling;
             self.unlink(k);
             self.note_detach(k);
+            self.demote_top_layer_subtree(k);
         }
         // The fragment algorithm takes the element as its context (tag,
         // namespace, and attributes drive the initial insertion mode and
@@ -1858,11 +1924,193 @@ impl Document {
             self.note_id_loss(atom, el);
         }
         if removed_any {
+            // Removing the `popover` attribute while open hides the
+            // popover (HTML "popover attribute changed" step).
+            if name.eq_ignore_ascii_case("popover") {
+                self.remove_from_top_layer(el);
+            }
             // As in `set_attribute`: any attribute can take part in
             // selector matching, so removal re-runs the style stage.
             // The removal's restyle scope is subtree-local like a write.
             self.mark_dirty_and_shadow_host(el, true);
             self.mark_style_localized(el);
+        }
+    }
+
+    /// Drop every top-layer member in the subtree rooted at `root`
+    /// (the root itself included). Removal methods and the subtree
+    /// clears (`set_text_content`, `set_inner_html`) call this after
+    /// unlinking: per HTML, removing a top-layer element from its
+    /// document removes it from the top layer (and therefore unmatches
+    /// `:popover-open` and re-applies the UA `overlay: none` rule).
+    /// Moves deliberately do NOT go through here: `insert_nodes`
+    /// detaches before re-linking, and a popover moved within its
+    /// document stays in the top layer.
+    fn demote_top_layer_subtree(&mut self, root: NodeId) {
+        if self.top_layer.is_empty() {
+            return;
+        }
+        let mut stack = vec![root];
+        let mut members = Vec::new();
+        while let Some(n) = stack.pop() {
+            if self.top_layer.contains(&n) {
+                members.push(n);
+            }
+            let mut child = self.first_child(n);
+            while let Some(c) = child {
+                stack.push(c);
+                child = self.next_sibling(c);
+            }
+        }
+        for n in members {
+            self.remove_from_top_layer(n);
+        }
+    }
+
+    /// The top layer, in promotion order.
+    pub fn top_layer(&self) -> &[NodeId] {
+        &self.top_layer
+    }
+
+    /// True when `node` is currently in the top layer.
+    pub fn is_in_top_layer(&self, node: NodeId) -> bool {
+        self.top_layer.contains(&node)
+    }
+
+    /// Promote `node` to the top layer (append, deduped). Callers
+    /// that model a spec API (`show_popover`, the parse-shim
+    /// adoption) validate state first; this is the raw set operation
+    /// and performs no validation beyond ownership. A real promotion
+    /// dirties the document (style-affecting: `:popover-open` starts
+    /// matching and the UA `overlay: none` exemption lifts), so a
+    /// post-parse show repaints; a deduped no-op dirties nothing.
+    /// Detached nodes record nothing (`mark_dirty` only tracks
+    /// attached subtrees), so parse-time adoption stays silent until
+    /// the subtree links in.
+    pub fn promote_to_top_layer(&mut self, node: NodeId) {
+        if self.owns(node) && !self.top_layer.contains(&node) {
+            self.top_layer.push(node);
+            self.mark_dirty(node, true);
+        }
+    }
+
+    /// Remove `node` from the top layer, if present. A real demotion
+    /// dirties the document like a promotion (style-affecting, for
+    /// the same reason); removing a non-member is a no-op that
+    /// dirties nothing. Demotions of already-detached subtrees
+    /// (see [`Document::demote_top_layer_subtree`]) record nothing,
+    /// since the nodes are no longer attached.
+    pub fn remove_from_top_layer(&mut self, node: NodeId) {
+        if self.top_layer.contains(&node) {
+            self.top_layer.retain(|n| *n != node);
+            self.mark_dirty(node, true);
+        }
+    }
+
+    /// The element's `popover` attribute state, or `None` when the
+    /// attribute is absent. Per HTML the attribute is enumerated
+    /// with invalid-value default `auto`: an empty value, an unknown
+    /// value, and `auto` all mean [`PopoverState::Auto`].
+    pub fn popover_state(&self, node: NodeId) -> Option<PopoverState> {
+        let value = self.get_attribute(node, "popover")?;
+        Some(match value.to_ascii_lowercase().as_str() {
+            "manual" => PopoverState::Manual,
+            "hint" => PopoverState::Hint,
+            _ => PopoverState::Auto,
+        })
+    }
+
+    /// True when `node` is a shown popover: it carries a `popover`
+    /// attribute and is in the top layer. This is exactly what
+    /// `:popover-open` matches.
+    pub fn is_popover_open(&self, node: NodeId) -> bool {
+        self.popover_state(node).is_some() && self.is_in_top_layer(node)
+    }
+
+    /// `HTMLElement.showPopover()`: promote to the top layer.
+    /// A successful show dirties the document (style-affecting), so
+    /// a post-parse show repaints; failed shows dirty nothing.
+    /// `NotSupported` when the element has no `popover` attribute,
+    /// `InvalidState` when it is not connected or already showing.
+    /// Showing an `auto` popover closes every other open `auto`
+    /// popover that is not an ancestor of this one (HTML "topmost
+    /// popover ancestor" rule, simplified to the ancestor chain:
+    /// `manual`/`hint` popovers are never auto-closed, and an
+    /// `auto` popover nested inside another stays open).
+    pub fn show_popover(&mut self, node: NodeId) -> Result<(), PopoverError> {
+        let state = self.popover_state(node).ok_or(PopoverError::NotSupported)?;
+        if !self.is_attached(node) {
+            return Err(PopoverError::InvalidState);
+        }
+        if self.is_in_top_layer(node) {
+            return Err(PopoverError::InvalidState);
+        }
+        if state == PopoverState::Auto {
+            let ancestors = self.ancestors(node);
+            let others: Vec<NodeId> = self
+                .top_layer
+                .iter()
+                .copied()
+                .filter(|n| {
+                    *n != node
+                        && !ancestors.contains(n)
+                        && self.popover_state(*n) == Some(PopoverState::Auto)
+                })
+                .collect();
+            for n in others {
+                self.remove_from_top_layer(n);
+            }
+        }
+        // Via the set op, so the show dirties the document (and the
+        // auto-closed others above were dirtied by their removals).
+        self.promote_to_top_layer(node);
+        Ok(())
+    }
+
+    /// `HTMLElement.hidePopover()`: demote from the top layer.
+    /// Hiding a shown popover dirties the document (style-affecting).
+    /// `NotSupported` when the element has no `popover` attribute;
+    /// hiding a popover that is not showing is a no-op (the spec's
+    /// hide algorithm returns early there, it does not throw).
+    pub fn hide_popover(&mut self, node: NodeId) -> Result<(), PopoverError> {
+        self.popover_state(node).ok_or(PopoverError::NotSupported)?;
+        self.remove_from_top_layer(node);
+        Ok(())
+    }
+
+    /// `HTMLElement.togglePopover(force)`: show when hidden, hide
+    /// when showing, returning whether the popover is open after the
+    /// call. A forced direction that already holds is a no-op that
+    /// returns the forced state without touching validity (so
+    /// `togglePopover(false)` on a hidden non-popover returns
+    /// `false`); otherwise this delegates to
+    /// [`Document::show_popover`] / [`Document::hide_popover`] and
+    /// propagates their errors.
+    pub fn toggle_popover(
+        &mut self,
+        node: NodeId,
+        force: Option<bool>,
+    ) -> Result<bool, PopoverError> {
+        match force {
+            Some(true) if self.is_popover_open(node) => Ok(true),
+            Some(false) if !self.is_popover_open(node) => Ok(false),
+            Some(true) => {
+                self.show_popover(node)?;
+                Ok(true)
+            }
+            Some(false) => {
+                self.hide_popover(node)?;
+                Ok(false)
+            }
+            None => {
+                if self.is_popover_open(node) {
+                    self.hide_popover(node)?;
+                    Ok(false)
+                } else {
+                    self.show_popover(node)?;
+                    Ok(true)
+                }
+            }
         }
     }
 
@@ -3833,6 +4081,11 @@ struct Compound {
     id: Option<String>,
     classes: Vec<String>,
     attrs: Vec<AttrSelector>,
+    /// `:popover-open`: the element is a shown popover (see
+    /// [`Document::is_popover_open`]). The only pseudo-class this
+    /// mini-parser supports; every other pseudo-class or
+    /// pseudo-element is a parse error, as before.
+    popover_open: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -3988,9 +4241,9 @@ fn parse_compound(tok: &str) -> Result<Compound, SelectorParseError> {
     let mut any = false;
     let bytes = tok.as_bytes();
     let mut i = 0;
-    if i < bytes.len() && !matches!(bytes[i], b'.' | b'#' | b'[') {
+    if i < bytes.len() && !matches!(bytes[i], b'.' | b'#' | b'[' | b':') {
         let mut j = i;
-        while j < bytes.len() && !matches!(bytes[j], b'.' | b'#' | b'[') {
+        while j < bytes.len() && !matches!(bytes[j], b'.' | b'#' | b'[' | b':') {
             j += 1;
         }
         let tag = &tok[i..j];
@@ -4018,7 +4271,7 @@ fn parse_compound(tok: &str) -> Result<Compound, SelectorParseError> {
                 let sigil = bytes[i];
                 i += 1;
                 let mut j = i;
-                while j < bytes.len() && !matches!(bytes[j], b'.' | b'#' | b'[') {
+                while j < bytes.len() && !matches!(bytes[j], b'.' | b'#' | b'[' | b':') {
                     j += 1;
                 }
                 let name = &tok[i..j];
@@ -4044,6 +4297,30 @@ fn parse_compound(tok: &str) -> Result<Compound, SelectorParseError> {
                 c.attrs.push(attr);
                 any = true;
                 i = next;
+            }
+            // The one supported pseudo-class. Anything else
+            // (`:hover`, `:not(...)`, `::backdrop`, ...) is a parse
+            // error, exactly like the old "invalid tag name" outcome
+            // for `p:first-child` — this parser never matched
+            // pseudo-classes, it just failed later and less clearly.
+            b':' => {
+                i += 1;
+                let mut j = i;
+                while j < bytes.len() && !matches!(bytes[j], b'.' | b'#' | b'[' | b':') {
+                    j += 1;
+                }
+                let name = &tok[i..j];
+                // Pseudo-class names are ASCII case-insensitive in
+                // CSS (the production selector engine lowercases
+                // them before matching), so `:POPOVER-OPEN` matches
+                // here too. Every other name still errors, including
+                // the empty name from `::backdrop` and `:not(...)`.
+                if !name.eq_ignore_ascii_case("popover-open") {
+                    return Err(err("unsupported pseudo-class in selector"));
+                }
+                c.popover_open = true;
+                any = true;
+                i = j;
             }
             _ => return Err(err("unexpected character in compound selector")),
         }
@@ -4408,6 +4685,9 @@ impl Document {
             if !ok {
                 return false;
             }
+        }
+        if c.popover_open && !self.is_popover_open(el) {
+            return false;
         }
         true
     }

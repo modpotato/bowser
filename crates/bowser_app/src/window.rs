@@ -2596,7 +2596,41 @@ pub const HEADLESS_PUMP_BUDGET: Duration = Duration::from_secs(2);
 /// outer `--timeout` deadline (the worker thread the binary runs the
 /// load on) and the driver's per-test kill remain the real backstops;
 /// this only guarantees the pump itself terminates.
-const HEADLESS_HARNESS_WAIT_BUDGET: Duration = Duration::from_secs(30);
+///
+/// This budget is one link of the WPT timer chain, and it must exceed
+/// the harness deadline the driver arms (see [`REPORTER_JS`] in
+/// `wpt_driver.rs`): testharness.js fires its timeout at setup +
+/// `timeout_multiplier` x 10 s, and JS timers cannot fire mid-install,
+/// so at the first pump iteration a past-due harness timer fires first.
+/// Scope, stated exactly: this covers normal-timeout tests and
+/// installs that start pumping before the runner budget expires.
+/// The chain invariant "harness deadline < pump deadline <
+/// child/runner kill, with margin, for any install duration" as
+/// literally stated is false: the pump deadline is pump_start +
+/// 90 s, i.e. child_start + install + 90 s, which exceeds the 180 s
+/// runner budget once install >= 90 s. The outcome is still correct
+/// there because a harness timer past due at pump start fires on the
+/// first pump iteration, before the child kill — but that is
+/// past-due firing, not the stated deadline ordering. What the
+/// 90 s budget actually guarantees is that the pump outlasts the
+/// full `timeout_multiplier` x 10 s harness deadline measured from
+/// setup, not just the deadline minus a typical install. With
+/// multiplier 8 the harness deadline is setup + 80 s, hence this
+/// 90 s budget; runs are validated with `bowser-wpt --timeout-secs
+/// 180` (the 60 s default in `bowser-wpt.rs`/`RunConfig` is NOT
+/// enough for a genuine harness TIMEOUT at multiplier 8 — the driver
+/// would kill the child at 60 s before the 80 s harness timer fires
+/// — and raising that default is a separate change outside this
+/// budget). Long-test exception: a test with `<meta name="timeout"
+/// content="long">` has a 60 s x 8 = 480 s harness deadline that is
+/// unreachable under this 90 s budget and the 180 s runner budget;
+/// it ends as a runner `DriverTimeout`, never a harness TIMEOUT
+/// (concrete instance: CSS2 line-height-interpolation, expected
+/// TIMEOUT), and needs a separate solution (e.g. capping the
+/// multiplier when `timeout_length` is long, or a pump budget keyed
+/// to it). Cost, stated plainly: a genuine harness TIMEOUT now
+/// takes ~80 s to report instead of ~30 s.
+const HEADLESS_HARNESS_WAIT_BUDGET: Duration = Duration::from_secs(90);
 
 /// Cap on the tasks one [`pump_headless`] iteration runs through the
 /// page's event loop (see

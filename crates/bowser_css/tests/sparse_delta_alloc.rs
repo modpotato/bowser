@@ -159,7 +159,11 @@ fn sparse_delta_allocates_once_per_element() {
     // present for every element with >= 1 deviating slot), so this
     // bound (measured + 32/element headroom) fails pre-change with
     // wide margin while passing deterministically post-change.
-    let bound = 382_656 + M * 32;
+    // w80 recalibration: five transition slots (191→196 computed
+    // properties, memo bitset 3→4 words) measure 397248 bytes
+    // against 389056 at the pre-change base, so the headroom moves
+    // to 48/element to keep deterministic slack over the new floor.
+    let bound = 382_656 + M * 48;
     assert!(
         bytes <= bound,
         "styling {M} elements allocated {bytes} bytes (bound {bound})"

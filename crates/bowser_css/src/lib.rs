@@ -46,7 +46,7 @@ pub use token::Token;
 pub use token::serialize_tokens;
 pub use value::{
     AttrData, BasicShape, CalcSizeBasis, ClipPath, Color, CounterData, CssValue, LengthUnit,
-    RepeatMode, Shadow, ShapeRadius, TransformContext, TransformFunction, TransformMatrix,
-    TransformOrigin, compose_transforms, evaluate_transform, length_to_px, parse_css_angle_deg,
-    parse_css_color, resolve_absolute_length,
+    RepeatMode, Shadow, ShapeRadius, StepPosition, TimingFunction, TransformContext,
+    TransformFunction, TransformMatrix, TransformOrigin, compose_transforms, evaluate_transform,
+    length_to_px, parse_css_angle_deg, parse_css_color, resolve_absolute_length,
 };

@@ -55,6 +55,7 @@ const SHORTHAND_NAMES: &[&str] = &[
     "scroll-padding",
     "scroll-padding-block",
     "scroll-padding-inline",
+    "transition",
 ];
 
 fn main() {

@@ -156,9 +156,11 @@ pub struct SourceLoc {
 /// Namespace of an element. The HTML parser only ever produces the three
 /// well-known namespaces; [`Namespace::Other`] arises from
 /// `document.createElementNS` with an arbitrary namespace URI (DOM
-/// "validate and extract" accepts any URI — only prefix rules are
-/// validated), so the element is never silently mis-namespaced as
-/// HTML/SVG/MathML.
+/// "validate and extract" accepts any URI). The only validation
+/// actually performed is the empty-tag `InvalidCharacterError` in
+/// the `createElementNS` callers: the prefix rules and XML Name
+/// checks are NOT validated (out of scope), so the element is
+/// never silently mis-namespaced as HTML/SVG/MathML.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Namespace {
     Html,
@@ -1920,6 +1922,19 @@ impl<'a, 'x, 'h> ScriptHost<'a, 'x, 'h> {
         self.tb.set_attr(el.to_el(), name, value);
     }
 
+    /// `removeAttribute(name)` on `el`: the name is normalized
+    /// exactly like [`Self::set_attribute`] (ASCII-lowercased for
+    /// HTML-namespace elements, verbatim otherwise), so a removal
+    /// always names the stored attribute. A stale handle fails
+    /// closed like `set_attribute`. The mutation count bumps only
+    /// when an attribute was actually removed.
+    pub fn remove_attribute(&mut self, el: ScriptElement, name: &str) {
+        if el.generation != self.tb.generation {
+            return;
+        }
+        self.tb.remove_attr(el.to_el(), name);
+    }
+
     /// `document.createElement(tag)`: creates a new HTML-namespace
     /// element with the given tag name (ASCII-lowercased, per DOM for
     /// HTML documents), not yet attached to the document. The returned
@@ -1933,6 +1948,30 @@ impl<'a, 'x, 'h> ScriptHost<'a, 'x, 'h> {
             Vec::new(),
             None,
         );
+        ScriptElement::from_el(el, generation)
+    }
+
+    /// `document.createElementNS(ns, tag)`: like [`create_element`]
+    /// but in an explicit namespace, not yet attached to the document.
+    /// The tag name is ASCII-lowercased only for the HTML namespace
+    /// (per DOM for HTML documents); other namespaces keep the name
+    /// as-is, so foreign names like `foreignObject` survive. The
+    /// snapshot emits the stored namespace verbatim, so the element
+    /// keeps it through the production install and its upgrade
+    /// identity refresh (which records the namespace alongside the
+    /// tag for the ordinal resolution's namespace check).
+    pub fn create_element_ns(&mut self, ns: Namespace, tag: &str) -> ScriptElement {
+        let generation = self.tb.generation;
+        let owned;
+        let name = if ns == Namespace::Html {
+            owned = tag.to_ascii_lowercase();
+            owned.as_str()
+        } else {
+            tag
+        };
+        let el = self
+            .tb
+            .create_element(TagName::from(name), ns, Vec::new(), None);
         ScriptElement::from_el(el, generation)
     }
 
@@ -2449,10 +2488,17 @@ impl<'a, 'x, 'h> ScriptHost<'a, 'x, 'h> {
         out
     }
 
-    /// Lowercased tag name of an element.
+    /// Tag name of an element, exactly as stored: HTML tags are
+    /// already lowercased at creation (parser and
+    /// [`create_element_ns`]), foreign tags keep their case
+    /// (`foreignObject`). Callers that need a case-insensitive
+    /// comparison do it themselves; the upgrade identity records
+    /// must see the exact name, or a case-sensitive foreign tag
+    /// check could never distinguish `foreignObject` from
+    /// `foreignobject` (w80fix F3).
     pub fn tag_name(&self, el: ScriptElement) -> Option<String> {
         let idx = self.check_el(el)?;
-        Some(self.tb.arena[idx].tag.to_string().to_ascii_lowercase())
+        Some(self.tb.arena[idx].tag.to_string())
     }
 
     /// `nextElementSibling` (`next = true`) / `previousElementSibling`.
@@ -7290,6 +7336,19 @@ impl<'a, 'x> TreeBuilder<'a, 'x> {
             None => self.arena[el].attrs.push((name, value.to_string())),
         }
         self.bump_mutation();
+    }
+
+    fn remove_attr(&mut self, el: El, name: &str) {
+        let name = if self.arena[el].ns == Namespace::Html {
+            AttrName::intern_lowered(name)
+        } else {
+            AttrName::from(name)
+        };
+        let before = self.arena[el].attrs.len();
+        self.arena[el].attrs.retain(|(k, _)| *k != name);
+        if self.arena[el].attrs.len() != before {
+            self.bump_mutation();
+        }
     }
 }
 

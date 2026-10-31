@@ -113,7 +113,8 @@ use crate::vm::Vm;
 use crate::wtf8::Wtf8;
 use bowser_css::{
     BasicShape, ClipPath, CssValue, Filter, RepeatMode, ShapeRadius, SnapAlign, SnapStop, SnapType,
-    Stylesheet, TransformFunction, Viewport, compute_style, default_ua_stylesheet,
+    StepPosition, Stylesheet, TimingFunction, TransformFunction, Viewport, compute_style,
+    default_ua_stylesheet,
 };
 use bowser_dom::{self as dom, Document, Namespace, NodeId, NodeKind};
 use bowser_html::{
@@ -2824,6 +2825,84 @@ fn adopt_shim_scroll(ctx: ContextId, roots: &RefCell<ParseShimRoots>) {
     apis.shim_element_scroll = resolved;
 }
 
+/// Adopt the parse shim's top layer into the production document
+/// (w80): a popover shown by a parser-inserted script stays shown
+/// after the production install. Resolution mirrors
+/// [`adopt_shim_scroll`]: each recorded arena resolves through its
+/// wrapper record (id first, unified ordinal second), skipping
+/// detached records, and only elements that still carry a `popover`
+/// attribute promote.
+fn adopt_shim_top_layer(ctx: ContextId, roots: &RefCell<ParseShimRoots>) {
+    let (arenas, records) = {
+        let roots = roots.borrow();
+        (roots.top_layer_ordered(), roots.element_wrappers.clone())
+    };
+    if arenas.is_empty() {
+        return;
+    }
+    let Some(apis_rc) = web_apis(ctx) else { return };
+    let doc_rc = {
+        let apis = apis_rc.borrow();
+        apis.live_document().ok()
+    };
+    let Some(doc_rc) = doc_rc else {
+        return;
+    };
+    let mut doc = doc_rc.borrow_mut();
+    // Iterate in show order (see `ParseShimRoots::top_layer_order`),
+    // so coexisting popovers keep their promotion order in the
+    // production document instead of landing in hash order.
+    for arena in arenas {
+        let Some(rec) = records
+            .iter()
+            .find(|rec| rec.el.arena_index() == arena && !rec.detached)
+        else {
+            continue;
+        };
+        // Resolve exactly like `upgrade_shim_element_wrappers`:
+        // a candidate whose tag (or namespace) differs from the
+        // recorded one is a different element — with duplicate
+        // `id`s the `id` candidate can name a same-`id` element
+        // that was never shown, so an unverified `id` hit must
+        // never promote. The ordinal candidate wins when it
+        // self-consistently carries the recorded `id`; the `id`
+        // candidate only wins when the ordinal no longer does
+        // (the element moved after the last identity refresh).
+        // The verification itself is the shared `upgrade_tag_ok`
+        // predicate (w80fix F-SMALL2): exact match for foreign
+        // namespaces, ASCII case-insensitive for HTML — the
+        // adopt copy must not drift from the upgrade copy again.
+        let tag_ok = |n: NodeId| {
+            upgrade_tag_ok(rec.tag_name.as_deref(), rec.namespace.as_ref(), doc.kind(n))
+        };
+        let ord_node = rec
+            .ordinal
+            .and_then(|ord| doc.get_elements_by_tag_name("*").item(ord))
+            .filter(|&n| tag_ok(n));
+        let id_node = rec
+            .id_attr
+            .as_deref()
+            .and_then(|id| doc.get_element_by_id(id))
+            .filter(|&n| tag_ok(n));
+        let ordinal_carries_id = |n: NodeId| {
+            rec.id_attr
+                .as_deref()
+                .is_none_or(|id| doc.get_attribute(n, "id") == Some(id))
+        };
+        let node = match (ord_node, id_node) {
+            (Some(o), Some(_)) if ordinal_carries_id(o) => Some(o),
+            (_, Some(i)) => Some(i),
+            (Some(o), None) => Some(o),
+            (None, None) => None,
+        };
+        if let Some(node) = node
+            && doc.get_attribute(node, "popover").is_some()
+        {
+            doc.promote_to_top_layer(node);
+        }
+    }
+}
+
 pub fn install_page_web_apis(
     vm: &mut Vm,
     document: Rc<RefCell<Document>>,
@@ -2928,6 +3007,7 @@ pub fn install_page_web_apis(
     let mid_parse_onload = if let Some(roots) = vm.pending_shim_listeners.take() {
         adopt_shim_listeners(ctx, &roots);
         adopt_shim_scroll(ctx, &roots);
+        adopt_shim_top_layer(ctx, &roots);
         let recorded = roots.borrow().shim_onload;
         // A script may have deleted or redefined the shim `onload`
         // accessor outright (`delete window.onload`,
@@ -3590,6 +3670,10 @@ const SHIM_ELEMENT_OWN_NAMES: &[&str] = &[
     "insertBefore",
     "getBoundingClientRect",
     "remove",
+    "matches",
+    "showPopover",
+    "hidePopover",
+    "togglePopover",
     "cloneNode",
     "scrollTo",
     "scrollBy",
@@ -3598,6 +3682,7 @@ const SHIM_ELEMENT_OWN_NAMES: &[&str] = &[
     "removeEventListener",
     "attributes",
     "parentNode",
+    "parentElement",
     "style",
     "className",
     "id",
@@ -3633,6 +3718,31 @@ const SHIM_ELEMENT_OWN_NAMES: &[&str] = &[
 /// [`upgrade_shim_element_wrappers`], as
 /// `(seq, etype, capture, callback, once, passive, signal, is_handler)`.
 type PendingShimListener = (u64, String, bool, Value, bool, bool, Value, bool);
+
+/// Upgrade tag verification, extracted from
+/// [`upgrade_shim_element_wrappers`]'s resolution closure so it is
+/// unit-testable: a candidate whose tag (or namespace) differs from
+/// the recorded one is a different element and must never satisfy
+/// the resolution. Tag case follows the candidate's namespace:
+/// HTML tags compare ASCII case-insensitively, foreign
+/// (SVG/MathML/Other) tags compare exactly, so a recorded
+/// `foreignObject` never verifies against a `foreignobject`
+/// candidate. The namespace check itself is exact in both cases
+/// (a `None` recorded namespace skips it, as before).
+fn upgrade_tag_ok(rec_tag: Option<&str>, rec_ns: Option<&Namespace>, kind: &NodeKind) -> bool {
+    match (rec_tag, kind) {
+        (Some(t), NodeKind::Element(d)) => {
+            let tag_same = if d.namespace == Namespace::Html {
+                d.tag_name.eq_ignore_ascii_case(t)
+            } else {
+                d.tag_name.as_str() == t
+            };
+            tag_same && rec_ns.is_none_or(|ns| *ns == d.namespace)
+        }
+        (Some(_), _) => false,
+        (None, _) => true,
+    }
+}
 
 /// Upgrade recorded parse-shim element wrappers in place (w51),
 /// mirroring the document upgrade in [`install_web_apis_inner`]:
@@ -3707,13 +3817,8 @@ fn upgrade_shim_element_wrappers(
                 // taken over): never upgrade onto it. An `id`
                 // candidate that fails the check falls back to
                 // the ordinal, exactly like a missing `id`.
-                let tag_ok = |n: NodeId| match (&rec.tag_name, doc.kind(n)) {
-                    (Some(t), NodeKind::Element(d)) => {
-                        d.tag_name.eq_ignore_ascii_case(t)
-                            && rec.namespace.as_ref().is_none_or(|ns| *ns == d.namespace)
-                    }
-                    (Some(_), _) => false,
-                    (None, _) => true,
+                let tag_ok = |n: NodeId| {
+                    upgrade_tag_ok(rec.tag_name.as_deref(), rec.namespace.as_ref(), doc.kind(n))
                 };
                 // w51 fix NEW-1: prefer the live-maintained ordinal
                 // candidate over the `id` candidate when it
@@ -4226,6 +4331,18 @@ fn install_web_apis_inner(
             def_native(heap, element_proto, "removeChild", n_remove_child)?;
             def_native(heap, element_proto, "matches", n_matches)?;
             def_native(heap, element_proto, "closest", n_closest)?;
+            // Popover API (HTML §6.12, w80): `showPopover` /
+            // `hidePopover` / `togglePopover` on the shared element
+            // prototype, so production wrappers (and upgraded shim
+            // wrappers, which keep this prototype) all expose them.
+            // The parse shim installs its own copies on its wrappers
+            // (see `wrap_parse_element`): the two surfaces share the
+            // Document-level state machine, not code, because the
+            // shim's elements live in the parser's tree, not a
+            // `Document`.
+            def_native(heap, element_proto, "showPopover", n_show_popover)?;
+            def_native(heap, element_proto, "hidePopover", n_hide_popover)?;
+            def_native(heap, element_proto, "togglePopover", n_toggle_popover)?;
             // w79k: `Element.querySelector`/`querySelectorAll`, scoped
             // to the receiver's descendants. (The parse shim's versions
             // are stripped at upgrade, and until now `element_proto`
@@ -4437,6 +4554,16 @@ fn install_web_apis_inner(
                 element_proto,
                 "previousElementSibling",
                 n_previous_element_sibling_get,
+                n_readonly_set,
+            )?;
+            // w80: `parentElement` (see `n_parent_element_get`):
+            // previously `undefined` on production wrappers, which
+            // broke any `el.parentElement.classList` chain.
+            def_accessor(
+                heap,
+                element_proto,
+                "parentElement",
+                n_parent_element_get,
                 n_readonly_set,
             )?;
             Ok(())
@@ -6263,6 +6390,34 @@ fn element_sibling_get(heap: &mut Heap, this: Value, next: bool) -> Result<Value
         Some(s) => {
             let mut g = rc.borrow_mut();
             Ok(wrap_node(heap, &mut g, s)?)
+        }
+        None => Ok(Value::Null),
+    }
+}
+
+/// `NonDocumentTypeChildNode.parentElement` (w80): the element
+/// parent, or `null` when the parent is the document node (or
+/// there is none). Mirrors [`element_sibling_get`]'s discipline:
+/// resolve the id under a short document borrow, wrap afterwards.
+/// Live prototype accessor (like the sibling accessors above), so
+/// fresh and upgraded wrappers both see it.
+fn n_parent_element_get(
+    heap: &mut Heap,
+    this: Value,
+    _args: &[Value],
+) -> Result<Value, NativeError> {
+    let rc = apis_rc(heap, this)?;
+    let node = target_node(heap, this, &rc.borrow())?;
+    let parent = {
+        let doc_rc = rc.borrow().live_document()?;
+        let doc = doc_rc.borrow();
+        doc.parent(node)
+            .filter(|p| matches!(doc.kind(*p), NodeKind::Element(_)))
+    };
+    match parent {
+        Some(p) => {
+            let mut g = rc.borrow_mut();
+            Ok(wrap_node(heap, &mut g, p)?)
         }
         None => Ok(Value::Null),
     }
@@ -11183,10 +11338,13 @@ const SVG_NAMESPACE_URI: &str = "http://www.w3.org/2000/svg";
 
 /// Resolve the `namespace` argument of `createElementNS` to a
 /// [`Namespace`]: `null`/`undefined`/`""` mean no namespace, which for an
-/// HTML document is the HTML namespace. Per the DOM "validate and extract"
-/// algorithm only the prefix rules are validated — any other namespace URI
-/// is legal and carried as [`Namespace::Other`], never silently
-/// mis-namespaced as HTML/SVG/MathML.
+/// HTML document is the HTML namespace. Any other namespace URI is
+/// legal and carried as [`Namespace::Other`], never silently
+/// mis-namespaced as HTML/SVG/MathML. Note the validation actually
+/// performed here and in the callers is only the empty-tag
+/// `InvalidCharacterError` below: the DOM "validate and extract"
+/// prefix rules and XML Name checks are NOT validated (out of
+/// scope), despite what this comment previously claimed.
 fn resolve_namespace_arg(heap: &mut Heap, v: Value) -> Result<Namespace, NativeError> {
     match v {
         Value::Null | Value::Undefined => Ok(Namespace::Html),
@@ -11203,7 +11361,9 @@ fn resolve_namespace_arg(heap: &mut Heap, v: Value) -> Result<Namespace, NativeE
 }
 
 /// `document.createElementNS`: like `createElement` but in an explicit
-/// namespace; the tag name is kept as-is (no ASCII lowercasing).
+/// namespace; the tag name is ASCII-lowercased for the HTML namespace
+/// (per DOM for HTML documents, matching the parse shim) and kept
+/// as-is for other namespaces, so `foreignObject` survives.
 fn n_create_element_ns(heap: &mut Heap, this: Value, args: &[Value]) -> Result<Value, NativeError> {
     let rc = apis_rc(heap, this)?;
     let ns = resolve_namespace_arg(
@@ -11956,6 +12116,73 @@ fn n_matches(heap: &mut Heap, this: Value, args: &[Value]) -> Result<Value, Nati
         .matches(node, &sel)
         .map_err(|e| NativeError::SyntaxError(e.message().to_string()))?;
     Ok(Value::Bool(hit))
+}
+
+/// `HTMLElement.showPopover()` (HTML §6.12, w80): promote the
+/// receiver to the document's top layer. Errors surface as
+/// `TypeError`s whose message carries the DOM name (the engine has
+/// no `DOMException` type — the existing convention, e.g.
+/// `createElementNS`'s `InvalidCharacterError`): `NotSupportedError`
+/// without a `popover` attribute, `InvalidStateError` when detached
+/// or already showing. Auto-close of other `auto` popovers lives in
+/// [`Document::show_popover`].
+fn n_show_popover(heap: &mut Heap, this: Value, _args: &[Value]) -> Result<Value, NativeError> {
+    let rc = apis_rc(heap, this)?;
+    let node = {
+        let g = rc.borrow();
+        target_node(heap, this, &g)?
+    };
+    let doc_rc = rc.borrow().live_document()?;
+    doc_rc
+        .borrow_mut()
+        .show_popover(node)
+        .map_err(|e| err_type(format!("showPopover: {e}")))?;
+    Ok(Value::Undefined)
+}
+
+/// `HTMLElement.hidePopover()` (w80): demote from the top layer.
+/// `NotSupportedError` without a `popover` attribute; hiding a
+/// popover that is not showing is a no-op.
+fn n_hide_popover(heap: &mut Heap, this: Value, _args: &[Value]) -> Result<Value, NativeError> {
+    let rc = apis_rc(heap, this)?;
+    let node = {
+        let g = rc.borrow();
+        target_node(heap, this, &g)?
+    };
+    let doc_rc = rc.borrow().live_document()?;
+    doc_rc
+        .borrow_mut()
+        .hide_popover(node)
+        .map_err(|e| err_type(format!("hidePopover: {e}")))?;
+    Ok(Value::Undefined)
+}
+
+/// `HTMLElement.togglePopover(force)` (w80): returns whether the
+/// popover is open after the call. An omitted `force` toggles; a
+/// present one forces, with the already-in-target-state case a
+/// no-op (see [`Document::toggle_popover`]). Truthiness follows the
+/// JS value: objects are truthy, `0`/`""`/`null`/`false` are falsy.
+fn n_toggle_popover(heap: &mut Heap, this: Value, args: &[Value]) -> Result<Value, NativeError> {
+    let rc = apis_rc(heap, this)?;
+    let node = {
+        let g = rc.borrow();
+        target_node(heap, this, &g)?
+    };
+    let force = match args.first().copied().unwrap_or(Value::Undefined) {
+        Value::Undefined => None,
+        Value::Bool(b) => Some(b),
+        Value::Int(i) => Some(i != 0),
+        Value::Float(f) => Some(f != 0.0 && !f.is_nan()),
+        Value::Null => Some(false),
+        Value::Str(s) => Some(!s.as_wtf8().is_empty()),
+        _ => Some(true),
+    };
+    let doc_rc = rc.borrow().live_document()?;
+    let open = doc_rc
+        .borrow_mut()
+        .toggle_popover(node, force)
+        .map_err(|e| err_type(format!("togglePopover: {e}")))?;
+    Ok(Value::Bool(open))
 }
 
 fn n_closest(heap: &mut Heap, this: Value, args: &[Value]) -> Result<Value, NativeError> {
@@ -17752,6 +17979,15 @@ const STYLE_PROPS: &[&str] = &[
     // is `none` for every non-top-layer element (UA rule), and
     // top-layer promotion is phase 2 work.
     "overlay",
+    // CSS Transitions 1 (w80): each longhand has its own computed
+    // slot in `bowser_css`; the `transition` shorthand itself is
+    // serialized from them (see `synthesize_computed_shorthands`).
+    "transition",
+    "transition-property",
+    "transition-duration",
+    "transition-delay",
+    "transition-timing-function",
+    "transition-behavior",
     // CSS Overflow 3 axes: the physical longhands and the logical
     // longhands (each longhand has its own computed slot in
     // `bowser_css`; the `overflow` shorthand itself is serialized from
@@ -18122,6 +18358,27 @@ fn css_value_to_string(v: &CssValue) -> String {
             out.push(')');
             out
         }
+        // `<time>` values (w80): serialized as seconds. `f32` Display
+        // prints `2` for 2.0 and `0.1` for the `100ms` normalization,
+        // so computed `transition-duration: 100ms` reads `0.1s`.
+        CssValue::Time(t) => format!("{t}s"),
+        // `<timing-function>` functional forms (w80): named functions
+        // stay `Keyword` and never reach this arm.
+        CssValue::TimingFunction(tf) => match tf {
+            TimingFunction::Steps { count, position } => format!(
+                "steps({}, {})",
+                count,
+                match position {
+                    StepPosition::Start => "start",
+                    StepPosition::End => "end",
+                    StepPosition::JumpNone => "jump-none",
+                    StepPosition::JumpBoth => "jump-both",
+                }
+            ),
+            TimingFunction::CubicBezier { x1, y1, x2, y2 } => {
+                format!("cubic-bezier({x1}, {y1}, {x2}, {y2})")
+            }
+        },
     }
 }
 
@@ -18150,6 +18407,28 @@ fn cssom_computed_value(prop: &str, value: &CssValue) -> String {
     ) && let CssValue::List(items) = value
         && !items.is_empty()
         && items.iter().all(|i| matches!(i, CssValue::List(_)))
+    {
+        return items
+            .iter()
+            .map(css_value_to_string)
+            .collect::<Vec<_>>()
+            .join(", ");
+    }
+    // w80fix: every transition longhand is a comma-separated list
+    // (keywords, times, or timing functions, one per layer); the
+    // generic `List` arm would space-join them, and the transition
+    // engine splits on top-level commas, so a space-joined
+    // serialization parses as one layer and kills the transition
+    // (duration) or silently falls back to `ease` (timing).
+    // `transition-behavior` is a single keyword, never a list.
+    if matches!(
+        prop,
+        "transition-property"
+            | "transition-duration"
+            | "transition-delay"
+            | "transition-timing-function"
+    ) && let CssValue::List(items) = value
+        && !items.is_empty()
     {
         return items
             .iter()
@@ -19013,6 +19292,16 @@ fn n_get_computed_style(
         // this the computed declaration answered those names with
         // `""` even though every longhand was present.
         synthesize_computed_shorthands(&mut props);
+        // w80fix: drive the clock-at-read discrete transition
+        // engine on the production surface, exactly as the parse
+        // shim does (see `crate::transition`). Keyed by the
+        // production `NodeId`: its Debug form carries the arena
+        // index plus the process-unique document tag, and the arena
+        // is append-only with tags never repeated, so the key never
+        // aliases another element. Read-only against the document
+        // — only this call's props snapshot is mutated — so there
+        // is no dirty or repaint interaction.
+        crate::transition::apply_transitions(&format!("prod:{node:?}"), &mut props);
         props
     };
     let mut g = rc.borrow_mut();
@@ -19538,6 +19827,66 @@ pub(crate) struct ParseShimRoots {
     /// `window.onload`. Traced (the callback must survive until the
     /// production install adopts it).
     shim_onload: Option<ParseShimOnload>,
+    /// Mid-parse top layer (w80): parse-arena indices of elements
+    /// shown via the shim's `showPopover` and not yet hidden,
+    /// removed, or auto-closed. The per-installation
+    /// [`ParseHostEntry`] slot dies with each script's guard, so
+    /// this shared set is the record that survives across
+    /// parser-inserted scripts of one parse: the shim's computed
+    /// style rebuild (`build_style_data`) promotes these arenas into
+    /// the rebuilt document's top-layer set, and
+    /// [`install_page_web_apis`] adopts them into the production
+    /// document (see [`adopt_shim_top_layer`]). Plain data: no
+    /// tracing needed. The set is pruned at the source, not just
+    /// masked at transfer: the shim's `removeAttribute('popover')`
+    /// path and its element-removal paths drop the arena (and, for
+    /// removals, the whole subtree), mirroring production
+    /// demotion — otherwise a re-add or reinsert would resurrect
+    /// the open state without `showPopover`. The
+    /// popover-attribute checks at transfer remain as
+    /// belt-and-braces for arenas whose element changed without
+    /// going through those paths.
+    top_layer: HashSet<usize>,
+    /// Promotion order for [`Self::top_layer`] (w80fix): the show
+    /// order, maintained in parallel by
+    /// [`Self::top_layer_insert`] / [`Self::top_layer_remove`].
+    /// A plain set iterates in hash order, which would adopt
+    /// coexisting popovers in nondeterministic order; both
+    /// [`adopt_shim_top_layer`] and `build_style_data` iterate
+    /// this order instead. Plain data: no tracing needed.
+    top_layer_order: Vec<usize>,
+}
+
+impl ParseShimRoots {
+    /// Record a show: insert into the set, appending to the
+    /// promotion order only on first insertion (a re-show after a
+    /// hide appends anew, so the order is always the latest show
+    /// order, like production's append-on-promote).
+    fn top_layer_insert(&mut self, arena: usize) {
+        if self.top_layer.insert(arena) {
+            self.top_layer_order.push(arena);
+        }
+    }
+
+    /// Record a hide / demotion: drop from both the set and the
+    /// promotion order, so a later re-show re-appends at the end.
+    fn top_layer_remove(&mut self, arena: usize) {
+        if self.top_layer.remove(&arena) {
+            self.top_layer_order.retain(|a| *a != arena);
+        }
+    }
+
+    /// The top layer in promotion (show) order. Filters against
+    /// the set, so any order entry whose set membership was lost
+    /// without going through [`Self::top_layer_remove`] (none
+    /// should exist) cannot promote a stale arena.
+    fn top_layer_ordered(&self) -> Vec<usize> {
+        self.top_layer_order
+            .iter()
+            .copied()
+            .filter(|a| self.top_layer.contains(a))
+            .collect()
+    }
 }
 
 /// One mid-parse `window.onload` assignment recorded by the parse shim
@@ -20401,6 +20750,7 @@ pub fn install_parse_document_shim(
             def(heap, doc, PARSE_CTX_KEY, Value::Float(id as f64))?;
             def_native(heap, doc, "write", n_parse_doc_write)?;
             def_native(heap, doc, "createElement", n_parse_doc_create_element)?;
+            def_native(heap, doc, "createElementNS", n_parse_doc_create_element_ns)?;
             def_native(heap, doc, "getElementById", n_parse_doc_get_element_by_id)?;
             // Parse-phase hit-testing: the shim wrapper carries only
             // `PARSE_CTX_KEY`, so the production `n_element_from_point`
@@ -20474,9 +20824,8 @@ pub fn install_parse_document_shim(
             };
             // The shim only exists mid-parse, so the document is always
             // still loading: harness `Output.resolve_log` treats this as
-            // "no render target yet" instead of reaching for
-            // `createElementNS`, which the parse-phase document does not
-            // have.
+            // "no render target yet" and never reaches for a render
+            // target element while the parse is unfinished.
             let loading = Value::Str(heap.alloc_str("loading")?);
             def(heap, doc, "readyState", loading)?;
             Ok(())
@@ -20673,6 +21022,39 @@ fn n_parse_doc_create_element(
         args.first().copied().unwrap_or(Value::Undefined),
     )?;
     let el = deref_parse_host(host).create_element(&tag);
+    wrap_parse_element(heap, id, el).map(Value::Object)
+}
+
+/// `document.createElementNS` on the parse-phase shim: the same
+/// namespace resolution as the production native
+/// ([`resolve_namespace_arg`]: `null`/`undefined`/`""`/XHTML URI mean
+/// HTML, MathML/SVG URIs mean their namespaces, anything else is
+/// carried as [`Namespace::Other`]), minted through the parse host
+/// so the element keeps its namespace through the snapshot and the
+/// production install. The upgrade path needs no change: the live
+/// identity refresh records the namespace alongside the tag, and
+/// [`upgrade_shim_element_wrappers`] verifies both before resolving
+/// a record onto a production node, so a same-tag element in a
+/// different namespace never satisfies the resolution. An empty tag
+/// throws the same `InvalidCharacterError` (as a `TypeError`, like
+/// the production native) instead of minting a nameless element.
+fn n_parse_doc_create_element_ns(
+    heap: &mut Heap,
+    this: Value,
+    args: &[Value],
+) -> Result<Value, NativeError> {
+    let (_obj, id, host) = parse_host(heap, this)?;
+    let ns = resolve_namespace_arg(
+        &mut *heap,
+        args.first().copied().unwrap_or(Value::Undefined),
+    )?;
+    let tag = arg_to_string(&mut *heap, args.get(1).copied().unwrap_or(Value::Undefined))?;
+    if tag.is_empty() {
+        return Err(err_type(
+            "createElementNS: InvalidCharacterError: qualified name is empty",
+        ));
+    }
+    let el = deref_parse_host(host).create_element_ns(ns, &tag);
     wrap_parse_element(heap, id, el).map(Value::Object)
 }
 
@@ -21630,6 +22012,47 @@ fn mark_shim_record_detached(id: u64, el: ScriptElement, detached: bool) {
     }
 }
 
+/// Drop one arena from slot `id`'s shim top layer (w80fix): the
+/// shim `removeAttribute('popover')` demotion, mirroring
+/// production `Document::remove_attribute`, which hides the
+/// popover when its attribute goes away. Only the element itself
+/// demotes — removing an ancestor's `popover` attribute never
+/// closes a descendant popover.
+fn drop_shim_top_layer_arena(id: u64, arena: usize) {
+    let roots = PARSE_HOSTS.with(|hosts| hosts.borrow().get(&id).map(|e| e.listeners.clone()));
+    let Some(roots) = roots else { return };
+    roots.borrow_mut().top_layer_remove(arena);
+}
+
+/// Drop every top-layer arena in the subtree rooted at `root`
+/// (w80fix): the shim element-removal demotion, mirroring
+/// production `Document::demote_top_layer_subtree` — removing a
+/// top-layer element (or an ancestor of one) from its document
+/// removes it from the top layer, so a later reinsert does not
+/// resurrect the open state without `showPopover`. The walk runs
+/// over the detached subtree (children stay linked to each other
+/// after unlinking), so it must run after the host removal.
+/// Moves deliberately do NOT go through here: a popover moved
+/// within its document stays in the top layer, like production.
+fn prune_shim_top_layer_subtree(
+    id: u64,
+    host: &ScriptHost<'static, 'static, 'static>,
+    root: ScriptElement,
+) {
+    let roots = PARSE_HOSTS.with(|hosts| hosts.borrow().get(&id).map(|e| e.listeners.clone()));
+    let Some(roots) = roots else { return };
+    let mut stack = vec![root];
+    let mut arenas = Vec::new();
+    while let Some(el) = stack.pop() {
+        arenas.push(el.arena_index());
+        stack.extend(host.child_elements(el));
+    }
+    let mut g = roots.borrow_mut();
+    for arena in arenas {
+        g.top_layer_remove(arena);
+    }
+}
+
 /// Whether `el` is connected to `host`'s document: its parent
 /// chain reaches the document element. (`parent_element` reports
 /// `None` both for the document element itself — its parent is
@@ -21782,6 +22205,8 @@ fn wrap_parse_element(
                 .map_err(|_| NativeError::OutOfMemory)?;
             def_native(heap, obj, "setAttribute", n_parse_el_set_attribute)
                 .map_err(|_| NativeError::OutOfMemory)?;
+            def_native(heap, obj, "removeAttribute", n_parse_el_remove_attribute)
+                .map_err(|_| NativeError::OutOfMemory)?;
             def_native(heap, obj, "getAttribute", n_parse_el_get_attribute)
                 .map_err(|_| NativeError::OutOfMemory)?;
             // EventTarget (w51): registrations are recorded in the
@@ -21830,6 +22255,22 @@ fn wrap_parse_element(
                 "parentNode",
                 n_parse_el_parent_node_get,
                 n_parse_el_parent_node_set,
+            )
+            .map_err(|_| NativeError::OutOfMemory)?;
+            // w80: `NonDocumentTypeChildNode.parentElement` — the
+            // parse shim had only `parentNode`, so
+            // `target.parentElement.classList` threw in WPT's
+            // interpolation harness (`createTargetContainer`) and
+            // `overlay-interpolation.html` died with 0 subtests
+            // (TIMEOUT) before any `test()` registered. The host's
+            // `parent_element` is exactly `parentElement` semantics
+            // (element parent only, else `None`).
+            def_accessor(
+                heap,
+                obj,
+                "parentElement",
+                n_parse_el_parent_element_get,
+                n_parse_el_parent_element_set,
             )
             .map_err(|_| NativeError::OutOfMemory)?;
             def_native(heap, obj, "replaceChild", n_parse_el_replace_child)
@@ -21979,6 +22420,21 @@ fn wrap_parse_element(
             )
             .map_err(|_| NativeError::OutOfMemory)?;
             def_native(heap, obj, "remove", n_parse_el_remove)
+                .map_err(|_| NativeError::OutOfMemory)?;
+            // Popover API (w80) and `matches` on the parse shim:
+            // the production element prototype's versions cannot
+            // serve parser-tree elements, so the shim carries its
+            // own (see the natives above). `matches` runs the full
+            // selector engine against the computed-style rebuild,
+            // so `:popover-open` works mid-parse (overlay-transition
+            // test 2's assertions run in a parser-inserted script).
+            def_native(heap, obj, "matches", n_parse_el_matches)
+                .map_err(|_| NativeError::OutOfMemory)?;
+            def_native(heap, obj, "showPopover", n_parse_el_show_popover)
+                .map_err(|_| NativeError::OutOfMemory)?;
+            def_native(heap, obj, "hidePopover", n_parse_el_hide_popover)
+                .map_err(|_| NativeError::OutOfMemory)?;
+            def_native(heap, obj, "togglePopover", n_parse_el_toggle_popover)
                 .map_err(|_| NativeError::OutOfMemory)?;
             def_accessor(
                 heap,
@@ -22132,6 +22588,30 @@ fn n_parse_el_set_attribute(
     // own wrapper.
     if name.eq_ignore_ascii_case("id") {
         refresh_shim_record_id(id, el);
+    }
+    Ok(Value::Undefined)
+}
+
+/// `removeAttribute(name)` on the parse shim (w80fix): the shim
+/// previously exposed no attribute-removal path at all, so a
+/// mid-parse script could neither remove an attribute nor, through
+/// it, demote a shown popover. Removing `popover`
+/// (case-insensitive, like production `remove_attribute`) drops
+/// the element from the shared top-layer set, so re-adding the
+/// attribute does not resurrect the open state.
+fn n_parse_el_remove_attribute(
+    heap: &mut Heap,
+    this: Value,
+    args: &[Value],
+) -> Result<Value, NativeError> {
+    let (id, host, el) = parse_el_host(heap, this, "removeAttribute")?;
+    let name = arg_to_string(
+        &mut *heap,
+        args.first().copied().unwrap_or(Value::Undefined),
+    )?;
+    deref_parse_host(host).remove_attribute(el, &name);
+    if name.eq_ignore_ascii_case("popover") {
+        drop_shim_top_layer_arena(id, el.arena_index());
     }
     Ok(Value::Undefined)
 }
@@ -22300,6 +22780,34 @@ fn n_parse_el_parent_node_set(
     Ok(Value::Undefined)
 }
 
+fn n_parse_el_parent_element_get(
+    heap: &mut Heap,
+    this: Value,
+    _args: &[Value],
+) -> Result<Value, NativeError> {
+    let (id, el) = parse_el_handle(heap, this, "parentElement")?;
+    let parent = PARSE_HOSTS.with(|hosts| {
+        let hosts = hosts.borrow();
+        let entry = hosts.get(&id)?;
+        let host_ptr = entry.host;
+        let host = deref_parse_host(host_ptr);
+        host.parent_element(el)
+    });
+    match parent {
+        Some(p) => wrap_parse_element(heap, id, p).map(Value::Object),
+        None => Ok(Value::Null),
+    }
+}
+
+fn n_parse_el_parent_element_set(
+    _heap: &mut Heap,
+    _this: Value,
+    _args: &[Value],
+) -> Result<Value, NativeError> {
+    // Read-only in the shim; ignore writes.
+    Ok(Value::Undefined)
+}
+
 /// Whether `anc` is `desc` itself or one of its ancestors, walked
 /// with the host's public fail-closed accessors. A stale handle yields
 /// `None` from `parent_element`, which ends the walk as "not an
@@ -22404,6 +22912,9 @@ fn n_parse_el_replace_child(
     // refreshed wholesale at the next script boundary — the
     // fragment handle itself stays detached, correctly).
     mark_shim_record_detached(id, old, true);
+    // w80fix: demote the replaced subtree's top layer, like
+    // `removeChild` above.
+    prune_shim_top_layer_subtree(id, host_ref, old);
     if !parse_is_fragment(heap, new_val) {
         refresh_shim_record_attachment(id, new);
     }
@@ -22860,6 +23371,28 @@ fn decl_value_preserving_math(
             .collect::<Vec<_>>()
             .join(", ");
     }
+    // w80fix: transition longhands are comma-separated lists on
+    // the specified surfaces too (this function feeds both the
+    // parse-shim store and production `el.style`); the generic
+    // list serializer would space-join them, corrupting the layer
+    // structure exactly as on the computed surface (see
+    // `cssom_computed_value`). `transition-behavior` is a single
+    // keyword, never a list.
+    if matches!(
+        prop,
+        "transition-property"
+            | "transition-duration"
+            | "transition-delay"
+            | "transition-timing-function"
+    ) && let CssValue::List(items) = value
+        && !items.is_empty()
+    {
+        return items
+            .iter()
+            .map(css_value_to_string)
+            .collect::<Vec<_>>()
+            .join(", ");
+    }
     canonical(prop, value)
 }
 
@@ -23112,6 +23645,16 @@ parse_style_props! {
     // silent JS expando and never reached the style attribute,
     // while `setProperty` (which bypasses the table) worked.
     ("overlay", n_parse_sp_get_overlay, n_parse_sp_set_overlay),
+    // w80: CSS Transitions longhands + shorthand, so direct
+    // `el.style.transition = "overlay 2s"` assignments reach the
+    // style attribute instead of becoming silent JS expandos (the
+    // same w79fix gap as `overlay` above).
+    ("transition", n_parse_sp_get_transition, n_parse_sp_set_transition),
+    ("transition-property", n_parse_sp_get_transition_property, n_parse_sp_set_transition_property),
+    ("transition-duration", n_parse_sp_get_transition_duration, n_parse_sp_set_transition_duration),
+    ("transition-delay", n_parse_sp_get_transition_delay, n_parse_sp_set_transition_delay),
+    ("transition-timing-function", n_parse_sp_get_transition_timing_function, n_parse_sp_set_transition_timing_function),
+    ("transition-behavior", n_parse_sp_get_transition_behavior, n_parse_sp_set_transition_behavior),
     ("border-inline", n_parse_sp_get_border_inline, n_parse_sp_set_border_inline),
     ("border-block", n_parse_sp_get_border_block, n_parse_sp_set_border_block),
     ("flex", n_parse_sp_get_flex, n_parse_sp_set_flex),
@@ -23395,6 +23938,13 @@ el_style_props! {
     // w79fix: twin of the parse-shim entries above (see that
     // comment): `overlay`, `border-inline`, `border-block`.
     ("overlay", n_el_sp_get_overlay, n_el_sp_set_overlay),
+    // w80: twin of the parse-shim entries above (see that comment).
+    ("transition", n_el_sp_get_transition, n_el_sp_set_transition),
+    ("transition-property", n_el_sp_get_transition_property, n_el_sp_set_transition_property),
+    ("transition-duration", n_el_sp_get_transition_duration, n_el_sp_set_transition_duration),
+    ("transition-delay", n_el_sp_get_transition_delay, n_el_sp_set_transition_delay),
+    ("transition-timing-function", n_el_sp_get_transition_timing_function, n_el_sp_set_transition_timing_function),
+    ("transition-behavior", n_el_sp_get_transition_behavior, n_el_sp_set_transition_behavior),
     ("border-inline", n_el_sp_get_border_inline, n_el_sp_set_border_inline),
     ("border-block", n_el_sp_get_border_block, n_el_sp_set_border_block),
     ("flex", n_el_sp_get_flex, n_el_sp_set_flex),
@@ -23764,6 +24314,83 @@ const FONT_SHORTHAND_LONGHANDS: &[&str] = &[
 
 /// The three longhands `flex` expands to, in serialization order.
 const FLEX_SHORTHAND_LONGHANDS: &[&str] = &["flex-grow", "flex-shrink", "flex-basis"];
+
+/// The four longhands `transition` expands to, in shorthand
+/// grammar order (property, duration, delay, timing-function).
+/// `transition-behavior` is NOT a shorthand longhand: it is a
+/// separate longhand and never appears in the synthesis.
+const TRANSITION_LONGHANDS: &[&str] = &[
+    "transition-property",
+    "transition-duration",
+    "transition-delay",
+    "transition-timing-function",
+];
+
+/// Serialize one `transition` shorthand from its four longhand
+/// serializations, dropping initial components (delay `0s`,
+/// timing `ease`) so `transition: overlay 1s` round-trips as
+/// `overlay 1s` and an unset element reads `all 0s`. Duration is
+/// always kept, even when `0s`. Serialization order is property,
+/// duration, timing (when non-`ease`), delay (when non-zero) —
+/// the CSS Transitions serialization order. Multi-layer longhands
+/// (comma-joined layer strings) synthesize per layer and re-join
+/// with `", "`; a shorter list repeats to the longest layer count
+/// (CSS list repetition). A lone CSS-wide keyword on every
+/// longhand reads back as that keyword; differing wide keywords
+/// yield `None`, like the `border` forms. Used by both the
+/// specified-style synthesis and the computed-style synthesis, so
+/// the two surfaces cannot drift.
+fn transition_shorthand_string(
+    property: &str,
+    duration: &str,
+    delay: &str,
+    timing: &str,
+) -> Option<String> {
+    if [property, duration, delay, timing]
+        .iter()
+        .any(|v| is_css_wide_keyword_str(v))
+    {
+        return if property == duration && property == delay && property == timing {
+            Some(property.to_string())
+        } else {
+            None
+        };
+    }
+    let layers: Vec<Vec<String>> = [property, duration, delay, timing]
+        .iter()
+        .map(|v| split_top_level_commas(v))
+        .collect();
+    let count = layers.iter().map(Vec::len).max().unwrap_or(0);
+    let mut out = Vec::with_capacity(count);
+    for i in 0..count {
+        let at = |j: usize| layers[j][i % layers[j].len()].as_str();
+        let (p, d, dl, t) = (at(0), at(1), at(2), at(3));
+        let mut parts = vec![p.to_string(), d.to_string()];
+        if t != "ease" {
+            parts.push(t.to_string());
+        }
+        if dl != "0s" && dl != "0" {
+            parts.push(dl.to_string());
+        }
+        out.push(parts.join(" "));
+    }
+    Some(out.join(", "))
+}
+
+/// Specified-style `transition` synthesis from the expanded
+/// longhand declarations (the parser always emits all four for a
+/// shorthand set, resetting omitted ones to their initials, so a
+/// missing longhand yields `None`).
+fn synthesize_transition_shorthand(decls: &[(String, String)], prop: &str) -> Option<String> {
+    if prop != "transition" {
+        return None;
+    }
+    let vals: Vec<&str> = TRANSITION_LONGHANDS
+        .iter()
+        .map(|lh| decl_value(decls, lh))
+        .collect::<Option<Vec<_>>>()?;
+    transition_shorthand_string(vals[0], vals[1], vals[2], vals[3])
+}
 
 fn decl_value<'a>(decls: &'a [(String, String)], prop: &str) -> Option<&'a str> {
     decls
@@ -24158,6 +24785,7 @@ fn synthesize_compound_shorthand(decls: &[(String, String)], prop: &str) -> Opti
     synthesize_border_shorthand_specified(decls, prop)
         .or_else(|| synthesize_font_shorthand(decls, prop))
         .or_else(|| synthesize_flex_shorthand(decls, prop))
+        .or_else(|| synthesize_transition_shorthand(decls, prop))
 }
 
 /// CSSOM shortest serialization of a box shorthand from its longhand
@@ -24211,6 +24839,10 @@ fn computed_shorthand_longhands(prop: &str) -> Option<&'static [&'static str]> {
                 "border" => BORDER_SHORTHAND_LONGHANDS,
                 "font" => FONT_SHORTHAND_LONGHANDS,
                 "flex" => FLEX_SHORTHAND_LONGHANDS,
+                // w80: `transition` is synthesized (never a slot of
+                // its own), so the computed loops skip it and the
+                // synthesis below fills it in.
+                "transition" => TRANSITION_LONGHANDS,
                 _ => return None,
             })
         })
@@ -24593,6 +25225,21 @@ fn synthesize_computed_shorthands(props: &mut HashMap<String, String>) {
             && let Some(short) = synthesize_background_shorthand(&decls, "background", false)
         {
             props.insert("background".to_string(), short);
+        }
+    }
+    // w80: `transition` in initial-dropping form (same core as the
+    // specified synthesis, so the surfaces agree): delay `0s` and
+    // timing `ease` drop, duration is always kept. This only fires
+    // when the props map carries all four longhands.
+    {
+        let vals: Option<Vec<String>> = TRANSITION_LONGHANDS
+            .iter()
+            .map(|lh| props.get(*lh).cloned())
+            .collect();
+        if let Some(vals) = vals
+            && let Some(short) = transition_shorthand_string(&vals[0], &vals[1], &vals[2], &vals[3])
+        {
+            props.insert("transition".to_string(), short);
         }
     }
 }
@@ -24990,12 +25637,21 @@ fn n_parse_el_text_content_set(
     this: Value,
     args: &[Value],
 ) -> Result<Value, NativeError> {
-    let (_id, host, el) = parse_el_host(heap, this, "textContent")?;
+    let (id, host, el) = parse_el_host(heap, this, "textContent")?;
     let t = arg_to_string(
         &mut *heap,
         args.first().copied().unwrap_or(Value::Undefined),
     )?;
-    deref_parse_host(host).set_text_content(el, &t);
+    let host_ref = deref_parse_host(host);
+    // w80fix: `textContent =` clears every child, so a shown
+    // popover inside is removed from the document — demote the
+    // cleared subtrees, like `removeChild`, so a later reinsert
+    // of a captured child does not resurrect it.
+    let kids = host_ref.child_elements(el);
+    host_ref.set_text_content(el, &t);
+    for kid in kids {
+        prune_shim_top_layer_subtree(id, host_ref, kid);
+    }
     Ok(Value::Undefined)
 }
 
@@ -25016,12 +25672,21 @@ fn n_parse_el_inner_html_set(
     this: Value,
     args: &[Value],
 ) -> Result<Value, NativeError> {
-    let (_id, host, el) = parse_el_host(heap, this, "innerHTML")?;
+    let (id, host, el) = parse_el_host(heap, this, "innerHTML")?;
     let h = arg_to_string(
         &mut *heap,
         args.first().copied().unwrap_or(Value::Undefined),
     )?;
-    deref_parse_host(host).set_inner_html(el, &h);
+    let host_ref = deref_parse_host(host);
+    // w80fix: `innerHTML =` replaces every child, so a shown
+    // popover inside is removed from the document — demote the
+    // replaced subtrees, like `removeChild`, so a later reinsert
+    // of a captured child does not resurrect it.
+    let kids = host_ref.child_elements(el);
+    host_ref.set_inner_html(el, &h);
+    for kid in kids {
+        prune_shim_top_layer_subtree(id, host_ref, kid);
+    }
     Ok(Value::Undefined)
 }
 
@@ -27165,8 +27830,9 @@ impl ParseLayoutHook {
         &mut self,
         host: &mut ScriptHost<'_, '_, '_>,
         el: ScriptElement,
+        top_layer: &[usize],
     ) -> Option<HashMap<String, String>> {
-        let data = self.style_data(host)?;
+        let data = self.style_data(host, top_layer)?;
         let node = *data.arena_node.get(&el.arena_index())?;
         let sheet_refs: Vec<&Stylesheet> = data.sheets.iter().collect();
         let viewport = Viewport {
@@ -27525,12 +28191,16 @@ impl ParseLayoutHook {
 
     /// The style data for the current tree state, cached per
     /// `mutation_count` (see [`Self::snap_data`]'s caching shape).
-    fn style_data(&mut self, host: &mut ScriptHost<'_, '_, '_>) -> Option<Rc<ParseStyleData>> {
+    fn style_data(
+        &mut self,
+        host: &mut ScriptHost<'_, '_, '_>,
+        top_layer: &[usize],
+    ) -> Option<Rc<ParseStyleData>> {
         let count = host.mutation_count();
         if let Some((_, data)) = self.style_cache.iter().find(|(c, _)| *c == count) {
             return Some(Rc::clone(data));
         }
-        let data = Rc::new(self.build_style_data(host)?);
+        let data = Rc::new(self.build_style_data(host, top_layer)?);
         // `build_style_data`'s snapshot may have flushed buffered
         // text (bumping the count); key the entry by the post-build
         // count, exactly like the layout entries.
@@ -27552,7 +28222,11 @@ impl ParseLayoutHook {
     /// always see `NoQuirks` and quirks inheritance rules (e.g.
     /// §3.11 font-style at the table boundary) would never apply
     /// to mid-parse `getComputedStyle` reads.
-    fn build_style_data(&mut self, host: &mut ScriptHost<'_, '_, '_>) -> Option<ParseStyleData> {
+    fn build_style_data(
+        &mut self,
+        host: &mut ScriptHost<'_, '_, '_>,
+        top_layer: &[usize],
+    ) -> Option<ParseStyleData> {
         let root_el = host.document_element()?;
         let mut rec = SnapshotRecorder::new();
         let order = host.snapshot_document(&mut rec);
@@ -27567,6 +28241,26 @@ impl ParseLayoutHook {
         let (mut doc, node_arena) = build.finish(&order);
         doc.set_quirks_mode(host.quirks_mode());
         let arena_node: HashMap<usize, NodeId> = node_arena.iter().map(|(&n, &a)| (a, n)).collect();
+        // w80: carry the shim's top layer into the rebuilt document.
+        // The snapshot carries attributes but no top-layer state, so
+        // without this a mid-parse `showPopover` would be invisible
+        // to the cascade (open popovers would still compute
+        // `overlay: none`, and `:popover-open` would never match).
+        // Iterate in show order (w80fix): the rebuilt document's
+        // top layer is ordered, so hash order here would scramble
+        // coexisting popovers' paint order. Only elements that
+        // still carry a `popover` attribute promote: a detached or
+        // attribute-stripped arena either never maps onto a
+        // rebuilt node or fails this check (the shim's removal
+        // paths prune the set at the source; this check is the
+        // backstop for anything that changed without them).
+        for &arena in top_layer {
+            if let Some(node) = arena_node.get(&arena)
+                && doc.get_attribute(*node, "popover").is_some()
+            {
+                doc.promote_to_top_layer(*node);
+            }
+        }
         let sheets: Vec<Stylesheet> = self.harvested_sheets(&rec);
         Some(ParseStyleData {
             doc,
@@ -29445,12 +30139,16 @@ fn n_parse_el_remove_child(
     let (id, host, parent) = parse_el_host(heap, this, "removeChild")?;
     let child_val = args.first().copied().unwrap_or(Value::Undefined);
     let child = parse_el_handle_any_slot(heap, child_val, "removeChild")?;
-    if deref_parse_host(host).remove_child(parent, child) {
+    let host_ref = deref_parse_host(host);
+    if host_ref.remove_child(parent, child) {
         // Live identity maintenance (w51 rework): the removed
         // element's record is marked detached, so the upgrade
         // drops it instead of resolving its stale ordinal onto
         // the next same-tag sibling.
         mark_shim_record_detached(id, child, true);
+        // w80fix: demote the removed subtree's top layer, so a
+        // later reinsert does not resurrect an open popover.
+        prune_shim_top_layer_subtree(id, host_ref, child);
         Ok(child_val)
     } else {
         Err(err_type("removeChild failed"))
@@ -29841,7 +30539,213 @@ fn n_parse_el_remove(heap: &mut Heap, this: Value, _args: &[Value]) -> Result<Va
     // element's record is marked detached (see
     // `n_parse_el_remove_child`).
     mark_shim_record_detached(id, el, true);
+    // w80fix: demote the removed subtree's top layer, so a later
+    // reinsert does not resurrect an open popover. Unconditional
+    // like the detached mark: an element already detached holds
+    // no top-layer entry, so the prune is a no-op for it.
+    prune_shim_top_layer_subtree(id, host_ref, el);
     Ok(Value::Undefined)
+}
+
+// -- popover ---------------------------------------------------------------
+
+/// The shim-side `popover` attribute state of `el` (same mapping as
+/// [`Document::popover_state`]: absent is `None`, `manual`/`hint`
+/// are their states, anything else is `auto`). The parser's tree
+/// carries no top-layer set, so the state machine lives in the
+/// shared shim roots (see [`ParseShimRoots::top_layer`]).
+fn parse_popover_state(
+    host: &ScriptHost<'static, 'static, 'static>,
+    el: ScriptElement,
+) -> Option<&'static str> {
+    let value = host
+        .get_attributes(el)
+        .into_iter()
+        .find(|(name, _)| name.eq_ignore_ascii_case("popover"))
+        .map(|(_, value)| value)?;
+    Some(match value.to_ascii_lowercase().as_str() {
+        "manual" => "manual",
+        "hint" => "hint",
+        _ => "auto",
+    })
+}
+
+/// Shared show/hide/toggle core for the shim popover natives: the
+/// production [`Document`] state machine, replayed against the
+/// parser's tree and the shared roots' top-layer set. Error
+/// messages carry the DOM names, like the production natives.
+/// After any state change the installation's computed-style and
+/// layout caches are dropped: both are keyed by the tree's
+/// `mutation_count`, which a popover show/hide does not bump (it is
+/// not a tree mutation), so without the drop a computed-style read
+/// after a show in the same script would serve the pre-show
+/// document (the open -> auto, close -> none, reopen -> auto
+/// sequence in overlay-transition.html runs exactly this way).
+fn parse_popover_apply(
+    id: u64,
+    host: *mut ScriptHost<'static, 'static, 'static>,
+    el: ScriptElement,
+    op: &str,
+    force: Option<bool>,
+) -> Result<bool, NativeError> {
+    let host_ref = deref_parse_host(host);
+    let arena = el.arena_index();
+    let is_open = PARSE_HOSTS.with(|hosts| {
+        hosts
+            .borrow()
+            .get(&id)
+            .is_some_and(|entry| entry.listeners.borrow().top_layer.contains(&arena))
+    });
+    // w80fix: the forced no-op arms come BEFORE validity, like
+    // production `Document::toggle_popover`: open-ness is
+    // well-defined without the attribute (not in the shim set
+    // means not open), so `togglePopover(false)` on a plain div
+    // returns false instead of throwing NotSupportedError, and
+    // `togglePopover(true)` on an open popover returns true.
+    match (op, force) {
+        ("togglePopover", Some(true)) if is_open => return Ok(true),
+        ("togglePopover", Some(false)) if !is_open => return Ok(false),
+        _ => {}
+    }
+    let state = parse_popover_state(host_ref, el).ok_or_else(|| {
+        err_type(format!(
+            "{op}: NotSupportedError: element has no popover attribute"
+        ))
+    })?;
+    let show = match op {
+        "showPopover" => true,
+        "hidePopover" => false,
+        _ => !is_open,
+    };
+    if show {
+        if !host_element_connected(host_ref, el) {
+            return Err(err_type(format!(
+                "{op}: InvalidStateError: popover is not connected"
+            )));
+        }
+        if is_open {
+            return Err(err_type(format!(
+                "{op}: InvalidStateError: popover is already showing"
+            )));
+        }
+    }
+    PARSE_HOSTS.with(|hosts| {
+        let mut hosts = hosts.borrow_mut();
+        let entry = hosts
+            .get_mut(&id)
+            .ok_or_else(|| err_type("document is not available outside the parser"))?;
+        let mut roots = entry.listeners.borrow_mut();
+        if show {
+            // Auto-close (same rule as `Document::show_popover`):
+            // showing an `auto` popover closes every other open
+            // `auto` popover except ancestors of this one. Ancestors
+            // come from the host's parent chain; other open popovers
+            // are resolved through the recorded wrappers (arena ->
+            // handle), and their states read from the live tree.
+            if state == "auto" {
+                let mut ancestors = HashSet::new();
+                let mut cur = host_ref.parent_element(el);
+                while let Some(p) = cur {
+                    ancestors.insert(p.arena_index());
+                    cur = host_ref.parent_element(p);
+                }
+                let open_arenas: Vec<usize> = roots.top_layer_ordered();
+                for other in open_arenas {
+                    if other == arena || ancestors.contains(&other) {
+                        continue;
+                    }
+                    let other_is_auto = roots
+                        .element_wrappers
+                        .iter()
+                        .find(|rec| rec.el.arena_index() == other)
+                        .is_some_and(|rec| parse_popover_state(host_ref, rec.el) == Some("auto"));
+                    if other_is_auto {
+                        roots.top_layer_remove(other);
+                    }
+                }
+            }
+            roots.top_layer_insert(arena);
+        } else {
+            roots.top_layer_remove(arena);
+        }
+        // Drop this installation's style/layout caches (see the fn
+        // docs): the next computed-style read rebuilds with the new
+        // top-layer set instead of serving the pre-change document.
+        entry.layout_hook.style_cache.clear();
+        entry.layout_hook.entries.clear();
+        Ok::<(), NativeError>(())
+    })?;
+    Ok(show)
+}
+
+/// `el.showPopover()` on the parse shim.
+fn n_parse_el_show_popover(
+    heap: &mut Heap,
+    this: Value,
+    _args: &[Value],
+) -> Result<Value, NativeError> {
+    let (id, host, el) = parse_el_host(heap, this, "showPopover")?;
+    parse_popover_apply(id, host, el, "showPopover", None)?;
+    Ok(Value::Undefined)
+}
+
+/// `el.hidePopover()` on the parse shim (hiding a popover that is
+/// not showing is a no-op, like production).
+fn n_parse_el_hide_popover(
+    heap: &mut Heap,
+    this: Value,
+    _args: &[Value],
+) -> Result<Value, NativeError> {
+    let (id, host, el) = parse_el_host(heap, this, "hidePopover")?;
+    parse_popover_apply(id, host, el, "hidePopover", None)?;
+    Ok(Value::Undefined)
+}
+
+/// `el.togglePopover(force)` on the parse shim.
+fn n_parse_el_toggle_popover(
+    heap: &mut Heap,
+    this: Value,
+    args: &[Value],
+) -> Result<Value, NativeError> {
+    let (id, host, el) = parse_el_host(heap, this, "togglePopover")?;
+    let force = match args.first().copied().unwrap_or(Value::Undefined) {
+        Value::Undefined => None,
+        v => Some(parse_truthy(v)),
+    };
+    let open = parse_popover_apply(id, host, el, "togglePopover", force)?;
+    Ok(Value::Bool(open))
+}
+
+/// `el.matches(selectors)` on the parse shim: the full selector
+/// engine, run against the same whole-tree rebuild the shim's
+/// `getComputedStyle` cascades against (so `:popover-open` reads
+/// the shared top-layer set, like computed `overlay` does). The
+/// parser's own `querySelector` engine has no pseudo-class support,
+/// so it cannot serve this. `None` when the element is outside the
+/// rebuilt document-element subtree (detached, template contents):
+/// such an element matches nothing here, the same fail-closed shape
+/// as the computed-style fallback path.
+fn n_parse_el_matches(heap: &mut Heap, this: Value, args: &[Value]) -> Result<Value, NativeError> {
+    let (id, el) = parse_el_handle(heap, this, "matches")?;
+    let sel = arg_to_string(
+        &mut *heap,
+        args.first().copied().unwrap_or(Value::Undefined),
+    )?;
+    let hit = PARSE_HOSTS.with(|hosts| {
+        let mut hosts = hosts.borrow_mut();
+        let entry = hosts.get_mut(&id)?;
+        let top = entry.listeners.borrow().top_layer_ordered();
+        let host_ref = deref_parse_host(entry.host);
+        let data = entry.layout_hook.style_data(host_ref, &top)?;
+        let node = *data.arena_node.get(&el.arena_index())?;
+        Some(data.doc.matches(node, &sel))
+    });
+    match hit {
+        Some(Ok(hit)) => Ok(Value::Bool(hit)),
+        Some(Err(e)) => Err(NativeError::SyntaxError(e.message().to_string())),
+        // No rebuilt document (or element outside it): no match.
+        None => Ok(Value::Bool(false)),
+    }
 }
 
 // -- classList ------------------------------------------------------------
@@ -30280,6 +31184,17 @@ const PARSE_COMPUTED_PROPS: &[(&str, &str, bool)] = &[
     // forces `none` for non-top-layer elements); top-layer
     // promotion is phase 2 work.
     ("overlay", "none", false),
+    // CSS Transitions 1 (w80): longhand initials from the cascade
+    // (`transition-property: all`, times `0s`, timing `ease`,
+    // behavior `normal`); the `transition` shorthand itself is
+    // synthesized from the longhands, so its initial is `""` (like
+    // `background`) rather than a bogus value.
+    ("transition", "", false),
+    ("transition-property", "all", false),
+    ("transition-duration", "0s", false),
+    ("transition-delay", "0s", false),
+    ("transition-timing-function", "ease", false),
+    ("transition-behavior", "normal", false),
     ("top", "auto", false),
     ("right", "auto", false),
     ("bottom", "auto", false),
@@ -30528,9 +31443,10 @@ fn n_parse_get_computed_style(
         // JS, so nothing re-enters `PARSE_HOSTS` while the entry
         // borrow is held.
         let host_ref = deref_parse_host(host);
-        entry.layout_hook.computed_props(host_ref, el)
+        let top = entry.listeners.borrow().top_layer_ordered();
+        entry.layout_hook.computed_props(host_ref, el, &top)
     });
-    let values = match cascaded {
+    let mut values = match cascaded {
         Some(v) => v,
         None => {
             let viewport = PARSE_HOSTS
@@ -30547,6 +31463,20 @@ fn n_parse_get_computed_style(
             parse_computed_fallback(host, el, viewport)
         }
     };
+    // w80: clock-at-read discrete transitions (see
+    // `crate::transition`): applied to the values map itself, so
+    // both the cascade path and the inline fallback drive
+    // transitions, and the returned object's own properties (and
+    // `getPropertyValue`, which reads them) all see the transitioned
+    // values. Keyed by parse host + arena index, stable across
+    // reads for the same element. Deliberately NOT hooked into
+    // `computed_props` itself: other callers must not drive
+    // transitions. The production surface hooks the same engine in
+    // `n_get_computed_style` (w80fix), under its own `prod:` keys.
+    {
+        let key = format!("parse:{id}:{}", el.arena_index());
+        crate::transition::apply_transitions(&key, &mut values);
+    }
     let obj = heap
         .alloc_object(Object::new(ObjectKind::Ordinary))
         .map_err(|_| NativeError::OutOfMemory)?;
@@ -33691,6 +34621,101 @@ mod tests {
     }
 
     #[test]
+    fn document_create_element_ns_html_uppercase_is_lowercased() {
+        // w80fix F1: production `createElementNS` must match the
+        // parse shim — the HTML namespace ASCII-lowercases the
+        // stored tag (so `tagName` reads `DIV` from a stored `div`,
+        // not from a spilled `DIV`), while foreign names keep
+        // their case exactly.
+        let mut fx = setup("<html><body></body></html>");
+        let doc_val = global_prop(&fx, "document");
+        let stored_tag = |fx: &Fixture, w: Value| -> String {
+            match fx.doc.borrow().kind(node_of(fx, w)) {
+                NodeKind::Element(e) => e.tag_name.as_str().to_string(),
+                _ => panic!("not an element"),
+            }
+        };
+        let div = str_val(&mut fx, "DIV");
+        let w = call_method(&mut fx, doc_val, n_create_element_ns, &[Value::Null, div]);
+        assert_eq!(stored_tag(&fx, w), "div");
+        assert_eq!(prop_str(&fx, obj_of(w), "tagName"), "DIV");
+        let svg_ns = str_val(&mut fx, "http://www.w3.org/2000/svg");
+        let fo = str_val(&mut fx, "foreignObject");
+        let w = call_method(&mut fx, doc_val, n_create_element_ns, &[svg_ns, fo]);
+        assert_eq!(stored_tag(&fx, w), "foreignObject");
+        assert_eq!(prop_str(&fx, obj_of(w), "tagName"), "FOREIGNOBJECT");
+    }
+
+    #[test]
+    fn upgrade_tag_ok_is_exact_for_foreign_namespaces() {
+        // w80fix F3: HTML tags verify ASCII case-insensitively,
+        // but SVG/MathML/Other tags are case-sensitive — a recorded
+        // `foreignObject` must NOT verify against a `foreignobject`
+        // candidate, and a namespace mismatch must never verify.
+        let foreign = |tag: &str| -> NodeKind {
+            NodeKind::Element(dom::ElementData {
+                tag_name: dom::TagName::from(tag),
+                namespace: Namespace::Svg,
+                attributes: dom::Attributes::new(),
+                shadow_root: None,
+            })
+        };
+        let html = |tag: &str| -> NodeKind {
+            NodeKind::Element(dom::ElementData {
+                tag_name: dom::TagName::from(tag),
+                namespace: Namespace::Html,
+                attributes: dom::Attributes::new(),
+                shadow_root: None,
+            })
+        };
+        assert!(upgrade_tag_ok(
+            Some("foreignObject"),
+            Some(&Namespace::Svg),
+            &foreign("foreignObject")
+        ));
+        assert!(!upgrade_tag_ok(
+            Some("foreignObject"),
+            Some(&Namespace::Svg),
+            &foreign("foreignobject")
+        ));
+        assert!(!upgrade_tag_ok(
+            Some("foreignObject"),
+            Some(&Namespace::Svg),
+            &foreign("FOREIGNOBJECT")
+        ));
+        assert!(!upgrade_tag_ok(
+            Some("foreignObject"),
+            Some(&Namespace::Svg),
+            &html("foreignObject")
+        ));
+        // HTML stays case-insensitive, in both directions.
+        assert!(upgrade_tag_ok(
+            Some("div"),
+            Some(&Namespace::Html),
+            &html("div")
+        ));
+        assert!(upgrade_tag_ok(
+            Some("DIV"),
+            Some(&Namespace::Html),
+            &html("div")
+        ));
+        assert!(upgrade_tag_ok(
+            Some("div"),
+            Some(&Namespace::Html),
+            &html("DIV")
+        ));
+        // No recorded tag verifies against anything, including a
+        // non-element; a recorded tag never verifies a non-element.
+        assert!(upgrade_tag_ok(None, None, &foreign("foreignObject")));
+        assert!(!upgrade_tag_ok(
+            Some("div"),
+            None,
+            &NodeKind::Text("x".into())
+        ));
+        assert!(upgrade_tag_ok(None, None, &NodeKind::Text("x".into())));
+    }
+
+    #[test]
     fn document_create_comment_and_fragment() {
         let mut fx = setup("<html><body></body></html>");
         let doc_val = global_prop(&fx, "document");
@@ -36110,6 +37135,84 @@ mod tests {
     }
 
     #[test]
+    fn cssom_computed_value_comma_joins_transition_longhands() {
+        // w80fix (F-TRANSITION, R1-M2): every transition longhand
+        // is a comma-separated list; the generic `List` arm would
+        // space-join them, and the engine splits on top-level
+        // commas, so a space-joined serialization parses as one
+        // layer and kills the transition (duration) or silently
+        // falls back to `ease` (timing). `transition-behavior`
+        // stays a single keyword and needs no list arm.
+        let list = |items: Vec<CssValue>| CssValue::List(items);
+        assert_eq!(
+            cssom_computed_value(
+                "transition-property",
+                &list(vec![
+                    CssValue::Keyword("opacity".into()),
+                    CssValue::Keyword("overlay".into()),
+                ])
+            ),
+            "opacity, overlay"
+        );
+        assert_eq!(
+            cssom_computed_value(
+                "transition-duration",
+                &list(vec![CssValue::Time(1.0), CssValue::Time(100.0)])
+            ),
+            "1s, 100s"
+        );
+        assert_eq!(
+            cssom_computed_value(
+                "transition-delay",
+                &list(vec![CssValue::Time(0.0), CssValue::Time(-50.0)])
+            ),
+            "0s, -50s"
+        );
+        assert_eq!(
+            cssom_computed_value(
+                "transition-timing-function",
+                &list(vec![
+                    CssValue::Keyword("linear".into()),
+                    CssValue::Keyword("ease".into()),
+                ])
+            ),
+            "linear, ease"
+        );
+        assert_eq!(
+            cssom_computed_value("transition-behavior", &CssValue::Keyword("normal".into())),
+            "normal"
+        );
+    }
+
+    #[test]
+    fn specified_style_comma_joins_transition_longhands() {
+        // w80fix (F-TRANSITION, R1-M2): the specified-style
+        // getters (parse shim store and production `el.style`)
+        // share the same space-join bug via
+        // `decl_value_preserving_math`; both must comma-join.
+        let find = |decls: &[(String, String)], prop: &str| {
+            decls
+                .iter()
+                .find(|(n, _)| n == prop)
+                .map(|(_, v)| v.clone())
+                .unwrap_or_default()
+        };
+        let shim = style_decls_from_text(
+            "transition-property: opacity, overlay; transition-duration: 1s, 100s; \
+             transition-delay: 0s, -50s; transition-timing-function: linear, ease;",
+        );
+        assert_eq!(find(&shim, "transition-property"), "opacity, overlay");
+        assert_eq!(find(&shim, "transition-duration"), "1s, 100s");
+        assert_eq!(find(&shim, "transition-delay"), "0s, -50s");
+        assert_eq!(find(&shim, "transition-timing-function"), "linear, ease");
+        let prod = el_style_decls(
+            "transition-duration: 1s, 100s; transition-timing-function: linear, ease;",
+        );
+        assert_eq!(find(&prod, "transition-duration"), "1s, 100s");
+        assert_eq!(find(&prod, "transition-timing-function"), "linear, ease");
+    }
+
+    #[test]
     fn synthesize_scroll_shorthand_round_trip() {
         let decls = |t: &str, r: &str, b: &str, l: &str| {
             vec![
@@ -37788,6 +38891,32 @@ mod tests {
             n_parse_css_supports(&mut fx.heap, global, &[cond]),
             Ok(Value::Bool(true))
         ));
+    }
+
+    #[test]
+    fn production_get_computed_style_applies_overlay_transition() {
+        // w80fix (F-TRANSITION, R3-M6): the production computed
+        // surface must drive the transition engine, not just the
+        // parse shim. Sequence mirrors the harness: seed `none`,
+        // show (entry flips early at progress 0.5), hide (exit
+        // holds `auto` at progress 0.5 instead of flipping
+        // instantly to `none`).
+        let mut fx = setup("<html><body><div id=\"d\" popover></div></body></html>");
+        let sheet = parse_stylesheet(
+            "#d { transition-property: overlay; transition-duration: 100s; \
+             transition-delay: -50s; transition-timing-function: linear; }",
+        );
+        fx.apis.borrow_mut().set_author_stylesheets(vec![sheet]);
+        let el = call_get_element_by_id(&mut fx, "d");
+        assert_eq!(computed_prop(&mut fx, el, "overlay"), "none");
+        n_show_popover(&mut fx.heap, el, &[]).unwrap();
+        assert_eq!(computed_prop(&mut fx, el, "overlay"), "auto");
+        n_hide_popover(&mut fx.heap, el, &[]).unwrap();
+        assert_eq!(
+            computed_prop(&mut fx, el, "overlay"),
+            "auto",
+            "exit transition must hold auto at progress 0.5"
+        );
     }
 
     #[test]
@@ -44744,6 +45873,587 @@ mod tests {
             "true"
         );
         remove_context(ContextId(ctx));
+    }
+
+    // w80 popover on the parse shim: the overlay-transition test 1
+    // shape (closed read, then show, then reads in the SAME script,
+    // so the style cache must refresh), `:popover-open` via shim
+    // `matches`, hide/reopen, auto-close, error names, and adoption
+    // of the open popover into the production document at install.
+    #[test]
+    fn parse_shim_popover_show_hide_and_overlay_sequence() {
+        let (mut probe, doc, ctx) = captured_install(
+            b"<html><body><div id=\"a\" popover></div><div id=\"b\" popover></div><script>\
+              globalThis.__a = document.getElementById('a');\
+              globalThis.__b = document.getElementById('b');\
+              globalThis.__out = [];\
+              __out.push(getComputedStyle(__a).overlay);\
+              __out.push(String(__a.matches(':popover-open')));\
+              __b.showPopover();\
+              __out.push(getComputedStyle(__a).overlay);\
+              __out.push(getComputedStyle(__b).overlay);\
+              __out.push(String(__b.matches(':popover-open')));\
+              __out.push(String(__a.matches(':popover-open')));\
+              __b.hidePopover();\
+              __out.push(getComputedStyle(__b).overlay);\
+              __out.push(String(__b.matches(':popover-open')));\
+              __b.showPopover();\
+              __out.push(getComputedStyle(__b).overlay);\
+              __a.showPopover();\
+              __out.push(String(__a.matches(':popover-open')));\
+              __out.push(String(__b.matches(':popover-open')));\
+              try { __b.showPopover(); __b.showPopover(); globalThis.__double = 'no-throw'; }\
+              catch (e) { globalThis.__double = String(e); }\
+              globalThis.__plain = document.createElement('div');\
+              document.body.appendChild(__plain);\
+              try { __plain.showPopover(); globalThis.__plainErr = 'no-throw'; }\
+              catch (e) { globalThis.__plainErr = String(e); }\
+              globalThis.__tog = __a.togglePopover();\
+              </script></body></html>",
+        );
+        // open -> auto, close -> none, reopen -> auto, auto-close,
+        // all through the shim computed-style path in one script.
+        assert_eq!(
+            node_list_str(&mut probe.vm, "__out.join(';');"),
+            "none;false;none;auto;true;false;none;false;auto;true;false"
+        );
+        assert!(
+            node_list_str(&mut probe.vm, "globalThis.__double;").contains("InvalidStateError"),
+            "double-show error: {}",
+            node_list_str(&mut probe.vm, "globalThis.__double;")
+        );
+        assert!(
+            node_list_str(&mut probe.vm, "globalThis.__plainErr;").contains("NotSupportedError"),
+            "plain-div show error: {}",
+            node_list_str(&mut probe.vm, "globalThis.__plainErr;")
+        );
+        // togglePopover on the closed-by-auto-close `a` reopens it
+        // (auto-closing `b` again).
+        assert_eq!(
+            node_list_str(&mut probe.vm, "String(globalThis.__tog);"),
+            "true"
+        );
+        // Adoption: after the production install, `a` (shown last
+        // via toggle) is still open in the production document, and
+        // production computed style / matches agree.
+        let a_node = doc.borrow().get_element_by_id("a").expect("div#a");
+        assert!(doc.borrow().is_popover_open(a_node));
+        assert_eq!(
+            node_list_str(&mut probe.vm, "getComputedStyle(__a).overlay;"),
+            "auto"
+        );
+        assert_eq!(
+            node_list_str(&mut probe.vm, "String(__a.matches(':popover-open'));"),
+            "true"
+        );
+        remove_context(ContextId(ctx));
+    }
+
+    // w80fix (F-SHIM-TOPLAYER): show -> removeAttribute('popover')
+    // -> setAttribute('popover', '') must NOT resurrect the open
+    // state: removing the attribute hides the popover (production
+    // `remove_attribute` demotes), so re-adding it leaves the
+    // element closed until a fresh `showPopover`. The
+    // case-insensitive spelling (`POPOVER`) demotes too.
+    #[test]
+    fn parse_shim_popover_remove_attr_then_readd_stays_closed() {
+        let (mut probe, doc, ctx) = captured_install(
+            b"<html><body><div id=\"a\" popover=\"manual\"></div><div id=\"b\" popover=\"manual\"></div><script>\
+              globalThis.__a = document.getElementById('a');\
+              globalThis.__b = document.getElementById('b');\
+              globalThis.__out = [];\
+              __a.showPopover();\
+              __b.showPopover();\
+              try { __a.removeAttribute('popover'); __out.push('removed-a'); }\
+              catch (e) { __out.push('err-a:' + String(e)); }\
+              __out.push(String(__a.matches(':popover-open')));\
+              __a.setAttribute('popover', '');\
+              __out.push(String(__a.matches(':popover-open')));\
+              try { __b.removeAttribute('POPOVER'); __out.push('removed-b'); }\
+              catch (e) { __out.push('err-b:' + String(e)); }\
+              __b.setAttribute('popover', 'manual');\
+              __out.push(String(__b.matches(':popover-open')));\
+              try { __a.showPopover(); __out.push('reshown'); }\
+              catch (e) { __out.push('err-reshow:' + String(e)); }\
+              __out.push(String(__a.matches(':popover-open')));\
+              </script></body></html>",
+        );
+        assert_eq!(
+            node_list_str(&mut probe.vm, "__out.join(';');"),
+            "removed-a;false;false;removed-b;false;reshown;true"
+        );
+        let a_node = doc.borrow().get_element_by_id("a").expect("div#a");
+        let b_node = doc.borrow().get_element_by_id("b").expect("div#b");
+        assert!(doc.borrow().is_popover_open(a_node));
+        assert!(!doc.borrow().is_popover_open(b_node));
+        remove_context(ContextId(ctx));
+    }
+
+    // w80fix (F-SHIM-TOPLAYER): show -> remove()/removeChild()
+    // -> reinsert must NOT resurrect the open state, including
+    // when the shown popover is a descendant of the removed
+    // subtree (production demotes the whole subtree on removal).
+    #[test]
+    fn parse_shim_popover_remove_then_reinsert_stays_closed() {
+        let (mut probe, doc, ctx) = captured_install(
+            b"<html><body><div id=\"a\" popover=\"manual\"></div><div id=\"wrap\"><div id=\"inner\" popover=\"manual\"></div></div><div id=\"c\" popover=\"manual\"></div><script>\
+              globalThis.__a = document.getElementById('a');\
+              globalThis.__wrap = document.getElementById('wrap');\
+              globalThis.__inner = document.getElementById('inner');\
+              globalThis.__c = document.getElementById('c');\
+              globalThis.__out = [];\
+              __a.showPopover();\
+              __inner.showPopover();\
+              __c.showPopover();\
+              __a.remove();\
+              document.body.appendChild(__a);\
+              __out.push(String(__a.matches(':popover-open')));\
+              document.body.removeChild(__wrap);\
+              document.body.appendChild(__wrap);\
+              __out.push(String(__inner.matches(':popover-open')));\
+              __c.remove();\
+              document.body.appendChild(__c);\
+              __out.push(String(__c.matches(':popover-open')));\
+              try { __a.showPopover(); __out.push('reshown'); }\
+              catch (e) { __out.push('err-reshow:' + String(e)); }\
+              __out.push(String(__a.matches(':popover-open')));\
+              </script></body></html>",
+        );
+        assert_eq!(
+            node_list_str(&mut probe.vm, "__out.join(';');"),
+            "false;false;false;reshown;true"
+        );
+        let a_node = doc.borrow().get_element_by_id("a").expect("div#a");
+        let inner_node = doc.borrow().get_element_by_id("inner").expect("div#inner");
+        let c_node = doc.borrow().get_element_by_id("c").expect("div#c");
+        assert!(doc.borrow().is_popover_open(a_node));
+        assert!(!doc.borrow().is_popover_open(inner_node));
+        assert!(!doc.borrow().is_popover_open(c_node));
+        remove_context(ContextId(ctx));
+    }
+
+    // w80fix (F-SHIM-TOPLAYER): `textContent =` / `innerHTML =`
+    // clear a container's children, so a shown popover inside is
+    // removed from the document — reinserting a captured child
+    // afterwards must NOT resurrect it (same demotion as
+    // `removeChild`, mirroring production's subtree-clear demotion).
+    #[test]
+    fn parse_shim_popover_subtree_clear_then_reinsert_stays_closed() {
+        let (mut probe, doc, ctx) = captured_install(
+            b"<html><body><div id=\"wrap1\"><div id=\"a\" popover=\"manual\"></div></div><div id=\"wrap2\"><div id=\"b\" popover=\"manual\"></div></div><script>\
+              globalThis.__wrap1 = document.getElementById('wrap1');\
+              globalThis.__wrap2 = document.getElementById('wrap2');\
+              globalThis.__a = document.getElementById('a');\
+              globalThis.__b = document.getElementById('b');\
+              globalThis.__out = [];\
+              __a.showPopover();\
+              __b.showPopover();\
+              __wrap1.textContent = 'x';\
+              document.body.appendChild(__a);\
+              __out.push(String(__a.matches(':popover-open')));\
+              __wrap2.innerHTML = '<span>y</span>';\
+              document.body.appendChild(__b);\
+              __out.push(String(__b.matches(':popover-open')));\
+              </script></body></html>",
+        );
+        assert_eq!(
+            node_list_str(&mut probe.vm, "__out.join(';');"),
+            "false;false"
+        );
+        let a_node = doc.borrow().get_element_by_id("a").expect("div#a");
+        let b_node = doc.borrow().get_element_by_id("b").expect("div#b");
+        assert!(!doc.borrow().is_popover_open(a_node));
+        assert!(!doc.borrow().is_popover_open(b_node));
+        remove_context(ContextId(ctx));
+    }
+
+    // w80fix (F-SHIM-TOPLAYER): `togglePopover(false)` on a plain
+    // div is a forced no-op returning false, not a
+    // NotSupportedError: production checks the forced no-op arms
+    // before validity, and open-ness is well-defined without the
+    // attribute (not in the shim set means not open).
+    #[test]
+    fn parse_shim_popover_toggle_forced_noop_on_plain_div() {
+        let (mut probe, _doc, ctx) = captured_install(
+            b"<html><body><div id=\"plain\"></div><div id=\"p\" popover></div><script>\
+              globalThis.__plain = document.getElementById('plain');\
+              globalThis.__p = document.getElementById('p');\
+              globalThis.__out = [];\
+              try { __out.push(String(__plain.togglePopover(false))); }\
+              catch (e) { __out.push('err:' + String(e)); }\
+              __p.showPopover();\
+              try { __out.push(String(__p.togglePopover(false))); }\
+              catch (e) { __out.push('err:' + String(e)); }\
+              __out.push(String(__p.matches(':popover-open')));\
+              try { __out.push(String(__p.togglePopover(true))); }\
+              catch (e) { __out.push('err:' + String(e)); }\
+              __out.push(String(__p.matches(':popover-open')));\
+              try { __out.push(String(__plain.togglePopover(true))); }\
+              catch (e) { __out.push(String(e).indexOf('NotSupportedError') >= 0 ? 'notsupported' : 'other:' + String(e)); }\
+              </script></body></html>",
+        );
+        assert_eq!(
+            node_list_str(&mut probe.vm, "__out.join(';');"),
+            "false;false;false;true;true;notsupported"
+        );
+        remove_context(ContextId(ctx));
+    }
+
+    // w80fix (F-SHIM-TOPLAYER): adoption with duplicate `id`s
+    // resolves the shown element, not the first same-`id` element
+    // bearing a `popover` attribute: the id candidate must fail
+    // the tag+namespace verification / ordinal check the upgrade
+    // applies, falling back to the ordinal.
+    #[test]
+    fn parse_shim_popover_adoption_duplicate_id_resolves_shown() {
+        let (mut probe, doc, ctx) = captured_install(
+            b"<html><body><div id=\"dup\" popover></div><div id=\"dup\" popover></div><script>\
+              globalThis.__di = 0;\
+              document.body.children.forEach(function(el) {\
+                if (el.tagName !== 'DIV') { return; }\
+                if (__di === 0) { globalThis.__first = el; } else { globalThis.__second = el; }\
+                __di++;\
+              });\
+              __second.showPopover();\
+              globalThis.__mid = String(__second.matches(':popover-open'));\
+              </script></body></html>",
+        );
+        assert_eq!(node_list_str(&mut probe.vm, "globalThis.__mid;"), "true");
+        let dups: Vec<NodeId> = doc
+            .borrow()
+            .get_elements_by_tag_name("div")
+            .into_iter()
+            .filter(|&n| doc.borrow().get_attribute(n, "id") == Some("dup"))
+            .collect();
+        assert_eq!(dups.len(), 2);
+        assert!(!doc.borrow().is_popover_open(dups[0]));
+        assert!(doc.borrow().is_popover_open(dups[1]));
+        remove_context(ContextId(ctx));
+    }
+
+    // w80fix (F-SMALL2): a foreign `foreignObject` popover shown
+    // mid-parse must still adopt after the top-layer verification
+    // tightens to exact match for foreign namespaces: the recorded
+    // name is the exact stored `foreignObject` (see the landed
+    // `tag_name` fix), so exact comparison accepts its own
+    // production node.
+    #[test]
+    fn parse_shim_popover_adoption_foreign_object_still_adopts() {
+        let (mut probe, doc, ctx) = captured_install(
+            b"<html><body><svg><foreignObject id=\"fo\" popover></foreignObject></svg><script>\
+              globalThis.__fo = document.getElementById('fo');\
+              __fo.showPopover();\
+              globalThis.__mid = String(__fo.matches(':popover-open'));\
+              </script></body></html>",
+        );
+        assert_eq!(node_list_str(&mut probe.vm, "globalThis.__mid;"), "true");
+        let fo = doc.borrow().get_element_by_id("fo").expect("foreignObject");
+        assert!(doc.borrow().is_popover_open(fo));
+        remove_context(ContextId(ctx));
+    }
+
+    // w80fix (F-SMALL2): adopt's verification must be exact for
+    // foreign namespaces, like `upgrade_tag_ok`: a record for
+    // `foreignObject` must NOT verify against a `foreignobject`
+    // candidate. The candidate is produced by shifting the
+    // record's ordinal: the script shows a `foreignObject`
+    // popover, then the test removes a preceding pad element
+    // from the production document before install, so the
+    // record's stale ordinal names the lowercase `foreignobject`
+    // element appended after it (same popover attribute, no
+    // `id`, so no `id` fallback can rescue it).
+    #[test]
+    fn parse_shim_popover_adoption_rejects_case_mismatched_foreign() {
+        let mut probe = ShimEval { vm: Vm::new() };
+        let (doc, _) = Document::parse_html_with_executor(
+            b"<html><body><div id=\"pad\"></div><script>\
+              globalThis.__fo = document.createElementNS('http://www.w3.org/2000/svg', 'foreignObject');\
+              __fo.setAttribute('popover', 'manual');\
+              document.body.appendChild(__fo);\
+              globalThis.__lo = document.createElementNS('http://www.w3.org/2000/svg', 'foreignobject');\
+              __lo.setAttribute('popover', 'manual');\
+              document.body.appendChild(__lo);\
+              __fo.showPopover();\
+              </script></body></html>",
+            true,
+            &mut probe,
+        );
+        let doc = Rc::new(RefCell::new(doc));
+        // Precondition: exactly one arena is shown, and its record
+        // is the id-less `foreignObject` record with an ordinal.
+        let (shown, fo_ordinal) = {
+            let roots = probe
+                .vm
+                .pending_shim_listeners
+                .as_ref()
+                .expect("shim roots")
+                .borrow();
+            let ordinal = roots
+                .element_wrappers
+                .iter()
+                .find(|rec| {
+                    rec.tag_name.as_deref() == Some("foreignObject")
+                        && rec.namespace == Some(Namespace::Svg)
+                        && !rec.detached
+                })
+                .and_then(|rec| rec.ordinal)
+                .expect("foreignObject record with ordinal");
+            (roots.top_layer_ordered().len(), ordinal)
+        };
+        assert_eq!(shown, 1, "one shown popover before install");
+        // Shift: remove the pad div preceding both elements, so
+        // the stale ordinal now names the lowercase element.
+        let lo = {
+            let mut d = doc.borrow_mut();
+            let body = d.get_elements_by_tag_name("body").item(0).expect("body");
+            let pad = d.get_element_by_id("pad").expect("pad");
+            d.remove_child(body, pad);
+            let all: Vec<NodeId> = d.get_elements_by_tag_name("*").into_iter().collect();
+            let cand = all[fo_ordinal];
+            assert!(
+                matches!(d.kind(cand), NodeKind::Element(e) if e.tag_name.as_str() == "foreignobject" && e.namespace == Namespace::Svg),
+                "stale ordinal must name the lowercase candidate"
+            );
+            assert!(
+                d.get_attribute(cand, "popover").is_some(),
+                "lowercase candidate carries popover, so only the tag check can stop it"
+            );
+            cand
+        };
+        let base = bowser_url::parse("http://example.com/", None).unwrap();
+        let ctx = probe
+            .vm
+            .install_page_web_apis(doc.clone(), base, "BowserTest/1.0")
+            .expect("production install");
+        assert!(
+            !doc.borrow().is_popover_open(lo),
+            "lowercase foreignobject candidate must not adopt a foreignObject record"
+        );
+        assert!(
+            !doc.borrow().top_layer().contains(&lo),
+            "lowercase candidate must not be in the production top layer"
+        );
+        remove_context(ContextId(ctx));
+    }
+
+    // w80fix (F-SHIM-TOPLAYER): coexisting manual popovers adopt
+    // in show order, not hash order. The shim set is unordered,
+    // so a single install can pass by chance; repeat installs and
+    // require show order every time.
+    #[test]
+    fn parse_shim_popover_adoption_preserves_show_order() {
+        for _ in 0..12 {
+            let (probe, doc, ctx) = captured_install(
+                b"<html><body><div id=\"m1\" popover=\"manual\"></div><div id=\"m2\" popover=\"manual\"></div><script>\
+                  globalThis.__m1 = document.getElementById('m1');\
+                  globalThis.__m2 = document.getElementById('m2');\
+                  __m1.showPopover();\
+                  __m2.showPopover();\
+                  </script></body></html>",
+            );
+            let order: Vec<String> = doc
+                .borrow()
+                .top_layer()
+                .iter()
+                .map(|&n| {
+                    doc.borrow()
+                        .get_attribute(n, "id")
+                        .unwrap_or_default()
+                        .to_string()
+                })
+                .collect();
+            assert_eq!(order, vec!["m1".to_string(), "m2".to_string()]);
+            remove_context(ContextId(ctx));
+            drop(probe);
+        }
+    }
+
+    #[test]
+    fn parse_shim_create_element_ns_upgrades_with_namespace() {
+        // The overlay-user-agent-rules shape: mid-parse
+        // `createElementNS` (null and arbitrary namespaces) must
+        // exist on the shim, and the minted elements must upgrade
+        // onto production nodes carrying their namespaces — not
+        // silently re-namespaced as HTML.
+        let (mut probe, doc, ctx) = captured_install(
+            b"<html><body><script>\
+              globalThis.__nullNs = document.createElementNS(null, 'div');\
+              __nullNs.id = 'ns-null';\
+              document.body.appendChild(__nullNs);\
+              globalThis.__weird = document.createElementNS('hello world', 'div');\
+              __weird.id = 'ns-weird';\
+              document.body.appendChild(__weird);\
+              globalThis.__svg = document.createElementNS('http://www.w3.org/2000/svg', 'svg');\
+              __svg.id = 'ns-svg';\
+              document.body.appendChild(__svg);\
+              globalThis.__mid = String(typeof document.createElementNS);\
+              try { document.createElementNS(null, ''); globalThis.__empty = 'no-throw'; }\
+              catch (e) { globalThis.__empty = String(e); }\
+              </script></body></html>",
+        );
+        assert_eq!(
+            node_list_str(&mut probe.vm, "globalThis.__mid;"),
+            "function"
+        );
+        assert!(
+            node_list_str(&mut probe.vm, "globalThis.__empty;").contains("InvalidCharacterError")
+        );
+        for (global, id) in [
+            ("__nullNs", "ns-null"),
+            ("__weird", "ns-weird"),
+            ("__svg", "ns-svg"),
+        ] {
+            assert_eq!(
+                node_list_str(
+                    &mut probe.vm,
+                    &format!("String(document.getElementById('{id}') === {global});")
+                ),
+                "true",
+                "{global} did not upgrade onto its production node"
+            );
+        }
+        let ns_of = |id: &str| -> Namespace {
+            let doc_ref = doc.borrow();
+            let node = doc_ref.get_element_by_id(id).expect("upgraded element");
+            match doc_ref.kind(node) {
+                NodeKind::Element(e) => e.namespace.clone(),
+                _ => panic!("{id} is not an element"),
+            }
+        };
+        assert_eq!(ns_of("ns-null"), Namespace::Html);
+        assert_eq!(ns_of("ns-weird"), Namespace::Other("hello world".into()));
+        assert_eq!(ns_of("ns-svg"), Namespace::Svg);
+        remove_context(ContextId(ctx));
+    }
+
+    #[test]
+    fn parse_shim_create_element_ns_upgrades_with_namespace_and_case() {
+        // w80fix F1+F4: an uppercase HTML tag and a mixed-case
+        // foreign tag minted mid-parse must upgrade onto production
+        // nodes carrying their namespaces AND their post-lowercasing
+        // stored tags. There is no `namespaceURI` accessor (adding
+        // one would touch the element prototype, the shim wrapper
+        // accessors, and the upgrade strip list), so the namespace
+        // is asserted here at the Rust level, through the upgraded
+        // production nodes — not just code-reviewed.
+        let (mut probe, doc, ctx) = captured_install(
+            b"<html><body><script>\
+              globalThis.__up = document.createElementNS(null, 'DIV');\
+              __up.id = 'ns-up';\
+              document.body.appendChild(__up);\
+              globalThis.__fo = document.createElementNS('http://www.w3.org/2000/svg', 'foreignObject');\
+              __fo.id = 'ns-fo';\
+              document.body.appendChild(__fo);\
+              </script></body></html>",
+        );
+        for (global, id) in [("__up", "ns-up"), ("__fo", "ns-fo")] {
+            assert_eq!(
+                node_list_str(
+                    &mut probe.vm,
+                    &format!("String(document.getElementById('{id}') === {global});")
+                ),
+                "true",
+                "{global} did not upgrade onto its production node"
+            );
+        }
+        let info_of = |id: &str| -> (Namespace, String) {
+            let doc_ref = doc.borrow();
+            let node = doc_ref.get_element_by_id(id).expect("upgraded element");
+            match doc_ref.kind(node) {
+                NodeKind::Element(e) => (e.namespace.clone(), e.tag_name.as_str().to_string()),
+                _ => panic!("{id} is not an element"),
+            }
+        };
+        assert_eq!(info_of("ns-up"), (Namespace::Html, "div".to_string()));
+        assert_eq!(
+            info_of("ns-fo"),
+            (Namespace::Svg, "foreignObject".to_string())
+        );
+        remove_context(ContextId(ctx));
+    }
+
+    // w80 popover: production show/hide/toggle, computed overlay
+    // sequence, `:popover-open` matching, and UA hidden/position
+    // rules, through the production natives.
+    #[test]
+    fn production_popover_show_hide_toggle_and_overlay() {
+        let mut fx = setup(
+            "<html><body><div id=\"p\" popover></div><div id=\"p2\" popover></div><div id=\"q\"></div></body></html>",
+        );
+        let sheet = parse_stylesheet("#p { overlay: auto; } #p2 { overlay: auto; }");
+        fx.apis.borrow_mut().set_author_stylesheets(vec![sheet]);
+        let p = call_get_element_by_id(&mut fx, "p");
+        let p2 = call_get_element_by_id(&mut fx, "p2");
+        let q = call_get_element_by_id(&mut fx, "q");
+        let open_sel = str_val(&mut fx, ":popover-open");
+        // Closed: UA hidden rule + UA `overlay: none` beat the author
+        // `auto`; `:popover-open` does not match.
+        assert_eq!(computed_prop(&mut fx, p, "overlay"), "none");
+        assert_eq!(computed_prop(&mut fx, p, "display"), "none");
+        assert_eq!(
+            n_matches(&mut fx.heap, p, &[open_sel]).unwrap(),
+            Value::Bool(false)
+        );
+        // Open: `auto`, fixed, block, `:popover-open` matches.
+        n_show_popover(&mut fx.heap, p, &[]).unwrap();
+        assert_eq!(computed_prop(&mut fx, p, "overlay"), "auto");
+        assert_eq!(computed_prop(&mut fx, p, "display"), "block");
+        assert_eq!(computed_prop(&mut fx, p, "position"), "fixed");
+        assert_eq!(
+            n_matches(&mut fx.heap, p, &[open_sel]).unwrap(),
+            Value::Bool(true)
+        );
+        // Double-show throws InvalidStateError (as a TypeError).
+        match n_show_popover(&mut fx.heap, p, &[]) {
+            Err(NativeError::TypeError(m)) => {
+                assert!(m.contains("InvalidStateError"), "double-show message: {m}")
+            }
+            other => panic!("double-show must throw InvalidStateError, got {other:?}"),
+        }
+        // No `popover` attribute: NotSupportedError.
+        match n_show_popover(&mut fx.heap, q, &[]) {
+            Err(NativeError::TypeError(m)) => assert!(
+                m.contains("NotSupportedError"),
+                "plain-div show message: {m}"
+            ),
+            other => panic!("plain-div show must throw NotSupportedError, got {other:?}"),
+        }
+        // Auto-close: showing p2 closes p.
+        n_show_popover(&mut fx.heap, p2, &[]).unwrap();
+        assert_eq!(
+            n_matches(&mut fx.heap, p, &[open_sel]).unwrap(),
+            Value::Bool(false)
+        );
+        assert_eq!(
+            n_matches(&mut fx.heap, p2, &[open_sel]).unwrap(),
+            Value::Bool(true)
+        );
+        // Hide: back to none; hiding again is a no-op.
+        n_hide_popover(&mut fx.heap, p2, &[]).unwrap();
+        assert_eq!(computed_prop(&mut fx, p2, "overlay"), "none");
+        n_hide_popover(&mut fx.heap, p2, &[]).unwrap();
+        // Toggle sequence, then forced directions.
+        assert_eq!(
+            n_toggle_popover(&mut fx.heap, p2, &[]).unwrap(),
+            Value::Bool(true)
+        );
+        assert_eq!(
+            n_toggle_popover(&mut fx.heap, p2, &[]).unwrap(),
+            Value::Bool(false)
+        );
+        assert_eq!(
+            n_toggle_popover(&mut fx.heap, p2, &[Value::Bool(true)]).unwrap(),
+            Value::Bool(true)
+        );
+        assert_eq!(
+            n_toggle_popover(&mut fx.heap, p2, &[Value::Bool(true)]).unwrap(),
+            Value::Bool(true)
+        );
+        assert_eq!(
+            n_toggle_popover(&mut fx.heap, p2, &[Value::Bool(false)]).unwrap(),
+            Value::Bool(false)
+        );
+        assert_eq!(computed_prop(&mut fx, p2, "overlay"), "none");
     }
 
     #[test]

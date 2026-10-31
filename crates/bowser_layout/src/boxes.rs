@@ -936,6 +936,40 @@ fn sanitize_intrinsic(entry: Option<IntrinsicDims>, tag: &str) -> IntrinsicDims 
     }
 }
 
+/// CSS Tables 3 table-structure fixup for replaced elements (see
+/// `css-tables/table-model-fixup-2`): a replaced element whose
+/// `display` computes to a table value generates no table-internal
+/// box at all — `table` behaves as `block`, every other table value
+/// as `inline`. Shared by pass 1 and the root/subtree-root path so
+/// the two cannot drift.
+///
+/// `raw_display` is the cascaded keyword, not the bucketed
+/// [`Display`]: `display_of` folds `table-caption` to `Block`, so
+/// only the raw keyword tells a replaced caption (→ `Inline`) from
+/// a replaced `flex`/`list-item` (→ `Block`, untouched).
+/// `display_of` itself keeps folding caption to `Block`: real
+/// captions stay block boxes (table layout identifies them by the
+/// raw keyword) and pseudo captions keep mapping to `Block` (see
+/// `pseudo.rs`), so this helper — not a new `Display` variant — is
+/// the contained fix shape.
+fn remap_replaced_table_display(display: Display, raw_display: &str) -> Display {
+    if raw_display.eq_ignore_ascii_case("table-caption") {
+        return Display::Inline;
+    }
+    match display {
+        Display::Table => Display::Block,
+        Display::TableRowGroup
+        | Display::TableHeaderGroup
+        | Display::TableFooterGroup
+        | Display::TableRow
+        | Display::TableCell
+        | Display::TableColumn
+        | Display::TableColumnGroup
+        | Display::InlineTable => Display::Inline,
+        other => other,
+    }
+}
+
 fn is_replaced_tag(tag: &str) -> bool {
     matches!(
         tag,
@@ -1778,6 +1812,20 @@ fn build_box_tree_rooted(
     if root_display == Display::None {
         return None;
     }
+    // Same fixup as pass 1 (shared helper): a replaced subtree root
+    // with a table display must not keep that display on its box —
+    // `layout_block` dispatches on `data.display`, so a `Block` box
+    // still carrying `Display::Table` would get table layout. The
+    // box type below then follows the existing arms (`table` →
+    // `Block`, every other table value → `Inline`, the same arm a
+    // plain inline subtree root takes). The whole-document root
+    // (`<html>`) is never a replaced tag, so this is a no-op there.
+    let root_display = if is_replaced_tag(tag_name(doc, root_el)) {
+        let raw = root_style.get_str_by_index(props::DISPLAY).unwrap_or("");
+        remap_replaced_table_display(root_display, raw)
+    } else {
+        root_display
+    };
 
     let mut forest = Forest {
         // Pre-size the arena (see `count_dom_nodes`): geometric growth
@@ -1987,6 +2035,28 @@ fn build_box_tree_rooted(
                     }
                     continue;
                 }
+                // CSS Tables 3 table-structure fixup (see
+                // `css-tables/table-model-fixup-2`): a replaced element
+                // whose `display` computes to a table value generates
+                // no table-internal box at all — `table` behaves as
+                // `block`, every other table value as `inline` (the
+                // `Inline` + replaced arm below then makes it an
+                // atomic `InlineBlock`). Remap the variable itself,
+                // not just the box type: `StyleData::display` drives
+                // `layout_block`'s table dispatch, so a `Block` box
+                // still carrying `Display::Table` would get table
+                // layout and zero height. The raw keyword is read
+                // here because `display_of` buckets `table-caption`
+                // to `Block`: without it a replaced caption would
+                // stay a block box and its WPT equal-tops cases would
+                // pass only vacuously (zero-height stacked blocks
+                // share a top) until real heights land.
+                let display = if is_replaced_tag(tag) {
+                    let raw = style.get_str_by_index(props::DISPLAY).unwrap_or("");
+                    remap_replaced_table_display(display, raw)
+                } else {
+                    display
+                };
                 let mut data = StyleData::from_style(
                     &style,
                     display,
@@ -2647,6 +2717,223 @@ mod tests {
             .find(|n| n.box_type == BoxType::TableRowGroup)
             .expect("row-group box");
         assert_eq!(group.section_kind, Some(SectionKind::Header));
+    }
+
+    #[test]
+    fn replaced_table_displays_remap_to_block_and_inline() {
+        // CSS Tables 3 fixup (`table-model-fixup-2`): a replaced
+        // element with a table `display` generates no table-internal
+        // box — `table` behaves as `block`, every other table value
+        // as `inline` (atomic `InlineBlock` here). The remapped
+        // `StyleData::display` matters, not just the box type:
+        // `layout_block` dispatches on it.
+        for (html, box_type, display) in [
+            (
+                "<input style=\"display: table\">",
+                BoxType::Block,
+                Display::Block,
+            ),
+            (
+                "<input style=\"display: table-row\">",
+                BoxType::InlineBlock,
+                Display::Inline,
+            ),
+            (
+                "<img style=\"display: table-cell\">",
+                BoxType::InlineBlock,
+                Display::Inline,
+            ),
+            (
+                "<input style=\"display: inline-table\">",
+                BoxType::InlineBlock,
+                Display::Inline,
+            ),
+            (
+                "<input style=\"display: table-column-group\">",
+                BoxType::InlineBlock,
+                Display::Inline,
+            ),
+            // `table-caption` is NOT bucketed away first: the raw
+            // keyword reaches the remap (w80fix R2-F1). Before the
+            // fix these two mapped to `Block`/`Block` — and the WPT
+            // caption cases still passed, vacuously, because a
+            // zero-height block stack shares a top.
+            (
+                "<input style=\"display: table-caption\">",
+                BoxType::InlineBlock,
+                Display::Inline,
+            ),
+            (
+                "<img style=\"display: table-caption\">",
+                BoxType::InlineBlock,
+                Display::Inline,
+            ),
+            // The remaining table-internal values, previously
+            // uncovered by this test.
+            (
+                "<input style=\"display: table-row-group\">",
+                BoxType::InlineBlock,
+                Display::Inline,
+            ),
+            (
+                "<input style=\"display: table-header-group\">",
+                BoxType::InlineBlock,
+                Display::Inline,
+            ),
+            (
+                "<input style=\"display: table-footer-group\">",
+                BoxType::InlineBlock,
+                Display::Inline,
+            ),
+            (
+                "<input style=\"display: table-column\">",
+                BoxType::InlineBlock,
+                Display::Inline,
+            ),
+        ] {
+            let page = format!("<html><body>{html}</body></html>");
+            let (doc, _) = Document::parse_html(page.as_bytes());
+            let ua = crate::ua_stylesheet();
+            let (forest, _) = build_box_tree_with_fonts(
+                &doc,
+                &[],
+                ua,
+                800.0,
+                600.0,
+                &HashMap::new(),
+                &crate::FixedFontMetrics,
+            )
+            .expect("box tree builds");
+            // Replaced boxes are the only ones carrying intrinsics.
+            let node = forest
+                .nodes
+                .iter()
+                .find(|n| n.intrinsic.is_some())
+                .expect("replaced box");
+            assert_eq!(node.box_type, box_type, "{html}");
+            assert_eq!(node.data.display, display, "{html}");
+        }
+        // Non-replaced elements are untouched by the remap.
+        let (doc, _) = Document::parse_html(
+            b"<html><body><div style=\"display: table-row\"></div></body></html>",
+        );
+        let ua = crate::ua_stylesheet();
+        let (forest, _) = build_box_tree_with_fonts(
+            &doc,
+            &[],
+            ua,
+            800.0,
+            600.0,
+            &HashMap::new(),
+            &crate::FixedFontMetrics,
+        )
+        .expect("box tree builds");
+        let row = forest
+            .nodes
+            .iter()
+            .find(|n| n.box_type == BoxType::TableRow)
+            .expect("row box");
+        assert_eq!(row.data.display, Display::TableRow);
+        // A non-replaced caption keeps the block box (table layout
+        // still identifies it via the raw `table-caption` keyword).
+        let (doc, _) = Document::parse_html(
+            b"<html><body><div style=\"display: table-caption\">c</div></body></html>",
+        );
+        let ua = crate::ua_stylesheet();
+        let (forest, _) = build_box_tree_with_fonts(
+            &doc,
+            &[],
+            ua,
+            800.0,
+            600.0,
+            &HashMap::new(),
+            &crate::FixedFontMetrics,
+        )
+        .expect("box tree builds");
+        let caption = forest
+            .nodes
+            .iter()
+            .find(|n| {
+                n.box_type == BoxType::Block
+                    && n.style
+                        .as_ref()
+                        .and_then(|s| s.get_str_by_index(props::DISPLAY))
+                        .is_some_and(|d| d.eq_ignore_ascii_case("table-caption"))
+            })
+            .expect("caption block box");
+        assert_eq!(caption.data.display, Display::Block);
+    }
+
+    #[test]
+    fn replaced_subtree_root_table_displays_remap() {
+        // R2-F5 / R1-L3: the pass-1 remap must also cover the
+        // root/subtree-root path. A replaced subtree root with
+        // `display: table` used to keep `Display::Table` on a `Block`
+        // box, so `layout_block` dispatched it to table layout.
+        for (html, tag, box_type, display) in [
+            (
+                "<input style=\"display: table\">",
+                "input",
+                BoxType::Block,
+                Display::Block,
+            ),
+            (
+                "<input style=\"display: table-caption\">",
+                "input",
+                BoxType::Inline,
+                Display::Inline,
+            ),
+            (
+                "<img style=\"display: table-row\">",
+                "img",
+                BoxType::Inline,
+                Display::Inline,
+            ),
+        ] {
+            let page = format!("<html><body>{html}</body></html>");
+            let (doc, _) = Document::parse_html(page.as_bytes());
+            let root_el = doc
+                .get_elements_by_tag_name(tag)
+                .item(0)
+                .expect("subtree root element");
+            let ua = crate::ua_stylesheet();
+            let (forest, root_idx) = build_box_tree_subtree_with_fonts(
+                &doc,
+                &[],
+                ua,
+                800.0,
+                600.0,
+                &HashMap::new(),
+                root_el,
+                &crate::FixedFontMetrics,
+            )
+            .expect("subtree box tree builds");
+            let node = &forest.nodes[root_idx];
+            assert_eq!(node.box_type, box_type, "{html}");
+            assert_eq!(node.data.display, display, "{html}");
+        }
+        // A non-replaced subtree root keeps its block box and display.
+        let (doc, _) = Document::parse_html(
+            b"<html><body><div style=\"display: table-caption\">c</div></body></html>",
+        );
+        let root_el = doc
+            .get_elements_by_tag_name("div")
+            .item(0)
+            .expect("div root");
+        let ua = crate::ua_stylesheet();
+        let (forest, root_idx) = build_box_tree_subtree_with_fonts(
+            &doc,
+            &[],
+            ua,
+            800.0,
+            600.0,
+            &HashMap::new(),
+            root_el,
+            &crate::FixedFontMetrics,
+        )
+        .expect("subtree box tree builds");
+        assert_eq!(forest.nodes[root_idx].box_type, BoxType::Block);
+        assert_eq!(forest.nodes[root_idx].data.display, Display::Block);
     }
 
     #[test]

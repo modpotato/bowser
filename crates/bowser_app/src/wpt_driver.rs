@@ -60,8 +60,12 @@
 //! `run_testharness` serves the test through the harness endpoint
 //! (`{base}/__bowser_harness__/<test-path>?__bowser_harness=1&id=<pct-id>&nonce=<nonce>`)
 //! instead of the raw test URL. The fixture server injects
-//! [`REPORTER_JS`] into the served page (just before `</body>`); the
-//! reporter registers testharness.js's `add_completion_callback`, which
+//! [`REPORTER_JS`] into the served page immediately after the
+//! `testharness.js` `</script>` tag, falling back to just before
+//! `</body>` only when that tag cannot be located (and then the
+//! multiplier may silently never apply: if tests already completed
+//! by `</body>`, `Tests.setup` is a no-op at phase >= HAVE_RESULTS);
+//! the reporter registers testharness.js's `add_completion_callback`, which
 //! receives the full `tests` array with per-test status fields, builds one
 //! Bowser-native report
 //! (`{"test","harness_status","tests":[{"name","status","message"}]}` —
@@ -670,6 +674,76 @@ const HARNESS_PREFIX: &str = "/__bowser_harness__/";
 /// the completion-flag global (see
 /// [`crate::script::HARNESS_COMPLETION_FLAG`).
 ///
+/// The reporter also stretches the harness timeout
+/// (`timeout_multiplier: 8`, alongside `output:false`): testharness.js
+/// arms a 10 s deadline at construction, and normal completion needs
+/// the window `load` handler's `setTimeout(...,0)` to run in the
+/// headless pump — but the pump starts only after the whole
+/// synchronous install (parse plus every inline script) finishes, and
+/// JS timers cannot fire mid-script. A page with many synchronous
+/// subtests (e.g. `css/CSS2/syntax/colors-007.html`, 1192 `test()`
+/// calls) takes longer than 10 s to install on this engine (measured
+/// ~13 s solo in w79, 36-39 s under wave contention, and 42.5-56.9 s
+/// total in contended multiplier-3 reruns), so at the first pump
+/// iteration the harness timer is already past due and fires before
+/// the load timer, reporting TIMEOUT with every subtest passing.
+/// Multiplying the deadline to 80 s moves it past even the worst
+/// observed contended install (56.9 s) with ~23 s of margin; 8 is
+/// chosen jointly with the headless pump budget, not alone: the pump
+/// budget (`HEADLESS_HARNESS_WAIT_BUDGET` in `window.rs`, 90 s from
+/// pump start) exceeds the full 80 s harness deadline measured from
+/// setup. Scope of that claim, stated exactly: it covers
+/// normal-timeout tests and installs that start pumping before the
+/// runner budget expires. The wall-clock chain "harness deadline <
+/// pump deadline < child/runner kill" as literally stated is false
+/// for long installs: the pump deadline is pump_start + 90 s, i.e.
+/// child_start + install + 90 s, which exceeds the 180 s runner
+/// budget once install >= 90 s. The outcome is still correct there
+/// because a harness timer already past due at pump start fires on
+/// the first pump iteration, before the child kill — but that is
+/// past-due firing, not the stated deadline ordering, so the
+/// ordering proof does not cover install >= 90 s. That joint raise is
+/// what the multiplier-3 ceiling and the rejected multiplier-5
+/// experiment were both missing: with multiplier 5 the 50 s deadline
+/// fell after the then-30 s pump budget, so all five genuine-TIMEOUT
+/// controls flipped to harness ERROR (the pump gave up, the child
+/// exited 1 on their install script error, and no report line
+/// arrived). A pump-time re-arm was also measured and rejected:
+/// `Tests.setup` returns early once any test has a result
+/// (`phase >= HAVE_RESULTS`, set by the first sync `test()`), so a
+/// `setup()` call from a pump timer is a no-op for exactly the
+/// sync-heavy pages that need it. The chain, restated for its actual
+/// scope: for a normal-timeout test, the harness timer fires inside
+/// the pump either at setup + 80 s (install < 80 s, within the
+/// pump's 90 s budget from pump start) or past due on the first pump
+/// iteration (install >= 80 s), provided the pump starts before the
+/// runner budget expires; the child `--timeout` is forwarded from the
+/// runner budget (see `run_testharness_with_markers`) and the runner
+/// watchdog enforces the same budget. That last link is the one this
+/// file cannot raise: runs are validated with
+/// `bowser-wpt --timeout-secs 180`, because the 60 s default in
+/// `bowser-wpt.rs`/`RunConfig` would kill a genuine-TIMEOUT control
+/// at 60 s before its 80 s harness timer fires (a runner
+/// `DriverTimeout`, which still matches `TIMEOUT` metadata but is
+/// not a harness TIMEOUT) and would kill a contended colors-007
+/// install past 60 s outright. Raising that default is a separate
+/// change in files outside this reporter.
+/// Long-test exception: a test with `<meta name="timeout"
+/// content="long">` has a 60 s base deadline, so at multiplier 8 its
+/// harness deadline is setup + 480 s — unreachable under the 90 s
+/// pump budget and the 180 s runner budget. For long tests the pump
+/// still expires first and the run ends as a runner `DriverTimeout`
+/// (concrete instance: `css/CSS2/linebox/animations/line-height-
+/// interpolation.html`, expected TIMEOUT, measured WATCHDOG-TIMEOUT
+/// at 180 s with 0 subtests in the w80fix rerun), never a harness
+/// TIMEOUT. That needs a separate solution (e.g. capping the
+/// multiplier when `timeout_length` is long, or a pump budget keyed
+/// to it); no timer redesign is attempted here. Cost of this fix,
+/// stated plainly: genuine harness TIMEOUTs now take ~80 s to report
+/// instead of ~10 s (and ~30 s at multiplier 3). Aggregate suite-time
+/// cost: every genuine TIMEOUT test now costs 60 s at the default
+/// (watchdog) instead of ~10 s pre-wave, and 80 s at 180 s validation.
+///
 /// Kept to conservative ES5 (`var`, function expressions, no `Date` —
 /// the engine has no `Date` yet): it only needs `add_completion_callback`
 /// (defined by testharness.js itself), `JSON.stringify`, `String`, and
@@ -733,7 +807,15 @@ try {
   // latches `enabled` on harness setup and a later `setup({output})`
   // cannot re-enable it, so this script is injected right after
   // `testharness.js` loads rather than at end of body.
-  if (typeof setup === "function") { try { setup({output:false}); } catch (e) {} }
+  // `timeout_multiplier:8` is this call's second job: `Tests.setup`
+  // multiplies the armed 10 s harness deadline and re-arms it, so a
+  // slow synchronous install (1192 `test()` calls in colors-007) does
+  // not trip the harness timeout before the headless pump can run the
+  // load handler's 0 ms timer. See the `REPORTER_JS` docs above for
+  // the joint arithmetic (80 s harness deadline, 90 s pump budget,
+  // 180 s runner budget) and what it costs.
+  if (typeof setup === "function") { try { setup({output:false, timeout_multiplier:8}); } catch (e) {} }
+
   // Per-test start: one marker line with the JSON-escaped test name.
   // Guarded — older harnesses may not define it — and best-effort: the
   // completion report below stays authoritative.
@@ -852,12 +934,18 @@ fn rfind_ascii_ci(haystack: &[u8], needle: &str) -> Option<usize> {
     })
 }
 
-/// Splice the reporter `<script>` into `html` just before `</body>`
-/// (case-insensitive), falling back to before `</html>`, then to the end
-/// of the document. Late injection is deliberate: the reporter must run
-/// after testharness.js defines `add_completion_callback`, and the
-/// completion callback receives the full `tests` array, so results that
-/// completed before registration are still observed.
+/// Splice the reporter `<script>` into `html` immediately after the
+/// `testharness.js` `</script>` tag (case-insensitive search), falling
+/// back to just before `</body>`, then before `</html>`, then to the end
+/// of the document. Early injection is deliberate: the reporter must run
+/// after testharness.js defines `add_completion_callback` but before the
+/// test's own scripts, because `setup({output:false,
+/// timeout_multiplier:8})` only takes effect before the first `test()`
+/// call — on the `</body>` fallback path, tests that already completed
+/// make `Tests.setup` a no-op (phase >= HAVE_RESULTS) and the multiplier
+/// silently never applies. The completion callback receives the full
+/// `tests` array, so results that completed before registration are
+/// still observed.
 ///
 /// `nonce` is this run's report nonce (see [`new_report_nonce`]),
 /// spliced as a closure `var` the page cannot reach from outside the
@@ -7749,9 +7837,9 @@ exit 0
 
     #[test]
     fn inject_reporter_follows_testharness_script_tag() {
-        // `setup({output:false})` only takes effect before the first
-        // `test()` call, so the reporter must land right after
-        // `testharness.js` loads, not at end of body.
+        // The reporter's `setup({output:false})` only takes effect
+        // before the first `test()` call, so the reporter must land
+        // right after `testharness.js` loads, not at end of body.
         let html = "<html><head><script src=\"/resources/testharness.js\"></script></head>\
             <body><script>test(function(){}, \"t\"); done();</script></body></html>";
         let page = inject_reporter(html, "dom/a.html", "testnonce");
@@ -7765,7 +7853,7 @@ exit 0
             "reporter after testharness.js"
         );
         assert!(reporter_pos < body_test, "reporter before first test()");
-        assert!(page.contains("setup({output:false})"));
+        assert!(page.contains("setup({output:false, timeout_multiplier:8})"));
     }
 
     #[test]
@@ -10314,7 +10402,7 @@ mod fixture_server_pipe_tests {
         let body = String::from_utf8(body).unwrap();
         assert!(body.contains("BOWSER_HARNESS_REPORT:"));
         // Injected immediately after the testharness.js script tag, so the
-        // reporter's `setup({output:false})` precedes the first `test()`.
+        // reporter's `setup(...)` precedes the first `test()`.
         let th = body.find("testharness.js").unwrap();
         let injected = body.find("BOWSER_HARNESS_REPORT:").unwrap();
         let under_test = body.find("<script src=\"/t.any.js\">").unwrap();

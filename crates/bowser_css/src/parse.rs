@@ -815,6 +815,17 @@ impl Parser<'_> {
             return Some(expand_shorthand(&prop, value, important));
         }
 
+        // `transition` takes comma-separated `<single-transition>`
+        // layers (CSS Transitions 2 §2); the generic value parser
+        // flattens comma groups, so layers split at the token level
+        // first (like `box-shadow` above). A value containing `var()`
+        // falls through to the generic path: `expand_shorthand`
+        // defers it and the cascade expands it after substitution
+        // (see `expand_transition_value`).
+        if prop == "transition" && !tokens_contain_var(toks) {
+            return parse_transition(toks, important);
+        }
+
         // Custom properties are token-preserving: store the raw token
         // stream verbatim and parse it only when a `var()` reference
         // substitutes it (see `Styler::resolve` in cascade.rs). Parsing
@@ -1458,10 +1469,272 @@ fn as_list(value: &CssValue) -> Vec<CssValue> {
 /// * After successful substitution, the cascade runs the same expansion
 ///   the parser would have (`expand_border_sides`, `expand_column_rule`,
 ///   `expand_border_radius`, `expand_background`, `expand_list_style`,
-///   `expand_box`, or the `font`
+///   `expand_box`, `expand_transition`, or the `font`
 ///   token parser),
 ///   emitting ALL longhands with omitted ones reset to initial values,
 ///   preserving `important`.
+///
+/// One `transition` layer's four shorthand longhands (CSS Transitions
+/// 2 §2): omitted components reset to their initials (`all` / `0s` /
+/// `0s` / `ease`). `transition-behavior` is NOT a shorthand longhand
+/// and never appears here.
+struct TransitionLayer {
+    property: CssValue,
+    duration: CssValue,
+    delay: CssValue,
+    timing: CssValue,
+}
+
+/// Classify one `<single-transition>` layer's components (in any
+/// order): at most one property ident, at most one timing function,
+/// at most two times (duration, then delay). `None` for any invalid
+/// shape: a duplicate component, a CSS-wide keyword (only valid as
+/// the whole value), a `transition-behavior` keyword (`normal` /
+/// `allow-discrete` are not shorthand components), a negative
+/// duration (invalid at computed-value time; rejecting it here drops
+/// the whole shorthand instead of leaving a half-applied longhand
+/// set), or any non-component value.
+fn classify_transition_layer(items: &[CssValue]) -> Option<TransitionLayer> {
+    let mut property = None;
+    let mut duration = None;
+    let mut delay = None;
+    let mut timing = None;
+    for item in items {
+        match item {
+            CssValue::Keyword(kw) => {
+                let k = kw.as_str();
+                if matches!(
+                    k,
+                    "inherit"
+                        | "initial"
+                        | "unset"
+                        | "revert"
+                        | "revert-layer"
+                        | "allow-discrete"
+                        | "normal"
+                ) {
+                    return None;
+                }
+                if matches!(
+                    k,
+                    "linear"
+                        | "ease"
+                        | "ease-in"
+                        | "ease-out"
+                        | "ease-in-out"
+                        | "step-start"
+                        | "step-end"
+                ) {
+                    if timing.is_some() {
+                        return None;
+                    }
+                    timing = Some(item.clone());
+                } else {
+                    // Any other ident is the transition property
+                    // (`none`, `all`, a property name, or a custom
+                    // property name); a second one invalidates.
+                    if property.is_some() {
+                        return None;
+                    }
+                    property = Some(item.clone());
+                }
+            }
+            CssValue::Time(t) => {
+                if duration.is_none() {
+                    if *t < 0.0 {
+                        return None;
+                    }
+                    duration = Some(item.clone());
+                } else if delay.is_none() {
+                    delay = Some(item.clone());
+                } else {
+                    return None;
+                }
+            }
+            // A unitless zero counts as `0s` (see the validators).
+            CssValue::Number(n) if *n == 0.0 => {
+                let zero = CssValue::Time(0.0);
+                if duration.is_none() {
+                    duration = Some(zero);
+                } else if delay.is_none() {
+                    delay = Some(zero);
+                } else {
+                    return None;
+                }
+            }
+            CssValue::TimingFunction(_) => {
+                if timing.is_some() {
+                    return None;
+                }
+                timing = Some(item.clone());
+            }
+            _ => return None,
+        }
+    }
+    Some(TransitionLayer {
+        property: property.unwrap_or_else(|| CssValue::Keyword("all".into())),
+        duration: duration.unwrap_or(CssValue::Time(0.0)),
+        delay: delay.unwrap_or(CssValue::Time(0.0)),
+        timing: timing.unwrap_or_else(|| CssValue::Keyword("ease".into())),
+    })
+}
+
+/// Emit `transition` longhands for classified layers: a single layer
+/// emits bare values; multiple layers emit one `List` per longhand
+/// (one entry per layer, in layer order).
+fn emit_transition_layers(layers: &[TransitionLayer]) -> Vec<(String, CssValue)> {
+    let one = |f: &dyn Fn(&TransitionLayer) -> CssValue| -> CssValue {
+        if layers.len() == 1 {
+            f(&layers[0])
+        } else {
+            CssValue::List(layers.iter().map(f).collect())
+        }
+    };
+    vec![
+        (
+            "transition-property".to_string(),
+            one(&|l| l.property.clone()),
+        ),
+        (
+            "transition-duration".to_string(),
+            one(&|l| l.duration.clone()),
+        ),
+        ("transition-delay".to_string(), one(&|l| l.delay.clone())),
+        (
+            "transition-timing-function".to_string(),
+            one(&|l| l.timing.clone()),
+        ),
+    ]
+}
+
+/// Expand a parsed `transition` value into its four longhands
+/// (shared by the eager shorthand arm in [`expand_shorthand`] and by
+/// the cascade's deferred-shorthand path, which calls this after
+/// `var()` substitution). Empty on any invalid shape. A CSS-wide
+/// keyword sets all four longhands to itself.
+///
+/// Comma structure survives substitution only as nested lists, so a
+/// substituted value is read as layers when every top-level item is
+/// itself a list; otherwise it is read as one layer, with a retry as
+/// layers when the one-layer parse fails (a substituted `overlay,
+/// color` arrives as a flat keyword list, which the one-layer parse
+/// rejects for two properties but the layer parse accepts). The one
+/// known misread: a substituted `2s, 1s` parses as one layer's
+/// duration + delay and never retries — the eager token-level
+/// parser ([`parse_transition`]) does not have this ambiguity.
+pub(crate) fn expand_transition_value(value: CssValue) -> Vec<(String, CssValue)> {
+    if let CssValue::Keyword(kw) = &value
+        && matches!(
+            kw.as_str(),
+            "inherit" | "initial" | "unset" | "revert" | "revert-layer"
+        )
+    {
+        return [
+            "transition-property",
+            "transition-duration",
+            "transition-delay",
+            "transition-timing-function",
+        ]
+        .iter()
+        .map(|p| (p.to_string(), value.clone()))
+        .collect();
+    }
+    if let CssValue::List(items) = &value
+        && items.iter().all(|i| matches!(i, CssValue::List(_)))
+        && !items.is_empty()
+    {
+        let mut layers = Vec::with_capacity(items.len());
+        for item in items {
+            match classify_transition_layer(&as_list(item)) {
+                Some(layer) => layers.push(layer),
+                None => return Vec::new(),
+            }
+        }
+        return emit_transition_layers(&layers);
+    }
+    match classify_transition_layer(&as_list(&value)) {
+        Some(layer) => emit_transition_layers(std::slice::from_ref(&layer)),
+        None => {
+            if let CssValue::List(items) = &value {
+                let mut layers = Vec::with_capacity(items.len());
+                for item in items {
+                    match classify_transition_layer(&as_list(item)) {
+                        Some(layer) => layers.push(layer),
+                        None => return Vec::new(),
+                    }
+                }
+                if layers.is_empty() {
+                    return Vec::new();
+                }
+                emit_transition_layers(&layers)
+            } else {
+                Vec::new()
+            }
+        }
+    }
+}
+
+/// Expand a parsed `transition` value into declarations (the
+/// [`expand_shorthand`] arm).
+fn expand_transition(value: CssValue, important: bool) -> Vec<Declaration> {
+    expand_transition_value(value)
+        .into_iter()
+        .map(|(name, v)| decl(PropertyName::intern(&name), v, important))
+        .collect()
+}
+
+/// Parse a `transition` declaration from tokens (CSS Transitions 2
+/// §2): split layers on top-level commas first (the generic value
+/// parser flattens comma groups), then classify each layer's
+/// components through the generic value parser (which handles `s` /
+/// `ms` times and `steps()` / `cubic-bezier()` timing functions).
+/// `None` for any invalid shape (an empty layer, a bad component, a
+/// negative duration). A sole CSS-wide keyword sets all four
+/// longhands to itself. Callers guarantee no `var()` in the tokens.
+fn parse_transition(toks: &[Token], important: bool) -> Option<Vec<Declaration>> {
+    let non_ws: Vec<&Token> = toks
+        .iter()
+        .filter(|t| !matches!(t, Token::Whitespace))
+        .collect();
+    if let [Token::Ident(kw)] = non_ws.as_slice()
+        && matches!(
+            kw.to_ascii_lowercase().as_str(),
+            "inherit" | "initial" | "unset" | "revert" | "revert-layer"
+        )
+    {
+        let v = CssValue::Keyword(kw.to_ascii_lowercase().into());
+        return Some(
+            [
+                "transition-property",
+                "transition-duration",
+                "transition-delay",
+                "transition-timing-function",
+            ]
+            .iter()
+            .map(|p| decl(PropertyName::intern(p), v.clone(), important))
+            .collect(),
+        );
+    }
+    let layer_toks: Vec<&[Token]> = match split_top_comma_tokens(toks) {
+        Some(layers) => layers,
+        None => vec![toks],
+    };
+    let mut layers = Vec::with_capacity(layer_toks.len());
+    for lt in layer_toks {
+        if lt.iter().all(|t| matches!(t, Token::Whitespace)) {
+            return None;
+        }
+        let value = parse_value(lt).ok()?;
+        layers.push(classify_transition_layer(&as_list(&value))?);
+    }
+    Some(
+        emit_transition_layers(&layers)
+            .into_iter()
+            .map(|(name, v)| decl(PropertyName::intern(&name), v, important))
+            .collect(),
+    )
+}
+
 fn expand_shorthand(property: &PropertyName, value: CssValue, important: bool) -> Vec<Declaration> {
     if value_contains_var(&value) {
         // Already interned at parse time: clone, don't re-intern (custom
@@ -1528,6 +1801,7 @@ fn expand_shorthand(property: &PropertyName, value: CssValue, important: bool) -
         "columns" => expand_columns(value, important),
         "column-rule" => expand_column_rule(value, important),
         "background" => expand_background(value, important),
+        "transition" => expand_transition(value, important),
         "list-style" => expand_list_style(value, important),
         "flex" => expand_flex(value, important),
         _ => vec![decl(property.clone(), value, important)],
@@ -2837,11 +3111,12 @@ fn split_top_comma_tokens(toks: &[Token]) -> Option<Vec<&[Token]>> {
 /// position and size cannot survive the generic value parser (like
 /// `font`'s `/` and `border-radius`'s `/`), and commas separate
 /// layers, so tokens are split at the top level first. A value
-/// containing any `var()` is NOT expanded here: it is stored as-is
+/// containing any `var()` is NOT expanded here: it is stored
 /// under the shorthand name and the cascade expands it after
 /// substitution (see `expand_shorthand` for the contract) — as a
-/// single slash-marker value, or as a list of per-layer values
-/// when commas are present.
+/// single slash-marker value, or, when commas are present, as a
+/// list of per-layer values wrapped once more per layer (see the
+/// comma branch) so layer boundaries survive substitution.
 fn parse_background(toks: &[Token], important: bool) -> Option<Vec<Declaration>> {
     match split_top_comma_tokens(toks) {
         None => {
@@ -2862,9 +3137,41 @@ fn parse_background(toks: &[Token], important: bool) -> Option<Vec<Declaration>>
             }
             let value = CssValue::List(layers);
             if value_contains_var(&value) {
+                // w80fix: author-level layer boundaries must survive
+                // `var()` substitution. A bare `List` of layers loses
+                // them: each `var()` splices flat into the enclosing
+                // list, so `var(--a), var(--b)` resolves exactly like
+                // the one-layer `var(--a) var(--b)` and the cascade
+                // can no longer tell layers apart (it merged them, or
+                // dropped the declaration when the merged position
+                // exceeded two items). Wrap each layer once more, so
+                // its resolved form is a single-item list holding the
+                // layer content: a `List` layer (multi-item or slash
+                // marker) wraps once, a scalar layer wraps twice (its
+                // substitution splices flat, so the inner list holds
+                // the substituted items). The cascade's layer-list
+                // arm unwraps one level before classifying, and the
+                // wrapped shape always defeats the slash-first arm
+                // (its `before` side is a single list, never a
+                // position item), so no provenance flag is needed and
+                // no shared substitution machinery changes: only this
+                // branch and the background expansion know the shape.
+                // A `var()` holding its own comma list still splices
+                // through: its groups land inside the wrapped layer
+                // and the expansion splits them back into layers.
+                let CssValue::List(layers) = value else {
+                    unreachable!("built as a list above")
+                };
+                let wrapped = layers
+                    .into_iter()
+                    .map(|layer| match layer {
+                        CssValue::List(items) => CssValue::List(vec![CssValue::List(items)]),
+                        scalar => CssValue::List(vec![CssValue::List(vec![scalar])]),
+                    })
+                    .collect();
                 return Some(vec![decl(
                     PropertyName::intern("background"),
-                    value,
+                    CssValue::List(wrapped),
                     important,
                 )]);
             }
@@ -4149,6 +4456,109 @@ mod tests {
         assert!(d.is_empty());
         let d = decls("p { border-inline: 1px 2px solid; }");
         assert!(d.is_empty());
+    }
+
+    #[test]
+    fn w80_transition_shorthand_expansion() {
+        use crate::value::{StepPosition, TimingFunction};
+        // Single layer, components in grammar order.
+        let d = decls("p { transition: overlay 2s; }");
+        assert_eq!(d.len(), 4);
+        assert_eq!(
+            get(&d, "transition-property"),
+            &CssValue::Keyword("overlay".into())
+        );
+        assert_eq!(get(&d, "transition-duration"), &CssValue::Time(2.0));
+        assert_eq!(get(&d, "transition-delay"), &CssValue::Time(0.0));
+        assert_eq!(
+            get(&d, "transition-timing-function"),
+            &CssValue::Keyword("ease".into())
+        );
+        // Any component order; ms normalizes to seconds; delay is the
+        // second time.
+        let d = decls("p { transition: 500ms linear overlay 250ms; }");
+        assert_eq!(
+            get(&d, "transition-property"),
+            &CssValue::Keyword("overlay".into())
+        );
+        assert_eq!(get(&d, "transition-duration"), &CssValue::Time(0.5));
+        assert_eq!(get(&d, "transition-delay"), &CssValue::Time(0.25));
+        assert_eq!(
+            get(&d, "transition-timing-function"),
+            &CssValue::Keyword("linear".into())
+        );
+        // Functional timing functions keep their structure.
+        let d = decls("p { transition: overlay 60s step-end; }");
+        assert_eq!(
+            get(&d, "transition-timing-function"),
+            &CssValue::Keyword("step-end".into())
+        );
+        let d = decls("p { transition: opacity 1s steps(1, end); }");
+        assert_eq!(
+            get(&d, "transition-timing-function"),
+            &CssValue::TimingFunction(TimingFunction::Steps {
+                count: 1,
+                position: StepPosition::End,
+            })
+        );
+        let d = decls("p { transition: opacity 1s cubic-bezier(0, 0.5, 1, 0.5); }");
+        assert_eq!(
+            get(&d, "transition-timing-function"),
+            &CssValue::TimingFunction(TimingFunction::CubicBezier {
+                x1: 0.0,
+                y1: 0.5,
+                x2: 1.0,
+                y2: 0.5,
+            })
+        );
+        // Multi-layer: one list entry per longhand, in layer order,
+        // with omitted components reset to initials per layer.
+        let d = decls("p { transition: overlay 2s, color 1s linear 0.5s; }");
+        assert_eq!(
+            get(&d, "transition-property"),
+            &CssValue::List(vec![
+                CssValue::Keyword("overlay".into()),
+                CssValue::Keyword("color".into()),
+            ])
+        );
+        assert_eq!(
+            get(&d, "transition-duration"),
+            &CssValue::List(vec![CssValue::Time(2.0), CssValue::Time(1.0)])
+        );
+        assert_eq!(
+            get(&d, "transition-delay"),
+            &CssValue::List(vec![CssValue::Time(0.0), CssValue::Time(0.5)])
+        );
+        // Omitted property resets to `all`, not to the other layer.
+        let d = decls("p { transition: 2s, color 1s; }");
+        assert_eq!(
+            get(&d, "transition-property"),
+            &CssValue::List(vec![
+                CssValue::Keyword("all".into()),
+                CssValue::Keyword("color".into()),
+            ])
+        );
+        // Wide keyword sets all four longhands.
+        let d = decls("p { transition: inherit; }");
+        assert_eq!(d.len(), 4);
+        assert!(
+            d.iter()
+                .all(|x| x.value == CssValue::Keyword("inherit".into()))
+        );
+        // Invalid layers drop the whole declaration: negative
+        // duration, three times, a duplicate property, a behavior
+        // keyword (not a shorthand component), a bad bezier.
+        assert!(decls("p { transition: overlay -1s; }").is_empty());
+        assert!(decls("p { transition: overlay 1s 2s 3s; }").is_empty());
+        assert!(decls("p { transition: overlay color 1s; }").is_empty());
+        assert!(decls("p { transition: overlay 1s allow-discrete; }").is_empty());
+        assert!(decls("p { transition: opacity 1s cubic-bezier(0, 0, 2, 1); }").is_empty());
+        assert!(decls("p { transition: overlay 1s,; }").is_empty());
+        // Longhands parse directly, including negative delays
+        // (grammar validation lives in the cascade, not the parser).
+        let d = decls("p { transition-duration: 100s; transition-delay: -50s; }");
+        assert_eq!(get(&d, "transition-duration"), &CssValue::Time(100.0));
+        assert_eq!(get(&d, "transition-delay"), &CssValue::Time(-50.0));
     }
 
     #[test]

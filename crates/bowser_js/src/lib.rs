@@ -66,6 +66,10 @@ mod bindings_encoding;
 mod bindings_storage;
 mod bindings_timers;
 mod bindings_url;
+/// Clock-at-read CSS Transitions engine for discrete properties
+/// (w80): [`transition::apply_transitions`] is hooked into the parse
+/// shim's `getComputedStyle`, where WPT testharness scripts run.
+mod transition;
 /// Viewport scroll state shared with the embedder: [`ScrollState`] is the
 /// tab's scroll offset (and its content-bound maximum), [`share_scroll_state`]
 /// attaches it to a page's web APIs so `window.scrollTo` and friends

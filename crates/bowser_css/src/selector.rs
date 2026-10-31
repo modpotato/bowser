@@ -131,6 +131,10 @@ pub(crate) enum PseudoClass {
     Focus,
     /// `:checked`: checked checkbox/radio inputs and selected options.
     Checked,
+    /// `:popover-open`: an element with a `popover` attribute that is
+    /// currently in the document's top layer (see
+    /// [`bowser_dom::Document::is_popover_open`]).
+    PopoverOpen,
     /// `:disabled` / `:enabled`: disableable form controls.
     Disabled,
     Enabled,
@@ -781,6 +785,7 @@ fn parse_pseudo(cur: &mut SelCursor, c: &mut CompoundSelector) -> Result<(), Sel
                 "active" => c.pseudos.push(PseudoClass::Active),
                 "focus" => c.pseudos.push(PseudoClass::Focus),
                 "checked" => c.pseudos.push(PseudoClass::Checked),
+                "popover-open" => c.pseudos.push(PseudoClass::PopoverOpen),
                 "disabled" => c.pseudos.push(PseudoClass::Disabled),
                 "enabled" => c.pseudos.push(PseudoClass::Enabled),
                 // Legacy single-colon pseudo-elements.
