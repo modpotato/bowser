@@ -4203,6 +4203,22 @@ fn install_web_apis_inner(
             // Node/Element surface shared by every element wrapper (and the
             // document wrapper, whose prototype is `element_proto`).
             def_native(heap, element_proto, "getAttribute", n_get_attribute)?;
+            // w79k follow-up: `Element.hasAttribute` never existed on
+            // any wrapper (not even the parse shim), so
+            // table-model-fixup-2's step body threw `callee is not a
+            // function` at `root.hasAttribute("unequal")` even after
+            // `querySelector` landed — the probe page isolated it.
+            //
+            // Known deviation, same pre-existing class as
+            // `getAttribute` / `matches` / `closest`: text and comment
+            // wrappers share this prototype, so they see
+            // `hasAttribute` / `querySelector` too, where browsers
+            // give `undefined` (the sibling accessors are the
+            // exception: `NonDocumentTypeChildNode` covers
+            // `CharacterData` / `DocumentType`, so those are correct
+            // on text nodes). Left as-is: fixing it would need a
+            // separate prototype per node kind.
+            def_native(heap, element_proto, "hasAttribute", n_has_attribute)?;
             def_native(heap, element_proto, "setAttribute", n_set_attribute)?;
             def_native(heap, element_proto, "removeAttribute", n_remove_attribute)?;
             def_native(heap, element_proto, "appendChild", n_append_child)?;
@@ -4210,6 +4226,24 @@ fn install_web_apis_inner(
             def_native(heap, element_proto, "removeChild", n_remove_child)?;
             def_native(heap, element_proto, "matches", n_matches)?;
             def_native(heap, element_proto, "closest", n_closest)?;
+            // w79k: `Element.querySelector`/`querySelectorAll`, scoped
+            // to the receiver's descendants. (The parse shim's versions
+            // are stripped at upgrade, and until now `element_proto`
+            // never defined them, so every post-upgrade element read
+            // threw `callee is not a function` — the root cause of
+            // table-model-fixup-2 failing 40/40.)
+            def_native(
+                heap,
+                element_proto,
+                "querySelector",
+                n_element_query_selector,
+            )?;
+            def_native(
+                heap,
+                element_proto,
+                "querySelectorAll",
+                n_element_query_selector_all,
+            )?;
             // `Element.attachShadow` / `ShadowRoot` (minimal viable
             // shadow DOM — see `n_attach_shadow`). The shadow root
             // wrapper shares this prototype, so `shadowRoot.appendChild`
@@ -4379,6 +4413,32 @@ fn install_web_apis_inner(
             // `n_element_focus`). Pages call `scroller.focus()` before
             // scrolling; without this the call throws.
             def_native(heap, element_proto, "focus", n_element_focus)?;
+            // `NonDocumentTypeChildNode.nextElementSibling` /
+            // `previousElementSibling` (w79): the parse shim defined
+            // these as own accessors, but the upgrade strips every
+            // shim own name (see `SHIM_ELEMENT_OWN_NAMES`) and
+            // `sync_props` never redefined them, so production
+            // wrappers answered `undefined` and any
+            // `el.nextElementSibling.nextElementSibling` chain threw
+            // (table-model-fixup-2's DOMContentLoaded handler, which
+            // registers its async_tests only after that chain).
+            // Live prototype accessors, like `childNodes` above, so
+            // fresh and upgraded wrappers both see them, and a stale
+            // shim accessor can never shadow them.
+            def_accessor(
+                heap,
+                element_proto,
+                "nextElementSibling",
+                n_next_element_sibling_get,
+                n_readonly_set,
+            )?;
+            def_accessor(
+                heap,
+                element_proto,
+                "previousElementSibling",
+                n_previous_element_sibling_get,
+                n_readonly_set,
+            )?;
             Ok(())
         },
     )?;
@@ -4481,6 +4541,19 @@ fn install_web_apis_inner(
             def_native(heap, doc_obj, "elementFromPoint", n_element_from_point)?;
             def_native(heap, doc_obj, "querySelector", n_query_selector)?;
             def_native(heap, doc_obj, "querySelectorAll", n_query_selector_all)?;
+            // w79fix: `Document` has no `hasAttribute` and no
+            // `nextElementSibling` / `previousElementSibling`, but the
+            // document wrapper's prototype is `element_proto`, so
+            // without an own property JS dispatch would resolve the
+            // prototype members and answer `false` / `null`. Browsers
+            // give `undefined` for all three, so shadow them with own
+            // `undefined`-valued properties — the same own-property
+            // shadowing mechanism as `querySelector` above, but with
+            // `undefined` because the document has no such member at
+            // all (unlike `querySelector`, which it redefines).
+            def(heap, doc_obj, "hasAttribute", Value::Undefined)?;
+            def(heap, doc_obj, "nextElementSibling", Value::Undefined)?;
+            def(heap, doc_obj, "previousElementSibling", Value::Undefined)?;
             def_native(
                 heap,
                 doc_obj,
@@ -6133,6 +6206,66 @@ fn n_child_nodes_get(heap: &mut Heap, this: Value, _args: &[Value]) -> Result<Va
         },
     )?;
     Ok(Value::Object(arr))
+}
+
+/// `el.nextElementSibling` / `el.previousElementSibling` (production
+/// wrappers; the parse shim has its own at
+/// [`n_parse_el_next_sibling_get`] / [`n_parse_el_prev_sibling_get`]):
+/// the nearest sibling that is an element, skipping text, comment,
+/// and other non-element nodes exactly as the shim's
+/// `sibling_element` does, or `null` at the ends. Never `undefined`:
+/// a chain like `el.nextElementSibling.nextElementSibling` must
+/// either land on an element or on `null`, never throw on a missing
+/// property (the table-model-fixup-2 failure mode).
+fn n_next_element_sibling_get(
+    heap: &mut Heap,
+    this: Value,
+    _args: &[Value],
+) -> Result<Value, NativeError> {
+    element_sibling_get(heap, this, true)
+}
+
+fn n_previous_element_sibling_get(
+    heap: &mut Heap,
+    this: Value,
+    _args: &[Value],
+) -> Result<Value, NativeError> {
+    element_sibling_get(heap, this, false)
+}
+
+fn element_sibling_get(heap: &mut Heap, this: Value, next: bool) -> Result<Value, NativeError> {
+    let rc = apis_rc(heap, this)?;
+    let node = target_node(heap, this, &rc.borrow())?;
+    // Resolve the sibling id first, under a short document borrow;
+    // wrapping it afterwards never holds the document borrow across
+    // `wrap_node` (same discipline as [`sync_props`]).
+    let sib = {
+        let doc_rc = rc.borrow().live_document()?;
+        let doc = doc_rc.borrow();
+        let mut cursor = if next {
+            doc.next_sibling(node)
+        } else {
+            doc.previous_sibling(node)
+        };
+        while let Some(c) = cursor {
+            if matches!(doc.kind(c), NodeKind::Element(_)) {
+                break;
+            }
+            cursor = if next {
+                doc.next_sibling(c)
+            } else {
+                doc.previous_sibling(c)
+            };
+        }
+        cursor
+    };
+    match sib {
+        Some(s) => {
+            let mut g = rc.borrow_mut();
+            Ok(wrap_node(heap, &mut g, s)?)
+        }
+        None => Ok(Value::Null),
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -11325,6 +11458,30 @@ fn n_get_attribute(heap: &mut Heap, this: Value, args: &[Value]) -> Result<Value
     }
 }
 
+/// `Element.hasAttribute`: true when the receiver carries the named
+/// attribute. Mirrors [`n_get_attribute`] (same name resolution and
+/// receiver handling); the presence test is `get_attribute(...).is_some()`.
+///
+/// Known deviation, shared with the document API and left unchanged
+/// so the element API does not diverge from it: a missing argument
+/// stringifies to `"undefined"`, and an invalid attribute name
+/// returns `false` instead of throwing `InvalidCharacterError`.
+fn n_has_attribute(heap: &mut Heap, this: Value, args: &[Value]) -> Result<Value, NativeError> {
+    let rc = apis_rc(heap, this)?;
+    let node = {
+        let g = rc.borrow();
+        target_node(heap, this, &g)?
+    };
+    let name = arg_to_string(
+        &mut *heap,
+        args.first().copied().unwrap_or(Value::Undefined),
+    )?;
+    let g = rc.borrow();
+    let doc_rc = g.live_document()?;
+    let doc = doc_rc.borrow();
+    Ok(Value::Bool(doc.get_attribute(node, &name).is_some()))
+}
+
 fn n_set_attribute(heap: &mut Heap, this: Value, args: &[Value]) -> Result<Value, NativeError> {
     let rc = apis_rc(heap, this)?;
     let node = {
@@ -11824,6 +11981,522 @@ fn n_closest(heap: &mut Heap, this: Value, args: &[Value]) -> Result<Value, Nati
         }
         None => Ok(Value::Null),
     }
+}
+
+/// Scope-relative selector support for `Element.querySelector` /
+/// `querySelectorAll` (w79fix). The shared document parser rejects a
+/// leading combinator and rejects `:` in a type selector, so
+/// `el.querySelector("> p")`, `el.querySelector(":scope > p")`, and
+/// `el.querySelector(":scope")` all threw `SyntaxError` even though
+/// the DOM spec allows them on an element (`:scope` denotes the
+/// receiver). The document path is deliberately untouched, so
+/// `document.querySelector` still rejects those same strings: only
+/// the element path below routes scope-relative groups through this
+/// evaluator, and every other group still goes through the shared
+/// `Document::query_selector_all_in` unchanged.
+///
+/// A scope-relative group is evaluated left to right from the
+/// receiver: `:scope` (plus any trailing simple selectors on the same
+/// compound, e.g. `:scope.a`) is the start set, a leading combinator
+/// starts from the receiver, and each step expands through children
+/// (`>`), descendants (whitespace), the next element sibling (`+`),
+/// or following element siblings (`~`), testing each candidate with
+/// `Document::matches` on the single compound. That makes
+/// `:scope`-anchored sibling steps able to return nodes outside the
+/// receiver's subtree, as in browsers, while plain groups stay
+/// descendant-only. Every compound is validated up front with a probe
+/// `matches` call, so a bad compound throws even when the receiver
+/// has no candidates to test it against (the shared path's
+/// fail-before-parse contract).
+fn split_selector_groups(sel: &str) -> Vec<&str> {
+    let bytes = sel.as_bytes();
+    let mut groups = Vec::new();
+    let mut start = 0usize;
+    let mut depth = 0u32;
+    let mut quote: Option<u8> = None;
+    let mut i = 0usize;
+    while i < bytes.len() {
+        let c = bytes[i];
+        if let Some(q) = quote {
+            if c == q {
+                quote = None;
+            }
+        } else {
+            match c {
+                b'\'' | b'"' => quote = Some(c),
+                b'[' => depth += 1,
+                b']' => depth = depth.saturating_sub(1),
+                b',' if depth == 0 => {
+                    groups.push(sel[start..i].trim());
+                    start = i + 1;
+                }
+                _ => {}
+            }
+        }
+        i += 1;
+    }
+    groups.push(sel[start..].trim());
+    groups
+}
+
+fn is_scope_relative_group(group: &str) -> bool {
+    let g = group.trim_start();
+    if g.starts_with('>') || g.starts_with('+') || g.starts_with('~') {
+        return true;
+    }
+    if let Some(rest) = g.strip_prefix(":scope") {
+        return rest.is_empty()
+            || rest.starts_with(|c: char| {
+                matches!(
+                    c,
+                    ' ' | '\t' | '\n' | '\r' | '>' | '+' | '~' | '.' | '#' | '[' | ':' | '*'
+                )
+            });
+    }
+    false
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ScopeCombinator {
+    Child,
+    NextSibling,
+    SubsequentSibling,
+    Descendant,
+}
+
+#[derive(Debug, Clone, Copy)]
+enum ScopeToken<'a> {
+    Comb(ScopeCombinator),
+    Compound(&'a str),
+}
+
+/// Split one scope-relative group into combinator / compound tokens.
+/// Whitespace between compounds is the implicit descendant combinator
+/// (recorded at evaluation, not here); `>`/`+`/`~` and whitespace
+/// inside `[...]` or quotes never split.
+fn tokenize_scope_group(group: &str) -> Result<Vec<ScopeToken<'_>>, NativeError> {
+    let err = || NativeError::SyntaxError("invalid scope-relative selector".to_string());
+    let bytes = group.as_bytes();
+    let mut tokens = Vec::new();
+    let mut i = 0usize;
+    while i < bytes.len() {
+        let b = bytes[i];
+        if b.is_ascii_whitespace() {
+            i += 1;
+            continue;
+        }
+        if b == b'>' || b == b'+' || b == b'~' {
+            tokens.push(ScopeToken::Comb(match b {
+                b'>' => ScopeCombinator::Child,
+                b'+' => ScopeCombinator::NextSibling,
+                _ => ScopeCombinator::SubsequentSibling,
+            }));
+            i += 1;
+            continue;
+        }
+        let start = i;
+        let mut quote: Option<u8> = None;
+        let mut depth = 0u32;
+        while i < bytes.len() {
+            let c = bytes[i];
+            if let Some(q) = quote {
+                if c == q {
+                    quote = None;
+                }
+                i += 1;
+                continue;
+            }
+            match c {
+                b'\'' | b'"' => {
+                    quote = Some(c);
+                    i += 1;
+                }
+                b'[' => {
+                    depth += 1;
+                    i += 1;
+                }
+                b']' => {
+                    depth = depth.saturating_sub(1);
+                    i += 1;
+                }
+                b'>' | b'+' | b'~' if depth == 0 => break,
+                _ if c.is_ascii_whitespace() && depth == 0 => break,
+                _ => i += 1,
+            }
+        }
+        if start == i {
+            return Err(err());
+        }
+        tokens.push(ScopeToken::Compound(&group[start..i]));
+    }
+    if tokens.is_empty() {
+        return Err(err());
+    }
+    Ok(tokens)
+}
+
+fn syntax_err(e: impl std::fmt::Display) -> NativeError {
+    NativeError::SyntaxError(e.to_string())
+}
+
+/// Byte index of a genuine `:scope` pseudo in `s`, i.e. one outside
+/// `[...]`/`(...)`/quotes and followed by the end of the compound or
+/// a simple-selector delimiter (`.`, `#`, `[`, `:`, `*`). A trailing
+/// name character (as in `:scopefoo`) is not a `:scope` pseudo, so
+/// such a compound falls through to the shared parser and throws.
+fn scope_pseudo_index(s: &str) -> Option<usize> {
+    let bytes = s.as_bytes();
+    let mut i = 0usize;
+    let mut bracket = 0u32;
+    let mut paren = 0u32;
+    let mut quote: Option<u8> = None;
+    while i < bytes.len() {
+        let b = bytes[i];
+        if let Some(q) = quote {
+            if b == q {
+                quote = None;
+            }
+            i += 1;
+            continue;
+        }
+        match b {
+            b'\'' | b'"' => quote = Some(b),
+            b'[' => bracket += 1,
+            b']' => bracket = bracket.saturating_sub(1),
+            b'(' => paren += 1,
+            b')' => paren = paren.saturating_sub(1),
+            b':' if bracket == 0 && paren == 0 && s[i..].starts_with(":scope") => {
+                let after = &s[i + ":scope".len()..];
+                if after.is_empty()
+                    || after.starts_with(|c: char| ['.', '#', '[', ':', '*'].contains(&c))
+                {
+                    return Some(i);
+                }
+            }
+            _ => {}
+        }
+        i += 1;
+    }
+    None
+}
+
+/// Match a compound that may contain `:scope` against `candidate`:
+/// the `:scope` part means "is the receiver", the remainder matches
+/// via the shared parser. Compounds without a genuine `:scope`
+/// pseudo go straight to the shared parser (so they still throw).
+fn matches_scope_compound(
+    doc: &Document,
+    candidate: NodeId,
+    scope: NodeId,
+    s: &str,
+) -> Result<bool, NativeError> {
+    let Some(idx) = scope_pseudo_index(s) else {
+        return doc.matches(candidate, s).map_err(syntax_err);
+    };
+    let stripped = format!("{}{}", &s[..idx], &s[idx + ":scope".len()..]);
+    let rest_ok = if scope_pseudo_index(&stripped).is_some() {
+        matches_scope_compound(doc, candidate, scope, &stripped)?
+    } else if stripped.is_empty() {
+        true
+    } else {
+        doc.matches(candidate, &stripped).map_err(syntax_err)?
+    };
+    Ok(candidate == scope && rest_ok)
+}
+
+/// Validate a compound that may contain `:scope`: validate the
+/// remainder after removing the `:scope` pseudo, so `div:scope` and
+/// bare `:scope` in a later position do not throw in the probe while
+/// a genuinely bad remainder (`:scope > :bad`) still does.
+fn validate_scope_compound(doc: &Document, scope: NodeId, s: &str) -> Result<(), NativeError> {
+    let Some(idx) = scope_pseudo_index(s) else {
+        return doc.matches(scope, s).map_err(syntax_err).map(|_| ());
+    };
+    let stripped = format!("{}{}", &s[..idx], &s[idx + ":scope".len()..]);
+    if scope_pseudo_index(&stripped).is_some() {
+        return validate_scope_compound(doc, scope, &stripped);
+    }
+    if stripped.is_empty() {
+        return Ok(());
+    }
+    doc.matches(scope, &stripped)
+        .map_err(syntax_err)
+        .map(|_| ())
+}
+
+/// Evaluate one scope-relative group against `scope` (see the header
+/// comment above [`split_selector_groups`]).
+fn eval_scope_group(
+    doc: &Document,
+    scope: NodeId,
+    group: &str,
+) -> Result<Vec<NodeId>, NativeError> {
+    let err = || NativeError::SyntaxError("invalid scope-relative selector".to_string());
+    let tokens = tokenize_scope_group(group)?;
+    // Validate every compound up front (probe `matches` on the scope
+    // itself: parsing happens before any element test, so this throws
+    // on a bad compound even with zero candidates).
+    for tok in &tokens {
+        if let ScopeToken::Compound(s) = tok {
+            validate_scope_compound(doc, scope, s)?;
+        }
+    }
+    let mut current: Vec<NodeId> = Vec::new();
+    let mut idx = 0usize;
+    match tokens.first() {
+        Some(ScopeToken::Compound(s)) if s.starts_with(":scope") => {
+            // The leading compound is the receiver filtered by its
+            // trailing simple selectors (`.a`, `#x`, `[attr]`,
+            // `:pseudo`, `*`); a non-`:scope` rest such as
+            // `:scopefoo` was already rejected by the probe above.
+            if !matches_scope_compound(doc, scope, scope, s)? {
+                return Ok(Vec::new());
+            }
+            current.push(scope);
+            idx = 1;
+        }
+        Some(ScopeToken::Comb(_)) => {
+            current.push(scope);
+        }
+        _ => return Err(err()),
+    }
+    let mut comb: Option<ScopeCombinator> = None;
+    for tok in tokens.iter().skip(idx) {
+        match tok {
+            ScopeToken::Comb(c) => {
+                if comb.is_some() {
+                    return Err(err());
+                }
+                comb = Some(*c);
+            }
+            ScopeToken::Compound(s) => {
+                let c = comb.take().unwrap_or(ScopeCombinator::Descendant);
+                let mut next: Vec<NodeId> = Vec::new();
+                let mut seen: HashSet<NodeId> = HashSet::new();
+                for &n in &current {
+                    match c {
+                        ScopeCombinator::Child => {
+                            for kid in doc.children(n) {
+                                if matches!(doc.kind(kid), NodeKind::Element(_))
+                                    && matches_scope_compound(doc, kid, scope, s)?
+                                {
+                                    next.push(kid);
+                                }
+                            }
+                        }
+                        ScopeCombinator::Descendant => {
+                            for d in doc.descendants(n) {
+                                if matches!(doc.kind(d), NodeKind::Element(_))
+                                    && seen.insert(d)
+                                    && matches_scope_compound(doc, d, scope, s)?
+                                {
+                                    next.push(d);
+                                }
+                            }
+                        }
+                        ScopeCombinator::NextSibling => {
+                            let mut cursor = doc.next_sibling(n);
+                            while let Some(sib) = cursor {
+                                if matches!(doc.kind(sib), NodeKind::Element(_)) {
+                                    if matches_scope_compound(doc, sib, scope, s)? {
+                                        next.push(sib);
+                                    }
+                                    break;
+                                }
+                                cursor = doc.next_sibling(sib);
+                            }
+                        }
+                        ScopeCombinator::SubsequentSibling => {
+                            let mut cursor = doc.next_sibling(n);
+                            while let Some(sib) = cursor {
+                                if matches!(doc.kind(sib), NodeKind::Element(_))
+                                    && matches_scope_compound(doc, sib, scope, s)?
+                                {
+                                    next.push(sib);
+                                }
+                                cursor = doc.next_sibling(sib);
+                            }
+                        }
+                    }
+                }
+                current = next;
+                if current.is_empty() {
+                    break;
+                }
+            }
+        }
+    }
+    if comb.is_some() {
+        return Err(err());
+    }
+    Ok(current)
+}
+
+/// Element-scoped `querySelectorAll`: the shared
+/// `Document::query_selector_all_in` when no group is scope-relative
+/// (zero behavior change there), otherwise each group evaluated
+/// separately — scope-relative groups by [`eval_scope_group`], the
+/// rest by the shared path — unioned in document order. One bad group
+/// fails the whole call, as in the shared path.
+fn element_query_all_in(
+    doc: &Document,
+    scope: NodeId,
+    sel: &str,
+) -> Result<Vec<NodeId>, NativeError> {
+    let groups = split_selector_groups(sel);
+    if groups.iter().all(|g| !is_scope_relative_group(g)) {
+        return doc.query_selector_all_in(scope, sel).map_err(syntax_err);
+    }
+    let mut out: Vec<NodeId> = Vec::new();
+    let mut seen: HashSet<NodeId> = HashSet::new();
+    for g in &groups {
+        let nodes = if is_scope_relative_group(g) {
+            eval_scope_group(doc, scope, g)?
+        } else {
+            doc.query_selector_all_in(scope, g).map_err(syntax_err)?
+        };
+        for n in nodes {
+            if seen.insert(n) {
+                out.push(n);
+            }
+        }
+    }
+    // Document order: position in the root preorder walk. Nodes
+    // outside that walk (a detached subtree) order by their own
+    // subtree's preorder walk instead of evaluation (group) order,
+    // so `qsa("p, :scope")` on a detached subtree yields the scope
+    // before its `p` child. Attached nodes sort before detached
+    // ones; the stable sort keeps any remaining ties in order.
+    let preorder = doc.descendants(doc.root());
+    let mut pos: HashMap<NodeId, usize> = HashMap::with_capacity(preorder.len());
+    for (i, n) in preorder.iter().enumerate() {
+        pos.insert(*n, i);
+    }
+    let mut detached_root = scope;
+    while let Some(parent) = doc.parent(detached_root) {
+        detached_root = parent;
+    }
+    let mut detached_pos: HashMap<NodeId, usize> = HashMap::new();
+    if detached_root != doc.root() {
+        detached_pos.insert(detached_root, 0);
+        for (i, n) in doc.descendants(detached_root).iter().enumerate() {
+            detached_pos.insert(*n, i + 1);
+        }
+    }
+    out.sort_by(|a, b| match (pos.get(a), pos.get(b)) {
+        (Some(x), Some(y)) => x.cmp(y),
+        (None, None) => detached_pos
+            .get(a)
+            .copied()
+            .unwrap_or(usize::MAX)
+            .cmp(&detached_pos.get(b).copied().unwrap_or(usize::MAX)),
+        (Some(_), None) => std::cmp::Ordering::Less,
+        (None, Some(_)) => std::cmp::Ordering::Greater,
+    });
+    Ok(out)
+}
+
+/// `Element.querySelector`: first descendant of the receiver (never
+/// the receiver itself) matching the selector, in document order, or
+/// `null`. Mirrors [`n_closest`]: the receiver resolves via
+/// [`target_node`] against the live document, and a bad selector raises
+/// `SyntaxError` like [`n_query_selector`] does. The document wrapper
+/// keeps its own document-wide `querySelector` (installed on `doc_obj`,
+/// shadowing this prototype method), so this scoped form only ever
+/// serves element receivers.
+///
+/// Scope-relative selectors (`:scope`, a leading combinator) are
+/// handled by [`element_query_all_in`]: `:scope` alone matches the
+/// receiver itself, and `:scope`-anchored sibling steps may match
+/// outside the receiver's subtree, per the DOM spec. Argument
+/// handling is deliberately the same as the document API — a missing
+/// argument stringifies to `"undefined"` — a known deviation shared
+/// with [`n_query_selector`], not diverged here.
+fn n_element_query_selector(
+    heap: &mut Heap,
+    this: Value,
+    args: &[Value],
+) -> Result<Value, NativeError> {
+    let rc = apis_rc(heap, this)?;
+    let node = {
+        let g = rc.borrow();
+        target_node(heap, this, &g)?
+    };
+    let sel = arg_to_string(
+        &mut *heap,
+        args.first().copied().unwrap_or(Value::Undefined),
+    )?;
+    let found = {
+        let doc_rc = rc.borrow().live_document()?;
+        let doc = doc_rc.borrow();
+        element_query_all_in(&doc, node, &sel)?.into_iter().next()
+    };
+    match found {
+        Some(n) => {
+            let mut g = rc.borrow_mut();
+            wrap_node(heap, &mut g, n).map_err(|_| NativeError::OutOfMemory)
+        }
+        None => Ok(Value::Null),
+    }
+}
+
+/// `Element.querySelectorAll`: every descendant of the receiver (never
+/// the receiver itself) matching the selector, in document order.
+/// Same Array-shaped, `node_list_proto`-linked result as the document
+/// [`n_query_selector_all`] (mirrored, not shared: the document form
+/// queries whole-document, this one queries the receiver's subtree).
+/// Scope-relative groups are evaluated by [`element_query_all_in`]
+/// (see [`split_selector_groups`]); a `:scope`-only selector yields
+/// the receiver itself, the one exception to "never the receiver".
+fn n_element_query_selector_all(
+    heap: &mut Heap,
+    this: Value,
+    args: &[Value],
+) -> Result<Value, NativeError> {
+    let rc = apis_rc(heap, this)?;
+    let node = {
+        let g = rc.borrow();
+        target_node(heap, this, &g)?
+    };
+    let sel = arg_to_string(
+        &mut *heap,
+        args.first().copied().unwrap_or(Value::Undefined),
+    )?;
+    let nodes = {
+        let doc_rc = rc.borrow().live_document()?;
+        let doc = doc_rc.borrow();
+        element_query_all_in(&doc, node, &sel)?
+    };
+    // Array-kind object with indexed properties, per builtin_object_array.
+    let arr = heap
+        .alloc_object(Object::new(ObjectKind::Array))
+        .map_err(|_| NativeError::OutOfMemory)?;
+    let proto = rc.borrow().gc_roots.borrow().node_list_proto;
+    // `arr` is unreachable from any GC root until the caller roots the
+    // returned value; `wrap_node` allocates, so hold a temporary root
+    // across the fill.
+    with_temp_root(
+        heap,
+        Value::Object(arr),
+        |heap| -> Result<(), NativeError> {
+            link_node_list_proto(heap, arr, proto);
+            let mut g = rc.borrow_mut();
+            for (i, n) in nodes.iter().enumerate() {
+                let w = wrap_node(heap, &mut g, *n).map_err(|_| NativeError::OutOfMemory)?;
+                // `w` may be a weak-cache wrapper invisible to the
+                // collector: root it across the allocating `def` (its
+                // key interning can trigger a threshold collection)
+                // until the array links it in, like `n_child_nodes_get`.
+                with_temp_root(heap, w, |heap| {
+                    def(heap, arr, &i.to_string(), w).map_err(|_| NativeError::OutOfMemory)
+                })?;
+            }
+            def(heap, arr, "length", Value::Int(nodes.len() as i32))
+                .map_err(|_| NativeError::OutOfMemory)?;
+            Ok(())
+        },
+    )?;
+    Ok(Value::Object(arr))
 }
 
 fn str_of(html: &str, heap: &mut Heap) -> Result<Value, NativeError> {
@@ -17037,6 +17710,21 @@ const STYLE_PROPS: &[&str] = &[
     "empty-cells",
     "color",
     "background-color",
+    // w79fix: the seven layered `background` longhands. The
+    // cascade carries all eight background longhands (see the
+    // initials in `bowser_css`), so adding them here is what
+    // lets `synthesize_computed_shorthands` fire for `background`
+    // on the live surface (it previously read `""` because the
+    // props map never carried image/repeat/position/size/
+    // attachment/origin/clip). The `background` shorthand itself
+    // is synthesized, never a slot, like `gap`/`margin`.
+    "background-image",
+    "background-position",
+    "background-size",
+    "background-repeat",
+    "background-attachment",
+    "background-origin",
+    "background-clip",
     // w78fix M4 (cascade slots landed by F-cascade): the color
     // longhands `outline-color` and `text-decoration-color` have
     // computed slots, so the live surface exposes them (like
@@ -17059,6 +17747,11 @@ const STYLE_PROPS: &[&str] = &[
     "visibility",
     "opacity",
     "z-index",
+    // CSS Position 4 (w79 phase 1): `overlay` has its own computed
+    // slot in `bowser_css`, so the live surface exposes it; the value
+    // is `none` for every non-top-layer element (UA rule), and
+    // top-layer promotion is phase 2 work.
+    "overlay",
     // CSS Overflow 3 axes: the physical longhands and the logical
     // longhands (each longhand has its own computed slot in
     // `bowser_css`; the `overflow` shorthand itself is serialized from
@@ -17159,6 +17852,25 @@ fn css_value_to_string(v: &CssValue) -> String {
                 .join(" ")
         ),
         CssValue::Color(c) => {
+            if c.a == 255 {
+                format!("rgb({}, {}, {})", c.r, c.g, c.b)
+            } else {
+                format!(
+                    "rgba({}, {}, {}, {})",
+                    c.r,
+                    c.g,
+                    c.b,
+                    f32::from(c.a) / 255.0
+                )
+            }
+        }
+        // w79: the canonical serializer is keyword-blind on purpose:
+        // a named color serializes as rgb()/rgba() here, so every
+        // computed path (which uses this function directly) keeps
+        // the w78fix3 invariant. The specified path prefers the
+        // keyword via `decl_value_preserving_math` /
+        // `specified_color_keyword` before ever reaching this arm.
+        CssValue::NamedColor { color: c, .. } => {
             if c.a == 255 {
                 format!("rgb({}, {}, {})", c.r, c.g, c.b)
             } else {
@@ -17423,6 +18135,27 @@ fn cssom_computed_value(prop: &str, value: &CssValue) -> String {
         && matches!(value, CssValue::Number(n) if *n == 0.0)
     {
         return "0px".to_string();
+    }
+    // w79: layered `background` longhands (see the matching arm in
+    // `decl_value_preserving_math`): layers join with `", "`.
+    if matches!(
+        prop,
+        "background-image"
+            | "background-position"
+            | "background-size"
+            | "background-repeat"
+            | "background-attachment"
+            | "background-origin"
+            | "background-clip"
+    ) && let CssValue::List(items) = value
+        && !items.is_empty()
+        && items.iter().all(|i| matches!(i, CssValue::List(_)))
+    {
+        return items
+            .iter()
+            .map(css_value_to_string)
+            .collect::<Vec<_>>()
+            .join(", ");
     }
     css_value_to_string(value)
 }
@@ -21824,7 +22557,10 @@ fn decl_value_canonical_preserving_math(
             }
         }
     }
-    css_value_to_string(value)
+    // w79: route through the property-aware computed serializer so
+    // layered `background` longhands comma-join (see
+    // `cssom_computed_value`) instead of space-joining.
+    cssom_computed_value(prop, value)
 }
 
 /// The computed-value counterpart of [`style_decls_from_text`]:
@@ -22051,13 +22787,42 @@ fn decl_value_preserving_math(
             }
         }
     }
+    // w79: a parsed named color carries its keyword in the value, so
+    // the specified surface prefers it directly — no raw-text scan
+    // needed, which is exactly what makes shorthand-expanded
+    // longhands (`border-color: aqua` -> `border-top-color`) read
+    // back as `aqua`: the raw entry belongs to the shorthand name,
+    // not the longhand. A list of named colors joins its keywords.
+    // Plain `Color` values still go through the raw scan below (hex
+    // and functional authorship keep rgb()/rgba()).
+    if let CssValue::NamedColor { keyword, .. } = value {
+        return keyword.as_str().to_owned();
+    }
+    if let CssValue::List(items) = value
+        && !items.is_empty()
+        && items
+            .iter()
+            .all(|i| matches!(i, CssValue::NamedColor { .. }))
+    {
+        return items
+            .iter()
+            .map(|i| match i {
+                CssValue::NamedColor { keyword, .. } => keyword.as_str(),
+                _ => unreachable!("all items are named colors"),
+            })
+            .collect::<Vec<_>>()
+            .join(" ");
+    }
     // Named colors / `transparent`: scan the unused raw entries for
     // this property for one whose keyword(s) re-parse to the parsed
     // color(s). Scanning (rather than taking the first unused entry)
     // survives duplicate properties, where the first unused raw entry
     // may belong to another declaration; a non-matching entry is left
     // unused and the canonical serializer runs instead.
-    if matches!(value, CssValue::Color(_) | CssValue::List(_)) {
+    if matches!(
+        value,
+        CssValue::Color(_) | CssValue::NamedColor { .. } | CssValue::List(_)
+    ) {
         for (i, (p, v)) in raw.iter().enumerate() {
             if !used[i]
                 && p == prop
@@ -22068,13 +22833,43 @@ fn decl_value_preserving_math(
             }
         }
     }
+    // w79: layered `background` longhands serialize their layers
+    // comma-joined, not space-joined: the cascade stores a
+    // multi-layer longhand as a list of per-layer lists, and the
+    // generic list serializer would flatten layers into one
+    // ambiguous run (`url(a.png) url(b.png)`). Single-layer values
+    // are never lists of lists for these properties, so this arm
+    // cannot misfire on them. `background-color` is not layered
+    // (it stays a single value) and is deliberately excluded.
+    if matches!(
+        prop,
+        "background-image"
+            | "background-position"
+            | "background-size"
+            | "background-repeat"
+            | "background-attachment"
+            | "background-origin"
+            | "background-clip"
+    ) && let CssValue::List(items) = value
+        && !items.is_empty()
+        && items.iter().all(|i| matches!(i, CssValue::List(_)))
+    {
+        return items
+            .iter()
+            .map(css_value_to_string)
+            .collect::<Vec<_>>()
+            .join(", ");
+    }
     canonical(prop, value)
 }
 
 /// Recover a keyword-authored color for the specified-style
-/// declaration store. `CssValue::Color` has already folded named
-/// colors and `transparent` to RGBA at parse time, so the serializer
-/// alone cannot tell `aqua` from `cyan` or `#00ffff`: a reverse RGB
+/// declaration store. A parsed named color arrives as
+/// `CssValue::NamedColor` and returns its keyword directly (w79).
+/// A plain `CssValue::Color` (hex/functional authorship, or a value
+/// built outside the parser) has already folded named colors and
+/// `transparent` to RGBA at parse time, so the serializer alone
+/// cannot tell `aqua` from `cyan` or `#00ffff`: a reverse RGB
 /// lookup would misreport both. The raw declaration text can, but
 /// only when verified: a bare ident that re-parses (via
 /// `bowser_css::parse_css_color`) to exactly the parsed color is the
@@ -22099,6 +22894,11 @@ fn specified_color_keyword(value: &CssValue, raw_text: &str) -> Option<String> {
         }
     }
     match value {
+        // w79: a parsed named color is authoritative — the keyword
+        // in the value IS the authored keyword, so no raw-text
+        // verification is needed (and the raw text may belong to a
+        // shorthand, not this longhand).
+        CssValue::NamedColor { keyword, .. } => Some(keyword.as_str().to_owned()),
         CssValue::Color(c) => {
             let tokens: Vec<&str> = raw_text.split_whitespace().collect();
             match tokens.as_slice() {
@@ -22117,6 +22917,9 @@ fn specified_color_keyword(value: &CssValue, raw_text: &str) -> Option<String> {
             let mut out = Vec::with_capacity(items.len());
             for (item, token) in items.iter().zip(tokens) {
                 match item {
+                    // w79: a named-color item contributes its own
+                    // keyword without raw verification (see above).
+                    CssValue::NamedColor { keyword, .. } => out.push(keyword.as_str().to_owned()),
                     CssValue::Color(c) => out.push(keyword_for(c, token)?),
                     _ => return None,
                 }
@@ -22302,6 +23105,15 @@ parse_style_props! {
     ("overflow-y", n_parse_sp_get_overflow_y, n_parse_sp_set_overflow_y),
     ("cursor", n_parse_sp_get_cursor, n_parse_sp_set_cursor),
     ("z-index", n_parse_sp_get_z_index, n_parse_sp_set_z_index),
+    // w79fix: `overlay` (CSS Position 4) and the w79 logical
+    // `border-inline` / `border-block` shorthands were missing from
+    // the curated tables, so a direct `el.style.overlay = "auto"`
+    // (resp. `borderInline` / `borderBlock`) assignment became a
+    // silent JS expando and never reached the style attribute,
+    // while `setProperty` (which bypasses the table) worked.
+    ("overlay", n_parse_sp_get_overlay, n_parse_sp_set_overlay),
+    ("border-inline", n_parse_sp_get_border_inline, n_parse_sp_set_border_inline),
+    ("border-block", n_parse_sp_get_border_block, n_parse_sp_set_border_block),
     ("flex", n_parse_sp_get_flex, n_parse_sp_set_flex),
     ("flex-direction", n_parse_sp_get_flex_direction, n_parse_sp_set_flex_direction),
     ("justify-content", n_parse_sp_get_justify_content, n_parse_sp_set_justify_content),
@@ -22580,6 +23392,11 @@ el_style_props! {
     ("overflow-y", n_el_sp_get_overflow_y, n_el_sp_set_overflow_y),
     ("cursor", n_el_sp_get_cursor, n_el_sp_set_cursor),
     ("z-index", n_el_sp_get_z_index, n_el_sp_set_z_index),
+    // w79fix: twin of the parse-shim entries above (see that
+    // comment): `overlay`, `border-inline`, `border-block`.
+    ("overlay", n_el_sp_get_overlay, n_el_sp_set_overlay),
+    ("border-inline", n_el_sp_get_border_inline, n_el_sp_set_border_inline),
+    ("border-block", n_el_sp_get_border_block, n_el_sp_set_border_block),
     ("flex", n_el_sp_get_flex, n_el_sp_set_flex),
     ("flex-direction", n_el_sp_get_flex_direction, n_el_sp_set_flex_direction),
     ("justify-content", n_el_sp_get_justify_content, n_el_sp_set_justify_content),
@@ -23079,6 +23896,12 @@ fn synthesize_border_side_shorthand(decls: &[(String, String)], prop: &str) -> O
         "border-right" => "right",
         "border-bottom" => "bottom",
         "border-left" => "left",
+        // w79: logical edge shorthands share the physical-side shape:
+        // `border-inline-start` reads its three edge longhands.
+        "border-inline-start" => "inline-start",
+        "border-inline-end" => "inline-end",
+        "border-block-start" => "block-start",
+        "border-block-end" => "block-end",
         _ => return None,
     };
     let vals: Vec<&str> = ["width", "style", "color"]
@@ -23181,11 +24004,63 @@ fn synthesize_columns_shorthand(decls: &[(String, String)], prop: &str) -> Optio
 /// families (w78fix H3): `border-width`/`border-style`/
 /// `border-color`, `overflow`, `border-<side>`, and `columns`.
 /// `None` for every other name.
+/// Synthesize `border-inline` / `border-block` from its two edges'
+/// agreed components (w79 item 3): each of width/style/color must
+/// match on both edges, else the shorthand is empty — the same
+/// agreement rule `border` applies across its four sides. The wide
+/// keyword rule mirrors the side forms. `specified` drops
+/// initial-valued components (and reads an all-initial set as
+/// `none`); the computed form keeps all three.
+fn synthesize_border_axis_shorthand(
+    decls: &[(String, String)],
+    prop: &str,
+    specified: bool,
+) -> Option<String> {
+    let (first, second) = match prop {
+        "border-inline" => ("inline-start", "inline-end"),
+        "border-block" => ("block-start", "block-end"),
+        _ => return None,
+    };
+    let mut parts = Vec::new();
+    for kind in ["width", "style", "color"] {
+        let a = decl_value(decls, &format!("border-{first}-{kind}"))?;
+        let b = decl_value(decls, &format!("border-{second}-{kind}"))?;
+        if a != b {
+            return None;
+        }
+        parts.push(a);
+    }
+    if parts.iter().any(|v| is_css_wide_keyword_str(v)) {
+        return if parts.iter().all(|v| *v == parts[0]) {
+            Some(parts[0].to_string())
+        } else {
+            None
+        };
+    }
+    if !specified {
+        return Some(parts.join(" "));
+    }
+    let initials = ["medium", "none", "currentcolor"];
+    let kept: Vec<&str> = parts
+        .iter()
+        .zip(initials)
+        .filter(|(v, init)| *v != init)
+        .map(|(v, _)| *v)
+        .collect();
+    if kept.is_empty() {
+        Some("none".to_string())
+    } else {
+        Some(kept.join(" "))
+    }
+}
+
 fn synthesize_extended_shorthand(decls: &[(String, String)], prop: &str) -> Option<String> {
     synthesize_border_component_shorthand(decls, prop)
         .or_else(|| synthesize_overflow_shorthand(decls, prop))
         .or_else(|| synthesize_border_side_shorthand(decls, prop))
+        .or_else(|| synthesize_border_axis_shorthand(decls, prop, true))
         .or_else(|| synthesize_columns_shorthand(decls, prop))
+        .or_else(|| synthesize_background_shorthand_specified(decls, prop))
 }
 
 /// Synthesize `font` from its six longhands, in CSS Fonts 3 §3.2
@@ -23244,6 +24119,15 @@ fn synthesize_font_shorthand(decls: &[(String, String)], prop: &str) -> Option<S
 /// Synthesize `flex` from its three longhands (`grow shrink basis`).
 /// The parser always emits all three for a shorthand set, so a
 /// missing longhand yields `None`.
+///
+/// w79 item 4 (unverified-pending-probe, synthesis intentionally
+/// unchanged): computed `flex` reads `0 0 auto` under generic CSSOM
+/// shorthand serialization, which is the expected form. Whether
+/// Chrome collapses a specified `0 0 auto` set back to `none` needs
+/// a live-browser probe, which cannot run from this worker; and
+/// Bowser loses authorship at expansion, so collapsing here would
+/// risk misreporting longhand-authored `0 0 auto` sets as `none`.
+/// Do not add a collapse until a probe confirms Chrome's behavior.
 fn synthesize_flex_shorthand(decls: &[(String, String)], prop: &str) -> Option<String> {
     if prop != "flex" {
         return None;
@@ -23350,8 +24234,229 @@ const BORDER_LEFT_LONGHANDS: &[&str] = &[
     "border-left-style",
     "border-left-color",
 ];
+/// Longhands for the logical `border-inline` / `border-block`
+/// shorthands (w79 item 3): both edges' width/style/color, in edge
+/// order. Used for specified-style clearing and computed synthesis.
+const BORDER_INLINE_LONGHANDS: &[&str] = &[
+    "border-inline-start-width",
+    "border-inline-start-style",
+    "border-inline-start-color",
+    "border-inline-end-width",
+    "border-inline-end-style",
+    "border-inline-end-color",
+];
+const BORDER_BLOCK_LONGHANDS: &[&str] = &[
+    "border-block-start-width",
+    "border-block-start-style",
+    "border-block-start-color",
+    "border-block-end-width",
+    "border-block-end-style",
+    "border-block-end-color",
+];
+/// Longhands for the logical edge shorthands (w79 item 3), in
+/// width/style/color order, for specified-style clearing.
+const BORDER_INLINE_START_LONGHANDS: &[&str] = &[
+    "border-inline-start-width",
+    "border-inline-start-style",
+    "border-inline-start-color",
+];
+const BORDER_INLINE_END_LONGHANDS: &[&str] = &[
+    "border-inline-end-width",
+    "border-inline-end-style",
+    "border-inline-end-color",
+];
+const BORDER_BLOCK_START_LONGHANDS: &[&str] = &[
+    "border-block-start-width",
+    "border-block-start-style",
+    "border-block-start-color",
+];
+const BORDER_BLOCK_END_LONGHANDS: &[&str] = &[
+    "border-block-end-width",
+    "border-block-end-style",
+    "border-block-end-color",
+];
 const OVERFLOW_LONGHANDS: &[&str] = &["overflow-x", "overflow-y"];
 const COLUMNS_LONGHANDS: &[&str] = &["column-width", "column-count"];
+/// The eight `background` longhands, in shorthand grammar order
+/// (image, position, size, repeat, attachment, origin, clip,
+/// color). Used for specified-style clearing and synthesis.
+const BACKGROUND_LONGHANDS: &[&str] = &[
+    "background-image",
+    "background-position",
+    "background-size",
+    "background-repeat",
+    "background-attachment",
+    "background-origin",
+    "background-clip",
+    "background-color",
+];
+
+/// Split a serialized shorthand component list on top-level
+/// commas (commas inside `()` — `url()`, gradients — do not
+/// split), trimming each layer. Used to recover `background`
+/// layers from their comma-joined longhand strings.
+fn split_top_level_commas(s: &str) -> Vec<String> {
+    let mut out = Vec::new();
+    let mut depth = 0i32;
+    let mut cur = String::new();
+    for c in s.chars() {
+        match c {
+            '(' => {
+                depth += 1;
+                cur.push(c);
+            }
+            ')' => {
+                depth -= 1;
+                cur.push(c);
+            }
+            ',' if depth <= 0 => {
+                out.push(cur.trim().to_string());
+                cur.clear();
+            }
+            _ => cur.push(c),
+        }
+    }
+    out.push(cur.trim().to_string());
+    out
+}
+
+/// One `background` layer's serialized components, in grammar
+/// order. `color` is `Some` only for the final layer (the color
+/// belongs to the final layer, never to an earlier one).
+struct BackgroundLayerParts<'a> {
+    image: &'a str,
+    position: &'a str,
+    size: &'a str,
+    repeat: &'a str,
+    attachment: &'a str,
+    origin: &'a str,
+    clip: &'a str,
+    color: Option<&'a str>,
+}
+
+/// Serialize one `background` layer. `specified` drops
+/// initial-valued components (like
+/// [`synthesize_border_shorthand_specified`]); the computed form
+/// keeps everything, with position/size always slash-joined. The
+/// box pair has its own rule: the initial pair
+/// (`padding-box`/`border-box`) drops entirely, equal non-initial
+/// boxes collapse to one value (one box keyword sets both origin
+/// and clip on re-parse, so dropping a lone initial origin is
+/// round-trip safe only when the boxes agree), and differing
+/// boxes both serialize. An all-dropped layer reads `none`.
+fn background_layer_string(parts: &BackgroundLayerParts<'_>, specified: bool) -> String {
+    let mut out: Vec<String> = Vec::new();
+    let is_initial = |v: &str, initials: &[&str]| initials.contains(&v);
+    if !specified || !is_initial(parts.image, &["none"]) {
+        out.push(parts.image.to_string());
+    }
+    let pos_init = parts.position == "0% 0%";
+    let size_init = parts.size == "auto auto" || parts.size == "auto";
+    if !specified || !pos_init || !size_init {
+        if !specified || !size_init {
+            out.push(format!("{} / {}", parts.position, parts.size));
+        } else {
+            out.push(parts.position.to_string());
+        }
+    }
+    if !specified || !is_initial(parts.repeat, &["repeat"]) {
+        out.push(parts.repeat.to_string());
+    }
+    if !specified || !is_initial(parts.attachment, &["scroll"]) {
+        out.push(parts.attachment.to_string());
+    }
+    if specified {
+        if !(parts.origin == "padding-box" && parts.clip == "border-box") {
+            if parts.origin == parts.clip {
+                out.push(parts.origin.to_string());
+            } else {
+                out.push(parts.origin.to_string());
+                out.push(parts.clip.to_string());
+            }
+        }
+    } else {
+        out.push(parts.origin.to_string());
+        out.push(parts.clip.to_string());
+    }
+    if let Some(color) = parts.color
+        && (!specified || !(color == "transparent" || color == "rgba(0, 0, 0, 0)"))
+    {
+        out.push(color.to_string());
+    }
+    if out.is_empty() {
+        "none".to_string()
+    } else {
+        out.join(" ")
+    }
+}
+
+/// Synthesize `background` from its eight longhands, in grammar
+/// order (image, position/size, repeat, attachment, origin, clip,
+/// color). `specified` selects the initial-dropping form (see
+/// [`background_layer_string`]); the computed form keeps every
+/// component. Multi-layer longhands (comma-joined layer strings)
+/// synthesize per layer and re-join with `", "`; the color is
+/// appended to the final layer only. A lone CSS-wide keyword on
+/// every longhand reads back as that keyword; differing wide
+/// keywords (or a wide keyword mixed with a normal value) yield
+/// `None`, like the `border` forms.
+fn synthesize_background_shorthand(
+    decls: &[(String, String)],
+    prop: &str,
+    specified: bool,
+) -> Option<String> {
+    if prop != "background" {
+        return None;
+    }
+    let vals: Vec<&str> = BACKGROUND_LONGHANDS
+        .iter()
+        .map(|lh| decl_value(decls, lh))
+        .collect::<Option<Vec<_>>>()?;
+    let (image, position, size, repeat, attachment, origin, clip, color) = (
+        vals[0], vals[1], vals[2], vals[3], vals[4], vals[5], vals[6], vals[7],
+    );
+    if vals.iter().any(|v| is_css_wide_keyword_str(v)) {
+        return if vals.iter().all(|v| *v == vals[0]) {
+            Some(vals[0].to_string())
+        } else {
+            None
+        };
+    }
+    // Layered longhands split into one string per layer; the
+    // layered longhands must agree on the layer count.
+    let layers: Vec<Vec<String>> = [image, position, size, repeat, attachment, origin, clip]
+        .iter()
+        .map(|v| split_top_level_commas(v))
+        .collect();
+    let count = layers[0].len();
+    if layers.iter().any(|l| l.len() != count) {
+        return None;
+    }
+    let mut out = Vec::with_capacity(count);
+    for (i, image_layer) in layers[0].iter().enumerate() {
+        let parts = BackgroundLayerParts {
+            image: image_layer,
+            position: &layers[1][i],
+            size: &layers[2][i],
+            repeat: &layers[3][i],
+            attachment: &layers[4][i],
+            origin: &layers[5][i],
+            clip: &layers[6][i],
+            color: if i + 1 == count { Some(color) } else { None },
+        };
+        out.push(background_layer_string(&parts, specified));
+    }
+    Some(out.join(", "))
+}
+
+/// Specified-style `background` synthesis (w79): the
+/// initial-dropping form of [`synthesize_background_shorthand`].
+fn synthesize_background_shorthand_specified(
+    decls: &[(String, String)],
+    prop: &str,
+) -> Option<String> {
+    synthesize_background_shorthand(decls, prop, true)
+}
 
 /// Longhands for every shorthand the specified-style surface
 /// synthesizes or clears (w78fix H3/H4): the scroll, inset, and box
@@ -23370,7 +24475,19 @@ fn specified_shorthand_longhands(prop: &str) -> Option<&'static [&'static str]> 
             "border-right" => Some(BORDER_RIGHT_LONGHANDS),
             "border-bottom" => Some(BORDER_BOTTOM_LONGHANDS),
             "border-left" => Some(BORDER_LEFT_LONGHANDS),
+            // w79: compound logical border shorthands and their edge
+            // forms, for specified-style clearing.
+            "border-inline" => Some(BORDER_INLINE_LONGHANDS),
+            "border-block" => Some(BORDER_BLOCK_LONGHANDS),
+            "border-inline-start" => Some(BORDER_INLINE_START_LONGHANDS),
+            "border-inline-end" => Some(BORDER_INLINE_END_LONGHANDS),
+            "border-block-start" => Some(BORDER_BLOCK_START_LONGHANDS),
+            "border-block-end" => Some(BORDER_BLOCK_END_LONGHANDS),
             "columns" => Some(COLUMNS_LONGHANDS),
+            // w79: the eight `background` longhands, in grammar
+            // order (image, position, size, repeat, attachment,
+            // origin, clip, color).
+            "background" => Some(BACKGROUND_LONGHANDS),
             _ => None,
         })
 }
@@ -23414,6 +24531,23 @@ fn synthesize_computed_shorthands(props: &mut HashMap<String, String>) {
         }
     }
     synthesize_border_shorthands(props);
+    // w79: `border-inline` / `border-block` in full (computed) form,
+    // from the six edge longhands. Like `background` below, this
+    // only fires when the props map carries all six.
+    for (shorthand, longs) in [
+        ("border-inline", BORDER_INLINE_LONGHANDS),
+        ("border-block", BORDER_BLOCK_LONGHANDS),
+    ] {
+        let decls: Vec<(String, String)> = longs
+            .iter()
+            .filter_map(|lh| props.get(*lh).map(|v| (lh.to_string(), v.clone())))
+            .collect();
+        if decls.len() == longs.len()
+            && let Some(short) = synthesize_border_axis_shorthand(&decls, shorthand, false)
+        {
+            props.insert(shorthand.to_string(), short);
+        }
+    }
     if let (Some(x), Some(y)) = (
         props.get("overflow-x").cloned(),
         props.get("overflow-y").cloned(),
@@ -23442,6 +24576,23 @@ fn synthesize_computed_shorthands(props: &mut HashMap<String, String>) {
         };
         if let Some(short) = short {
             props.insert(shorthand.to_string(), short);
+        }
+    }
+    // w79: `background` in full (computed) form, from its eight
+    // longhands. This only fires when the props map carries all
+    // eight; since w79fix both live surfaces' prop tables list
+    // the seven layered longhands (plus `background-color`),
+    // live `getComputedStyle(el).background` now synthesizes
+    // from them instead of reading `""`.
+    {
+        let decls: Vec<(String, String)> = BACKGROUND_LONGHANDS
+            .iter()
+            .filter_map(|lh| props.get(*lh).map(|v| (lh.to_string(), v.clone())))
+            .collect();
+        if decls.len() == BACKGROUND_LONGHANDS.len()
+            && let Some(short) = synthesize_background_shorthand(&decls, "background", false)
+        {
+            props.insert("background".to_string(), short);
         }
     }
 }
@@ -26449,8 +27600,17 @@ impl ParseLayoutHook {
         chain: &[ScriptElement],
     ) -> ScriptElement {
         let el = chain[0];
+        // Fixed: the containing block is the viewport, which only a
+        // document-rooted pass has. An element-rooted pass lays the
+        // element out as the rebuilt document's root at (0, 0),
+        // discarding its left/top (and right/bottom) offsets entirely
+        // — static and dynamic fixed alike read (0, 0) (WPT
+        // `position-absolute-dynamic-formatting-context`: the fixed
+        // box "stays in-flow"). Root at the document element so the
+        // fixed box lays out against the real initial containing
+        // block.
         if inline_position(host, el).as_deref() == Some("fixed") {
-            return el;
+            return chain.last().copied().unwrap_or(el);
         }
         let mut root_idx = if chain.len() > 1 { 1 } else { 0 };
         for (i, &h) in chain.iter().enumerate().skip(1) {
@@ -26559,7 +27719,14 @@ impl ParseLayoutHook {
             }
         };
         match eff.as_deref() {
-            Some("fixed") => (root.arena_index() != el.arena_index()).then_some(el),
+            // Fixed: only a document-rooted pass lays the box against
+            // the viewport containing block (see `select_partial_root`).
+            // Widen to the document element, never back to the element
+            // itself: an element-rooted pass discards its offsets.
+            Some("fixed") => {
+                let wide = chain.last().copied().unwrap_or(el);
+                (wide.arena_index() != root.arena_index()).then_some(wide)
+            }
             Some("absolute") => {
                 let wide = chain.last().copied().unwrap_or(el);
                 (wide.arena_index() != root.arena_index()).then_some(wide)
@@ -28335,18 +29502,151 @@ fn parse_is_fragment(heap: &Heap, v: Value) -> bool {
     }
 }
 
+/// The scroll shift a mid-parse `getBoundingClientRect` must subtract
+/// to convert its measured rect into viewport coordinates: the window
+/// scroll plus every ancestor scroller's recorded offset.
+///
+/// The partial layout bakes sticky constraints at the script-written
+/// offsets (`scroll_bake`), so a stuck box's measured rect is in
+/// scroller-content coordinates (e.g. scroll 100 + `top: 50` measures
+/// 150); without this subtraction every post-scroll read lands exactly
+/// one scroll offset above the viewport answer (WPT
+/// `position-sticky-get-bounding-client-rect`: 150 instead of 50, and
+/// a relative box reads 50 instead of -50). The production getter
+/// subtracts the same quantity via [`scroll_shift`]; the shim never
+/// did, because it returned the raw partial-tree rect.
+///
+/// Applies in full when the serving pass was rooted at the document
+/// element, i.e. the rect is in document coordinates. Subtree-rooted
+/// passes report root-relative coordinates by contract (the ancestors
+/// above the root were never laid out), and shifting those by
+/// document-level scrolls would corrupt them — except when the root
+/// itself is a scroller, whose own scroll shifts its content relative
+/// to its box. A fixed box is already viewport-anchored in a
+/// document-rooted pass, so it never shifts.
+/// An absolutely positioned box only scrolls with scrollers at or
+/// above its offset parent (its containing block): a scroller between
+/// the box and its containing block does not move it. In-flow boxes
+/// (static, relative, sticky) scroll with every ancestor scroller.
+/// Fail-closed to zero on any resolution failure: a no-box element
+/// must keep reading (0, 0), never a shifted zero.
+fn parse_gbcr_scroll_shift(heap: &Heap, this: Value, m: &ParseElementGeometry) -> (f32, f32) {
+    let Ok((id, host_ptr, el)) = parse_el_host(heap, this, "getBoundingClientRect") else {
+        return (0.0, 0.0);
+    };
+    PARSE_HOSTS.with(|hosts| {
+        let mut hosts = hosts.borrow_mut();
+        let Some(entry) = hosts.get_mut(&id) else {
+            return (0.0, 0.0);
+        };
+        // SAFETY: `host_ptr` addresses the parser's tree through the
+        // `ParseShimGuard` contract documented on `deref_parse_host`,
+        // while the hook borrows from the thread-local `PARSE_HOSTS`
+        // map: the two are disjoint objects. The partial layout runs
+        // no JS, so nothing re-enters `PARSE_HOSTS` while the entry
+        // borrow is held (same discipline as
+        // `parse_measured_element`).
+        let host = deref_parse_host(host_ptr);
+        let Some(chain) = ancestor_chain(host, el) else {
+            return (0.0, 0.0);
+        };
+        let Some(doc_el) = chain.last() else {
+            return (0.0, 0.0);
+        };
+        let doc_arena = doc_el.arena_index();
+        // The serving entry is the MRU-last one (`ensure_layout`
+        // rotates the hit to the back); it must be document-rooted
+        // and must actually contain this element's box, otherwise the
+        // measurement was a cached miss and the honest zero stands.
+        let Some((key, boxes)) = entry.layout_hook.entries.last() else {
+            return (0.0, 0.0);
+        };
+        if !boxes.contains_key(&el.arena_index()) {
+            return (0.0, 0.0);
+        }
+        // Subtree-rooted pass: the rect is relative to the root's
+        // border box, and a scroller above the root moves root and
+        // element together, so no document-level shift applies — with
+        // one exception: when the root IS a scroller, its own scroll
+        // shifts its content relative to its box, so the root's
+        // recorded offset must come off. In-flow boxes always scroll
+        // with the root's content; an absolute box does only when its
+        // containing block is inside the subtree (an offset parent
+        // was found there) — with its containing block outside, the
+        // root's scroll does not move it. A fixed box never shifts.
+        if key.1 != doc_arena {
+            if inline_position(host, el).as_deref() == Some("fixed") {
+                return (0.0, 0.0);
+            }
+            if inline_position(host, el).as_deref() == Some("absolute") && m.offset_parent.is_none()
+            {
+                return (0.0, 0.0);
+            }
+            if let Some(&(_, off)) = entry
+                .layout_hook
+                .scroll_bake
+                .iter()
+                .find(|(a, _)| *a == key.1)
+            {
+                return (off.0, off.1);
+            }
+            return (0.0, 0.0);
+        }
+        if inline_position(host, el).as_deref() == Some("fixed") {
+            return (0.0, 0.0);
+        }
+        let mut sx = entry.window_scroll.0;
+        let mut sy = entry.window_scroll.1;
+        // Chain index of the offset parent (the containing block for
+        // absolute boxes): scrollers at or above it move the box,
+        // scrollers below it do not. `usize::MAX` when there is no
+        // offset parent (viewport containing block): no ancestor
+        // scroller moves the box, only the window scroll does.
+        // In-flow boxes take every ancestor scroller (gate 0).
+        let abs_gate = if inline_position(host, el).as_deref() == Some("absolute") {
+            match m.offset_parent {
+                Some(op) => chain
+                    .iter()
+                    .position(|h| h.arena_index() == op.arena_index())
+                    .unwrap_or(usize::MAX),
+                None => usize::MAX,
+            }
+        } else {
+            0
+        };
+        for (j, anc) in chain.iter().enumerate().skip(1) {
+            if j < abs_gate {
+                continue;
+            }
+            if let Some(&(_, off)) = entry
+                .layout_hook
+                .scroll_bake
+                .iter()
+                .find(|(a, _)| *a == anc.arena_index())
+            {
+                sx += off.0;
+                sy += off.1;
+            }
+        }
+        (sx, sy)
+    })
+}
+
 fn n_parse_el_get_bounding_client_rect(
     heap: &mut Heap,
     this: Value,
     _args: &[Value],
 ) -> Result<Value, NativeError> {
     let (id, m) = parse_measured_element(heap, this, "getBoundingClientRect")?;
-    // DOMRect fields are doubles. `x`/`y` are relative to the
-    // partial-layout root (the element's containing block): the
-    // ancestors above the root are never laid out mid-parse
-    // (see `ParseLayoutHook`).
-    let x = m.rect.x as f64;
-    let y = m.rect.y as f64;
+    // DOMRect fields are doubles. Document-rooted passes measure in
+    // document coordinates: convert to viewport coordinates by
+    // subtracting the window scroll and ancestor scroller offsets
+    // (see `parse_gbcr_scroll_shift`). Subtree-rooted passes keep
+    // their root-relative contract: the ancestors above the root are
+    // never laid out mid-parse (see `ParseLayoutHook`).
+    let (shx, shy) = parse_gbcr_scroll_shift(heap, this, &m);
+    let x = (m.rect.x - shx) as f64;
+    let y = (m.rect.y - shy) as f64;
     let w = m.rect.w as f64;
     let h = m.rect.h as f64;
     let rect = alloc_dom_rect(heap, parse_dom_rect_proto(id), x, y, w, h)?;
@@ -28872,6 +30172,21 @@ const PARSE_COMPUTED_PROPS: &[(&str, &str, bool)] = &[
     ("visibility", "visible", true),
     ("color", "black", true),
     ("background-color", "transparent", false),
+    // w79fix: the seven layered `background` longhands (initials
+    // matching the cascade's), plus the `background` shorthand
+    // row (initial `""`, like `border` below, so a
+    // synthesis-failing element does not fall back to a bogus
+    // value). Without these rows the shim's computed object never
+    // carried the longhands, so `synthesize_computed_shorthands`
+    // could not fire for `background` there either.
+    ("background-image", "none", false),
+    ("background-position", "0% 0%", false),
+    ("background-size", "auto auto", false),
+    ("background-repeat", "repeat", false),
+    ("background-attachment", "scroll", false),
+    ("background-origin", "padding-box", false),
+    ("background-clip", "border-box", false),
+    ("background", "", false),
     ("opacity", "1", false),
     ("width", "auto", false),
     ("height", "auto", false),
@@ -28957,6 +30272,14 @@ const PARSE_COMPUTED_PROPS: &[(&str, &str, bool)] = &[
     ("overflow-y", "visible", false),
     ("cursor", "auto", true),
     ("z-index", "auto", false),
+    // CSS Position 4 (w79 phase 1): `overlay` (`none | auto`, not
+    // inherited). This row is what makes the parse shim's computed
+    // style expose it (`in` check) and `CSS.supports` accept it —
+    // without it both gates fail before any value is read. The
+    // computed value itself comes from the real cascade (UA rule
+    // forces `none` for non-top-layer elements); top-layer
+    // promotion is phase 2 work.
+    ("overlay", "none", false),
     ("top", "auto", false),
     ("right", "auto", false),
     ("bottom", "auto", false),
@@ -32441,6 +33764,419 @@ mod tests {
         let div = doc.get_elements_by_tag_name("div").item(0).unwrap();
         assert_eq!(doc.inner_html(div), "<b>new</b><span>s</span>");
         assert_eq!(doc.get_element_by_id("a"), None);
+    }
+
+    #[test]
+    fn w79k_production_element_query_selector() {
+        // w79k: production `Element.querySelector`/`querySelectorAll`,
+        // scoped to the receiver's descendants. Fail-before: neither
+        // name existed on `element_proto` (the shim versions are
+        // stripped at upgrade), so table-model-fixup-2's first
+        // step-body statement (`root.querySelector("[target=a]")`)
+        // threw `callee is not a function` 40/40.
+        let mut fx = setup(
+            "<html><body><div id=\"root\" foo=\"\"><p id=\"p1\" class=\"a\">one</p><span id=\"tgt\" target=\"a\">t</span><section id=\"sec\"><p id=\"p2\" class=\"b\">two</p></section></div><p id=\"outside\" class=\"a\">out</p></body></html>",
+        );
+        let proto = fx.apis.borrow().gc_roots.borrow().element_proto.unwrap();
+        assert!(
+            fx.heap
+                .get_property(proto, Wtf8::from_str("querySelector"))
+                .is_some(),
+            "element_proto must define querySelector"
+        );
+        assert!(
+            fx.heap
+                .get_property(proto, Wtf8::from_str("querySelectorAll"))
+                .is_some(),
+            "element_proto must define querySelectorAll"
+        );
+        let root = call_get_element_by_id(&mut fx, "root");
+        let p1 = call_get_element_by_id(&mut fx, "p1");
+        let tgt = call_get_element_by_id(&mut fx, "tgt");
+        let p2 = call_get_element_by_id(&mut fx, "p2");
+        let qs = |fx: &mut Fixture, recv: Value, sel: &str| -> Value {
+            let s = str_val(fx, sel);
+            n_element_query_selector(&mut fx.heap, recv, &[s]).unwrap()
+        };
+        let qsa = |fx: &mut Fixture, recv: Value, sel: &str| -> Vec<NodeId> {
+            let s = str_val(fx, sel);
+            let arr = n_element_query_selector_all(&mut fx.heap, recv, &[s]).unwrap();
+            let Value::Object(o) = arr else {
+                panic!("querySelectorAll must return an object")
+            };
+            let len = match fx
+                .heap
+                .get_property(o, Wtf8::from_str("length"))
+                .unwrap()
+                .value
+            {
+                Value::Int(n) => n,
+                _ => panic!("length must be an int"),
+            };
+            (0..len)
+                .map(|i| {
+                    let v = fx
+                        .heap
+                        .get_property(o, Wtf8::from_str(&i.to_string()))
+                        .unwrap()
+                        .value;
+                    node_of(fx, v)
+                })
+                .collect()
+        };
+        // The fixup-2 statement shape: attribute selector on the root.
+        // (Each step is bound before the next read: the query closures
+        // take `&mut Fixture`, so a result and its expected node cannot
+        // be compared inside one expression.)
+        let tgt_id = node_of(&fx, tgt);
+        let hit = qs(&mut fx, root, "[target=a]");
+        assert_eq!(node_of(&fx, hit), tgt_id);
+        // First match in document order; the scope element never matches.
+        let p1_id = node_of(&fx, p1);
+        let first_p = qs(&mut fx, root, "p");
+        assert_eq!(node_of(&fx, first_p), p1_id);
+        assert_eq!(qs(&mut fx, root, "div"), Value::Null);
+        assert_eq!(qs(&mut fx, root, "#root"), Value::Null);
+        assert_eq!(qs(&mut fx, root, "em"), Value::Null);
+        // Descendants only: the outside `.a` paragraph is invisible.
+        let only_a = qsa(&mut fx, root, ".a");
+        assert_eq!(only_a, vec![p1_id]);
+        // Comma-group union in document order, not group order.
+        let tgt_id2 = node_of(&fx, tgt);
+        let p2_id = node_of(&fx, p2);
+        let both = vec![p1_id, tgt_id2, p2_id];
+        assert_eq!(qsa(&mut fx, root, "p, span"), both);
+        assert_eq!(qsa(&mut fx, root, "span, p"), both);
+        assert_eq!(qsa(&mut fx, root, "em"), Vec::<NodeId>::new());
+        // Bad selector raises SyntaxError, like document.querySelector.
+        let bad = str_val(&mut fx, ">>>");
+        assert!(matches!(
+            n_element_query_selector(&mut fx.heap, root, &[bad]),
+            Err(NativeError::SyntaxError(_))
+        ));
+        let bad_all = str_val(&mut fx, "p, >>>");
+        assert!(matches!(
+            n_element_query_selector_all(&mut fx.heap, root, &[bad_all]),
+            Err(NativeError::SyntaxError(_))
+        ));
+        // w79k follow-up: `hasAttribute` on the prototype, present
+        // and absent cases (fixup-2 reads `root.hasAttribute("unequal")`).
+        assert!(
+            fx.heap
+                .get_property(proto, Wtf8::from_str("hasAttribute"))
+                .is_some(),
+            "element_proto must define hasAttribute"
+        );
+        let root_id_attr = str_val(&mut fx, "id");
+        let has_id = n_has_attribute(&mut fx.heap, root, &[root_id_attr]).unwrap();
+        assert_eq!(has_id, Value::Bool(true));
+        let missing_attr = str_val(&mut fx, "unequal");
+        let has_unequal = n_has_attribute(&mut fx.heap, root, &[missing_attr]).unwrap();
+        assert_eq!(has_unequal, Value::Bool(false));
+        // The document wrapper keeps its document-wide form (its own
+        // `doc_obj` definitions shadow the prototype methods).
+        let doc_val = global_prop(&fx, "document");
+        let outside = call_get_element_by_id(&mut fx, "outside");
+        let outside_sel = str_val(&mut fx, "#outside");
+        let doc_hit = n_query_selector(&mut fx.heap, doc_val, &[outside_sel]).unwrap();
+        assert_eq!(node_of(&fx, doc_hit), node_of(&fx, outside));
+        // w79fix pins for previously unpinned-but-correct behavior.
+        // Empty-valued attribute: present, with an empty value.
+        let foo_attr = str_val(&mut fx, "foo");
+        let has_foo = n_has_attribute(&mut fx.heap, root, &[foo_attr]).unwrap();
+        assert_eq!(has_foo, Value::Bool(true));
+        let foo_val = n_get_attribute(&mut fx.heap, root, &[foo_attr]).unwrap();
+        assert_eq!(str_contents(&fx, foo_val), "");
+        // Attribute names are ASCII case-insensitive on HTML elements.
+        let id_upper = str_val(&mut fx, "ID");
+        let has_id_upper = n_has_attribute(&mut fx.heap, root, &[id_upper]).unwrap();
+        assert_eq!(has_id_upper, Value::Bool(true));
+        // `*` returns elements only: the text nodes inside the root
+        // ("one", "t", "two") are not in the result.
+        let sec = call_get_element_by_id(&mut fx, "sec");
+        let sec_id = node_of(&fx, sec);
+        let star = qsa(&mut fx, root, "*");
+        assert_eq!(star, vec![p1_id, tgt_id2, sec_id, p2_id]);
+        // Scope-relative selectors on an element (w79fix): a leading
+        // combinator is implicitly scoped to the receiver, `:scope`
+        // denotes the receiver, and mixed groups union in order.
+        let root_id = node_of(&fx, root);
+        let child_p = qs(&mut fx, root, "> p");
+        assert_eq!(node_of(&fx, child_p), p1_id);
+        let scope_child_p = qs(&mut fx, root, ":scope > p");
+        assert_eq!(node_of(&fx, scope_child_p), p1_id);
+        let scope_self = qs(&mut fx, root, ":scope");
+        assert_eq!(node_of(&fx, scope_self), root_id);
+        assert_eq!(qsa(&mut fx, root, "> p"), vec![p1_id]);
+        assert_eq!(qsa(&mut fx, root, ":scope"), vec![root_id]);
+        assert_eq!(qsa(&mut fx, root, ":scope p"), vec![p1_id, p2_id]);
+        assert_eq!(qsa(&mut fx, root, ":scope > p, span"), vec![p1_id, tgt_id2]);
+        // The same strings stay invalid on the document: the
+        // scope-relative handling lives on the element path only.
+        for sel in ["> p", ":scope > p", ":scope"] {
+            let s = str_val(&mut fx, sel);
+            assert!(
+                matches!(
+                    n_query_selector(&mut fx.heap, doc_val, &[s]),
+                    Err(NativeError::SyntaxError(_))
+                ),
+                "document.querySelector({sel:?}) must throw SyntaxError"
+            );
+        }
+        // Document dispatch through real property lookup, not a
+        // direct native call: the function resolved off `doc_obj`
+        // must be the document-wide native (not the element
+        // prototype's), and invoking it must query document-wide.
+        let Value::Object(doc_obj) = doc_val else {
+            panic!("document must be an object")
+        };
+        let doc_qs = fx
+            .heap
+            .get_property(doc_obj, Wtf8::from_str("querySelector"))
+            .unwrap()
+            .value;
+        let proto_qs = fx
+            .heap
+            .get_property(proto, Wtf8::from_str("querySelector"))
+            .unwrap()
+            .value;
+        assert_ne!(doc_qs, proto_qs, "doc_obj must shadow querySelector");
+        let Value::Object(doc_qs_obj) = doc_qs else {
+            panic!("document.querySelector must be a function object")
+        };
+        let ObjectKind::NativeFunction(doc_qs_fn) = object_kind(doc_qs_obj) else {
+            panic!("document.querySelector must be a native function")
+        };
+        assert!(
+            std::ptr::fn_addr_eq(doc_qs_fn, {
+                let expected: NativeFn = n_query_selector;
+                expected
+            }),
+            "doc_obj.querySelector must be the document native"
+        );
+        let outside_sel2 = str_val(&mut fx, "#outside");
+        let resolved_hit = doc_qs_fn(&mut fx.heap, doc_val, &[outside_sel2]).unwrap();
+        assert_eq!(node_of(&fx, resolved_hit), node_of(&fx, outside));
+        // And the members `Document` does not have are shadowed to
+        // `undefined` on `doc_obj` (w79fix), not resolved through
+        // the prototype to `false` / `null`.
+        for name in [
+            "hasAttribute",
+            "nextElementSibling",
+            "previousElementSibling",
+        ] {
+            assert_eq!(
+                fx.heap
+                    .get_property(doc_obj, Wtf8::from_str(name))
+                    .unwrap()
+                    .value,
+                Value::Undefined,
+                "document.{name} must be undefined"
+            );
+        }
+        // Detached subtree: queries stay inside it (and scope-relative
+        // selectors work there too), never leaking into the document.
+        let div_tag = str_val(&mut fx, "div");
+        let detached = n_create_element(&mut fx.heap, doc_val, &[div_tag]).unwrap();
+        let p_tag = str_val(&mut fx, "p");
+        let dp = n_create_element(&mut fx.heap, doc_val, &[p_tag]).unwrap();
+        n_append_child(&mut fx.heap, detached, &[dp]).unwrap();
+        let dp_id = node_of(&fx, dp);
+        let dp_hit = qs(&mut fx, detached, "p");
+        assert_eq!(node_of(&fx, dp_hit), dp_id);
+        let dp_scope = qs(&mut fx, detached, "> p");
+        assert_eq!(node_of(&fx, dp_scope), dp_id);
+        let dp_self = qs(&mut fx, detached, ":scope");
+        assert_eq!(node_of(&fx, dp_self), node_of(&fx, detached));
+        assert_eq!(qs(&mut fx, detached, "#outside"), Value::Null);
+    }
+
+    #[test]
+    fn w79fix_scope_relative_edges() {
+        // w79fix round-2 pins: `:scope*` is scope-relative, a
+        // `:scope` compound in a non-leading position evaluates
+        // against receiver identity (never via the shared parser),
+        // detached mixed groups order in tree order, sibling steps
+        // return element siblings outside the receiver's subtree,
+        // and a bad compound throws even with zero candidates.
+        let mut fx = setup(
+            "<html><body><div id=\"recv\"></div>text<!--c--><p id=\"s1\">one</p><p id=\"s2\">two</p></body></html>",
+        );
+        let recv = call_get_element_by_id(&mut fx, "recv");
+        let s1 = call_get_element_by_id(&mut fx, "s1");
+        let s2 = call_get_element_by_id(&mut fx, "s2");
+        let recv_id = node_of(&fx, recv);
+        let s1_id = node_of(&fx, s1);
+        let s2_id = node_of(&fx, s2);
+        let qs = |fx: &mut Fixture, r: Value, sel: &str| -> Value {
+            let s = str_val(fx, sel);
+            n_element_query_selector(&mut fx.heap, r, &[s]).unwrap()
+        };
+        let qsa = |fx: &mut Fixture, r: Value, sel: &str| -> Vec<NodeId> {
+            let s = str_val(fx, sel);
+            let arr = n_element_query_selector_all(&mut fx.heap, r, &[s]).unwrap();
+            let Value::Object(o) = arr else {
+                panic!("querySelectorAll must return an object")
+            };
+            let len = match fx
+                .heap
+                .get_property(o, Wtf8::from_str("length"))
+                .unwrap()
+                .value
+            {
+                Value::Int(n) => n,
+                _ => panic!("length must be an int"),
+            };
+            (0..len)
+                .map(|i| {
+                    let v = fx
+                        .heap
+                        .get_property(o, Wtf8::from_str(&i.to_string()))
+                        .unwrap()
+                        .value;
+                    node_of(fx, v)
+                })
+                .collect()
+        };
+        // `:scope*` returns the receiver (fail-before: SyntaxError).
+        let star_hit = qs(&mut fx, recv, ":scope*");
+        assert_eq!(node_of(&fx, star_hit), recv_id);
+        assert_eq!(qsa(&mut fx, recv, ":scope*"), vec![recv_id]);
+        // `:scope` is not its own child (fail-before: SyntaxError).
+        assert_eq!(qs(&mut fx, recv, ":scope > :scope"), Value::Null);
+        assert_eq!(qsa(&mut fx, recv, ":scope > :scope"), Vec::<NodeId>::new());
+        // A later `div:scope` compound must not throw either.
+        assert_eq!(
+            qsa(&mut fx, recv, ":scope + div:scope"),
+            Vec::<NodeId>::new()
+        );
+        // Sibling steps return siblings outside the receiver's
+        // subtree, element-only (the text and comment between the
+        // receiver and `s1` are skipped).
+        let plus_hit = qs(&mut fx, recv, ":scope + p");
+        assert_eq!(node_of(&fx, plus_hit), s1_id);
+        assert_eq!(qsa(&mut fx, recv, ":scope ~ p"), vec![s1_id, s2_id]);
+        let lead_plus_hit = qs(&mut fx, recv, "+ p");
+        assert_eq!(node_of(&fx, lead_plus_hit), s1_id);
+        assert_eq!(qsa(&mut fx, recv, "~ p"), vec![s1_id, s2_id]);
+        // Up-front validation: a bad compound throws even though
+        // the childless receiver has zero candidates.
+        let bad = str_val(&mut fx, ":scope > :bad");
+        assert!(matches!(
+            n_element_query_selector_all(&mut fx.heap, recv, &[bad]),
+            Err(NativeError::SyntaxError(_))
+        ));
+        // Detached mixed groups in tree order, not group order
+        // (fail-before: `[p, scope]`).
+        let doc_val = global_prop(&fx, "document");
+        let div_tag = str_val(&mut fx, "div");
+        let detached = n_create_element(&mut fx.heap, doc_val, &[div_tag]).unwrap();
+        let p_tag = str_val(&mut fx, "p");
+        let dp = n_create_element(&mut fx.heap, doc_val, &[p_tag]).unwrap();
+        n_append_child(&mut fx.heap, detached, &[dp]).unwrap();
+        let detached_id = node_of(&fx, detached);
+        let dp_id = node_of(&fx, dp);
+        assert_eq!(
+            qsa(&mut fx, detached, "p, :scope"),
+            vec![detached_id, dp_id]
+        );
+        assert_eq!(
+            qsa(&mut fx, detached, ":scope, p"),
+            vec![detached_id, dp_id]
+        );
+        assert_eq!(qsa(&mut fx, detached, "p"), vec![dp_id]);
+    }
+
+    #[test]
+    fn w79_production_element_siblings() {
+        // w79 item H (fail-before: production wrappers expose no
+        // `nextElementSibling`/`previousElementSibling` — the shim
+        // accessor is stripped at upgrade and `element_proto` never
+        // defines one — so table-model-fixup-2's DOMContentLoaded
+        // handler throws `cannot read property
+        // 'nextElementSibling' of Undefined` before registering any
+        // async_test). Element siblings only: text and comment nodes
+        // are skipped, `null` at the ends.
+        let mut fx = setup(
+            "<html><body><hr id=\"h\"><!--sep--><p id=\"p1\">one</p>text<p id=\"p2\">two</p><div id=\"root\"></div><span id=\"last\"></span></body></html>",
+        );
+        let proto = fx.apis.borrow().gc_roots.borrow().element_proto.unwrap();
+        assert!(
+            fx.heap
+                .get_accessor(proto, Wtf8::from_str("nextElementSibling"))
+                .is_some()
+        );
+        assert!(
+            fx.heap
+                .get_accessor(proto, Wtf8::from_str("previousElementSibling"))
+                .is_some()
+        );
+        let next = |fx: &mut Fixture, v: Value| -> Value {
+            n_next_element_sibling_get(&mut fx.heap, v, &[]).unwrap()
+        };
+        let prev = |fx: &mut Fixture, v: Value| -> Value {
+            n_previous_element_sibling_get(&mut fx.heap, v, &[]).unwrap()
+        };
+        let h = call_get_element_by_id(&mut fx, "h");
+        let p1 = call_get_element_by_id(&mut fx, "p1");
+        let p2 = call_get_element_by_id(&mut fx, "p2");
+        let root = call_get_element_by_id(&mut fx, "root");
+        let last = call_get_element_by_id(&mut fx, "last");
+        let h_id = node_of(&fx, h);
+        let p1_id = node_of(&fx, p1);
+        let p2_id = node_of(&fx, p2);
+        let root_id = node_of(&fx, root);
+        let last_id = node_of(&fx, last);
+        // Skips the comment after <hr> and the text between the <p>s.
+        // (Each step is bound before the next read: the getter takes
+        // `&mut Fixture`, so chained calls cannot nest in one
+        // expression.)
+        let n_h = next(&mut fx, h);
+        assert_eq!(node_of(&fx, n_h), p1_id);
+        let n_p1 = next(&mut fx, p1);
+        assert_eq!(node_of(&fx, n_p1), p2_id);
+        let n_p2 = next(&mut fx, p2);
+        assert_eq!(node_of(&fx, n_p2), root_id);
+        let n_root = next(&mut fx, root);
+        assert_eq!(node_of(&fx, n_root), last_id);
+        assert_eq!(next(&mut fx, last), Value::Null);
+        assert_eq!(prev(&mut fx, h), Value::Null);
+        let pr_p1 = prev(&mut fx, p1);
+        assert_eq!(node_of(&fx, pr_p1), h_id);
+        let pr_p2 = prev(&mut fx, p2);
+        assert_eq!(node_of(&fx, pr_p2), p1_id);
+        let pr_last = prev(&mut fx, last);
+        assert_eq!(node_of(&fx, pr_last), root_id);
+        // The fixup-2 handler chain, element by element: `hr` ->
+        // first <p> -> second <p> (desc) -> <div> (root). Each step
+        // must be a real wrapper, never `undefined`, so the chain
+        // never throws.
+        let inner = next(&mut fx, h);
+        let desc = next(&mut fx, inner);
+        assert_eq!(node_of(&fx, desc), p2_id);
+        let chained_root = next(&mut fx, desc);
+        assert_eq!(node_of(&fx, chained_root), root_id);
+        // Detached subtree: the same element-only skipping and
+        // `null` ends, with a text node between the elements.
+        let doc_val = global_prop(&fx, "document");
+        let div_tag = str_val(&mut fx, "div");
+        let detached = n_create_element(&mut fx.heap, doc_val, &[div_tag]).unwrap();
+        let span_tag = str_val(&mut fx, "span");
+        let s1 = n_create_element(&mut fx.heap, doc_val, &[span_tag]).unwrap();
+        let s2 = n_create_element(&mut fx.heap, doc_val, &[span_tag]).unwrap();
+        let text_val = str_val(&mut fx, "gap");
+        let gap = n_create_text_node(&mut fx.heap, doc_val, &[text_val]).unwrap();
+        n_append_child(&mut fx.heap, detached, &[s1]).unwrap();
+        n_append_child(&mut fx.heap, detached, &[gap]).unwrap();
+        n_append_child(&mut fx.heap, detached, &[s2]).unwrap();
+        let s1_id = node_of(&fx, s1);
+        let s2_id = node_of(&fx, s2);
+        let n_s1 = next(&mut fx, s1);
+        assert_eq!(node_of(&fx, n_s1), s2_id);
+        assert_eq!(next(&mut fx, s2), Value::Null);
+        assert_eq!(prev(&mut fx, s1), Value::Null);
+        let pr_s2 = prev(&mut fx, s2);
+        assert_eq!(node_of(&fx, pr_s2), s1_id);
     }
 
     // -- events ---------------------------------------------------------
@@ -36020,6 +37756,124 @@ mod tests {
         assert_eq!(computed_prop(&mut fx, el, "color"), "rgb(0, 128, 0)");
     }
 
+    // w79 overlay phase 1: computed read-back + `CSS.supports`.
+    // Author `overlay: auto` computes to `none` for a non-top-layer
+    // element (UA rule); top-layer promotion is phase 2 work.
+    #[test]
+    fn get_computed_style_and_supports_overlay() {
+        let mut fx = setup("<html><body><div id=\"d\">x</div></body></html>");
+        let sheet = parse_stylesheet("#d { overlay: auto; }");
+        fx.apis.borrow_mut().set_author_stylesheets(vec![sheet]);
+        let el = call_get_element_by_id(&mut fx, "d");
+        assert_eq!(computed_prop(&mut fx, el, "overlay"), "none");
+        let global = Value::Object(fx.global);
+        let prop = str_val(&mut fx, "overlay");
+        let auto = str_val(&mut fx, "auto");
+        let none = str_val(&mut fx, "none");
+        let bad = str_val(&mut fx, "banana");
+        assert!(matches!(
+            n_parse_css_supports(&mut fx.heap, global, &[prop, auto]),
+            Ok(Value::Bool(true))
+        ));
+        assert!(matches!(
+            n_parse_css_supports(&mut fx.heap, global, &[prop, none]),
+            Ok(Value::Bool(true))
+        ));
+        assert!(matches!(
+            n_parse_css_supports(&mut fx.heap, global, &[prop, bad]),
+            Ok(Value::Bool(false))
+        ));
+        let cond = str_val(&mut fx, "overlay: auto");
+        assert!(matches!(
+            n_parse_css_supports(&mut fx.heap, global, &[cond]),
+            Ok(Value::Bool(true))
+        ));
+    }
+
+    #[test]
+    fn style_overlay_and_logical_border_accessors_reach_specified_style() {
+        // w79fix: `overlay`, `border-inline`, and `border-block`
+        // were absent from the curated accessor tables, so a direct
+        // `el.style.overlay = "auto"` assignment became a silent JS
+        // expando and never reached the style attribute (while
+        // `setProperty("overlay", "auto")` worked, because it
+        // bypasses the table). Fail-before: on the pre-fix tree
+        // `getPropertyValue("overlay")` reads `""` and the live
+        // `length` does not count `overlay` (a plain `.overlay`
+        // read would only show the silent JS expando, never the
+        // style attribute).
+        // This pins specified retention only: computed `overlay`
+        // is still `none` for a non-top-layer element (phase 1 UA
+        // rule; top-layer promotion is phase 2), so the computed
+        // assertion below is `none`, not `auto`.
+        let (mut vm, _doc) = computed_style_vm(b"<html><body><div id=\"d\">x</div></body></html>");
+        let el = "document.getElementById(\"d\")";
+        vm.eval(&format!("{el}.style.overlay = \"auto\";")).unwrap();
+        assert_eq!(
+            node_list_str(&mut vm, &format!("{el}.style.overlay;")),
+            "auto"
+        );
+        assert_eq!(
+            node_list_str(
+                &mut vm,
+                &format!("{el}.style.getPropertyValue(\"overlay\");")
+            ),
+            "auto"
+        );
+        vm.eval(&format!("{el}.style.overlay = \"banana\";"))
+            .unwrap();
+        assert_eq!(
+            node_list_str(&mut vm, &format!("{el}.style.overlay;")),
+            "auto",
+            "invalid overlay value must be a no-op"
+        );
+        assert_eq!(
+            node_list_str(&mut vm, &format!("getComputedStyle({el}).overlay;")),
+            "none"
+        );
+        vm.eval(&format!("{el}.style.borderInline = \"2px solid aqua\";"))
+            .unwrap();
+        assert_eq!(
+            node_list_str(&mut vm, &format!("{el}.style.borderInline;")),
+            "2px solid aqua"
+        );
+        vm.eval(&format!("{el}.style.borderBlock = \"1px dotted red\";"))
+            .unwrap();
+        assert_eq!(
+            node_list_str(&mut vm, &format!("{el}.style.borderBlock;")),
+            "1px dotted red"
+        );
+        vm.eval(&format!("{el}.style.borderInline = \"\";"))
+            .unwrap();
+        vm.eval(&format!("{el}.style.borderBlock = \"\";")).unwrap();
+        assert_eq!(
+            node_list_str(&mut vm, &format!("{el}.style.length;")),
+            "1",
+            "only the overlay declaration survives clearing both axes"
+        );
+        // Shim mirror: the same assignments through the parse shim.
+        let r = shim_result(
+            b"<html><body><div id=t></div>\
+              <script>var t = document.getElementById('t'); var out = [];\
+              t.style.overlay = 'auto';\
+              out.push(t.style.overlay === 'auto' ? 'ok' : 'overlay->' + t.style.overlay);\
+              out.push(t.style.getPropertyValue('overlay') === 'auto' ? 'ok' : 'overlay-pv->' + t.style.getPropertyValue('overlay'));\
+              t.style.borderInline = '2px solid aqua';\
+              out.push(t.style.borderInline === '2px solid aqua' ? 'ok' : 'borderInline->' + t.style.borderInline);\
+              t.style.borderBlock = '1px dotted red';\
+              out.push(t.style.borderBlock === '1px dotted red' ? 'ok' : 'borderBlock->' + t.style.borderBlock);\
+              t.style.borderInline = ''; t.style.borderBlock = '';\
+              out.push(t.style.length === 1 ? 'ok' : 'clear-len->' + t.style.length);\
+              globalThis.__result = out.join('|');</script>\
+              </body></html>",
+        );
+        let failures: Vec<&str> = r.split('|').filter(|s| *s != "ok").collect();
+        assert!(
+            failures.is_empty(),
+            "shim overlay/logical-border failures: {failures:?}"
+        );
+    }
+
     fn vm_eval_str(vm: &mut Vm, expr: &str) -> String {
         let v = vm.eval(expr).unwrap();
         let Value::Str(s) = v else {
@@ -36355,7 +38209,7 @@ mod tests {
         );
         assert_eq!(
             node_list_str(&mut vm, &format!("{el}.style.border;")),
-            "2px solid rgb(255, 0, 0)"
+            "2px solid red"
         );
         // `font`: reaches the computed font size; specified read-back
         // drops `normal` components and joins size/line-height.
@@ -36492,7 +38346,7 @@ mod tests {
             .unwrap();
         assert_eq!(
             node_list_str(&mut vm, &format!("{el}.style.borderTop;")),
-            "1px dotted rgb(0, 0, 255)"
+            "1px dotted blue"
         );
         vm.eval(&format!("{el}.style.borderTop = \"\";")).unwrap();
         assert_eq!(node_list_str(&mut vm, &format!("{el}.style.length;")), "0");
@@ -36525,7 +38379,7 @@ mod tests {
               t.style.removeProperty('overflow');\
               out.push(t.style.length === 0 ? 'ok' : 'overflow-clear->' + t.style.length);\
               t.style.borderTop = '1px dotted blue';\
-              out.push(t.style.borderTop === '1px dotted rgb(0, 0, 255)' ? 'ok' : 'borderTop->' + t.style.borderTop);\
+              out.push(t.style.borderTop === '1px dotted blue' ? 'ok' : 'borderTop->' + t.style.borderTop);\
               t.style.borderTop = '';\
               out.push(t.style.length === 0 ? 'ok' : 'borderTop-clear->' + t.style.length);\
               t.style.columns = '200px 3';\
@@ -36600,7 +38454,7 @@ mod tests {
             "unset"
         );
         // `flex-grow` is not a curated accessor (it is not in the
-        // 116-property table), so it is read via `getPropertyValue`,
+        // 119-property table), so it is read via `getPropertyValue`,
         // which still goes through the synthesized-aware getter.
         assert_eq!(
             node_list_str(
@@ -36673,10 +38527,10 @@ mod tests {
         let el = "document.getElementById(\"d\")";
         for (set, expected) in [
             ("solid", "solid"),
-            ("red", "rgb(255, 0, 0)"),
+            ("red", "red"),
             ("2px", "2px"),
             ("none", "none"),
-            ("2px solid red", "2px solid rgb(255, 0, 0)"),
+            ("2px solid red", "2px solid red"),
         ] {
             vm.eval(&format!("{el}.style.border = \"{set}\";")).unwrap();
             assert_eq!(
@@ -36696,7 +38550,7 @@ mod tests {
     #[test]
     fn curated_style_table_exposed_on_both_surfaces() {
         // w78fix L1 (drift guard): every entry of the curated
-        // 116-property table must be a defined style accessor (not
+        // 119-property table must be a defined style accessor (not
         // `undefined`) on BOTH the production and the parse-shim
         // surfaces. The list is a copy of the table: if a macro
         // entry is dropped from one surface, or the table grows
@@ -36784,6 +38638,11 @@ mod tests {
             "overflow-y",
             "cursor",
             "z-index",
+            // w79fix: `overlay`, `border-inline`, `border-block`
+            // (see the macro entries above).
+            "overlay",
+            "border-inline",
+            "border-block",
             "flex",
             "flex-direction",
             "justify-content",
@@ -36820,7 +38679,7 @@ mod tests {
             "scrollbar-gutter",
             "overflow-clip-margin",
         ];
-        assert_eq!(names.len(), 116);
+        assert_eq!(names.len(), 119);
         let (mut vm, _doc) = computed_style_vm(b"<html><body><div id=\"d\">x</div></body></html>");
         let joined = names.join(",");
         let missing = node_list_str(
@@ -37042,6 +38901,143 @@ mod tests {
     }
 
     #[test]
+    fn w79_background_shorthand_synthesis() {
+        // w79 item 2 (fail-before: base has no `background`
+        // synthesis at all). Specified form drops initial
+        // components; computed form (via
+        // `synthesize_computed_shorthands`) keeps them all.
+        let decls = style_decls_from_text("background: red");
+        assert_eq!(
+            synthesize_extended_shorthand(&decls, "background"),
+            Some("red".to_string())
+        );
+        let decls =
+            style_decls_from_text("background: url(a.png) no-repeat center/cover padding-box");
+        assert_eq!(
+            synthesize_extended_shorthand(&decls, "background"),
+            // Note: `css_value_to_string` renders `CssValue::Url` bare
+            // (no `url()` wrapper) — the pre-existing serializer
+            // convention for this surface, not a synthesis choice.
+            Some("a.png center / cover no-repeat padding-box".to_string())
+        );
+        let mut props: HashMap<String, String> =
+            decls.iter().map(|(n, v)| (n.clone(), v.clone())).collect();
+        synthesize_computed_shorthands(&mut props);
+        assert_eq!(
+            props.get("background").map(String::as_str),
+            Some("a.png center / cover no-repeat scroll padding-box padding-box rgba(0, 0, 0, 0)")
+        );
+    }
+
+    #[test]
+    fn w79_specified_expanded_color_keyword() {
+        // w79 item 1 (fail-before: on the base tree the expanded
+        // longhands serialize rgb() because the keyword is lost at
+        // parse time and the raw-text recovery only matches the
+        // shorthand's own property name). `border-color: aqua` must
+        // read `aqua` on every side on the specified surface and
+        // rgb() on the computed surface; same for `border: solid
+        // aqua` (color component) and `background: aqua` (color
+        // longhand).
+        let specified = style_decls_from_text("border-color: aqua");
+        for side in ["top", "right", "bottom", "left"] {
+            assert_eq!(
+                specified
+                    .iter()
+                    .find(|(n, _)| n == &format!("border-{side}-color"))
+                    .map(|(_, v)| v.as_str()),
+                Some("aqua"),
+                "specified border-{side}-color"
+            );
+        }
+        let computed = computed_style_decls_from_text("border-color: aqua");
+        for side in ["top", "right", "bottom", "left"] {
+            assert_eq!(
+                computed
+                    .iter()
+                    .find(|(n, _)| n == &format!("border-{side}-color"))
+                    .map(|(_, v)| v.as_str()),
+                Some("rgb(0, 255, 255)"),
+                "computed border-{side}-color"
+            );
+        }
+        let specified = style_decls_from_text("border: solid aqua");
+        assert_eq!(
+            specified
+                .iter()
+                .find(|(n, _)| n == "border-top-color")
+                .map(|(_, v)| v.as_str()),
+            Some("aqua")
+        );
+        assert_eq!(
+            style_decls_from_text("background: aqua")
+                .iter()
+                .find(|(n, _)| n == "background-color")
+                .map(|(_, v)| v.as_str()),
+            Some("aqua")
+        );
+        assert_eq!(
+            computed_style_decls_from_text("background: aqua")
+                .iter()
+                .find(|(n, _)| n == "background-color")
+                .map(|(_, v)| v.as_str()),
+            Some("rgb(0, 255, 255)")
+        );
+    }
+
+    #[test]
+    fn w79_logical_border_shorthand_synthesis() {
+        // w79 item 3: axis shorthands synthesize from their two
+        // edges' agreed components (specified form drops initials);
+        // edge shorthands synthesize like the physical sides; a
+        // disagreement between edges empties the axis shorthand;
+        // computed form keeps all three components.
+        let decls = style_decls_from_text("border-inline: 2px solid aqua");
+        assert_eq!(
+            synthesize_extended_shorthand(&decls, "border-inline"),
+            Some("2px solid aqua".to_string())
+        );
+        assert_eq!(
+            synthesize_extended_shorthand(&decls, "border-inline-start"),
+            Some("2px solid aqua".to_string())
+        );
+        let decls = style_decls_from_text("border-block-end: dashed");
+        assert_eq!(
+            synthesize_extended_shorthand(&decls, "border-block-end"),
+            Some("dashed".to_string())
+        );
+        // Edges disagree: no axis shorthand.
+        let mut decls = style_decls_from_text("border-inline: 2px solid aqua");
+        if let Some((_, v)) = decls
+            .iter_mut()
+            .find(|(n, _)| n == "border-inline-end-width")
+        {
+            *v = "3px".to_string();
+        }
+        assert_eq!(synthesize_extended_shorthand(&decls, "border-inline"), None);
+        // Computed form: all components kept, including initials
+        // (unlike the specified form, which drops them).
+        let decls = style_decls_from_text("border-inline: dashed");
+        let mut props: HashMap<String, String> =
+            decls.iter().map(|(n, v)| (n.clone(), v.clone())).collect();
+        synthesize_computed_shorthands(&mut props);
+        assert_eq!(
+            props.get("border-inline").map(String::as_str),
+            Some("medium dashed currentcolor")
+        );
+        // Clearing the axis shorthand clears its six longhands, and
+        // setting it replaces them (clearing registration).
+        let mut decls = style_decls_from_text("border-inline: 2px solid aqua");
+        style_apply_set(&mut decls, "border-inline", "");
+        assert!(decls.iter().all(|(n, _)| !n.starts_with("border-inline-")));
+        style_apply_set(&mut decls, "border-inline", "1px dotted red");
+        assert_eq!(
+            synthesize_extended_shorthand(&decls, "border-inline"),
+            Some("1px dotted red".to_string())
+        );
+    }
+
+    #[test]
     fn computed_style_decls_serialize_colors_canonically() {
         // w78fix3: the detached computed fallback must not inherit
         // specified-style keyword preservation — `color: red` reads
@@ -37210,22 +39206,118 @@ mod tests {
 
     #[test]
     fn wide_keyword_shorthand_set_is_not_lost() {
-        // LOW2: setting a shorthand to a lone wide keyword must never
-        // silently drop the set. Today the parser expands it to the
-        // longhands, so this pins the observable property; if a
-        // future shorthand stops expanding, the wide-defense arm in
-        // `style_apply_set` stores it as a deferred declaration
-        // instead of clearing the stale longhands and losing it.
-        let mut decls = vec![("border-top-width".to_string(), "2px".to_string())];
+        // LOW2, tightened (w79fix, whole-diff review finding 7):
+        // setting a shorthand to a lone wide keyword must never
+        // silently drop the set. The old form accepted EITHER a
+        // stored ("border", "inherit") decl OR >= 12 inherit
+        // longhands, so it passed via the expansion disjunct even
+        // if the deferred-store path regressed. The exact form
+        // below pins the path that actually runs today: the
+        // parser expands `border: inherit` to exactly the 12
+        // longhands (no stored shorthand decl), the stale value
+        // is replaced, unrelated declarations survive, and the
+        // compound synthesis reads the set back as `inherit`.
+        // NOTE (probe-verified, w79fix): no curated shorthand
+        // reaches the empty-`checked` arm of `style_apply_set`
+        // today — all 35 shorthands in
+        // `specified_shorthand_longhands` expand every one of the
+        // five wide keywords at parse time, so the deferred-store
+        // push in that arm is defense for a future unexpanded
+        // shorthand and cannot be pinned through `border: inherit`
+        // (or any other current shorthand) alone. This test pins
+        // the observable non-loss property through the expansion
+        // path that runs, and the synthesis side (uniform keyword
+        // -> the keyword, mixed keywords -> None) is pinned by
+        // `mixed_wide_keywords_synthesize_empty`, which is
+        // unchanged.
+        let mut decls = vec![
+            ("border-top-width".to_string(), "2px".to_string()),
+            ("border-top-color".to_string(), "red".to_string()),
+            ("color".to_string(), "green".to_string()),
+        ];
         style_apply_set(&mut decls, "border", "inherit");
         assert!(
-            decls.contains(&("border".to_string(), "inherit".to_string()))
-                || decls
-                    .iter()
-                    .filter(|(n, v)| n.starts_with("border-") && v == "inherit")
-                    .count()
-                    >= 12,
-            "wide border set lost: {decls:?}"
+            !decls.contains(&("border".to_string(), "inherit".to_string())),
+            "border: inherit must expand, not store a shorthand decl: {decls:?}"
+        );
+        let inherit_longhands: Vec<&(String, String)> = decls
+            .iter()
+            .filter(|(n, v)| n.starts_with("border-") && v == "inherit")
+            .collect();
+        assert_eq!(
+            inherit_longhands.len(),
+            12,
+            "border: inherit must yield exactly 12 inherit longhands: {decls:?}"
+        );
+        assert!(
+            !decls.iter().any(|(_, v)| v == "red" || v == "2px"),
+            "stale border values survive a border: inherit set: {decls:?}"
+        );
+        assert!(
+            decls.contains(&("color".to_string(), "green".to_string())),
+            "unrelated declarations must survive: {decls:?}"
+        );
+        assert_eq!(
+            synthesize_compound_shorthand(&decls, "border"),
+            Some("inherit".to_string()),
+            "expanded inherit longhands must synthesize back to inherit"
+        );
+    }
+
+    #[test]
+    fn computed_background_synthesizes_on_live_and_shim_surfaces() {
+        // w79fix (whole-diff review finding 6): `background`
+        // synthesis existed but never fired on the live surface,
+        // because neither prop table listed the seven layered
+        // longhands, so `getComputedStyle(el).background` read
+        // `""`. Wiring the longhands into `STYLE_PROPS` (live)
+        // and `PARSE_COMPUTED_PROPS` (shim) makes the shared
+        // synthesis fire on both. Fail-before: both reads below
+        // are `undefined` (not `""`: `background` was absent from
+        // the props map, so `wrap_style` defined no such property;
+        // longhands also absent), still a failing test. The serialized form
+        // keeps every computed component, and `url()` serializes
+        // bare (`a.png`) per the pre-existing serializer
+        // convention. A bare element still synthesizes the
+        // initial background instead of reading `""`.
+        let (mut vm, _doc) = computed_style_vm(
+            b"<html><body><div id=\"d\" style=\"background: url(a.png) no-repeat center/cover padding-box\">x</div></body></html>",
+        );
+        let gcs = "getComputedStyle(document.getElementById(\"d\"))";
+        assert_eq!(
+            node_list_str(&mut vm, &format!("{gcs}.background;")),
+            "a.png center / cover no-repeat scroll padding-box padding-box rgba(0, 0, 0, 0)"
+        );
+        assert_eq!(
+            node_list_str(&mut vm, &format!("{gcs}.backgroundImage;")),
+            "a.png"
+        );
+        assert_eq!(
+            node_list_str(&mut vm, &format!("{gcs}.backgroundClip;")),
+            "padding-box"
+        );
+        let (mut vm2, _doc2) =
+            computed_style_vm(b"<html><body><div id=\"d\">x</div></body></html>");
+        assert_eq!(
+            node_list_str(
+                &mut vm2,
+                "getComputedStyle(document.getElementById(\"d\")).background;"
+            ),
+            "none 0% 0% / auto auto repeat scroll padding-box border-box rgba(0, 0, 0, 0)"
+        );
+        let r = shim_result(
+            b"<html><body><div id=t style=\"background: url(a.png) no-repeat center/cover padding-box\"></div>\
+              <script>var t = document.getElementById('t'); var cs = getComputedStyle(t); var out = [];\
+              out.push(cs.background === 'a.png center / cover no-repeat scroll padding-box padding-box rgba(0, 0, 0, 0)' ? 'ok' : 'background->' + cs.background);\
+              out.push(cs.backgroundImage === 'a.png' ? 'ok' : 'image->' + cs.backgroundImage);\
+              out.push(cs.backgroundClip === 'padding-box' ? 'ok' : 'clip->' + cs.backgroundClip);\
+              globalThis.__result = out.join('|');</script>\
+              </body></html>",
+        );
+        let failures: Vec<&str> = r.split('|').filter(|s| *s != "ok").collect();
+        assert!(
+            failures.is_empty(),
+            "shim computed background failures: {failures:?}"
         );
     }
 

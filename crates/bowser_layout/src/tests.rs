@@ -12188,13 +12188,18 @@ fn w78fix_sticky_bottom_padded_scroller() {
     // M2, bottom mirror of `w78_sticky_overflow_padding_*`: a
     // padded scroller (`padding: 20px 0`, content box 20..220) with
     // `bottom: 0`. The sticky box's natural y is 220; the
-    // content-box scrollport's far edge puts it at
-    // 20 + 0 + 200 - 0 - 100 = 120. Reverting only the size term
-    // in `sticky_scrollport_axis` (padding-box size 240, keeping
-    // the content-box origin 20) would give 20 + 240 - 100 = 160,
-    // not 140; 140 is the full padding-box variant (origin 0 +
-    // size 240 - 100). Either way the 120 pin discriminates.
-    // This pins the content-box size term in
+    // padding-box scrollport's far edge (w79: CSS Overflow 3 §2.3
+    // — the scrollport coincides with the padding box — and CSS
+    // Position 3 §3.4 — the sticky view rectangle is the scrollport
+    // inset by the insets) puts it at 20 (content-box origin, the
+    // scroll-origin anchor, unchanged by w79) + 240 (padding-box
+    // size) - 100 = 160. The pre-w79 content-box size (200) pinned
+    // it at 120, a full padding short of the scrollport's far edge;
+    // the full padding-box variant with a moved origin
+    // (0 + 240 - 100 = 140) is NOT used — moving the origin would
+    // change the start-edge behavior pinned by
+    // `w78_sticky_overflow_padding_*`, which w79 leaves untouched.
+    // This pins the padding-box size term in
     // `sticky_scrollport_axis`; the origin term is already pinned
     // by the top-edge tests.
     let html = r#"<div id="sc"><div id="contents"><div id="pre"></div><div id="container"><div id="filler"></div><div id="sticky"></div></div></div></div>"#;
@@ -12218,20 +12223,17 @@ fn w78fix_sticky_bottom_padded_scroller() {
     let y = body(&l).children[0].children[0].children[1].children[1]
         .rect
         .y;
-    assert!(approx(y, 120.0), "bottom padded y={y} != 120");
+    assert!(approx(y, 160.0), "bottom padded y={y} != 160");
 }
 
 #[test]
 fn w78fix_sticky_right_padded_scroller() {
     // M2, right mirror: a padded scroller (`padding: 0 20px`,
     // content box 20..220) with `right: 0`. Natural x is 220
-    // (20 content origin + 200 filler); the content-box far edge
-    // puts the 100px box at 20 + 0 + 200 - 100 = 120.
-    // Reverting only the size term in `sticky_scrollport_axis`
-    // (padding-box size 240, keeping the content-box origin 20)
-    // would give 20 + 240 - 100 = 160, not 140; 140 is the full
-    // padding-box variant (origin 0 + size 240 - 100). Either way
-    // the 120 pin discriminates. The containing-block bound
+    // (20 content origin + 200 filler); the padding-box far edge
+    // (w79, same spec citation as the bottom mirror above) puts
+    // the 100px box at 20 + 240 - 100 = 160, not the pre-w79
+    // content-box 120. The containing-block bound
     // (container content box 20..520) does not interfere.
     let html = r#"<div id="sc"><div id="container"><div id="filler"></div><div id="sticky"></div></div></div>"#;
     let css = "body { margin: 0; } \
@@ -12252,7 +12254,7 @@ fn w78fix_sticky_right_padded_scroller() {
         &offsets,
     );
     let x = body(&l).children[0].children[0].children[1].rect.x;
-    assert!(approx(x, 120.0), "right padded x={x} != 120");
+    assert!(approx(x, 160.0), "right padded x={x} != 160");
 }
 
 #[test]
@@ -12360,11 +12362,10 @@ fn w78fix2_multicol_promoted_inline_block_min_content() {
     // kids-max inline-block arm gives 50. Fail-before: the
     // item's min-content measured 50 (the inline-block arm
     // shadowed the multicol arm) while its max-content already
-    // measured 120. The lone (unpromoted) shape is NOT pinned
-    // here: it stays an `InlineBlock` box, so the multicol gate
-    // does not apply to it in either dispatch — that is the
-    // layout-gate divergence noted on the max-content arm, not
-    // an intrinsic-dispatch difference.
+    // measured 120. The lone (unpromoted) shape is pinned by
+    // the w79 twin `w79_multicol_unpromoted_inline_block_min_max`
+    // (both gates now accept an `InlineBlock` box carrying
+    // `display: inline-block`).
     let css = ".c { display: flex; } .i { display: inline-block; column-count: 2; column-gap: 20px; } \\\n         .a { width: 50px; height: 10px; } .b { width: 50px; height: 10px; } \\\n         .s { width: 0px; height: 0px; }";
     let item = r#"<div class="i" id="item"><div class="a"></div><div class="b"></div></div>"#;
     let (bt, w_min, w_max) = w78fix2_forest_item_min_max(
@@ -12380,6 +12381,150 @@ fn w78fix2_multicol_promoted_inline_block_min_content() {
         approx(w_max, 120.0),
         "promoted multicol max-content w={w_max} != 120"
     );
+}
+
+#[test]
+fn w79_multicol_unpromoted_inline_block_min_max() {
+    // w79: the unpromoted twin of
+    // `w78fix2_multicol_promoted_inline_block_min_content` — same
+    // CSS, no block-level flex sibling, so the item stays an
+    // `InlineBlock` box at intrinsic-walk time. Before w79 both
+    // gates (`multicol_intrinsic_params` and `layout_block`'s
+    // multicol gate) accepted only `Block`/`AnonymousBlock`, so
+    // the lone item measured the kids-max inline-block arm (50)
+    // while real layout blockified it via `wrap_flex_text_runs`
+    // and laid it out 120 wide inside a 50-wide container. The
+    // w79 fix moves BOTH gates together to also accept an
+    // `InlineBlock` box carrying `display: inline-block`, so the
+    // intrinsic min/max are the column transform 50 * 2 + 20 = 120.
+    let css = ".c { display: flex; } .i { display: inline-block; column-count: 2; column-gap: 20px; } \
+         .a { width: 50px; height: 10px; } .b { width: 50px; height: 10px; }";
+    let item = r#"<div class="i" id="item"><div class="a"></div><div class="b"></div></div>"#;
+    let (bt, w_min, w_max) = w78fix2_forest_item_min_max(
+        &format!("<!DOCTYPE html><div class=\"c\">{item}</div>"),
+        css,
+    );
+    assert_eq!(bt, BoxType::InlineBlock, "lone item must stay unpromoted");
+    assert!(
+        approx(w_min, 120.0),
+        "unpromoted multicol min-content w={w_min} != 120"
+    );
+    assert!(
+        approx(w_max, 120.0),
+        "unpromoted multicol max-content w={w_max} != 120"
+    );
+}
+
+#[test]
+fn w79_multicol_unpromoted_inline_block_shrink_container() {
+    // w79 end-to-end: a `display: flex` container sized by a
+    // content keyword over the lone (unpromoted) multicol
+    // inline-block item must measure 120 (the shrink-to-fit path,
+    // not just the gate), the item must actually lay out 120
+    // wide, and its two 50px children must land in two columns
+    // (second child at item x + 50 + 20 gap). Fail-before: the
+    // container measured 50 while the item laid out 120 and
+    // overflowed it. Checked for both `min-content` and
+    // `max-content` container widths.
+    for keyword in ["min-content", "max-content"] {
+        let css = format!(
+            "body {{ margin: 0; }} .c {{ display: flex; width: {keyword}; }} \
+             .i {{ display: inline-block; column-count: 2; column-gap: 20px; }} \
+             .a {{ width: 50px; height: 10px; }} .b {{ width: 50px; height: 10px; }}"
+        );
+        let l = layout_html(
+            r#"<div class="c"><div class="i"><div class="a"></div><div class="b"></div></div></div>"#,
+            &css,
+        );
+        let container = &body(&l).children[0];
+        let item = &container.children[0];
+        assert!(
+            approx(container.rect.w, 120.0),
+            "{keyword}: container w={} != 120",
+            container.rect.w
+        );
+        assert!(
+            approx(item.rect.w, 120.0),
+            "{keyword}: item w={} != 120",
+            item.rect.w
+        );
+        assert_eq!(
+            item.children.len(),
+            2,
+            "{keyword}: item must have 2 children"
+        );
+        assert!(
+            approx(item.children[0].rect.x, item.rect.x),
+            "{keyword}: first child x={} != item x={}",
+            item.children[0].rect.x,
+            item.rect.x
+        );
+        assert!(
+            approx(item.children[1].rect.x, item.rect.x + 70.0),
+            "{keyword}: second child x={} != item x + 70",
+            item.children[1].rect.x
+        );
+    }
+}
+
+#[test]
+fn w79_multicol_inline_flex_grid_table_keep_own_arms() {
+    // w79 regression: widening the multicol gates to
+    // `InlineBlock` boxes must not sweep in inline-flex, inline-
+    // grid, or inline-table — those are claimed by their own
+    // earlier intrinsic arms (flex arm, grid arm, table arm, in
+    // both dispatches). Discriminators: children 50 and 30, no
+    // gap, `column-count: 2`. The multicol transform would give
+    // 2 * 50 = 100 in both min and max; the own arms give 80 for
+    // flex (row item sum 50 + 30) and 50 for grid (no explicit
+    // template, so auto-placement stacks both items in the single
+    // implicit column: max child) and 80 for table (one row, two
+    // cells whose definite-width children are 50 and 30: the table
+    // arm sums the columns, the multicol transform would give
+    // 2 * 80 = 160 from the row's 80 min-content).
+    let cases: [(&str, &str, &str, f32); 3] = [
+        (
+            "inline-flex",
+            ".a { width: 50px; height: 10px; } .b { width: 30px; height: 10px; }",
+            r#"<div class="a"></div><div class="b"></div>"#,
+            80.0,
+        ),
+        (
+            "inline-grid",
+            ".a { width: 50px; height: 10px; } .b { width: 30px; height: 10px; }",
+            r#"<div class="a"></div><div class="b"></div>"#,
+            50.0,
+        ),
+        (
+            "inline-table",
+            ".r { display: table-row; } .a { display: table-cell; } .b { display: table-cell; } .x { width: 50px; height: 10px; } .y { width: 30px; height: 10px; }",
+            r#"<div class="r"><div class="a"><div class="x"></div></div><div class="b"><div class="y"></div></div></div>"#,
+            80.0,
+        ),
+    ];
+    for (display, inner_css, inner_html, want) in cases {
+        let css = format!(
+            ".c {{ display: flex; }} .i {{ display: {display}; column-count: 2; }} {inner_css}"
+        );
+        let item = format!(r#"<div class="i" id="item">{inner_html}</div>"#);
+        let (bt, w_min, w_max) = w78fix2_forest_item_min_max(
+            &format!("<!DOCTYPE html><div class=\"c\">{item}</div>"),
+            &css,
+        );
+        assert_eq!(
+            bt,
+            BoxType::InlineBlock,
+            "{display}: lone item must stay unpromoted at walk time"
+        );
+        assert!(
+            approx(w_min, want),
+            "{display}: min-content w={w_min} != {want} (multicol arm would differ)"
+        );
+        assert!(
+            approx(w_max, want),
+            "{display}: max-content w={w_max} != {want} (multicol arm would differ)"
+        );
+    }
 }
 
 #[test]

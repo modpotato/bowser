@@ -429,6 +429,14 @@ head, script, style, title, meta, link { display: none; }
 img { display: inline-block; }
 button, input, select, textarea { display: inline-block; }
 pre { white-space: pre; }
+/* CSS Position 4 (w79 phase 1): every element computes `overlay: none`
+   unless it is in the top layer. The `!important` UA rule beats author
+   normal AND author `!important` declarations (UA important is the top
+   cascade rank), so author `overlay: auto` on a non-top-layer element
+   computes to `none` (see overlay-computed.html). Top-layer promotion
+   (phase 2) must exempt elements actually in the top layer; until then
+   this rule is unconditional. */
+* { overlay: none !important; }
 "#;
 
 /// The default user-agent stylesheet (HTML display defaults).
@@ -637,24 +645,56 @@ fn table_presentational_hints(doc: &Document, node: NodeId) -> Vec<Declaration> 
         // `tr`/section mappings above): only the table-derived
         // border/padding hints need an ancestor table.
         cell_dimension_hints(doc, node, &mut text);
-        // w78fix: the HTML rendering `td[nowrap], th[nowrap]
+        // w79fix: the HTML rendering `td[nowrap], th[nowrap]
         // { white-space: nowrap }` rule as a presentational hint:
         // injected here at the presentational-hint cascade level, so
         // it beats UA declarations and loses to any author
         // declaration (including an author `white-space: normal`,
-        // which the old layout-level floor arm could not see). It is
-        // gated to quirks / limited-quirks documents: the task's
-        // standards-mode control must stay wrapping, and the §3.9
-        // floor in `bowser_layout` remains quirks-only. (HTML §15.3.8
-        // writes the rule for all documents; ungating it here would
-        // also unwrap standards-mode nowrap cells — a deliberate
-        // follow-up, not a silent change, if full spec fidelity is
-        // wanted.) Presence of the attribute is enough; its value is
-        // irrelevant, like the layout arm's `nowrap_attr`.
-        if !matches!(doc.quirks_mode(), QuirksMode::NoQuirks)
-            && doc.get_attribute(node, "nowrap").is_some()
-        {
-            hint_decl(&mut text, "white-space", "nowrap");
+        // which the old layout-level floor arm could not see).
+        // Ungated (w79, the follow-up the w78 comment deferred):
+        // HTML §15.3.8 writes the rule for all documents, so
+        // standards-mode nowrap cells unwrap too — a real
+        // web-compat behavior change for standards pages using
+        // `td nowrap`. This does NOT ungate the §3.9 floor in
+        // `bowser_layout`, which remains full-quirks-only. Presence
+        // of the attribute is enough; its value is irrelevant, like
+        // the layout arm's `nowrap_attr`.
+        if doc.get_attribute(node, "nowrap").is_some() {
+            // w79fix: HTML §15.3.8, end of Tables — in quirks mode
+            // ONLY, a `nowrap` cell whose `width` ATTRIBUTE parses
+            // as a nonzero length (not an error, not a percentage)
+            // gets `white-space: normal` instead of the nowrap hint
+            // above. This gate is deliberately textually distinct
+            // from the ungated hint: `== Quirks`, not the hint's
+            // no-gate — reusing the wider gate would wrongly wrap
+            // limited-quirks cells. Only the width ATTRIBUTE
+            // triggers it: CSS style width never reaches this arm.
+            // `html_dimension_nonzero` already drops zero and
+            // unparseable values (`None`), and percentages end in
+            // `%`, so `ends_with("px")` is exactly the
+            // nonzero-length test.
+            // FLOOR INTERACTION (documented, not reworked): this
+            // reset sets computed `white-space` to normal, so the
+            // §3.9 floor in `bowser_layout` — gated on the resolved
+            // `white-space == NoWrap` — switches off for
+            // attribute-width cells, even though Quirks §3.9 itself
+            // conditions only on the nowrap attribute plus a
+            // nonzero-length computed width, and historical Gecko
+            // kept both the wrap reset and the width floor. No WPT
+            // case covers a nowrap + width-attribute cell (the local
+            // nowrap entries use style width only), so whether such
+            // a cell should (a) wrap and (b) still be floored at
+            // the width is unverified: the floor gate is left
+            // unchanged pending that evidence.
+            let wrap_reset = matches!(doc.quirks_mode(), QuirksMode::Quirks)
+                && doc
+                    .get_attribute(node, "width")
+                    .is_some_and(|v| html_dimension_nonzero(v).is_some_and(|d| d.ends_with("px")));
+            if wrap_reset {
+                hint_decl(&mut text, "white-space", "normal");
+            } else {
+                hint_decl(&mut text, "white-space", "nowrap");
+            }
         }
     } else if tag.eq_ignore_ascii_case("tr") {
         // WHATWG HTML rendering § "Tables": the `tr` element's
@@ -1450,6 +1490,21 @@ computed_props! {
     // `getComputedStyle` had nothing to project.
     OUTLINE_COLOR = "outline-color",
     TEXT_DECORATION_COLOR = "text-decoration-color",
+    // w79: appended at the END of the list, never inserted
+    // mid-list (see the w78fix note above): `background-size` /
+    // `background-origin` / `background-clip` previously had no
+    // computed slots at all, so the `background` shorthand could
+    // not expand to them.
+    BACKGROUND_SIZE = "background-size",
+    BACKGROUND_ORIGIN = "background-origin",
+    BACKGROUND_CLIP = "background-clip",
+    // w79 overlay phase 1: `overlay` (CSS Position 4, `none | auto`,
+    // not inherited) previously had no computed slot at all, so
+    // `ComputedStyle::get("overlay")` fell through to the
+    // custom-properties map and read `None`, and author
+    // `overlay: auto` was dropped. Appended at the END, never
+    // inserted mid-list (see the w78fix note above).
+    OVERLAY = "overlay",
 }
 
 // `Styler` keys its resolved-value memo by `COMPUTED_PROPS` index as `u8`.
@@ -2757,6 +2812,12 @@ fn hash_css_value(h: u64, value: &CssValue) -> u64 {
         }
         CssValue::Percentage(n) => share_mix(share_mix(h, 2), n.to_bits() as u64),
         CssValue::Color(c) => share_mix(
+            share_mix(h, 3),
+            u32::from_le_bytes([c.r, c.g, c.b, c.a]) as u64,
+        ),
+        // Keyword-insensitive hash, matching the manual `PartialEq`:
+        // a named color hashes exactly like its plain `Color`.
+        CssValue::NamedColor { color: c, .. } => share_mix(
             share_mix(h, 3),
             u32::from_le_bytes([c.r, c.g, c.b, c.a]) as u64,
         ),
@@ -4512,9 +4573,17 @@ impl<'a> Styler<'a> {
                     self.resolve_inner(node, &cand.value, &env, preserve_case)
                 {
                     // The `font` expansion parses comma groups itself
-                    // (family boundaries); every other shorthand sees the
-                    // `parse_value` shape its expansion was written for.
-                    let substituted = if cand.property.atom() == PropertyAtom::FONT {
+                    // (family boundaries), and so does `background`
+                    // (layer boundaries: a single-item layer must stay
+                    // a nested list, or >= 3 single-item layers flatten
+                    // to a flat list whose second image reads as a
+                    // duplicate and drops the whole declaration);
+                    // every other shorthand sees the `parse_value`
+                    // shape its expansion was written for.
+                    let substituted = if matches!(
+                        cand.property.atom(),
+                        PropertyAtom::FONT | PropertyAtom::BACKGROUND
+                    ) {
                         substituted
                     } else {
                         normalize_comma_groups(substituted)
@@ -5754,6 +5823,8 @@ fn initial_value(property: &str) -> Option<CssValue> {
         "perspective" => kw("none"),
         // CSS Contain 1: no containment by default.
         "contain" => kw("none"),
+        // CSS Position 4: `overlay` is `none | auto`, not inherited.
+        "overlay" => kw("none"),
         // CSS Transforms 1 §14: initial `50% 50%` (matches
         // `TransformOrigin::initial`).
         "transform-origin" => {
@@ -5780,6 +5851,13 @@ fn initial_value(property: &str) -> Option<CssValue> {
         "background-position" => {
             CssValue::List(vec![CssValue::Percentage(0.0), CssValue::Percentage(0.0)])
         }
+        // w79: `background-size` initial is `auto auto` (CSS
+        // Backgrounds 3 §3.4), stored as a two-item list like
+        // `background-position`'s initial above; origin/clip are
+        // the spec initials (`padding-box` / `border-box`).
+        "background-size" => CssValue::List(vec![kw("auto"), kw("auto")]),
+        "background-origin" => kw("padding-box"),
+        "background-clip" => kw("border-box"),
         "text-decoration" => kw("none"),
         "text-decoration-style" => kw("solid"),
         // CSS Text Decoration 3: `text-decoration-color` is not
@@ -6103,7 +6181,8 @@ pub fn is_valid_for_property(property: &str, value: &CssValue) -> bool {
         | "border-block-start-color"
         | "border-block-end-color"
         | "column-rule-color" => {
-            matches!(value, CssValue::Color(_)) || is_kw(value, &["currentcolor"])
+            matches!(value, CssValue::Color(_) | CssValue::NamedColor { .. })
+                || is_kw(value, &["currentcolor"])
         }
         // `text-decoration-color` is `<color>` (CSS Text Decoration 3);
         // `outline-color` is `auto | <color>` (CSS UI 4) with legacy
@@ -6111,10 +6190,11 @@ pub fn is_valid_for_property(property: &str, value: &CssValue) -> bool {
         // both, so the explicit arms must keep accepting them while
         // now rejecting non-color values (lengths, etc.).
         "text-decoration-color" => {
-            matches!(value, CssValue::Color(_)) || is_kw(value, &["currentcolor"])
+            matches!(value, CssValue::Color(_) | CssValue::NamedColor { .. })
+                || is_kw(value, &["currentcolor"])
         }
         "outline-color" => {
-            matches!(value, CssValue::Color(_))
+            matches!(value, CssValue::Color(_) | CssValue::NamedColor { .. })
                 || is_kw(value, &["currentcolor", "auto", "invert"])
         }
         "margin-top" | "margin-right" | "margin-bottom" | "margin-left" => {
@@ -6582,6 +6662,10 @@ pub fn is_valid_for_property(property: &str, value: &CssValue) -> bool {
             value,
             &["static", "relative", "absolute", "fixed", "sticky"],
         ),
+        // CSS Position 4: `overlay` is `none | auto` (CSS-wide keywords
+        // are accepted by the callers' CSS-wide gate, as for every
+        // other single-keyword arm here).
+        "overlay" => is_kw(value, &["none", "auto"]),
         "float" => is_kw(value, &["left", "right", "none"]),
         "clear" => is_kw(value, &["none", "left", "right", "both"]),
         "overflow" => {
@@ -6819,7 +6903,10 @@ pub fn is_valid_for_property(property: &str, value: &CssValue) -> bool {
         "text-transform" => is_kw(value, &["none", "capitalize", "uppercase", "lowercase"]),
         "text-decoration" => matches!(
             value,
-            CssValue::Keyword(_) | CssValue::List(_) | CssValue::Color(_)
+            CssValue::Keyword(_)
+                | CssValue::List(_)
+                | CssValue::Color(_)
+                | CssValue::NamedColor { .. }
         ),
         "text-decoration-style" => is_kw(value, &["solid", "double", "dotted", "dashed", "wavy"]),
         "vertical-align" => {
@@ -6874,20 +6961,81 @@ pub fn is_valid_for_property(property: &str, value: &CssValue) -> bool {
             // (`bowser_paint::gradient::parse_gradient`).
             matches!(value, CssValue::Url(_) | CssValue::Gradient { .. })
                 || is_kw(value, &["none"])
+                || matches!(value, CssValue::List(items) if items.iter().all(|i| {
+                    matches!(i, CssValue::Url(_) | CssValue::Gradient { .. })
+                        || is_kw(i, &["none"])
+                        || matches!(i, CssValue::List(inner) if inner.len() == 1 && (matches!(&inner[0], CssValue::Url(_) | CssValue::Gradient { .. }) || is_kw(&inner[0], &["none"])))
+                }))
         }
-        "background-repeat" => is_kw(
-            value,
-            &[
-                "repeat",
-                "no-repeat",
-                "repeat-x",
-                "repeat-y",
-                "space",
-                "round",
-            ],
-        ),
+        "background-repeat" => {
+            // Single layer: one keyword, or two (`repeat no-repeat`
+            // and friends); layered (w79): a list of those per layer.
+            let is_repeat_kw = |v: &CssValue| {
+                is_kw(
+                    v,
+                    &[
+                        "repeat", "no-repeat", "repeat-x", "repeat-y", "space", "round",
+                    ],
+                )
+            };
+            is_repeat_kw(value)
+                || matches!(value, CssValue::List(items) if items.iter().all(|i| {
+                    is_repeat_kw(i)
+                        || matches!(i, CssValue::List(inner) if (1..=2).contains(&inner.len()) && inner.iter().all(is_repeat_kw))
+                }))
+        }
         "background-position" => {
             is_length_or_pct(value) || matches!(value, CssValue::Keyword(_) | CssValue::List(_))
+        }
+        "background-attachment" => {
+            is_kw(value, &["scroll", "fixed", "local"])
+                || matches!(value, CssValue::List(items) if items.iter().all(|i| {
+                    is_kw(i, &["scroll", "fixed", "local"])
+                        || matches!(i, CssValue::List(inner) if inner.len() == 1 && is_kw(&inner[0], &["scroll", "fixed", "local"]))
+                }))
+        }
+        "background-size" => {
+            // `<bg-size>`: one or two of `<length-percentage> |
+            // auto`, or lone `cover` / `contain`; layered (w79): a
+            // list of those per layer. `Math`/`MathDeferred` are the
+            // cascade's evaluated `calc()` forms, admitted like
+            // `is_length_or_pct`.
+            let is_size_item = |v: &CssValue| {
+                matches!(
+                    v,
+                    CssValue::Length(_, _)
+                        | CssValue::Percentage(_)
+                        | CssValue::Math(_)
+                        | CssValue::MathDeferred { .. }
+                ) || matches!(v, CssValue::Number(n) if *n == 0.0)
+                    || is_kw(v, &["auto", "cover", "contain"])
+            };
+            let is_size_value = |v: &CssValue| {
+                is_size_item(v)
+                    || matches!(v, CssValue::List(items) if (1..=2).contains(&items.len()) && items.iter().all(is_size_item) && !(items.len() == 2 && items.iter().any(|i| is_kw(i, &["cover", "contain"]))))
+            };
+            is_size_value(value)
+                || matches!(value, CssValue::List(items) if items.iter().all(is_size_value))
+        }
+        "background-origin" => {
+            is_kw(value, &["padding-box", "border-box", "content-box"])
+                || matches!(value, CssValue::List(items) if items.iter().all(|i| {
+                    is_kw(i, &["padding-box", "border-box", "content-box"])
+                        || matches!(i, CssValue::List(inner) if inner.len() == 1 && is_kw(&inner[0], &["padding-box", "border-box", "content-box"]))
+                }))
+        }
+        "background-clip" => {
+            // `text` is a valid clip value (CSS Backgrounds 3 §3.7)
+            // but never a valid origin; the combined arm w79 added
+            // dropped it from both. Paint has no text-clip support,
+            // so admitting it here is readback-only for now.
+            is_kw(
+                value,
+                &["padding-box", "border-box", "content-box", "text"],
+            ) || matches!(value, CssValue::List(items) if items.iter().all(|i| {
+                is_kw(i, &["padding-box", "border-box", "content-box", "text"])
+                    || matches!(i, CssValue::List(inner) if inner.len() == 1 && is_kw(&inner[0], &["padding-box", "border-box", "content-box", "text"]))
+            }))
         }
         "list-style-type" => matches!(value, CssValue::Keyword(_)),
         "list-style-position" => is_kw(value, &["inside", "outside"]),
@@ -7143,6 +7291,19 @@ fn is_shorthand_property(property: &PropertyName) -> bool {
             | PropertyAtom::BORDER_BLOCK_WIDTH
             | PropertyAtom::BORDER_BLOCK_STYLE
             | PropertyAtom::BORDER_BLOCK_COLOR
+    )
+    // w79: the compound logical border shorthands have no
+    // `PropertyAtom` (adding one needs `build.rs` `SHORTHAND_NAMES`,
+    // outside this worker's scope); match them by name so deferred
+    // `var()` values still route to `expand_deferred_shorthand`.
+    || matches!(
+        property.as_str(),
+        "border-inline"
+            | "border-block"
+            | "border-inline-start"
+            | "border-inline-end"
+            | "border-block-start"
+            | "border-block-end"
     )
 }
 
@@ -7428,6 +7589,34 @@ fn expand_deferred_shorthand(
     property: &PropertyName,
     value: CssValue,
 ) -> Vec<(PropertyName, CssValue)> {
+    // w79: compound logical border shorthands have no `PropertyAtom`
+    // (see `is_shorthand_property`); dispatch them by name before the
+    // atom match so deferred `var()` values expand. `border-inline` /
+    // `border-block` expand directly to the six edge longhands (the
+    // pipeline does not re-expand intermediate side shorthands).
+    if matches!(
+        property.as_str(),
+        "border-inline"
+            | "border-block"
+            | "border-inline-start"
+            | "border-inline-end"
+            | "border-block-start"
+            | "border-block-end"
+    ) {
+        let pairs = match property.as_str() {
+            "border-inline" => {
+                expand_border_sides(&["border-inline-start", "border-inline-end"], value)
+            }
+            "border-block" => {
+                expand_border_sides(&["border-block-start", "border-block-end"], value)
+            }
+            _ => expand_border_sides(&[property.as_str()], value),
+        };
+        return pairs
+            .into_iter()
+            .map(|(name, v)| (PropertyName::from(name), v))
+            .collect();
+    }
     // The `*_value` mirrors below still return `(String, CssValue)`
     // pairs; interning happens once at this boundary so the cascade hot
     // path above works purely on atoms.
@@ -7978,6 +8167,32 @@ fn expand_border_sides(prefixes: &[&str], value: CssValue) -> Vec<(String, CssVa
     let mut width = None;
     let mut style = None;
     let mut color = None;
+    // w79: lone CSS-wide keyword expands per longhand, mirroring
+    // parse.rs's w78fix H4 arm. Without this, a deferred
+    // `border: var(--x)` resolving to `inherit` (and the new logical
+    // border shorthands below) silently dropped the declaration
+    // instead of setting every longhand to the keyword.
+    if let [item] = as_list(&value).as_slice()
+        && is_css_wide_keyword(item)
+    {
+        let kw = item.clone();
+        let mut out = Vec::new();
+        let push_side = |prefix: &str, out: &mut Vec<(String, CssValue)>| {
+            out.push(decl(&format!("{prefix}-width"), kw.clone()));
+            out.push(decl(&format!("{prefix}-style"), kw.clone()));
+            out.push(decl(&format!("{prefix}-color"), kw.clone()));
+        };
+        for prefix in prefixes {
+            if *prefix == "border" {
+                for side in ["top", "right", "bottom", "left"] {
+                    push_side(&format!("border-{side}"), &mut out);
+                }
+            } else {
+                push_side(prefix, &mut out);
+            }
+        }
+        return out;
+    }
     for item in as_list(&value) {
         match item {
             // Unitless zero is a valid `<length>` (CSS-wide rule), and a
@@ -7994,7 +8209,7 @@ fn expand_border_sides(prefixes: &[&str], value: CssValue) -> Vec<(String, CssVa
                 }
                 width = Some(item);
             }
-            CssValue::Color(_) => {
+            CssValue::Color(_) | CssValue::NamedColor { .. } => {
                 if color.is_some() {
                     return Vec::new();
                 }
@@ -8075,7 +8290,7 @@ fn expand_column_rule_value(value: &CssValue) -> Vec<(String, CssValue)> {
                 }
                 width = Some(item);
             }
-            CssValue::Color(_) => {
+            CssValue::Color(_) | CssValue::NamedColor { .. } => {
                 if color.is_some() {
                     return Vec::new();
                 }
@@ -8610,91 +8825,459 @@ fn expand_font_value(value: &CssValue) -> Vec<(String, CssValue)> {
     font_longhands(style, variant, weight, size, normal, family)
 }
 
-/// `background: <color> <image> <repeat> <attachment> <position>` in any order.
-/// All five longhands are always emitted; omitted components reset to
-/// initial values (`transparent`, `none`, `repeat`, `scroll`, `0% 0%`).
-fn expand_background(value: CssValue) -> Vec<(String, CssValue)> {
-    let mut color = None;
-    let mut image = None;
-    let mut repeat = None;
-    let mut attachment = None;
-    let mut position: Vec<CssValue> = Vec::new();
-    for item in as_list(&value) {
+/// One classified `background` layer: every component a single
+/// layer can carry. `position`/`size`/`repeat` hold their raw item
+/// lists (1-2 items each); `boxes` holds the 1-2 box keywords in
+/// order (origin first, clip second), except that a lone `text`
+/// is clip-only: it is never an origin (see `bg_layer_values`),
+/// and `text` in the first position of a two-box form is
+/// rejected in `classify_bg_layer`.
+struct BgLayer {
+    color: Option<CssValue>,
+    image: Option<CssValue>,
+    repeat: Vec<CssValue>,
+    attachment: Option<CssValue>,
+    position: Vec<CssValue>,
+    size: Option<CssValue>,
+    boxes: Vec<CssValue>,
+}
+
+fn is_bg_repeat_kw(k: &str) -> bool {
+    matches!(
+        k,
+        "repeat" | "no-repeat" | "repeat-x" | "repeat-y" | "space" | "round"
+    )
+}
+
+fn is_bg_box_kw(k: &str) -> bool {
+    matches!(k, "padding-box" | "border-box" | "content-box")
+}
+
+fn is_bg_position_item(v: &CssValue) -> bool {
+    matches!(
+        v,
+        CssValue::Length(_, _)
+            | CssValue::Percentage(_)
+            | CssValue::Math(_)
+            | CssValue::MathDeferred { .. }
+    ) || matches!(v, CssValue::Keyword(k) if matches!(k.as_str(), "left" | "right" | "top" | "bottom" | "center"))
+}
+
+fn is_bg_size_item(v: &CssValue) -> bool {
+    matches!(
+        v,
+        CssValue::Length(_, _)
+            | CssValue::Percentage(_)
+            | CssValue::Math(_)
+            | CssValue::MathDeferred { .. }
+    ) || matches!(v, CssValue::Number(n) if *n == 0.0)
+        || matches!(v, CssValue::Keyword(k) if matches!(k.as_str(), "auto" | "cover" | "contain"))
+}
+
+/// Classify one layer's items (`size_items` is the `/`-separated
+/// size group, if any) into a [`BgLayer`]. `None` rejects the whole
+/// shorthand: an unclassifiable item, a duplicated component, a
+/// position with more than two items, a `repeat-x`/`repeat-y`
+/// combined with a second repeat keyword, or a `cover`/`contain`
+/// size combined with another size item.
+fn classify_bg_layer(items: &[CssValue], size_items: Option<&[CssValue]>) -> Option<BgLayer> {
+    let mut layer = BgLayer {
+        color: None,
+        image: None,
+        repeat: Vec::new(),
+        attachment: None,
+        position: Vec::new(),
+        size: None,
+        boxes: Vec::new(),
+    };
+    for item in items {
         match item {
-            CssValue::Color(_) => {
-                if color.is_some() {
-                    return Vec::new();
+            CssValue::Color(_) | CssValue::NamedColor { .. } => {
+                if layer.color.is_some() {
+                    return None;
                 }
-                color = Some(item);
+                layer.color = Some(item.clone());
             }
             CssValue::Url(_) | CssValue::Gradient { .. } => {
-                if image.is_some() {
-                    return Vec::new();
+                if layer.image.is_some() {
+                    return None;
                 }
-                image = Some(item);
+                layer.image = Some(item.clone());
             }
-            CssValue::Length(_, _) | CssValue::Percentage(_) => position.push(item),
+            CssValue::Length(_, _)
+            | CssValue::Percentage(_)
+            | CssValue::Math(_)
+            | CssValue::MathDeferred { .. } => layer.position.push(item.clone()),
             CssValue::Keyword(kw) => {
                 let k = kw.as_str();
                 if k == "currentcolor" {
-                    if color.is_some() {
-                        return Vec::new();
+                    if layer.color.is_some() {
+                        return None;
                     }
-                    color = Some(CssValue::Keyword(kw));
-                } else if matches!(
-                    k,
-                    "repeat" | "no-repeat" | "repeat-x" | "repeat-y" | "space" | "round"
-                ) {
-                    if repeat.is_some() {
-                        return Vec::new();
+                    layer.color = Some(item.clone());
+                } else if is_bg_repeat_kw(k) {
+                    if layer.repeat.iter().any(|r| {
+                        matches!(r, CssValue::Keyword(rk) if matches!(rk.as_str(), "repeat-x" | "repeat-y"))
+                    }) || matches!(k, "repeat-x" | "repeat-y") && !layer.repeat.is_empty()
+                        || layer.repeat.len() >= 2
+                    {
+                        return None;
                     }
-                    repeat = Some(CssValue::Keyword(kw));
+                    layer.repeat.push(item.clone());
                 } else if matches!(k, "scroll" | "fixed" | "local") {
-                    if attachment.is_some() {
-                        return Vec::new();
+                    if layer.attachment.is_some() {
+                        return None;
                     }
-                    attachment = Some(CssValue::Keyword(kw));
+                    layer.attachment = Some(item.clone());
                 } else if matches!(k, "left" | "right" | "top" | "bottom" | "center") {
-                    position.push(CssValue::Keyword(kw));
-                } else if k == "none" {
-                    if image.is_some() {
-                        return Vec::new();
+                    layer.position.push(item.clone());
+                } else if is_bg_box_kw(k) || k == "text" {
+                    // `text` is clip-only, not a `<bg-box>`: it is
+                    // admitted here so the lone/two-box split in
+                    // `bg_layer_values` can place it, and rejected
+                    // as an origin below. Keeping `is_bg_box_kw`
+                    // to the three origin-valid boxes (rather than
+                    // adding `text` to it) is what stops a lone
+                    // `text` from being mapped to origin=`text`.
+                    if layer.boxes.len() >= 2 {
+                        return None;
                     }
-                    image = Some(CssValue::Keyword(kw));
+                    layer.boxes.push(item.clone());
+                } else if k == "none" {
+                    if layer.image.is_some() {
+                        return None;
+                    }
+                    layer.image = Some(item.clone());
                 } else {
-                    return Vec::new();
+                    return None;
                 }
             }
-            _ => return Vec::new(),
+            _ => return None,
         }
     }
-    if position.len() > 2 {
-        return Vec::new();
+    // `text` can never be `background-origin`. In a two-box
+    // form the first keyword is the origin, so `text` there
+    // invalidates the whole layer (a lone `text` is fine: it is
+    // the clip, resolved in `bg_layer_values`). This check must
+    // wait until the loop ends, because a first-seen `text`
+    // cannot be judged until a second box does or does not
+    // arrive.
+    if layer.boxes.len() == 2
+        && matches!(&layer.boxes[0], CssValue::Keyword(k) if k.as_str() == "text")
+    {
+        return None;
     }
-    // Every longhand is emitted; omitted ones reset to initial values.
-    let color = color.unwrap_or(CssValue::Color(Color {
+    if layer.position.len() > 2 {
+        return None;
+    }
+    if let Some(size_items) = size_items {
+        if size_items.is_empty() || size_items.len() > 2 {
+            return None;
+        }
+        if size_items
+            .iter()
+            .any(|i| matches!(i, CssValue::Keyword(k) if matches!(k.as_str(), "cover" | "contain")))
+            && size_items.len() != 1
+        {
+            return None;
+        }
+        if !size_items.iter().all(is_bg_size_item) {
+            return None;
+        }
+        layer.size = Some(if size_items.len() == 1 {
+            size_items[0].clone()
+        } else {
+            CssValue::List(size_items.to_vec())
+        });
+    }
+    Some(layer)
+}
+
+/// Classify a `/`-separated layer: `before` holds the layer items
+/// up to the position, `after` holds the size group followed by
+/// any remaining layer items (`background: url(a.png) center/cover
+/// no-repeat padding-box` splits as size `[cover]` plus trailing
+/// `[padding-box]`). The size is a prefix of `after`: a lone
+/// `cover`/`contain`, or one or two `<length-percentage>`/`auto`
+/// items; anything after the size that is itself a position item
+/// rejects the layer (the position lives before the slash). A
+/// slash with no position in `before` is invalid: the grammar
+/// attaches `/ <size>` to `<position>`, so `red/cover` (no
+/// position) does not match any layer alternative.
+fn classify_bg_slash_layer(before: &[CssValue], after: &[CssValue]) -> Option<BgLayer> {
+    if after.is_empty() {
+        return None;
+    }
+    if !before.iter().any(is_bg_position_item) {
+        return None;
+    }
+    let (size, rest) = match &after[0] {
+        CssValue::Keyword(k) if matches!(k.as_str(), "cover" | "contain") => {
+            (&after[..1], &after[1..])
+        }
+        _ => {
+            let mut n = 0;
+            while n < after.len() && n < 2 && is_bg_size_item(&after[n]) {
+                if matches!(&after[n], CssValue::Keyword(k) if matches!(k.as_str(), "cover" | "contain"))
+                {
+                    return None;
+                }
+                n += 1;
+            }
+            if n == 0 {
+                return None;
+            }
+            (&after[..n], &after[n..])
+        }
+    };
+    if rest.iter().any(is_bg_position_item) {
+        return None;
+    }
+    let mut items = before.to_vec();
+    items.extend(rest.iter().cloned());
+    classify_bg_layer(&items, Some(size))
+}
+
+/// The eight `background` longhand values for one classified layer,
+/// in `bg_layer_values` order: color, image, repeat, attachment,
+/// position, size, origin, clip. A named alias keeps the 8-tuple
+/// under clippy's `type_complexity` threshold at its use sites.
+type BgLayerValues = (
+    CssValue,
+    CssValue,
+    CssValue,
+    CssValue,
+    CssValue,
+    CssValue,
+    CssValue,
+    CssValue,
+);
+
+/// Per-layer longhand values for one classified layer, with omitted
+/// components at their initials. A single `<bg-box>` keyword sets
+/// both origin and clip (CSS Backgrounds 3 §3.7); two set origin
+/// then clip. The exception is a lone `text`: it is clip-only, so
+/// it sets clip=`text` with origin at its initial
+/// (`padding-box`), never origin=`text`. A two-box form with
+/// `text` first never reaches here: `classify_bg_layer` rejects
+/// it, since `text` can never be the origin.
+fn bg_layer_values(layer: &BgLayer) -> BgLayerValues {
+    let color = layer.color.clone().unwrap_or(CssValue::Color(Color {
         r: 0,
         g: 0,
         b: 0,
         a: 0,
-    })); // transparent
-    let image = image.unwrap_or(CssValue::Keyword("none".into()));
-    let repeat = repeat.unwrap_or(CssValue::Keyword("repeat".into()));
-    let attachment = attachment.unwrap_or(CssValue::Keyword("scroll".into()));
-    let position = if position.is_empty() {
-        CssValue::List(vec![CssValue::Percentage(0.0), CssValue::Percentage(0.0)])
-    } else if position.len() == 1 {
-        position.pop().expect("one position")
+    }));
+    let image = layer
+        .image
+        .clone()
+        .unwrap_or(CssValue::Keyword("none".into()));
+    let repeat = if layer.repeat.is_empty() {
+        CssValue::Keyword("repeat".into())
+    } else if layer.repeat.len() == 1 {
+        layer.repeat[0].clone()
     } else {
-        CssValue::List(position)
+        CssValue::List(layer.repeat.clone())
     };
-    vec![
+    let attachment = layer
+        .attachment
+        .clone()
+        .unwrap_or(CssValue::Keyword("scroll".into()));
+    let position = if layer.position.is_empty() {
+        CssValue::List(vec![CssValue::Percentage(0.0), CssValue::Percentage(0.0)])
+    } else if layer.position.len() == 1 {
+        layer.position[0].clone()
+    } else {
+        CssValue::List(layer.position.clone())
+    };
+    let size = layer.size.clone().unwrap_or(CssValue::List(vec![
+        CssValue::Keyword("auto".into()),
+        CssValue::Keyword("auto".into()),
+    ]));
+    let (origin, clip) = match layer.boxes.as_slice() {
+        [] => (
+            CssValue::Keyword("padding-box".into()),
+            CssValue::Keyword("border-box".into()),
+        ),
+        [only] if matches!(only, CssValue::Keyword(k) if k.as_str() == "text") => {
+            (CssValue::Keyword("padding-box".into()), only.clone())
+        }
+        [only] => (only.clone(), only.clone()),
+        [first, second] => (first.clone(), second.clone()),
+        _ => unreachable!("classify caps boxes at two"),
+    };
+    (
+        color, image, repeat, attachment, position, size, origin, clip,
+    )
+}
+
+/// Emit the eight longhands for classified layers. One layer emits
+/// scalar longhands (the historical shapes); several layers emit
+/// per-layer lists for every layered longhand (each layer's value
+/// wrapped in its own list, so layers stay distinct from a single
+/// layer's multi-value component), while `background-color` stays
+/// a single value: only the final layer may carry a color, so it is
+/// that layer's color or `transparent`.
+fn emit_bg_layers(layers: &[BgLayer]) -> Option<Vec<(String, CssValue)>> {
+    if layers.is_empty() {
+        return None;
+    }
+    // A color on a non-final layer invalidates the shorthand (CSS
+    // Backgrounds 3 §3.7: the color belongs to the final layer only).
+    if layers[..layers.len() - 1].iter().any(|l| l.color.is_some()) {
+        return None;
+    }
+    let values: Vec<BgLayerValues> = layers.iter().map(bg_layer_values).collect();
+    let color = values.last().expect("non-empty layers").0.clone();
+    if layers.len() == 1 {
+        let (_, image, repeat, attachment, position, size, origin, clip) =
+            values.into_iter().next().expect("one layer");
+        return Some(vec![
+            decl("background-color", color),
+            decl("background-image", image),
+            decl("background-repeat", repeat),
+            decl("background-attachment", attachment),
+            decl("background-position", position),
+            decl("background-size", size),
+            decl("background-origin", origin),
+            decl("background-clip", clip),
+        ]);
+    }
+    let wrap = |f: fn(&BgLayerValues) -> CssValue| {
+        CssValue::List(values.iter().map(|v| CssValue::List(vec![f(v)])).collect())
+    };
+    Some(vec![
         decl("background-color", color),
-        decl("background-image", image),
-        decl("background-repeat", repeat),
-        decl("background-attachment", attachment),
-        decl("background-position", position),
-    ]
+        decl("background-image", wrap(|v| v.1.clone())),
+        decl("background-repeat", wrap(|v| v.2.clone())),
+        decl("background-attachment", wrap(|v| v.3.clone())),
+        decl("background-position", wrap(|v| v.4.clone())),
+        decl("background-size", wrap(|v| v.5.clone())),
+        decl("background-origin", wrap(|v| v.6.clone())),
+        decl("background-clip", wrap(|v| v.7.clone())),
+    ])
+}
+
+/// Expand `background` after `var()` substitution (the cascade-side
+/// twin of parse.rs's `expand_background`): `<bg-layer>#` with a
+/// final-layer `<color>`, each layer
+/// `<image> || <position> [ / <size> ]? || <repeat> || <attachment>
+/// || <box> || <box>` in any order. Every longhand is emitted;
+/// omitted components reset to initial values (`transparent`,
+/// `none`, `repeat`, `scroll`, `0% 0%`, `auto auto`,
+/// `padding-box`, `border-box`).
+///
+/// Value shapes (see the parse-side contract): a flat item list is
+/// one layer; `List([List(before), List(after)])` is the `/` marker
+/// (position/size split); a list of lists is the layer list from a
+/// substituted comma-separated value. The `/` marker and a
+/// two-layer list share the two-nested-list shape, so the slash
+/// reading is tried first (like `expand_font_value`).
+///
+/// KNOWN-WRONG (w79fix 2, pinned by
+/// `w79fix_background_slash_vs_two_layers_known_wrong`): when layer
+/// 1 contains a position item and layer 2 is 1-2
+/// `<length-percentage>` items (e.g. `--bg: url(a.png) center, 50%`),
+/// the slash reading wins and the value computes as a single layer
+/// (`center` / `50%`), losing layer 2 entirely. The two readings are
+/// indistinguishable at this level: a genuine slash size of 1-2
+/// lengths/percentages (`url(a.png) center/50%`) produces the exact
+/// same `List([List, List])`. Fixing it properly needs comma-group
+/// provenance through substitution — the slash-vs-comma distinction
+/// is lost when `resolve_inner` converts both a `Slash` and a
+/// `Comma` result to `List([List, List])` — so it is deferred, not
+/// papered over with a heuristic that would flip the genuine slash
+/// case. It still yields a valid background, never a drop.
+/// A lone CSS-wide keyword expands per longhand, like `expand_box`.
+fn expand_background(value: CssValue) -> Vec<(String, CssValue)> {
+    let items = as_list(&value);
+    if items.len() == 1 && is_css_wide_keyword(&items[0]) {
+        let kw = items[0].clone();
+        return [
+            "background-color",
+            "background-image",
+            "background-repeat",
+            "background-attachment",
+            "background-position",
+            "background-size",
+            "background-origin",
+            "background-clip",
+        ]
+        .iter()
+        .map(|p| decl(p, kw.clone()))
+        .collect();
+    }
+    // `/` marker: exactly two nested lists, second group a size.
+    if let CssValue::List(groups) = &value
+        && groups.len() == 2
+        && let (CssValue::List(before), CssValue::List(after)) = (&groups[0], &groups[1])
+        && let Some(layer) = classify_bg_slash_layer(before, after)
+    {
+        return emit_bg_layers(std::slice::from_ref(&layer)).unwrap_or_default();
+    }
+    // Layer list: every item a list (a substituted comma-separated
+    // value, or the parse-side layer-list store). Each item is a
+    // slash marker or a plain item list.
+    if let CssValue::List(groups) = &value
+        && !groups.is_empty()
+        && groups.iter().all(|g| matches!(g, CssValue::List(_)))
+    {
+        let mut layers = Vec::with_capacity(groups.len());
+        for group in groups {
+            let CssValue::List(group) = group else {
+                unreachable!("all items are lists")
+            };
+            let layer = match group.as_slice() {
+                [CssValue::List(before), CssValue::List(after)]
+                    if classify_bg_slash_layer(before, after).is_some() =>
+                {
+                    classify_bg_slash_layer(before, after)
+                }
+                _ => classify_bg_layer(group, None),
+            };
+            match layer {
+                Some(layer) => layers.push(layer),
+                None => return Vec::new(),
+            }
+        }
+        return emit_bg_layers(&layers).unwrap_or_default();
+    }
+    // Mixed layer list: some groups are lists, some are scalars — a
+    // layer list that reached this expansion after single-item
+    // groups were flattened elsewhere (a scalar group is a one-item
+    // layer). A flat single layer can never contain a nested list
+    // (its items are scalars), so this arm only rescues values the
+    // flat classifier below would drop outright.
+    if let CssValue::List(groups) = &value
+        && groups.len() >= 2
+        && groups.iter().any(|g| matches!(g, CssValue::List(_)))
+        && groups.iter().any(|g| !matches!(g, CssValue::List(_)))
+    {
+        let mut layers = Vec::with_capacity(groups.len());
+        for group in groups {
+            let layer = match group {
+                CssValue::List(group) => match group.as_slice() {
+                    [CssValue::List(before), CssValue::List(after)]
+                        if classify_bg_slash_layer(before, after).is_some() =>
+                    {
+                        classify_bg_slash_layer(before, after)
+                    }
+                    _ => classify_bg_layer(group, None),
+                },
+                scalar => classify_bg_layer(std::slice::from_ref(scalar), None),
+            };
+            match layer {
+                Some(layer) => layers.push(layer),
+                None => return Vec::new(),
+            }
+        }
+        return emit_bg_layers(&layers).unwrap_or_default();
+    }
+    // Flat single layer.
+    let Some(layer) = classify_bg_layer(&items, None) else {
+        return Vec::new();
+    };
+    emit_bg_layers(std::slice::from_ref(&layer)).unwrap_or_default()
 }
 
 /// `list-style: <type> <position> <image>` in any order. All three
@@ -9257,7 +9840,31 @@ impl<'a> Styler<'a> {
             value = None;
             invalid = true;
         }
-        value = value.map(normalize_comma_groups);
+        // `background-*` longhands keep per-layer lists: their
+        // values are comma-grouped by layer (see the collect-site
+        // exemption for the `background` shorthand), and flattening
+        // single-item layers here would merge >= 3 layers exactly
+        // as the collect site used to (the two-layer shape survives
+        // only because of the slash-marker guard in
+        // `normalize_comma_groups`). A `background-image` longhand
+        // substituted from a comma-separated `var()` keeps the same
+        // per-layer shape for consistency.
+        value = if prop.starts_with("background-") {
+            value
+        } else {
+            value.map(normalize_comma_groups)
+        };
+        // w79: computed values never carry authored color keywords:
+        // a `NamedColor` (e.g. from `border-color: aqua`, or from a
+        // `var()` substituted to a bare keyword) strips to its plain
+        // `Color` here, before grammar validation, so computed style,
+        // layout, and paint keep seeing exactly the shapes they
+        // matched before — and `currentcolor` substitution (which
+        // matches only the `currentcolor` keyword) can never mistake
+        // a named color for it. The specified surface keeps the
+        // keyword because it parses fresh from text and never runs
+        // this path.
+        value = value.map(CssValue::strip_named_colors);
         // `grid-auto-flow`'s two-keyword form must read as one keyword
         // (see `fold_grid_auto_flow`); fold before grammar validation so
         // the validator sees the folded shape on both validation passes.
@@ -11244,15 +11851,37 @@ mod tests {
         let n = COMPUTED_PROPS.len();
         assert_eq!(
             COMPUTED_PROPS.iter().position(|p| *p == "outline-color"),
-            Some(n - 2),
-            "outline-color must be appended second-to-last"
+            Some(n - 6),
+            "outline-color must stay second among the appended tail"
         );
         assert_eq!(
             COMPUTED_PROPS
                 .iter()
                 .position(|p| *p == "text-decoration-color"),
+            Some(n - 5),
+            "text-decoration-color must follow outline-color"
+        );
+        // w79 appended the three background longhands after them.
+        assert_eq!(
+            COMPUTED_PROPS.iter().position(|p| *p == "background-size"),
+            Some(n - 4)
+        );
+        assert_eq!(
+            COMPUTED_PROPS
+                .iter()
+                .position(|p| *p == "background-origin"),
+            Some(n - 3)
+        );
+        assert_eq!(
+            COMPUTED_PROPS.iter().position(|p| *p == "background-clip"),
+            Some(n - 2),
+            "background-clip must precede overlay"
+        );
+        // w79 overlay phase 1 appended `overlay` after them.
+        assert_eq!(
+            COMPUTED_PROPS.iter().position(|p| *p == "overlay"),
             Some(n - 1),
-            "text-decoration-color must be appended last"
+            "overlay must be appended last"
         );
         let aqua = CssValue::Color(Color {
             r: 0,
@@ -11564,8 +12193,14 @@ mod tests {
             s.get_by_index(props::MARGIN_TOP),
             Some(&CssValue::Length(5.0, LengthUnit::Px))
         );
+        // Bound is 7, not 6: the UA `* { overlay: none !important }`
+        // rule (w79 phase 1) wins on every element but parses to a
+        // fresh `none` Arc, not the shared initial Arc, so the sparse
+        // writer stores it as a deviating slot — the same precedent as
+        // the UA `span { display: inline; }` rule, whose value equals
+        // the `display` initial.
         assert!(
-            s.stored_slots() <= 6,
+            s.stored_slots() <= 7,
             "styled p stored {}",
             s.stored_slots()
         );
@@ -12028,15 +12663,15 @@ mod tests {
 
     #[test]
     fn nowrap_presentational_hint() {
-        // w78fix item 1 (fail-before: limited-quirks `td nowrap`
-        // computes `white-space: normal`, so the cell wraps): the
-        // HTML rendering presentational hint `td[nowrap],
+        // w79fix: the HTML rendering presentational hint `td[nowrap],
         // th[nowrap] { white-space: nowrap }`, implemented in
         // `table_presentational_hints` at the presentational-hint
         // cascade level — beating UA declarations, losing to any
-        // author declaration — and gated to quirks / limited-quirks
-        // documents so standards mode is unchanged (see the layout
-        // tests for the table-measurement consequences).
+        // author declaration — now ungated, per HTML §15.3.8, which
+        // writes the rule for all documents (the w78 quirks /
+        // limited-quirks gate is removed; see the layout tests for
+        // the table-measurement consequences). The §3.9 floor in
+        // `bowser_layout` remains full-quirks-only.
         let limited = "<!DOCTYPE HTML PUBLIC \"-//W3C//DTD HTML 4.01 Transitional//EN\" \"http://www.w3.org/TR/html4/loose.dtd\"><html><body><table><tr><td nowrap>x</td><th nowrap>y</th></tr></table></body></html>";
         let (doc, _) = Document::parse_html(limited.as_bytes());
         let td = doc.query_selector("td").unwrap().expect("td");
@@ -12055,13 +12690,51 @@ mod tests {
         let td = doc.query_selector("td").unwrap().expect("td");
         let s = compute_style(&doc, td, &[], &ua(), &vp());
         assert_eq!(s.get_str("white-space"), Some("nowrap"));
-        // Standards mode: no hint, the cell keeps the initial value.
+        // Standards mode: the hint applies too (w79 ungating).
         let (doc, _) = Document::parse_html(
             b"<!DOCTYPE html><html><body><table><tr><td nowrap>x</td></tr></table></body></html>",
         );
         let td = doc.query_selector("td").unwrap().expect("td");
         let s = compute_style(&doc, td, &[], &ua(), &vp());
-        assert_eq!(s.get_str("white-space"), Some("normal"));
+        assert_eq!(s.get_str("white-space"), Some("nowrap"));
+    }
+
+    #[test]
+    fn w79fix_quirks_nowrap_width_attribute_resets_white_space() {
+        // HTML §15.3.8, end of Tables (w79, fail-before: the
+        // `width="50"` case below computed `nowrap`): in quirks mode only, a
+        // `td`/`th` with a `nowrap` attribute but also a `width`
+        // attribute whose value parses as a nonzero length (not an
+        // error, not a percentage) gets a presentational hint
+        // `white-space: normal` instead of the `nowrap` hint. This
+        // gate is `== Quirks` only and textually distinct from the
+        // ungated nowrap hint above: reusing the wider gate would
+        // wrongly wrap limited-quirks cells. Only the width
+        // ATTRIBUTE triggers it, not CSS style width.
+        let quirks = "<!DOCTYPE HTML PUBLIC \"-//W3C//DTD HTML 4.0 Transitional//EN\">";
+        let limited = "<!DOCTYPE HTML PUBLIC \"-//W3C//DTD HTML 4.01 Transitional//EN\" \"http://www.w3.org/TR/html4/loose.dtd\">";
+        let ws = |doctype: &str, inner: &str| {
+            let html =
+                format!("{doctype}<html><body><table><tr>{inner}</tr></table></body></html>");
+            let (doc, _) = Document::parse_html(html.as_bytes());
+            let td = doc.query_selector("td").unwrap().expect("td");
+            let s = compute_style(&doc, td, &[], &ua(), &vp());
+            s.get_str("white-space").unwrap().to_owned()
+        };
+        // Full-quirks matrix.
+        assert_eq!(ws(quirks, "<td nowrap width=\"50\">x</td>"), "normal");
+        assert_eq!(ws(quirks, "<td nowrap width=\"50px\">x</td>"), "normal");
+        assert_eq!(ws(quirks, "<td nowrap width=\"50%\">x</td>"), "nowrap");
+        assert_eq!(ws(quirks, "<td nowrap width=\"0\">x</td>"), "nowrap");
+        assert_eq!(ws(quirks, "<td nowrap width=\"abc\">x</td>"), "nowrap");
+        assert_eq!(ws(quirks, "<td nowrap>x</td>"), "nowrap");
+        // Gate checks: the reset does NOT fire outside full quirks
+        // (the ungated nowrap hint still applies in both).
+        assert_eq!(ws(limited, "<td nowrap width=\"50\">x</td>"), "nowrap");
+        assert_eq!(
+            ws("<!DOCTYPE html>", "<td nowrap width=\"50\">x</td>"),
+            "nowrap"
+        );
     }
 
     #[test]
@@ -12520,12 +13193,13 @@ mod tests {
         // the per-node memo is a bitset plus a vec header — versus the
         // old 1464 heap bytes per style and 2928 heap bytes per memo
         // (187 slots * 8 / 16 bytes), now paid only per deviating
-        // slot at 16 bytes each.
+        // slot at 16 bytes each. w79 added three background slots
+        // (190 slots total) plus one overlay slot (191 total).
         assert_eq!(std::mem::size_of::<ComputedStyle>(), 24);
         assert!(std::mem::size_of::<MemoSet>() <= 48);
         assert_eq!(
             PROP_COUNT * std::mem::size_of::<Option<Arc<CssValue>>>(),
-            1496
+            1528
         );
     }
 
@@ -13560,6 +14234,467 @@ mod tests {
     }
 
     #[test]
+    fn w79_named_color_strips_at_computed_time() {
+        // w79 item 1: a named color parses to `NamedColor` and
+        // computes to plain `Color` (keyword-insensitive equality
+        // keeps the `Color` expectation true either way, so assert
+        // the variant shape too via `authored_color_keyword`).
+        let (doc, div, _) = sample();
+        let s = style(&doc, div, "div { border-color: aqua; }", &vp());
+        for side in ["top", "right", "bottom", "left"] {
+            let v = s.get(&format!("border-{side}-color")).expect("longhand");
+            assert_eq!(
+                v,
+                &CssValue::Color(Color {
+                    r: 0,
+                    g: 255,
+                    b: 255,
+                    a: 255
+                }),
+                "{side}"
+            );
+            assert_eq!(v.authored_color_keyword(), None, "{side}");
+        }
+        // Same through a `var()` substitution: the substituted
+        // keyword also strips, and never becomes `currentcolor`.
+        let s = style(
+            &doc,
+            div,
+            "div { --c: aqua; border-top-color: var(--c); }",
+            &vp(),
+        );
+        assert_eq!(
+            s.get("border-top-color"),
+            Some(&CssValue::Color(Color {
+                r: 0,
+                g: 255,
+                b: 255,
+                a: 255
+            }))
+        );
+        // `transparent` is a named color too, not `currentcolor`.
+        let s = style(&doc, div, "div { color: transparent; }", &vp());
+        assert_eq!(
+            s.get("color"),
+            Some(&CssValue::Color(Color {
+                r: 0,
+                g: 0,
+                b: 0,
+                a: 0
+            }))
+        );
+    }
+
+    #[test]
+    fn w79_background_slots_and_slash() {
+        // w79 item 2: the three new slots compute, `/ size` works
+        // through the cascade, and a `var()`-deferred background
+        // expands after substitution.
+        let (doc, div, _) = sample();
+        let s = style(
+            &doc,
+            div,
+            "div { background: url(a.png) center/cover no-repeat padding-box; }",
+            &vp(),
+        );
+        assert_eq!(s.get("background-size"), Some(&kw("cover")));
+        assert_eq!(s.get("background-position"), Some(&kw("center")));
+        assert_eq!(s.get("background-origin"), Some(&kw("padding-box")));
+        // One box keyword sets both origin and clip.
+        assert_eq!(s.get("background-clip"), Some(&kw("padding-box")));
+        assert_eq!(s.get("background-repeat"), Some(&kw("no-repeat")));
+        let s = style(
+            &doc,
+            div,
+            "div { --bg: url(a.png) center/cover; background: var(--bg); }",
+            &vp(),
+        );
+        assert_eq!(s.get("background-size"), Some(&kw("cover")));
+        // Multi-layer longhands keep per-layer lists.
+        let s = style(
+            &doc,
+            div,
+            "div { background: url(a.png) no-repeat, url(b.png) red; }",
+            &vp(),
+        );
+        assert_eq!(
+            s.get("background-image"),
+            Some(&CssValue::List(vec![
+                CssValue::List(vec![CssValue::Url("a.png".into())]),
+                CssValue::List(vec![CssValue::Url("b.png".into())]),
+            ]))
+        );
+        assert_eq!(
+            s.get("background-color"),
+            Some(&CssValue::Color(Color {
+                r: 255,
+                g: 0,
+                b: 0,
+                a: 255
+            }))
+        );
+    }
+
+    #[test]
+    fn w79fix_background_var_three_single_item_layers() {
+        // w79fix 1: a `var()`-deferred background with >= 3 layers,
+        // every layer a single item, must not be dropped. Before the
+        // fix `normalize_comma_groups` flattened the substituted
+        // `List[List[Url], List[Url], List[Url]]` to a flat
+        // `List[Url, Url, Url]`, whose second `Url` read as a
+        // duplicate image, so the whole declaration dropped and all
+        // eight longhands fell back to initials. The same shape
+        // through the direct path, and a mixed shape (one multi-item
+        // layer among single-item layers), pin the two
+        // normalization sites that must preserve layer boundaries.
+        let (doc, div, _) = sample();
+        let three_images = CssValue::List(vec![
+            CssValue::List(vec![CssValue::Url("a.png".into())]),
+            CssValue::List(vec![CssValue::Url("b.png".into())]),
+            CssValue::List(vec![CssValue::Url("c.png".into())]),
+        ]);
+        let transparent = CssValue::Color(Color {
+            r: 0,
+            g: 0,
+            b: 0,
+            a: 0,
+        });
+        let s = style(
+            &doc,
+            div,
+            "div { --bg: url(a.png), url(b.png), url(c.png); background: var(--bg); }",
+            &vp(),
+        );
+        assert_eq!(s.get("background-image"), Some(&three_images));
+        assert_eq!(s.get("background-color"), Some(&transparent));
+        assert_eq!(
+            s.get("background-repeat"),
+            Some(&CssValue::List(vec![
+                CssValue::List(vec![kw("repeat")]),
+                CssValue::List(vec![kw("repeat")]),
+                CssValue::List(vec![kw("repeat")]),
+            ]))
+        );
+        // Mixed: a multi-item layer among single-item layers.
+        let s = style(
+            &doc,
+            div,
+            "div { --bg: url(a.png), url(b.png) center, url(c.png); background: var(--bg); }",
+            &vp(),
+        );
+        assert_eq!(s.get("background-image"), Some(&three_images));
+        assert_eq!(
+            s.get("background-position"),
+            Some(&CssValue::List(vec![
+                CssValue::List(vec![CssValue::List(vec![
+                    CssValue::Percentage(0.0),
+                    CssValue::Percentage(0.0),
+                ])]),
+                CssValue::List(vec![kw("center")]),
+                CssValue::List(vec![CssValue::List(vec![
+                    CssValue::Percentage(0.0),
+                    CssValue::Percentage(0.0),
+                ])]),
+            ]))
+        );
+        // Mixed, the other way: one multi-item layer first.
+        let s = style(
+            &doc,
+            div,
+            "div { --bg: url(a.png) no-repeat, url(b.png), url(c.png); background: var(--bg); }",
+            &vp(),
+        );
+        assert_eq!(s.get("background-image"), Some(&three_images));
+        assert_eq!(
+            s.get("background-repeat"),
+            Some(&CssValue::List(vec![
+                CssValue::List(vec![kw("no-repeat")]),
+                CssValue::List(vec![kw("repeat")]),
+                CssValue::List(vec![kw("repeat")]),
+            ]))
+        );
+        // Direct (non-`var()`) three single-item layers keep the same
+        // per-layer shape: the computed-value stage must not flatten
+        // them either (it used to, for any count above two).
+        let s = style(
+            &doc,
+            div,
+            "div { background: url(a.png), url(b.png), url(c.png); }",
+            &vp(),
+        );
+        assert_eq!(s.get("background-image"), Some(&three_images));
+        assert_eq!(s.get("background-color"), Some(&transparent));
+    }
+
+    #[test]
+    fn w79fix_background_slash_vs_two_layers_known_wrong() {
+        // w79fix 2, KNOWN-WRONG behavior, pinned deliberately: the
+        // slash marker `List([List(before), List(after)])` and a
+        // two-layer value have identical shapes, and the slash
+        // reading wins whenever layer 1 contains a position item and
+        // layer 2 is 1-2 `<length-percentage>` items. Here layer 2
+        // (`50%`) is a valid position-only layer, but it computes as
+        // the size of a single layer and layer 2 is lost entirely.
+        // The correct reading would be two layers (image
+        // `List[List[Url(a)], List[none]]`, position
+        // `List[List[center], List[50%]]`). Fixing it properly needs
+        // comma-group provenance through substitution (the slash vs
+        // comma distinction is lost when `resolve_inner` converts
+        // both to `List([List, List])`), which is larger than this
+        // fix; this test pins the misreading so it cannot silently
+        // change shape (e.g. into a drop) without updating the test.
+        let (doc, div, _) = sample();
+        let s = style(
+            &doc,
+            div,
+            "div { --bg: url(a.png) center, 50%; background: var(--bg); }",
+            &vp(),
+        );
+        assert_eq!(
+            s.get("background-image"),
+            Some(&CssValue::Url("a.png".into()))
+        );
+        assert_eq!(s.get("background-position"), Some(&kw("center")));
+        assert_eq!(s.get("background-size"), Some(&CssValue::Percentage(50.0)));
+    }
+
+    #[test]
+    fn w79fix_background_calc_position_and_size() {
+        // w79fix 3: `calc()` is a valid `<length-percentage>` for
+        // both position and size, on the direct and `var()` paths.
+        // Pure-length calcs evaluate to plain lengths at computed
+        // time, so these assert evaluated values; the parse-side
+        // test pins the verbatim `calc(50%)` size form.
+        let (doc, div, _) = sample();
+        let s = style(
+            &doc,
+            div,
+            "div { background: center/calc(10px + 5px); }",
+            &vp(),
+        );
+        assert_eq!(
+            s.get("background-size"),
+            Some(&CssValue::Length(15.0, LengthUnit::Px))
+        );
+        assert_eq!(s.get("background-position"), Some(&kw("center")));
+        let s = style(
+            &doc,
+            div,
+            "div { background: calc(10px) 20px/cover; }",
+            &vp(),
+        );
+        assert_eq!(
+            s.get("background-position"),
+            Some(&CssValue::List(vec![
+                CssValue::Length(10.0, LengthUnit::Px),
+                CssValue::Length(20.0, LengthUnit::Px),
+            ]))
+        );
+        assert_eq!(s.get("background-size"), Some(&kw("cover")));
+        let s = style(
+            &doc,
+            div,
+            "div { --bg: calc(10px) 20px/cover; background: var(--bg); }",
+            &vp(),
+        );
+        assert_eq!(
+            s.get("background-position"),
+            Some(&CssValue::List(vec![
+                CssValue::Length(10.0, LengthUnit::Px),
+                CssValue::Length(20.0, LengthUnit::Px),
+            ]))
+        );
+        assert_eq!(s.get("background-size"), Some(&kw("cover")));
+        let s = style(
+            &doc,
+            div,
+            "div { --bg: center/calc(10px + 5px); background: var(--bg); }",
+            &vp(),
+        );
+        assert_eq!(
+            s.get("background-size"),
+            Some(&CssValue::Length(15.0, LengthUnit::Px))
+        );
+    }
+
+    #[test]
+    fn w79fix_background_clip_text() {
+        // w79fix 4: `text` is a valid `background-clip` value (not
+        // valid for `background-origin`). Paint has no text-clip
+        // support, so the impact here is readback only: the value
+        // must survive validation to the computed surface instead
+        // of falling back to the `border-box` initial.
+        assert!(is_valid_for_property("background-clip", &kw("text")));
+        assert!(!is_valid_for_property("background-origin", &kw("text")));
+        assert!(is_valid_for_property(
+            "background-clip",
+            &CssValue::List(vec![
+                CssValue::List(vec![kw("text")]),
+                CssValue::List(vec![kw("border-box")]),
+            ])
+        ));
+        assert!(!is_valid_for_property(
+            "background-origin",
+            &CssValue::List(vec![
+                CssValue::List(vec![kw("text")]),
+                CssValue::List(vec![kw("border-box")]),
+            ])
+        ));
+        let (doc, div, _) = sample();
+        let s = style(&doc, div, "div { background-clip: text; }", &vp());
+        assert_eq!(s.get("background-clip"), Some(&kw("text")));
+        // Layered form through the computed surface (flat comma
+        // list from the generic longhand parser).
+        let s = style(
+            &doc,
+            div,
+            "div { background-clip: text, border-box; }",
+            &vp(),
+        );
+        assert_eq!(
+            s.get("background-clip"),
+            Some(&CssValue::List(vec![kw("text"), kw("border-box")]))
+        );
+        let s = style(&doc, div, "div { background-origin: text; }", &vp());
+        assert_eq!(s.get("background-origin"), Some(&kw("padding-box")));
+    }
+
+    #[test]
+    fn w79fix2_background_shorthand_clip_text() {
+        // w79fix2 (round-2 re-review of 073b543): the shorthand
+        // must agree with the longhand, which already admits
+        // `text` for `background-clip`. Before the fix both the
+        // direct and `var()` paths dropped the whole shorthand on
+        // any `text` box keyword, losing image, color and
+        // everything else. `text` is clip-only: a lone `text`
+        // sets clip=`text` with origin at its initial
+        // (`padding-box`), never origin=`text`; in a two-box
+        // form `text` is allowed only in the clip (second)
+        // position, so `text padding-box` is invalid and drops.
+        let (doc, div, _) = sample();
+        // Lone `text`: clip only, origin stays initial.
+        let s = style(&doc, div, "div { background: url(a.png) text; }", &vp());
+        assert_eq!(
+            s.get("background-image"),
+            Some(&CssValue::Url("a.png".into()))
+        );
+        assert_eq!(s.get("background-origin"), Some(&kw("padding-box")));
+        assert_eq!(s.get("background-clip"), Some(&kw("text")));
+        // Lone `text` does not drop a color either.
+        let s = style(&doc, div, "div { background: red text; }", &vp());
+        assert_eq!(
+            s.get("background-color"),
+            Some(&CssValue::Color(Color {
+                r: 255,
+                g: 0,
+                b: 0,
+                a: 255
+            }))
+        );
+        assert_eq!(s.get("background-origin"), Some(&kw("padding-box")));
+        assert_eq!(s.get("background-clip"), Some(&kw("text")));
+        // Two-box forms: `text` only in the clip position.
+        let s = style(
+            &doc,
+            div,
+            "div { background: url(a.png) padding-box text; }",
+            &vp(),
+        );
+        assert_eq!(
+            s.get("background-image"),
+            Some(&CssValue::Url("a.png".into()))
+        );
+        assert_eq!(s.get("background-origin"), Some(&kw("padding-box")));
+        assert_eq!(s.get("background-clip"), Some(&kw("text")));
+        let s = style(
+            &doc,
+            div,
+            "div { background: url(a.png) border-box text; }",
+            &vp(),
+        );
+        assert_eq!(s.get("background-origin"), Some(&kw("border-box")));
+        assert_eq!(s.get("background-clip"), Some(&kw("text")));
+        // `text` in the origin position is invalid: the whole
+        // shorthand drops, so every longhand falls back to its
+        // initial (image `none`, clip `border-box`).
+        let s = style(
+            &doc,
+            div,
+            "div { background: url(a.png) text padding-box; }",
+            &vp(),
+        );
+        assert_eq!(s.get("background-image"), Some(&kw("none")));
+        assert_eq!(s.get("background-origin"), Some(&kw("padding-box")));
+        assert_eq!(s.get("background-clip"), Some(&kw("border-box")));
+        // `var()` path agrees with the direct path.
+        let s = style(
+            &doc,
+            div,
+            "div { --bg: url(a.png) text; background: var(--bg); }",
+            &vp(),
+        );
+        assert_eq!(
+            s.get("background-image"),
+            Some(&CssValue::Url("a.png".into()))
+        );
+        assert_eq!(s.get("background-origin"), Some(&kw("padding-box")));
+        assert_eq!(s.get("background-clip"), Some(&kw("text")));
+        let s = style(
+            &doc,
+            div,
+            "div { --bg: url(a.png) border-box text; background: var(--bg); }",
+            &vp(),
+        );
+        assert_eq!(s.get("background-origin"), Some(&kw("border-box")));
+        assert_eq!(s.get("background-clip"), Some(&kw("text")));
+        let s = style(
+            &doc,
+            div,
+            "div { --bg: url(a.png) text padding-box; background: var(--bg); }",
+            &vp(),
+        );
+        assert_eq!(s.get("background-image"), Some(&kw("none")));
+        assert_eq!(s.get("background-clip"), Some(&kw("border-box")));
+        // Layered form: the rule applies per layer.
+        let s = style(
+            &doc,
+            div,
+            "div { background: url(a.png) text, url(b.png) padding-box; }",
+            &vp(),
+        );
+        assert_eq!(
+            s.get("background-image"),
+            Some(&CssValue::List(vec![
+                CssValue::List(vec![CssValue::Url("a.png".into())]),
+                CssValue::List(vec![CssValue::Url("b.png".into())]),
+            ]))
+        );
+        assert_eq!(
+            s.get("background-origin"),
+            Some(&CssValue::List(vec![
+                CssValue::List(vec![kw("padding-box")]),
+                CssValue::List(vec![kw("padding-box")]),
+            ]))
+        );
+        assert_eq!(
+            s.get("background-clip"),
+            Some(&CssValue::List(vec![
+                CssValue::List(vec![kw("text")]),
+                CssValue::List(vec![kw("padding-box")]),
+            ]))
+        );
+        // One invalid layer drops the whole layered shorthand.
+        let s = style(
+            &doc,
+            div,
+            "div { background: url(a.png) text padding-box, url(b.png); }",
+            &vp(),
+        );
+        assert_eq!(s.get("background-image"), Some(&kw("none")));
+        assert_eq!(s.get("background-clip"), Some(&kw("border-box")));
+    }
+
+    #[test]
     fn border_radius_computes_corner_radii() {
         let (doc, div, _) = sample();
         // The shorthand cascades into all four corner longhands.
@@ -13604,6 +14739,73 @@ mod tests {
         assert_eq!(
             s.get("border-top-left-radius"),
             Some(&CssValue::Length(0.0, LengthUnit::Px))
+        );
+    }
+
+    #[test]
+    fn w79_logical_border_shorthands_compute() {
+        // w79 item 3: compound logical shorthands compute to the edge
+        // longhands, including the deferred `var()` path (which needs
+        // the by-name dispatch, since these shorthands have no atom),
+        // and a deferred wide keyword expands per longhand.
+        let (doc, div, _) = sample();
+        let s = style(
+            &doc,
+            div,
+            "div { border-inline: 2px solid aqua; border-block-end: dashed; }",
+            &vp(),
+        );
+        assert_eq!(
+            s.get("border-inline-start-width"),
+            Some(&CssValue::Length(2.0, LengthUnit::Px))
+        );
+        assert_eq!(s.get("border-inline-end-style"), Some(&kw("solid")));
+        // Computed colors strip the authored keyword (item 1).
+        assert_eq!(
+            s.get("border-inline-start-color"),
+            Some(&CssValue::Color(Color {
+                r: 0,
+                g: 255,
+                b: 255,
+                a: 255
+            }))
+        );
+        assert_eq!(s.get("border-block-end-style"), Some(&kw("dashed")));
+        assert_eq!(s.get("border-block-end-width"), Some(&kw("medium")));
+        let s = style(
+            &doc,
+            div,
+            "div { --b: 3px dotted red; border-inline-start: var(--b); }",
+            &vp(),
+        );
+        assert_eq!(
+            s.get("border-inline-start-width"),
+            Some(&CssValue::Length(3.0, LengthUnit::Px))
+        );
+        assert_eq!(s.get("border-inline-start-style"), Some(&kw("dotted")));
+        // A deferred wide keyword expands per longhand at the
+        // `expand_deferred_shorthand` boundary (through `style()` it
+        // would resolve against the parent, so assert the expansion
+        // directly: six longhands, each the keyword itself).
+        let pairs = expand_deferred_shorthand(
+            &PropertyName::from("border-block"),
+            CssValue::Keyword("inherit".into()),
+        );
+        assert_eq!(pairs.len(), 6);
+        assert!(
+            pairs
+                .iter()
+                .all(|(_, v)| v == &CssValue::Keyword("inherit".into()))
+        );
+        assert!(
+            pairs
+                .iter()
+                .any(|(p, _)| p.as_str() == "border-block-start-width")
+        );
+        assert!(
+            pairs
+                .iter()
+                .any(|(p, _)| p.as_str() == "border-block-end-color")
         );
     }
 
@@ -19877,6 +21079,45 @@ mod tests {
         assert!(matches!(
             s.get("filter"),
             Some(CssValue::Filter(Filter::List(_)))
+        ));
+    }
+
+    // w79 overlay phase 1: parse/validate/compute only (no top-layer
+    // promotion — that is separately scoped phase 2 work).
+    #[test]
+    fn overlay_computes_via_ua_rule() {
+        let (doc, div, p) = sample();
+        // Initial value is `none`.
+        let s = style(&doc, div, "div { color: red; }", &vp());
+        assert_eq!(s.get_str("overlay"), Some("none"));
+        // Author `overlay: auto` computes to `none` for non-top-layer
+        // elements: the UA rule `* { overlay: none !important }` beats
+        // author normal declarations.
+        let s = style(&doc, div, "div { overlay: auto; }", &vp());
+        assert_eq!(s.get_str("overlay"), Some("none"));
+        // Explicit `none` stays `none`.
+        let s = style(&doc, div, "div { overlay: none; }", &vp());
+        assert_eq!(s.get_str("overlay"), Some("none"));
+        // Invalid values are rejected: the UA `none` still applies.
+        for bad in [
+            "div { overlay: foo; }",
+            "div { overlay: 10px; }",
+            "div { overlay: auto none; }",
+            "div { overlay: top; }",
+        ] {
+            let s = style(&doc, div, bad, &vp());
+            assert_eq!(s.get_str("overlay"), Some("none"), "{bad}");
+        }
+        // Not inherited: the child keeps `none`.
+        let s = style(&doc, p, "div { overlay: auto; }", &vp());
+        assert_eq!(s.get_str("overlay"), Some("none"));
+        // Validation arm directly.
+        assert!(is_valid_for_property("overlay", &kw("auto")));
+        assert!(is_valid_for_property("overlay", &kw("none")));
+        assert!(!is_valid_for_property("overlay", &kw("foo")));
+        assert!(!is_valid_for_property(
+            "overlay",
+            &CssValue::Length(10.0, LengthUnit::Px)
         ));
     }
 

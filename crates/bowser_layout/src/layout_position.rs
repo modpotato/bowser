@@ -1139,7 +1139,7 @@ fn cb_scrollable_size(
 }
 
 /// Scrollport `(origin, size, live scroll offset)` for one axis of the
-/// sticky box `i`: the content box of the nearest scroll container with
+/// sticky box `i`: the scrollport of the nearest scroll container with
 /// a matching scrollable axis (see [`sticky_scroller`]), or the
 /// viewport's when the box scrolls with the viewport on that axis. The
 /// scroll offset is measured from the content origin, so the view
@@ -1149,7 +1149,22 @@ fn cb_scrollable_size(
 /// `position-sticky-overflow-padding`: with 20px top padding a
 /// `top: 0` box sticks at scroll + 20, and at scroll 315 the
 /// containing-block bound, not the scrollport, pins it at 320). The
-/// nested scroller's offset comes from `nested_offsets` (see
+/// origin is therefore deliberately NOT moved here (w79: the
+/// start-edge pins are untouched).
+/// The SIZE term, however, is the scrollport's own extent, and the
+/// scrollport IS the padding box (CSS Overflow 3 §2.3: the visual
+/// viewport of a scroll container "coincides with its padding box,
+/// and is called the scrollport"; CSS Position 3 §3.4: the sticky
+/// view rectangle is the scrollport inset by the sticky offsets).
+/// Pre-w79 the size subtracted borders AND paddings (the content
+/// box), so a `bottom: 0` / `right: 0` box in a padded scroller was
+/// pinned a full padding short of the scrollport's far edge. Since
+/// w79 the size subtracts borders only. That size change is the
+/// whole w79 far-edge fix: `sticky_cb` is NOT changed — the
+/// containing-block bound is a different rectangle (the containing
+/// block of a block container is its content box), and its padded
+/// pins (`w78_sticky_padded_cb_margin_counts_at_*`) stay as they are.
+/// The nested scroller's offset comes from `nested_offsets` (see
 /// [`nested_scroll_offset`]); inside a `fixed` subtree with no scroll
 /// container of its own the viewport frame constrains at a zero offset
 /// (see [`apply_sticky_constraints`]).
@@ -1170,17 +1185,9 @@ fn sticky_scrollport_axis(
             let (sx, sy) = nested_scroll_offset(forest, p, nested_offsets);
             let s = if horizontal { sx } else { sy };
             if horizontal {
-                (
-                    n.rect.x + m.bl + m.pl,
-                    (n.rect.w - m.bl - m.br - m.pl - m.pr).max(0.0),
-                    s,
-                )
+                (n.rect.x + m.bl + m.pl, (n.rect.w - m.bl - m.br).max(0.0), s)
             } else {
-                (
-                    n.rect.y + m.bt + m.pt,
-                    (n.rect.h - m.bt - m.bb - m.pt - m.pb).max(0.0),
-                    s,
-                )
+                (n.rect.y + m.bt + m.pt, (n.rect.h - m.bt - m.bb).max(0.0), s)
             }
         }
         None if fixed_limit.is_some() => (0.0, vp_size, 0.0),

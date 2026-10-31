@@ -2213,6 +2213,50 @@ impl Document {
         Ok(out)
     }
 
+    /// First descendant of `el` (never `el` itself) matching `selectors`,
+    /// in document order, or `None` (the DOM `Element.querySelector`).
+    /// Comma-group semantics match [`Document::query_selector_all`]:
+    /// the earliest descendant in document order matching any group,
+    /// not the first group's first match. A group that fails to parse
+    /// is a [`SelectorParseError`], failing the whole call even when
+    /// `el` has no descendants. A node id from another document yields
+    /// `Ok(None)`: [`Document::descendants`] is fail-closed there.
+    pub fn query_selector_in(
+        &self,
+        el: NodeId,
+        selectors: &str,
+    ) -> Result<Option<NodeId>, SelectorParseError> {
+        Ok(self
+            .query_selector_all_in(el, selectors)?
+            .into_iter()
+            .next())
+    }
+
+    /// Every descendant of `el` (never `el` itself) matching `selectors`,
+    /// in document order, each node once (the DOM
+    /// `Element.querySelectorAll`). Comma groups are unioned in document
+    /// order, like [`Document::query_selector_all`]: the candidate set
+    /// is the descendant walk itself, so no dedup scan is needed — each
+    /// descendant is visited exactly once and tested against all groups.
+    /// Combinator steps walk ancestors/siblings with the same
+    /// [`Document::node_matches_any_group`] machinery as the
+    /// document-wide query (the parse-tree scoped query behaves the
+    /// same way), so a descendant combinator may be satisfied by an
+    /// ancestor above `el`, exactly as in the document-wide match.
+    pub fn query_selector_all_in(
+        &self,
+        el: NodeId,
+        selectors: &str,
+    ) -> Result<Vec<NodeId>, SelectorParseError> {
+        let mut scratch = SelectorScratch::new();
+        let groups = scratch.parse_groups_cached(selectors)?;
+        Ok(self
+            .descendants(el)
+            .into_iter()
+            .filter(|n| self.node_matches_any_group(*n, &groups))
+            .collect())
+    }
+
     /// Iterative pre-order walk of the subtree rooted at `node`
     /// (inclusive). The callback returns whether to keep walking; returning
     /// `false` stops the walk immediately (useful for first-hit searches).

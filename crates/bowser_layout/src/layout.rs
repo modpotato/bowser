@@ -3877,10 +3877,22 @@ fn layout_block(
     // (`resume_block` for block children, `do_inline_layout` for line
     // boxes) then distribute them across the columns. Stashed on the
     // node so the completion paths can read it back.
-    let multicol = if matches!(
+    // w79: this gate moves together with `multicol_intrinsic_params`
+    // (never one alone): an `InlineBlock` box carrying
+    // `display: inline-block` qualifies alongside `Block` /
+    // `AnonymousBlock`, so an unpromoted multicol inline-block lays
+    // out as multicol exactly as its intrinsic sizes measure it.
+    // The existing exclusions are kept verbatim: `flex_kind` still
+    // claims flex/inline-flex, and the table/grid displays still
+    // claim their own engines below (they share the `InlineBlock`
+    // box type, so the display key — not the box type — is what
+    // keeps them out).
+    let multicol = if (matches!(
         forest.nodes[idx].box_type,
         BoxType::Block | BoxType::AnonymousBlock
-    ) && flex_kind(forest, idx).is_none()
+    ) || (forest.nodes[idx].box_type == BoxType::InlineBlock
+        && forest.nodes[idx].data.display == Display::InlineBlock))
+        && flex_kind(forest, idx).is_none()
         && !matches!(
             forest.nodes[idx].data.display,
             Display::Table | Display::Grid | Display::InlineTable | Display::InlineGrid
@@ -9349,10 +9361,24 @@ struct IntrinsicCols {
 /// column-width-involved containers resolve their longhands here with
 /// the same per-longhand semantics.
 fn multicol_intrinsic_params(forest: &Forest, i: usize) -> Option<IntrinsicCols> {
-    if !matches!(
+    // w79: both gates move together (see `layout_block`'s multicol
+    // gate). A `Block`/`AnonymousBlock` box qualifies as before, and
+    // so does an `InlineBlock` box carrying `display: inline-block`
+    // — the unpromoted shape of a multicol inline-block, which real
+    // layout blockifies (via `wrap_flex_text_runs` / the flex/grid
+    // promotion triggers) and lays out as multicol. The display
+    // key is what keeps inline-flex/grid/table out: they share the
+    // `InlineBlock` box type but carry their own display, and their
+    // own earlier arms in both intrinsic dispatches (flex arm,
+    // grid arm, table arm) claim them before the multicol arm is
+    // reached; a replaced inline box (`display: inline`) is not a
+    // block container at all and is excluded the same way.
+    if !(matches!(
         forest.nodes[i].box_type,
         BoxType::Block | BoxType::AnonymousBlock
-    ) {
+    ) || (forest.nodes[i].box_type == BoxType::InlineBlock
+        && forest.nodes[i].data.display == Display::InlineBlock))
+    {
         return None;
     }
     let n = &forest.nodes[i];
@@ -10748,16 +10774,15 @@ fn preferred_width_mcw(
             // contributes the min-content size, a definite specified
             // width contributes exactly (content overflowing it does
             // not grow the contribution — css-sizing-3 §5.2).
-            // NOTE (w78fix): this arm is left in its pre-existing
-            // position ahead of the display-keyed atomic arm below.
-            // `multicol_intrinsic_params` itself gates on
-            // `Block`/`AnonymousBlock` (mirroring `layout_block`'s
-            // multicol gate), so a multicol inline-block still
-            // differs by promotion state — but that is a layout-gate
-            // divergence, not an intrinsic-dispatch one, and widening
-            // only the intrinsic gate would size a box as multicol
-            // that real layout lays out as a plain block. Left for a
-            // follow-up that moves both gates together.
+            // NOTE (w79): `multicol_intrinsic_params` and
+            // `layout_block`'s multicol gate moved together to also
+            // accept an `InlineBlock` box carrying
+            // `display: inline-block`, so a multicol inline-block
+            // measures and lays out as multicol regardless of
+            // promotion state. The pre-w79 divergence noted here
+            // (widening only the intrinsic gate would size a box
+            // as multicol that real layout laid out as a plain
+            // block) is closed by that joint move.
             _ if let Some(cols) = multicol_intrinsic_params(forest, i) => {
                 if matches!(forest.nodes[i].data.width, SpecLen::MinContent) {
                     min_content_width_pooled(forest, i, fonts, mcw, inner)
@@ -12179,11 +12204,11 @@ fn min_content_width_pooled_impl(
             // through to this arm; the display-keyed arm captured
             // it instead and measured kids-max instead of the
             // column-transformed size, while max-content still
-            // measured the column transform. An unpromoted
-            // multicol inline-block is unaffected: it is an
-            // `InlineBlock` box, so `multicol_intrinsic_params`
-            // (which gates on `Block`/`AnonymousBlock`) returns
-            // `None` here and it still reaches the arm below.
+            // measured the column transform. Since w79 the
+            // unpromoted shape takes this arm too:
+            // `multicol_intrinsic_params` accepts an `InlineBlock`
+            // box carrying `display: inline-block`, in lockstep
+            // with `layout_block`'s multicol gate.
             _ if let Some(cols) = multicol_intrinsic_params(forest, i) => {
                 let content = forest.nodes[i]
                     .children

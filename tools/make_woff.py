@@ -268,7 +268,11 @@ _SYNTH_BASE_GLYPHS = [
     _SYNTH_SIMPLE_2PT,
     {"kind": "composite", "components": _SYNTH_COMP, "bbox": (1, 2, 30, 40),
      "instructions": b"\x01\x02"},
-    {"kind": "empty", "bbox": b"\x00" * 8},
+    # Trailing empty glyph: no explicit bbox. WOFF2 REC §5.1
+    # rejects any explicit bbox on an empty glyph, so the
+    # bit must stay clear here or every base-derived
+    # fixture would reject.
+    {"kind": "empty"},
 ]
 # Untransformed 3-glyph font for the raw-`glyf`/`loca` hmtx cases:
 # glyph0 empty, glyph1 xMin 10, glyph2 xMin 30; short loca 0,0,5,10
@@ -307,12 +311,15 @@ def synthetic(outdir: str) -> None:
     write("woff2-synth-head-patch.woff2", _build_woff2(tabs))
 
     # Positive: composite end-to-end (XY scale + 2x2 matrix +
-    # instructions) plus an empty glyph with a zero explicit bbox.
+    # instructions) plus an empty glyph with no explicit bbox.
     write("woff2-synth-composite.woff2",
           _build_woff2(_synth_base_tables(_SYNTH_BASE_GLYPHS, 1, 16)))
 
-    # Positive: empty glyph with a zero explicit bbox, then a simple
-    # glyph with an explicit bbox.
+    # Negative: empty glyph with a zero explicit bbox, then a
+    # simple glyph with an explicit bbox. WOFF2 REC §5.1
+    # rejects any explicit bbox on an empty glyph, zero
+    # included, so this is a reject case alongside the
+    # nonzero fixture below.
     glyphs = [
         {"kind": "empty", "bbox": b"\x00" * 8},
         {"kind": "simple", "points": [(0, 0, True), (10, 5, True)],
@@ -328,6 +335,20 @@ def synthetic(outdir: str) -> None:
          "contours": [1], "bbox": (3, 4, 10, 5), "instructions": b""},
     ]
     write("woff2-synth-empty-bbox-nonzero.woff2",
+          _build_woff2(_synth_base_tables(glyphs, 1, 12)))
+
+    # Positive: same glyph order with the empty glyph's bbox bit
+    # cleared, so the simple glyph's explicit bbox is the one
+    # consumed. (3, 4, 10, 5) differs from the points' own bounds
+    # (0, 0, 10, 5), so it pins the simple-explicit-bbox branch
+    # against the recompute-from-points path, and the empty
+    # glyph first pins that it consumes no bbox bytes.
+    glyphs = [
+        {"kind": "empty"},
+        {"kind": "simple", "points": [(0, 0, True), (10, 5, True)],
+         "contours": [1], "bbox": (3, 4, 10, 5), "instructions": b""},
+    ]
+    write("woff2-synth-simple-explicit-bbox.woff2",
           _build_woff2(_synth_base_tables(glyphs, 1, 12)))
 
     # Negative: transformed hmtx without hhea.

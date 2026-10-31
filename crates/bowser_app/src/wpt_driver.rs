@@ -102,6 +102,7 @@
 //! | marker line that does not parse            | `Err(DriverError::BadReport)`                     |
 //! | exit 0, no report                          | `Ok(HarnessResult { status: SubtestsUnknown, .. })` |
 //! | exit 1, no report                          | `Ok(HarnessResult { status: Error, .. })`         |
+//! | exit 1, no report, stderr has "bowser: timed out after Ns" | `Err(DriverError::Timeout { after: Ns })` |
 //! | exit >= 2                                  | `Err(DriverError::BrowserGone)`                   |
 //! | killed by signal                           | `Err(DriverError::BrowserGone)`                   |
 //! | no exit within `timeout`                   | child killed; `Err(DriverError::Timeout)`         |
@@ -473,6 +474,34 @@ fn stderr_tail(stderr: &[u8]) -> String {
         stderr
     };
     String::from_utf8_lossy(tail).into_owned()
+}
+
+/// The child's own `--timeout` deadline, parsed from a
+/// `bowser: timed out after Ns` line in the stderr tail (`main.rs`
+/// prints exactly that line when the child's deadline fires), or
+/// `None` when no such line is present. The match is on the full
+/// `bowser: timed out after ` prefix, not the loose substring
+/// `timed out after`: a `--check` navigation timeout prints as
+/// `bowser: check: navigation timed out after Ns` (see
+/// [`crate::NavError`]), which is a page-level failure
+/// deadline, not the child's `--timeout` deadline, and must not
+/// classify as a child timeout. A tail truncated by the 512-byte
+/// cap so the line is missing (or unparseable) also yields `None`,
+/// falling back to the page-failed mapping — the safe direction.
+fn child_timeout_from_stderr(stderr_tail: &str) -> Option<Duration> {
+    for line in stderr_tail.lines() {
+        let Some((_, rest)) = line.split_once("bowser: timed out after ") else {
+            continue;
+        };
+        let digits: String = rest.chars().take_while(|c| c.is_ascii_digit()).collect();
+        if digits.is_empty() || !rest[digits.len()..].starts_with('s') {
+            continue;
+        }
+        if let Ok(secs) = digits.parse::<u64>() {
+            return Some(Duration::from_secs(secs));
+        }
+    }
+    None
 }
 
 /// Prefix of the one report line the injected reporter prints to the
@@ -901,7 +930,16 @@ impl BowserDriver {
         let nonce = new_report_nonce();
         let url = self.harness_url(test, &nonce);
         let start = Instant::now();
-        let out = match self.run_child(&["--check", &url], timeout) {
+        // Forward the runner budget as the child's own `--timeout`
+        // deadline (main.rs, default 30s): without this a slow test
+        // the runner budgeted 60s for still dies at the child's
+        // invisible 30s constant. The driver still kills at `timeout`
+        // first on ties, and both paths classify as
+        // `DriverError::Timeout` (see `interpret_harness_output`).
+        // Ceiling division, minimum 1s: `--timeout` rejects 0.
+        let child_timeout_secs = ((timeout.as_millis() as u64).saturating_add(999) / 1000).max(1);
+        let child_timeout = child_timeout_secs.to_string();
+        let out = match self.run_child(&["--check", "--timeout", &child_timeout, &url], timeout) {
             Ok(out) => out,
             Err(ChildError::Timeout) => {
                 return Err(DriverError::Timeout {
@@ -942,6 +980,8 @@ impl BowserDriver {
             &nonce,
             verdict,
             &out.stdout.bytes,
+            &stderr_tail(&out.stderr.bytes),
+            timeout,
             out.stdout.truncated,
             duration_ms,
         )
@@ -971,15 +1011,31 @@ enum RunVerdict {
 /// — the page never loaded testharness.js, it errored first, or its
 /// tests need the event loop the headless pipeline does not pump — and
 /// the verdict decides: a clean load is [`HarnessStatus::SubtestsUnknown`]
-/// (never a pass), a page-level failure is [`HarnessStatus::Error`].
+/// (never a pass), a page-level failure is [`HarnessStatus::Error`],
+/// except when `stderr_tail` shows the child's own `--timeout` deadline
+/// firing (`"bowser: timed out after Ns"`, see `main.rs`): the page
+/// did not fail, it ran out of time, so that is
+/// [`DriverError::Timeout`] instead — the classification slow tests'
+/// `expected: TIMEOUT` metadata matches. The reported `after` is the
+/// child's parsed `Ns`, not the runner budget: the two deadlines are
+/// distinct (a `--check` navigation timeout prints a different line
+/// and stays a page failure; see `child_timeout_from_stderr`).
+/// `stderr_tail` is empty on the session transport, which has no
+/// per-operation stderr; its timeouts surface as driver-side kills.
 /// Marker parsing runs over the capped buffer only, and the truncation
 /// cut is recorded on the markers so a truncated run is never silently
 /// reported as clean.
+#[allow(clippy::too_many_arguments)]
 fn interpret_harness_output(
     test: &TestItem,
     nonce: &str,
     verdict: RunVerdict,
     console: &[u8],
+    stderr_tail: &str,
+    // Kept for call-site symmetry with the driver-side kill paths:
+    // the child-timeout report here comes from the parsed stderr
+    // line, not this runner budget (see `child_timeout_from_stderr`).
+    _timeout: Duration,
     truncated: bool,
     duration_ms: Option<u64>,
 ) -> Result<(HarnessResult, TestharnessMarkers), DriverError> {
@@ -1006,7 +1062,22 @@ fn interpret_harness_output(
         }
         return Ok((report, markers));
     }
-    // No report line: fall back to the verdict mapping.
+    // No report line: fall back to the verdict mapping — except a
+    // page-level failure whose stderr shows the child's own deadline
+    // firing. A timed-out child exits 1 like any page failure, but
+    // classifying it as Error misattributes a slow run (and breaks
+    // `expected: TIMEOUT` metadata); it is a timeout, reported at
+    // the child's own deadline (not the runner budget `timeout`).
+    // The branch stays gated on `PageFailed` with no report line, so
+    // exit >= 2 and clean runs are unaffected.
+    if verdict == RunVerdict::PageFailed
+        && let Some(after) = child_timeout_from_stderr(stderr_tail)
+    {
+        return Err(DriverError::Timeout {
+            test: test.id.clone(),
+            after,
+        });
+    }
     let status = match verdict {
         RunVerdict::Clean => HarnessStatus::SubtestsUnknown,
         RunVerdict::PageFailed => HarnessStatus::Error,
@@ -6331,6 +6402,12 @@ impl SessionDriver {
                     SessionVerdict::PageFailed => RunVerdict::PageFailed,
                 },
                 &resp.console,
+                // The session transport has no per-operation stderr:
+                // its timeouts surface as driver-side kills, never as
+                // a child deadline line, so the empty tail keeps the
+                // page-failed mapping unchanged here.
+                "",
+                timeout,
                 resp.truncated,
                 duration_ms,
             ),
@@ -7354,6 +7431,83 @@ exit 0
             .run_testharness(&item("dom/a.html", "/dom/a.html"), Duration::from_secs(5))
             .unwrap_err();
         assert!(matches!(err, DriverError::BrowserGone(_)), "{err:?}");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn run_testharness_child_timeout_stderr_maps_to_driver_timeout() {
+        let dir = scratch("harnesschildtimeout");
+        // A child that hit its own `--timeout` deadline: exit 1, no
+        // report line, stderr carrying main.rs's
+        // "bowser: timed out after Ns" line. That is a TIMEOUT, not a
+        // harness Error: the runner's metadata for slow tests (e.g.
+        // colors-007, expected TIMEOUT) must match the classification.
+        // The reported deadline is the child's own 30s, not the 60s
+        // runner budget (w79fix: the old loose-substring match
+        // reported the runner budget for whatever deadline fired).
+        let child_timeout = write_exe(
+            &dir,
+            "childtimeout.sh",
+            "#!/bin/sh\necho 'bowser: timed out after 30s' >&2\nexit 1\n",
+        );
+        let err = driver_with(child_timeout)
+            .run_testharness(&item("css/a.html", "/css/a.html"), Duration::from_secs(60))
+            .unwrap_err();
+        assert_eq!(
+            err,
+            DriverError::Timeout {
+                test: "css/a.html".into(),
+                after: Duration::from_secs(30),
+            }
+        );
+
+        // A `--check` navigation timeout prints a different line
+        // ("bowser: check: navigation timed out after Ns"): that is
+        // a page-level failure deadline, not the child's `--timeout`
+        // deadline, so it stays a harness Error despite containing
+        // the substring "timed out after".
+        let nav_timeout = write_exe(
+            &dir,
+            "navtimeout.sh",
+            "#!/bin/sh\necho 'bowser: check: navigation timed out after 5s' >&2\nexit 1\n",
+        );
+        let r = driver_with(nav_timeout)
+            .run_testharness(&item("css/a.html", "/css/a.html"), Duration::from_secs(60))
+            .unwrap();
+        assert_eq!(r.status, HarnessStatus::Error);
+
+        // Exit 1 without the timeout line stays a harness Error.
+        let page_err = write_exe(
+            &dir,
+            "pageerr.sh",
+            "#!/bin/sh\necho 'boom: load failed' >&2\nexit 1\n",
+        );
+        let r = driver_with(page_err)
+            .run_testharness(&item("css/a.html", "/css/a.html"), Duration::from_secs(60))
+            .unwrap();
+        assert_eq!(r.status, HarnessStatus::Error);
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn run_testharness_passes_runner_timeout_to_child() {
+        let dir = scratch("harnesstimeoutarg");
+        // The fake child exits 0 only when it sees the `--timeout 5`
+        // pair matching the 5s runner timeout, and exits 3 otherwise:
+        // an exit-0 run (SubtestsUnknown, no report line) proves the
+        // driver forwarded the runner budget instead of leaving the
+        // child's invisible 30s default in place.
+        let exe = write_exe(
+            &dir,
+            "checkarg.sh",
+            "#!/bin/sh\nprev=\"\"\nfor a in \"$@\"; do\n  if [ \"$prev\" = \"--timeout\" ] && [ \"$a\" = \"5\" ]; then exit 0; fi\n  prev=\"$a\"\ndone\nexit 3\n",
+        );
+        let r = driver_with(exe)
+            .run_testharness(&item("css/a.html", "/css/a.html"), Duration::from_secs(5))
+            .unwrap();
+        assert_eq!(r.status, HarnessStatus::SubtestsUnknown);
 
         let _ = std::fs::remove_dir_all(&dir);
     }

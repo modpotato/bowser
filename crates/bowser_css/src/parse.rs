@@ -746,6 +746,14 @@ impl Parser<'_> {
             return parse_border_radius(toks, important);
         }
 
+        // `background` needs the `/` between position and size,
+        // which the generic value parser cannot represent, and
+        // commas separate layers; parse it from tokens directly
+        // (like `border-radius` above).
+        if prop == "background" {
+            return parse_background(toks, important);
+        }
+
         // `grid-column` / `grid-row` place items with `start / end` line
         // syntax; the `/` cannot survive the generic value parser, so
         // split on it like `font` and `border-radius`. The `/`-separated
@@ -1492,6 +1500,25 @@ fn expand_shorthand(property: &PropertyName, value: CssValue, important: bool) -
         "border-top" | "border-right" | "border-bottom" | "border-left" => {
             expand_border_sides(&[property.as_str()], value, important)
         }
+        // w79: compound logical border shorthands (CSS Logical
+        // Properties 1). `border-inline`/`border-block` set both edges
+        // directly to the six edge longhands (the pipeline does not
+        // re-expand intermediate side shorthands); the four edge
+        // shorthands set their three longhands. Classification mirrors
+        // `expand_border_sides`, including its wide-keyword arm.
+        "border-inline" => expand_border_sides(
+            &["border-inline-start", "border-inline-end"],
+            value,
+            important,
+        ),
+        "border-block" => expand_border_sides(
+            &["border-block-start", "border-block-end"],
+            value,
+            important,
+        ),
+        "border-inline-start" | "border-inline-end" | "border-block-start" | "border-block-end" => {
+            expand_border_sides(&[property.as_str()], value, important)
+        }
         "gap" | "grid-gap" => expand_gap(value, important),
         // CSS Box Alignment 3 §6.1: `place-self` sets `align-self` and
         // `justify-self` (one value sets both).
@@ -1954,7 +1981,7 @@ fn expand_border_sides(prefixes: &[&str], value: CssValue, important: bool) -> V
                 }
                 width = Some(item);
             }
-            CssValue::Color(_) => {
+            CssValue::Color(_) | CssValue::NamedColor { .. } => {
                 if color.is_some() {
                     return Vec::new();
                 }
@@ -2051,7 +2078,7 @@ fn expand_column_rule(value: CssValue, important: bool) -> Vec<Declaration> {
                 }
                 width = Some(item);
             }
-            CssValue::Color(_) => {
+            CssValue::Color(_) | CssValue::NamedColor { .. } => {
                 if color.is_some() {
                     return Vec::new();
                 }
@@ -2385,96 +2412,465 @@ fn parse_font_shorthand(toks: &[Token], important: bool) -> Option<Vec<Declarati
 /// `background: <color> <image> <repeat> <attachment> <position>` in any order.
 /// All five longhands are always emitted; omitted components reset to
 /// initial values (`transparent`, `none`, `repeat`, `scroll`, `0% 0%`).
-fn expand_background(value: CssValue, important: bool) -> Vec<Declaration> {
-    let mut color = None;
-    let mut image = None;
-    let mut repeat = None;
-    let mut attachment = None;
-    let mut position: Vec<CssValue> = Vec::new();
-    for item in as_list(&value) {
+/// One classified `background` layer: every component a single
+/// layer can carry. Mirrors cascade.rs's `BgLayer` (kept in sync
+/// with it); the parse side never sees `MathDeferred`, but `calc()`
+/// (`Math`) is a valid `<length-percentage>` for position and size
+/// here exactly as in the cascade twin (w79fix 3: rejecting it in
+/// the direct path while the `var()` path admitted it in size was
+/// a divergence, and position `calc()` was rejected on both).
+/// `boxes` holds the 1-2 box keywords in order (origin first,
+/// clip second), except that a lone `text` is clip-only: it is
+/// never an origin (see `bg_layer_values`), and `text` in the
+/// first position of a two-box form is rejected in
+/// `classify_bg_layer`.
+struct BgLayer {
+    color: Option<CssValue>,
+    image: Option<CssValue>,
+    repeat: Vec<CssValue>,
+    attachment: Option<CssValue>,
+    position: Vec<CssValue>,
+    size: Option<CssValue>,
+    boxes: Vec<CssValue>,
+}
+
+fn is_bg_repeat_kw(k: &str) -> bool {
+    matches!(
+        k,
+        "repeat" | "no-repeat" | "repeat-x" | "repeat-y" | "space" | "round"
+    )
+}
+
+fn is_bg_box_kw(k: &str) -> bool {
+    matches!(k, "padding-box" | "border-box" | "content-box")
+}
+
+fn is_bg_size_item(v: &CssValue) -> bool {
+    matches!(
+        v,
+        CssValue::Length(_, _) | CssValue::Percentage(_) | CssValue::Math(_)
+    ) || matches!(v, CssValue::Keyword(k) if matches!(k.as_str(), "auto" | "cover" | "contain"))
+}
+
+fn is_bg_position_item(v: &CssValue) -> bool {
+    matches!(
+        v,
+        CssValue::Length(_, _) | CssValue::Percentage(_) | CssValue::Math(_)
+    ) || matches!(v, CssValue::Keyword(k) if matches!(k.as_str(), "left" | "right" | "top" | "bottom" | "center"))
+}
+
+/// Classify one layer's items (`size_items` is the `/`-separated
+/// size group, if any) into a [`BgLayer`]; `None` rejects the whole
+/// shorthand (see cascade.rs's `classify_bg_layer` for the rule
+/// list, which this mirrors).
+fn classify_bg_layer(items: &[CssValue], size_items: Option<&[CssValue]>) -> Option<BgLayer> {
+    let mut layer = BgLayer {
+        color: None,
+        image: None,
+        repeat: Vec::new(),
+        attachment: None,
+        position: Vec::new(),
+        size: None,
+        boxes: Vec::new(),
+    };
+    for item in items {
         match item {
-            CssValue::Color(_) => {
-                if color.is_some() {
-                    return Vec::new();
+            CssValue::Color(_) | CssValue::NamedColor { .. } => {
+                if layer.color.is_some() {
+                    return None;
                 }
-                color = Some(item);
+                layer.color = Some(item.clone());
             }
             CssValue::Url(_) | CssValue::Gradient { .. } => {
-                if image.is_some() {
-                    return Vec::new();
+                if layer.image.is_some() {
+                    return None;
                 }
-                image = Some(item);
+                layer.image = Some(item.clone());
             }
-            CssValue::Length(_, _) | CssValue::Percentage(_) => position.push(item),
+            CssValue::Length(_, _) | CssValue::Percentage(_) | CssValue::Math(_) => {
+                layer.position.push(item.clone())
+            }
             CssValue::Keyword(kw) => {
                 let k = kw.as_str();
                 if k == "currentcolor" {
-                    if color.is_some() {
-                        return Vec::new();
+                    if layer.color.is_some() {
+                        return None;
                     }
-                    color = Some(CssValue::Keyword(kw));
-                } else if matches!(
-                    k,
-                    "repeat" | "no-repeat" | "repeat-x" | "repeat-y" | "space" | "round"
-                ) {
-                    if repeat.is_some() {
-                        return Vec::new();
+                    layer.color = Some(item.clone());
+                } else if is_bg_repeat_kw(k) {
+                    if layer.repeat.iter().any(|r| {
+                        matches!(r, CssValue::Keyword(rk) if matches!(rk.as_str(), "repeat-x" | "repeat-y"))
+                    }) || matches!(k, "repeat-x" | "repeat-y") && !layer.repeat.is_empty()
+                        || layer.repeat.len() >= 2
+                    {
+                        return None;
                     }
-                    repeat = Some(CssValue::Keyword(kw));
+                    layer.repeat.push(item.clone());
                 } else if matches!(k, "scroll" | "fixed" | "local") {
-                    if attachment.is_some() {
-                        return Vec::new();
+                    if layer.attachment.is_some() {
+                        return None;
                     }
-                    attachment = Some(CssValue::Keyword(kw));
+                    layer.attachment = Some(item.clone());
                 } else if matches!(k, "left" | "right" | "top" | "bottom" | "center") {
-                    position.push(CssValue::Keyword(kw));
-                } else if k == "none" {
-                    if image.is_some() {
-                        return Vec::new();
+                    layer.position.push(item.clone());
+                } else if is_bg_box_kw(k) || k == "text" {
+                    // `text` is clip-only, not a `<bg-box>`: it is
+                    // admitted here so the lone/two-box split in
+                    // `bg_layer_values` can place it, and rejected
+                    // as an origin below. Keeping `is_bg_box_kw`
+                    // to the three origin-valid boxes (rather than
+                    // adding `text` to it) is what stops a lone
+                    // `text` from being mapped to origin=`text`.
+                    if layer.boxes.len() >= 2 {
+                        return None;
                     }
-                    image = Some(CssValue::Keyword(kw));
+                    layer.boxes.push(item.clone());
+                } else if k == "none" {
+                    if layer.image.is_some() {
+                        return None;
+                    }
+                    layer.image = Some(item.clone());
                 } else {
-                    return Vec::new();
+                    return None;
                 }
             }
-            _ => return Vec::new(),
+            _ => return None,
         }
     }
-    if position.len() > 2 {
-        return Vec::new();
+    // `text` can never be `background-origin`. In a two-box
+    // form the first keyword is the origin, so `text` there
+    // invalidates the whole layer (a lone `text` is fine: it is
+    // the clip, resolved in `bg_layer_values`). This check must
+    // wait until the loop ends, because a first-seen `text`
+    // cannot be judged until a second box does or does not
+    // arrive.
+    if layer.boxes.len() == 2
+        && matches!(&layer.boxes[0], CssValue::Keyword(k) if k.as_str() == "text")
+    {
+        return None;
     }
-    // Every longhand is emitted; omitted ones reset to initial values.
-    let color = color.unwrap_or(CssValue::Color(Color {
+    if layer.position.len() > 2 {
+        return None;
+    }
+    if let Some(size_items) = size_items {
+        if size_items.is_empty() || size_items.len() > 2 {
+            return None;
+        }
+        if size_items
+            .iter()
+            .any(|i| matches!(i, CssValue::Keyword(k) if matches!(k.as_str(), "cover" | "contain")))
+            && size_items.len() != 1
+        {
+            return None;
+        }
+        if !size_items.iter().all(is_bg_size_item) {
+            return None;
+        }
+        layer.size = Some(if size_items.len() == 1 {
+            size_items[0].clone()
+        } else {
+            CssValue::List(size_items.to_vec())
+        });
+    }
+    Some(layer)
+}
+
+/// Classify a `/`-separated layer: `before` holds the layer items
+/// up to the position, `after` holds the size group followed by
+/// any remaining layer items (`background: url(a.png) center/cover
+/// no-repeat padding-box` splits as size `[cover]` plus trailing
+/// `[padding-box]`). The size is a prefix of `after`: a lone
+/// `cover`/`contain`, or one or two `<length-percentage>`/`auto`
+/// items; anything after the size that is itself a position item
+/// rejects the layer (the position lives before the slash). A
+/// slash with no position in `before` is invalid: the grammar
+/// attaches `/ <size>` to `<position>`, so `red/cover` (no
+/// position) does not match any layer alternative.
+fn classify_bg_slash_layer(before: &[CssValue], after: &[CssValue]) -> Option<BgLayer> {
+    if after.is_empty() {
+        return None;
+    }
+    if !before.iter().any(is_bg_position_item) {
+        return None;
+    }
+    let (size, rest) = match &after[0] {
+        CssValue::Keyword(k) if matches!(k.as_str(), "cover" | "contain") => {
+            (&after[..1], &after[1..])
+        }
+        _ => {
+            let mut n = 0;
+            while n < after.len() && n < 2 && is_bg_size_item(&after[n]) {
+                if matches!(&after[n], CssValue::Keyword(k) if matches!(k.as_str(), "cover" | "contain"))
+                {
+                    return None;
+                }
+                n += 1;
+            }
+            if n == 0 {
+                return None;
+            }
+            (&after[..n], &after[n..])
+        }
+    };
+    if rest.iter().any(is_bg_position_item) {
+        return None;
+    }
+    let mut items = before.to_vec();
+    items.extend(rest.iter().cloned());
+    classify_bg_layer(&items, Some(size))
+}
+
+/// The eight `background` longhand values for one classified layer,
+/// in `bg_layer_values` order: color, image, repeat, attachment,
+/// position, size, origin, clip. A named alias keeps the 8-tuple
+/// under clippy's `type_complexity` threshold at its use sites.
+type BgLayerValues = (
+    CssValue,
+    CssValue,
+    CssValue,
+    CssValue,
+    CssValue,
+    CssValue,
+    CssValue,
+    CssValue,
+);
+
+/// Per-layer longhand values for one classified layer, with omitted
+/// components at their initials (mirrors cascade.rs's
+/// `bg_layer_values`). A single `<bg-box>` keyword sets both
+/// origin and clip; a lone `text` is clip-only, so it sets
+/// clip=`text` with origin at its initial (`padding-box`), never
+/// origin=`text`. A two-box form with `text` first never reaches
+/// here: `classify_bg_layer` rejects it, since `text` can never
+/// be the origin.
+fn bg_layer_values(layer: &BgLayer) -> BgLayerValues {
+    let color = layer.color.clone().unwrap_or(CssValue::Color(Color {
         r: 0,
         g: 0,
         b: 0,
         a: 0,
-    })); // transparent
-    let image = image.unwrap_or(CssValue::Keyword("none".into()));
-    let repeat = repeat.unwrap_or(CssValue::Keyword("repeat".into()));
-    let attachment = attachment.unwrap_or(CssValue::Keyword("scroll".into()));
-    let position = if position.is_empty() {
-        CssValue::List(vec![CssValue::Percentage(0.0), CssValue::Percentage(0.0)])
-    } else if position.len() == 1 {
-        position.pop().expect("one position")
+    }));
+    let image = layer
+        .image
+        .clone()
+        .unwrap_or(CssValue::Keyword("none".into()));
+    let repeat = if layer.repeat.is_empty() {
+        CssValue::Keyword("repeat".into())
+    } else if layer.repeat.len() == 1 {
+        layer.repeat[0].clone()
     } else {
-        CssValue::List(position)
+        CssValue::List(layer.repeat.clone())
     };
-    vec![
-        decl(PropertyName::intern("background-color"), color, important),
-        decl(PropertyName::intern("background-image"), image, important),
-        decl(PropertyName::intern("background-repeat"), repeat, important),
-        decl(
-            PropertyName::intern("background-attachment"),
-            attachment,
-            important,
+    let attachment = layer
+        .attachment
+        .clone()
+        .unwrap_or(CssValue::Keyword("scroll".into()));
+    let position = if layer.position.is_empty() {
+        CssValue::List(vec![CssValue::Percentage(0.0), CssValue::Percentage(0.0)])
+    } else if layer.position.len() == 1 {
+        layer.position[0].clone()
+    } else {
+        CssValue::List(layer.position.clone())
+    };
+    let size = layer.size.clone().unwrap_or(CssValue::List(vec![
+        CssValue::Keyword("auto".into()),
+        CssValue::Keyword("auto".into()),
+    ]));
+    let (origin, clip) = match layer.boxes.as_slice() {
+        [] => (
+            CssValue::Keyword("padding-box".into()),
+            CssValue::Keyword("border-box".into()),
         ),
-        decl(
-            PropertyName::intern("background-position"),
-            position,
-            important,
-        ),
-    ]
+        [only] if matches!(only, CssValue::Keyword(k) if k.as_str() == "text") => {
+            (CssValue::Keyword("padding-box".into()), only.clone())
+        }
+        [only] => (only.clone(), only.clone()),
+        [first, second] => (first.clone(), second.clone()),
+        _ => unreachable!("classify caps boxes at two"),
+    };
+    (
+        color, image, repeat, attachment, position, size, origin, clip,
+    )
+}
+
+/// Emit the eight longhands for classified layers (mirrors
+/// cascade.rs's `emit_bg_layers`): one layer emits scalar
+/// longhands; several layers emit per-layer lists for every layered
+/// longhand (each layer's value wrapped in its own list), while
+/// `background-color` stays a single value from the final layer.
+fn emit_bg_layers(layers: &[BgLayer], important: bool) -> Option<Vec<Declaration>> {
+    if layers.is_empty() {
+        return None;
+    }
+    if layers[..layers.len() - 1].iter().any(|l| l.color.is_some()) {
+        return None;
+    }
+    let values: Vec<BgLayerValues> = layers.iter().map(bg_layer_values).collect();
+    let color = values.last().expect("non-empty layers").0.clone();
+    let mk = |name: &str, v: CssValue| decl(PropertyName::intern(name), v, important);
+    if layers.len() == 1 {
+        let (_, image, repeat, attachment, position, size, origin, clip) =
+            values.into_iter().next().expect("one layer");
+        return Some(vec![
+            mk("background-color", color),
+            mk("background-image", image),
+            mk("background-repeat", repeat),
+            mk("background-attachment", attachment),
+            mk("background-position", position),
+            mk("background-size", size),
+            mk("background-origin", origin),
+            mk("background-clip", clip),
+        ]);
+    }
+    let wrap = |f: fn(&BgLayerValues) -> CssValue| {
+        CssValue::List(values.iter().map(|v| CssValue::List(vec![f(v)])).collect())
+    };
+    Some(vec![
+        mk("background-color", color),
+        mk("background-image", wrap(|v| v.1.clone())),
+        mk("background-repeat", wrap(|v| v.2.clone())),
+        mk("background-attachment", wrap(|v| v.3.clone())),
+        mk("background-position", wrap(|v| v.4.clone())),
+        mk("background-size", wrap(|v| v.5.clone())),
+        mk("background-origin", wrap(|v| v.6.clone())),
+        mk("background-clip", wrap(|v| v.7.clone())),
+    ])
+}
+
+/// Expand a single `background` layer value: a flat item list, or
+/// the `/`-separated `List([List(before), List(after)])` marker.
+/// A lone CSS-wide keyword expands per longhand, like `expand_box`.
+/// Every longhand is emitted; omitted components reset to initial
+/// values (`transparent`, `none`, `repeat`, `scroll`, `0% 0%`,
+/// `auto auto`, `padding-box`, `border-box`).
+fn expand_background(value: CssValue, important: bool) -> Vec<Declaration> {
+    let items = as_list(&value);
+    if items.len() == 1 && is_css_wide_keyword(&items[0]) {
+        let kw = items[0].clone();
+        return [
+            "background-color",
+            "background-image",
+            "background-repeat",
+            "background-attachment",
+            "background-position",
+            "background-size",
+            "background-origin",
+            "background-clip",
+        ]
+        .iter()
+        .map(|p| decl(PropertyName::intern(p), kw.clone(), important))
+        .collect();
+    }
+    if let CssValue::List(groups) = &value
+        && groups.len() == 2
+        && let (CssValue::List(before), CssValue::List(after)) = (&groups[0], &groups[1])
+        && let Some(layer) = classify_bg_slash_layer(before, after)
+    {
+        return emit_bg_layers(std::slice::from_ref(&layer), important).unwrap_or_default();
+    }
+    let Some(layer) = classify_bg_layer(&items, None) else {
+        return Vec::new();
+    };
+    emit_bg_layers(std::slice::from_ref(&layer), important).unwrap_or_default()
+}
+
+/// Expand a multi-layer `background` value: each entry is one
+/// layer's value — a `/`-separated marker or a plain item list.
+/// Only called when the token-level comma split already proved
+/// there are several layers, so no slash/layer ambiguity arises
+/// here (unlike the cascade's deferred reading).
+fn expand_background_layers(layers: &[CssValue], important: bool) -> Vec<Declaration> {
+    let mut classified = Vec::with_capacity(layers.len());
+    for layer_value in layers {
+        let layer = match layer_value {
+            CssValue::List(groups)
+                if groups.len() == 2
+                    && matches!(&groups[0], CssValue::List(_))
+                    && matches!(&groups[1], CssValue::List(_)) =>
+            {
+                let (CssValue::List(before), CssValue::List(after)) = (&groups[0], &groups[1])
+                else {
+                    unreachable!("both groups are lists")
+                };
+                classify_bg_slash_layer(before, after)
+            }
+            other => classify_bg_layer(&as_list(other), None),
+        };
+        match layer {
+            Some(layer) => classified.push(layer),
+            None => return Vec::new(),
+        }
+    }
+    emit_bg_layers(&classified, important).unwrap_or_default()
+}
+
+/// Split tokens on top-level commas (commas inside `()`/`[]`/
+/// functions are not top-level), returning one token slice per
+/// layer, or `None` when there is no top-level comma. Unlike
+/// [`split_top_comma`], this keeps token slices so each layer can
+/// still be slash-split afterwards.
+fn split_top_comma_tokens(toks: &[Token]) -> Option<Vec<&[Token]>> {
+    let mut depth = 0u32;
+    let mut cuts = Vec::new();
+    for (i, t) in toks.iter().enumerate() {
+        match t {
+            Token::Function(_) | Token::LParen | Token::LBracket => depth += 1,
+            Token::RParen | Token::RBracket => depth = depth.saturating_sub(1),
+            Token::Comma if depth == 0 => cuts.push(i),
+            _ => {}
+        }
+    }
+    if cuts.is_empty() {
+        return None;
+    }
+    let mut out = Vec::with_capacity(cuts.len() + 1);
+    let mut start = 0;
+    for c in cuts {
+        out.push(&toks[start..c]);
+        start = c + 1;
+    }
+    out.push(&toks[start..]);
+    Some(out)
+}
+
+/// Parse a `background` declaration from tokens. The `/` between
+/// position and size cannot survive the generic value parser (like
+/// `font`'s `/` and `border-radius`'s `/`), and commas separate
+/// layers, so tokens are split at the top level first. A value
+/// containing any `var()` is NOT expanded here: it is stored as-is
+/// under the shorthand name and the cascade expands it after
+/// substitution (see `expand_shorthand` for the contract) — as a
+/// single slash-marker value, or as a list of per-layer values
+/// when commas are present.
+fn parse_background(toks: &[Token], important: bool) -> Option<Vec<Declaration>> {
+    match split_top_comma_tokens(toks) {
+        None => {
+            let value = parse_slash_aware_value(toks)?;
+            if value_contains_var(&value) {
+                return Some(vec![decl(
+                    PropertyName::intern("background"),
+                    value,
+                    important,
+                )]);
+            }
+            Some(expand_background(value, important))
+        }
+        Some(layer_toks) => {
+            let mut layers = Vec::with_capacity(layer_toks.len());
+            for lt in layer_toks {
+                layers.push(parse_slash_aware_value(lt)?);
+            }
+            let value = CssValue::List(layers);
+            if value_contains_var(&value) {
+                return Some(vec![decl(
+                    PropertyName::intern("background"),
+                    value,
+                    important,
+                )]);
+            }
+            Some(expand_background_layers(&as_list(&value), important))
+        }
+    }
 }
 
 /// `list-style: <type> <position> <image>` in any order. All three
@@ -3698,6 +4094,64 @@ mod tests {
     }
 
     #[test]
+    fn w79_logical_border_shorthands() {
+        // w79 item 3: compound logical border shorthands expand
+        // directly to the edge longhands. `border-inline` sets both
+        // edges; each edge shorthand sets its three longhands;
+        // omitted components reset to initials (medium/none/
+        // currentcolor); named colors keep their keyword (item 1).
+        let d = decls("p { border-inline: 2px solid aqua; }");
+        assert_eq!(d.len(), 6);
+        for edge in ["inline-start", "inline-end"] {
+            assert_eq!(
+                get(&d, &format!("border-{edge}-width")),
+                &CssValue::Length(2.0, LengthUnit::Px)
+            );
+            assert_eq!(
+                get(&d, &format!("border-{edge}-style")),
+                &CssValue::Keyword("solid".into())
+            );
+            assert_eq!(
+                get(&d, &format!("border-{edge}-color")),
+                &CssValue::NamedColor {
+                    color: Color {
+                        r: 0,
+                        g: 255,
+                        b: 255,
+                        a: 255
+                    },
+                    keyword: "aqua".into(),
+                }
+            );
+        }
+        let d = decls("p { border-block-start: dashed; }");
+        assert_eq!(d.len(), 3);
+        assert_eq!(
+            get(&d, "border-block-start-width"),
+            &CssValue::Keyword("medium".into())
+        );
+        assert_eq!(
+            get(&d, "border-block-start-style"),
+            &CssValue::Keyword("dashed".into())
+        );
+        assert_eq!(
+            get(&d, "border-block-start-color"),
+            &CssValue::Keyword("currentcolor".into())
+        );
+        // Wide keyword expands per longhand; invalid components drop.
+        let d = decls("p { border-inline-end: inherit; }");
+        assert_eq!(d.len(), 3);
+        assert!(
+            d.iter()
+                .all(|x| x.value == CssValue::Keyword("inherit".into()))
+        );
+        let d = decls("p { border-block: 1px frobnicate; }");
+        assert!(d.is_empty());
+        let d = decls("p { border-inline: 1px 2px solid; }");
+        assert!(d.is_empty());
+    }
+
+    #[test]
     fn border_radius_expansion() {
         // One value: all four corners.
         let d = decls("div { border-radius: 6px; }");
@@ -4139,9 +4593,9 @@ mod tests {
             get(&d, "background-attachment"),
             &CssValue::Keyword("scroll".into())
         );
-        assert_eq!(d.len(), 5);
+        assert_eq!(d.len(), 8);
         let d = decls("p { background: #fff; }");
-        assert_eq!(d.len(), 5);
+        assert_eq!(d.len(), 8);
         assert_eq!(
             get(&d, "background-color"),
             &CssValue::Color(Color {
@@ -4161,7 +4615,7 @@ mod tests {
             &CssValue::List(vec![CssValue::Percentage(0.0), CssValue::Percentage(0.0),])
         );
         let d = decls("p { background: 10px 20px; }");
-        assert_eq!(d.len(), 5);
+        assert_eq!(d.len(), 8);
         assert_eq!(
             get(&d, "background-position"),
             &CssValue::List(vec![
@@ -4537,6 +4991,312 @@ mod tests {
         // `only print` still never matches.
         let s = sheet("@media only print { div { color: red; } }");
         assert!(!s.rules()[0].media.as_ref().unwrap().matches(1000.0, 800.0));
+    }
+
+    #[test]
+    fn w79_named_color_parse_and_equality() {
+        // w79 item 1: a bare ident color parses to `NamedColor`
+        // (keyword kept, lowercased), hex/functional colors stay
+        // plain `Color`, and equality is keyword-insensitive: a
+        // parsed `aqua` equals its `Color` and equals `cyan` (same
+        // channels), while a different color does not.
+        let d = decls("p { border-color: aqua; color: AQUA; }");
+        assert_eq!(
+            get(&d, "border-top-color"),
+            &CssValue::NamedColor {
+                color: Color {
+                    r: 0,
+                    g: 255,
+                    b: 255,
+                    a: 255
+                },
+                keyword: "aqua".into(),
+            }
+        );
+        assert_eq!(
+            get(&d, "border-top-color").authored_color_keyword(),
+            Some("aqua")
+        );
+        assert_eq!(
+            get(&d, "color"),
+            &CssValue::NamedColor {
+                color: Color {
+                    r: 0,
+                    g: 255,
+                    b: 255,
+                    a: 255
+                },
+                keyword: "aqua".into(),
+            }
+        );
+        let aqua = CssValue::NamedColor {
+            color: Color {
+                r: 0,
+                g: 255,
+                b: 255,
+                a: 255,
+            },
+            keyword: "aqua".into(),
+        };
+        let cyan = CssValue::NamedColor {
+            color: Color {
+                r: 0,
+                g: 255,
+                b: 255,
+                a: 255,
+            },
+            keyword: "cyan".into(),
+        };
+        assert_eq!(aqua, cyan);
+        assert_eq!(
+            aqua,
+            CssValue::Color(Color {
+                r: 0,
+                g: 255,
+                b: 255,
+                a: 255
+            })
+        );
+        assert_ne!(
+            aqua,
+            CssValue::Color(Color {
+                r: 255,
+                g: 0,
+                b: 0,
+                a: 255
+            })
+        );
+        // `transparent` keeps its keyword too.
+        let d = decls("p { background-color: transparent; }");
+        assert_eq!(
+            get(&d, "background-color").authored_color_keyword(),
+            Some("transparent")
+        );
+        // Hex stays a plain `Color` with no keyword.
+        let d = decls("p { color: #00ffff; }");
+        assert_eq!(get(&d, "color").authored_color_keyword(), None);
+        assert!(matches!(get(&d, "color"), CssValue::Color(_)));
+    }
+
+    #[test]
+    fn w79_background_shorthand_new_longhands() {
+        // w79 item 2 (fail-before: base expands only 5 longhands and
+        // drops any `/ size` value outright). Single layer with all
+        // components, including `/ size` and box keywords.
+        let d = decls("p { background: red url(a.png) no-repeat center/cover padding-box; }");
+        assert_eq!(d.len(), 8);
+        assert_eq!(
+            get(&d, "background-color"),
+            &CssValue::NamedColor {
+                color: Color {
+                    r: 255,
+                    g: 0,
+                    b: 0,
+                    a: 255
+                },
+                keyword: "red".into(),
+            }
+        );
+        assert_eq!(get(&d, "background-image"), &CssValue::Url("a.png".into()));
+        assert_eq!(
+            get(&d, "background-repeat"),
+            &CssValue::Keyword("no-repeat".into())
+        );
+        assert_eq!(
+            get(&d, "background-position"),
+            &CssValue::Keyword("center".into())
+        );
+        assert_eq!(
+            get(&d, "background-size"),
+            &CssValue::Keyword("cover".into())
+        );
+        assert_eq!(
+            get(&d, "background-origin"),
+            &CssValue::Keyword("padding-box".into())
+        );
+        // One box keyword sets both origin and clip.
+        assert_eq!(
+            get(&d, "background-clip"),
+            &CssValue::Keyword("padding-box".into())
+        );
+        // Two box keywords split origin/clip; two-value repeat and
+        // two-value size keep their lists.
+        let d = decls(
+            "p { background: url(a.png) repeat no-repeat 10px 20px / 50% auto border-box content-box; }",
+        );
+        assert_eq!(d.len(), 8);
+        assert_eq!(
+            get(&d, "background-repeat"),
+            &CssValue::List(vec![
+                CssValue::Keyword("repeat".into()),
+                CssValue::Keyword("no-repeat".into()),
+            ])
+        );
+        assert_eq!(
+            get(&d, "background-size"),
+            &CssValue::List(vec![
+                CssValue::Percentage(50.0),
+                CssValue::Keyword("auto".into()),
+            ])
+        );
+        assert_eq!(
+            get(&d, "background-origin"),
+            &CssValue::Keyword("border-box".into())
+        );
+        assert_eq!(
+            get(&d, "background-clip"),
+            &CssValue::Keyword("content-box".into())
+        );
+        // Omitted longhands reset to initials, including the new ones.
+        let d = decls("p { background: red; }");
+        assert_eq!(d.len(), 8);
+        assert_eq!(
+            get(&d, "background-size"),
+            &CssValue::List(vec![
+                CssValue::Keyword("auto".into()),
+                CssValue::Keyword("auto".into()),
+            ])
+        );
+        assert_eq!(
+            get(&d, "background-origin"),
+            &CssValue::Keyword("padding-box".into())
+        );
+        assert_eq!(
+            get(&d, "background-clip"),
+            &CssValue::Keyword("border-box".into())
+        );
+        // Multi-layer: each longhand becomes a per-layer list.
+        let d = decls("p { background: url(a.png) no-repeat, url(b.png) red; }");
+        assert_eq!(d.len(), 8);
+        assert_eq!(
+            get(&d, "background-image"),
+            &CssValue::List(vec![
+                CssValue::List(vec![CssValue::Url("a.png".into())]),
+                CssValue::List(vec![CssValue::Url("b.png".into())]),
+            ])
+        );
+        assert_eq!(
+            get(&d, "background-color"),
+            &CssValue::Color(Color {
+                r: 255,
+                g: 0,
+                b: 0,
+                a: 255
+            })
+        );
+    }
+
+    #[test]
+    fn w79fix_background_calc_position_and_size() {
+        // w79fix 3 (parse side): `calc()` is a valid
+        // `<length-percentage>` for both position and size. Before
+        // the fix the direct path dropped both forms (the size form
+        // diverged from the `var()` path, which already admitted
+        // `Math` in size). The parse expansion keeps `calc()` as a
+        // verbatim `Math` value; evaluation happens in the cascade.
+        use crate::value::{LengthUnit, MathExpr};
+        let d = decls("p { background: center/calc(50%); }");
+        assert_eq!(d.len(), 8);
+        assert_eq!(
+            get(&d, "background-size"),
+            &CssValue::Math(MathExpr::Percentage(50.0))
+        );
+        assert_eq!(
+            get(&d, "background-position"),
+            &CssValue::Keyword("center".into())
+        );
+        let d = decls("p { background: calc(10px) 20px/cover; }");
+        assert_eq!(d.len(), 8);
+        assert_eq!(
+            get(&d, "background-position"),
+            &CssValue::List(vec![
+                CssValue::Math(MathExpr::Length(10.0, LengthUnit::Px)),
+                CssValue::Length(20.0, LengthUnit::Px),
+            ])
+        );
+        assert_eq!(
+            get(&d, "background-size"),
+            &CssValue::Keyword("cover".into())
+        );
+        let d = decls("p { background: url(a.png) calc(10px) 20px; }");
+        assert_eq!(d.len(), 8);
+        assert_eq!(
+            get(&d, "background-position"),
+            &CssValue::List(vec![
+                CssValue::Math(MathExpr::Length(10.0, LengthUnit::Px)),
+                CssValue::Length(20.0, LengthUnit::Px),
+            ])
+        );
+    }
+
+    #[test]
+    fn w79fix2_background_shorthand_clip_text() {
+        // w79fix2 (parse side; mirrors cascade.rs's
+        // `w79fix2_background_shorthand_clip_text`): `text` is a
+        // clip-only box keyword in the shorthand. A lone `text`
+        // sets clip=`text` with origin at its initial
+        // (`padding-box`); `text` in the clip (second) position
+        // of a two-box form works; `text` in the origin (first)
+        // position is invalid and drops the whole declaration.
+        let d = decls("p { background: url(a.png) text; }");
+        assert_eq!(d.len(), 8);
+        assert_eq!(get(&d, "background-image"), &CssValue::Url("a.png".into()));
+        assert_eq!(
+            get(&d, "background-origin"),
+            &CssValue::Keyword("padding-box".into())
+        );
+        assert_eq!(
+            get(&d, "background-clip"),
+            &CssValue::Keyword("text".into())
+        );
+        let d = decls("p { background: url(a.png) padding-box text; }");
+        assert_eq!(d.len(), 8);
+        assert_eq!(
+            get(&d, "background-origin"),
+            &CssValue::Keyword("padding-box".into())
+        );
+        assert_eq!(
+            get(&d, "background-clip"),
+            &CssValue::Keyword("text".into())
+        );
+        let d = decls("p { background: url(a.png) border-box text; }");
+        assert_eq!(
+            get(&d, "background-origin"),
+            &CssValue::Keyword("border-box".into())
+        );
+        assert_eq!(
+            get(&d, "background-clip"),
+            &CssValue::Keyword("text".into())
+        );
+        // `text` can never be origin: the whole shorthand drops.
+        assert!(decls("p { background: url(a.png) text padding-box; }").is_empty());
+        assert!(decls("p { background: url(a.png) text text; }").is_empty());
+        // Layered form: the rule applies per layer, and one
+        // invalid layer drops the whole shorthand.
+        let d = decls("p { background: url(a.png) text, url(b.png) padding-box; }");
+        assert_eq!(d.len(), 8);
+        assert_eq!(
+            get(&d, "background-image"),
+            &CssValue::List(vec![
+                CssValue::List(vec![CssValue::Url("a.png".into())]),
+                CssValue::List(vec![CssValue::Url("b.png".into())]),
+            ])
+        );
+        assert_eq!(
+            get(&d, "background-origin"),
+            &CssValue::List(vec![
+                CssValue::List(vec![CssValue::Keyword("padding-box".into())]),
+                CssValue::List(vec![CssValue::Keyword("padding-box".into())]),
+            ])
+        );
+        assert_eq!(
+            get(&d, "background-clip"),
+            &CssValue::List(vec![
+                CssValue::List(vec![CssValue::Keyword("text".into())]),
+                CssValue::List(vec![CssValue::Keyword("padding-box".into())]),
+            ])
+        );
+        assert!(decls("p { background: url(a.png) text padding-box, url(b.png); }").is_empty());
     }
 
     #[test]
@@ -4917,7 +5677,10 @@ mod tests {
         assert_eq!(len_px(&s.offset_y), 3.0);
         assert_eq!(len_px(&s.blur), 4.0);
         assert_eq!(len_px(&s.spread), 5.0);
-        assert!(matches!(s.color, CssValue::Color(_)));
+        assert!(matches!(
+            s.color,
+            CssValue::Color(_) | CssValue::NamedColor { .. }
+        ));
         // Unitless zero is a valid `<length>`.
         let v = shadow_of("box-shadow: 0 0", "box-shadow").expect("parses");
         assert_eq!(layers(&v).len(), 1);
@@ -4944,7 +5707,10 @@ mod tests {
             let s = &layers(&v)[0];
             assert_eq!(len_px(&s.offset_x), 2.0, "{css}");
             assert_eq!(len_px(&s.offset_y), 3.0, "{css}");
-            assert!(matches!(s.color, CssValue::Color(_)), "{css}");
+            assert!(
+                matches!(s.color, CssValue::Color(_) | CssValue::NamedColor { .. }),
+                "{css}"
+            );
             assert_eq!(s.inset, css.contains("inset"), "{css}");
         }
     }

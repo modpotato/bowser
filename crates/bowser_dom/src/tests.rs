@@ -385,6 +385,48 @@ fn selector_groups_and_malformed() {
 }
 
 #[test]
+fn w79k_query_selector_in_scoped_descendants() {
+    // w79k: `Element.querySelector(All)` — descendants only, document
+    // order, comma-group union. The scope element itself never matches,
+    // even when it satisfies the selector, and matches outside the
+    // scope are invisible.
+    let doc = selector_fixture();
+    let div = doc.query_selector("#app").expect("valid").unwrap();
+    let section = doc.query_selector("section").expect("valid").unwrap();
+    let qs_all_in = |el, sel: &str| -> Vec<String> {
+        doc.query_selector_all_in(el, sel)
+            .expect("valid selector")
+            .into_iter()
+            .map(|n| doc.text_content(n))
+            .collect()
+    };
+    assert_eq!(qs_all_in(div, "p"), vec!["t", "u"]);
+    assert_eq!(qs_all_in(div, "div"), Vec::<String>::new());
+    assert_eq!(qs_all_in(div, "#app"), Vec::<String>::new());
+    assert_eq!(qs_all_in(section, "p"), vec!["t"]);
+    assert_eq!(qs_all_in(section, ".b"), vec!["t"]);
+    // Union in document order, not group order.
+    assert_eq!(qs_all_in(div, "#x, p"), vec!["t", "u"]);
+    assert_eq!(qs_all_in(div, "p, #x"), vec!["t", "u"]);
+    assert_eq!(
+        doc.query_selector_in(section, "p")
+            .expect("valid")
+            .map(|n| doc.text_content(n)),
+        Some("t".to_string())
+    );
+    assert_eq!(doc.query_selector_in(div, "span").expect("valid"), None);
+    assert_eq!(
+        doc.query_selector_in(div, "div").expect("valid"),
+        None,
+        "the scope element itself must not match"
+    );
+    // One bad group fails the whole call, like the document-wide query.
+    assert!(doc.query_selector_all_in(div, ">>>").is_err());
+    assert!(doc.query_selector_all_in(div, "p, >>>").is_err());
+    assert!(doc.query_selector_in(div, "").is_err());
+}
+
+#[test]
 fn query_selector_first_match_in_document_order() {
     // `query_selector` agrees with the first hit of `query_selector_all`
     // across combinators, groups, and malformed groups — it just stops

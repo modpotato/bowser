@@ -3569,25 +3569,27 @@ pub(crate) fn auto_column_maxima(
 /// directly, a content-box length floors it after padding/border
 /// (`pad`).
 ///
-/// w78fix: the arm is additionally gated on the cell's resolved
-/// `white-space` being `nowrap` (read from the forest node's
-/// computed style, which already reflects the hint and any author
-/// override): an author `white-space: normal` specified on the
-/// cell outranks the presentational hint, so it now correctly
-/// disables the floor, where the old arm applied whenever the
-/// attribute was present. Percentages are not lengths: no quirk.
-fn quirks_nowrap_min_floor(
-    forest: &mut Forest,
-    node: usize,
-    fonts: &dyn FontMetrics,
-    mcw_scratch: &mut Vec<f32>,
-    int_bufs: &mut WalkBufs,
-    pad: f32,
-) -> Option<f32> {
-    if forest.quirks_mode != QuirksMode::Quirks
-        || !forest.nodes[node].nowrap_attr
-        || forest.nodes[node].data.white_space != WhiteSpace::NoWrap
-    {
+/// w79fix: the arm is NOT gated on the cell's resolved `white-space`.
+/// Quirks §3.9 conditions only on the cell being `td`/`th`, the
+/// `nowrap` attribute, and a nonzero `<length>` computed width — it
+/// says nothing about `white-space`. The w78 white-space gate was
+/// therefore wrong, and w79 exposed it: the w79 quirks reset correctly
+/// makes a full-quirks `td`/`th[nowrap]` with a nonzero-length width
+/// compute `white-space: normal` (so it wraps), which switched the
+/// floor off for exactly the cells §3.9 targets — historical Gecko
+/// kept both the wrap reset and the width floor.
+/// The floor returns only the width's outer measure: both call sites
+/// already `max` it against a `need_min` carrying the cell's actual
+/// (wrapping-aware) min-content, so the result is exactly §3.9's
+/// `max(computed width, outer min-content width)`. Returning the
+/// old recomputed max-content measure here as well would over-floor
+/// a wrapping cell to its unwrapped line (364 for the width-attr
+/// fixture, where the spec/Gecko result is `max(240, 112) = 240`
+/// for width 200 and 112 for width 50) — for a nowrap cell the two
+/// measures coincide, so the classic fixtures are unchanged.
+/// Percentages are not lengths: no quirk.
+fn quirks_nowrap_min_floor(forest: &Forest, node: usize, pad: f32) -> Option<f32> {
+    if forest.quirks_mode != QuirksMode::Quirks || !forest.nodes[node].nowrap_attr {
         return None;
     }
     let spec = table_col_spec(forest.nodes[node].data.width);
@@ -3597,25 +3599,10 @@ fn quirks_nowrap_min_floor(
     if p <= 0.0 {
         return None;
     }
-    let width_outer = match forest.nodes[node].data.box_sizing {
+    Some(match forest.nodes[node].data.box_sizing {
         BoxSizing::BorderBox => p,
         BoxSizing::ContentBox => p + pad,
-    };
-    // Fresh cache and inner buffers: `auto_column_minima` owns no
-    // `PrefWidthCache`, and sharing the caller's `int_bufs` as the
-    // inner buffers would corrupt the min-content walk's state.
-    let mut pw_cache = PrefWidthCache::new(forest.nodes.len());
-    let mut inner = WalkBufs::new();
-    let mcw = preferred_width_mcw(
-        forest,
-        node,
-        fonts,
-        &mut pw_cache,
-        mcw_scratch,
-        int_bufs,
-        &mut inner,
-    );
-    Some(width_outer.max(mcw + pad))
+    })
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -3711,17 +3698,10 @@ pub(crate) fn auto_column_minima(
         let mut need_min = (mcw.max(specified) + pad).max(min_bb);
         // WHATWG Quirks §3.9 (see `quirks_nowrap_min_floor`): a
         // nowrap cell's outer min-content is floored by its
-        // nowrap measure.
+        // specified width's outer measure.
         if !grid.fixed
             && !grid.vertical
-            && let Some(floor) = quirks_nowrap_min_floor(
-                forest,
-                cell.node,
-                fonts,
-                &mut mcw_scratch,
-                &mut int_bufs,
-                pad,
-            )
+            && let Some(floor) = quirks_nowrap_min_floor(forest, cell.node, pad)
         {
             need_min = need_min.max(floor);
         }
@@ -3830,14 +3810,7 @@ pub(crate) fn auto_column_minima(
             // over the spanned columns below.
             if !grid.fixed
                 && !grid.vertical
-                && let Some(floor) = quirks_nowrap_min_floor(
-                    forest,
-                    cell.node,
-                    fonts,
-                    &mut mcw_scratch,
-                    &mut int_bufs,
-                    pad,
-                )
+                && let Some(floor) = quirks_nowrap_min_floor(forest, cell.node, pad)
             {
                 need_min = need_min.max(floor);
             }
@@ -15720,16 +15693,32 @@ mod table_tests {
             "quirks nowrap floor table w {}, want 240",
             table.rect.w
         );
-        // Standards control: same fixture, no quirk — wrapping
-        // min-content (longest word 72 + 40 = 112).
+        // Standards control (w79: the hint is now ungated, so the
+        // standards cell unwraps like the quirks/limited cases —
+        // 364, not the old wrapping min-content 112; the §3.9 floor
+        // itself stays full-quirks-only and plays no part here).
         let l = lay(
             "<!DOCTYPE html>",
             "<td nowrap style=\"width: 50px\">nowrap nowrap nowrap nowrap</td>",
         );
         let table = &l.children[0].children[0];
         assert!(
-            approx(table.rect.w, 112.0),
-            "standards nowrap table w {}, want 112 (no quirk)",
+            approx(table.rect.w, 364.0),
+            "standards nowrap table w {}, want 364 (hint unwraps, no floor)",
+            table.rect.w
+        );
+        // Standards 200px/no-floor case (w79, mirror of the
+        // limited-quirks 200px case): hint content measure, no
+        // floor — "hi" 24 + 40 padding = 64, and the 50px table
+        // grows to it.
+        let l = lay(
+            "<!DOCTYPE html>",
+            "<td nowrap style=\"width: 200px\">hi</td>",
+        );
+        let table = &l.children[0].children[0];
+        assert!(
+            approx(table.rect.w, 64.0),
+            "standards nowrap width table w {}, want 64 (hint content measure, no floor)",
             table.rect.w
         );
         // Percentage width is not a length: no §3.9 floor — but the
@@ -15909,11 +15898,13 @@ mod table_tests {
 
     #[test]
     fn w78fix_full_quirks_nowrap_author_override() {
-        // w78fix item 1, quirks arm: the remaining §3.9 floor is
-        // gated on the cell's resolved `white-space` being `nowrap`,
-        // so an author `white-space: normal` on a full-quirks nowrap
-        // cell also wraps (112) instead of being floored to the
-        // unwrapped line (364, the pre-fix result).
+        // w78fix item 1, quirks arm (w79fix: the §3.9 floor itself is
+        // no longer gated on resolved `white-space` — see
+        // `quirks_nowrap_min_floor` — but this fixture is unchanged):
+        // an author `white-space: normal` on a full-quirks nowrap
+        // cell wraps (112) instead of being floored to the unwrapped
+        // line (364, the pre-fix result), because the 50px width's
+        // outer floor (90) sits below the wrapping min-content.
         let css =
             "table { width: 50px; border-spacing: 0; } td { padding: 20px; font-size: 20px; }";
         let quirks_doctype = "<!DOCTYPE HTML PUBLIC \"-//W3C//DTD HTML 4.0 Transitional//EN\">";
@@ -15927,6 +15918,146 @@ mod table_tests {
         assert!(
             approx(table.rect.w, 112.0),
             "full-quirks author-normal nowrap table w {}, want 112 (wrapping min-content)",
+            table.rect.w
+        );
+    }
+
+    #[test]
+    fn w79fix_quirks_nowrap_author_override_width_floor() {
+        // w79fix round 2: the discriminating author-override case
+        // for the §3.9 floor. The width-50 fixture above cannot tell
+        // floor-on from floor-off (outer floor 90 sits below the
+        // wrapping min-content 112), and the width-200 case in
+        // `w79fix_quirks_nowrap_width_attribute_wraps` is the
+        // width-attribute wrap-reset case, not author override.
+        // Here the width comes from author CSS (`width: 200px`)
+        // with author `white-space: normal`, so the cell wraps
+        // (min-content 112) and the §3.9 floor — nowrap attribute
+        // plus a nonzero-length computed width, with no gating on
+        // resolved `white-space` — floors its outer min-content to
+        // 200 + 40 padding = 240. Floor-off would give 112: a
+        // specified width alone never floors the column minimum
+        // (CSS Tables 3 §3.8.3, see
+        // `specified_cell_width_does_not_floor_column_minimum`),
+        // and with a 50px table the assignable width is
+        // max(50, minima), so the column maximum cannot pull the
+        // table up to 240 either. The limited-quirks twin proves
+        // the 240 is the full-quirks floor, not the CSS width
+        // itself: the same cell there measures 112.
+        let css =
+            "table { width: 50px; border-spacing: 0; } td { padding: 20px; font-size: 20px; }";
+        let quirks_doctype = "<!DOCTYPE HTML PUBLIC \"-//W3C//DTD HTML 4.0 Transitional//EN\">";
+        let limited_doctype = "<!DOCTYPE HTML PUBLIC \"-//W3C//DTD HTML 4.01 Transitional//EN\" \"http://www.w3.org/TR/html4/loose.dtd\">";
+        let l = layout_table_html(
+            &format!(
+                "{quirks_doctype}<table><tr><td nowrap style=\"width: 200px; white-space: normal\">nowrap nowrap nowrap nowrap</td></tr></table>"
+            ),
+            css,
+        );
+        let table = &l.children[0].children[0];
+        assert!(
+            approx(table.rect.w, 240.0),
+            "full-quirks author-normal nowrap width-200 table w {}, want 240 (floor on despite author override)",
+            table.rect.w
+        );
+        let l = layout_table_html(
+            &format!(
+                "{limited_doctype}<table><tr><td nowrap style=\"width: 200px; white-space: normal\">nowrap nowrap nowrap nowrap</td></tr></table>"
+            ),
+            css,
+        );
+        let table = &l.children[0].children[0];
+        assert!(
+            approx(table.rect.w, 112.0),
+            "limited-quirks author-normal nowrap width-200 table w {}, want 112 (no §3.9 floor outside full quirks)",
+            table.rect.w
+        );
+    }
+
+    #[test]
+    fn w79fix_quirks_nowrap_width_attribute_wraps() {
+        // HTML §15.3.8 end of Tables (w79, fail-before: the
+        // quirks case measured 364, unwrapped): in full quirks
+        // only, `nowrap` plus a nonzero-length `width` ATTRIBUTE
+        // resets the cell to `white-space: normal`, so it wraps —
+        // wrapping min-content (longest word 72 + 40 padding =
+        // 112). w79fix floor interaction: the reset does NOT switch
+        // off the §3.9 floor — Quirks §3.9 conditions only on the
+        // nowrap attribute plus a nonzero-length computed width, and
+        // historical Gecko kept both the wrap reset and the width
+        // floor. The 112 below is the wrap-plus-floor result, not a
+        // floor-off result: the 50px width's outer floor (50 + 40
+        // padding = 90) sits below the wrapping min-content (112),
+        // so floor-on and floor-off are indistinguishable here.
+        // The width="200" case below discriminates: spec/Gecko floor
+        // gives max(200 + 40, 112) = 240, floor-off gives 112.
+        // The reset gate is full-quirks-only, so limited-quirks and
+        // standards cells with the same attribute still unwrap via
+        // the hint (364). CSS style width never triggers the reset.
+        let css =
+            "table { width: 50px; border-spacing: 0; } td { padding: 20px; font-size: 20px; }";
+        let quirks_doctype = "<!DOCTYPE HTML PUBLIC \"-//W3C//DTD HTML 4.0 Transitional//EN\">";
+        let limited_doctype = "<!DOCTYPE HTML PUBLIC \"-//W3C//DTD HTML 4.01 Transitional//EN\" \"http://www.w3.org/TR/html4/loose.dtd\">";
+        let l = layout_table_html(
+            &format!(
+                "{quirks_doctype}<table><tr><td nowrap width=\"50\">nowrap nowrap nowrap nowrap</td></tr></table>"
+            ),
+            css,
+        );
+        let table = &l.children[0].children[0];
+        assert!(
+            approx(table.rect.w, 112.0),
+            "quirks nowrap width-attr table w {}, want 112 (wraps, 90 floor below 112 min-content)",
+            table.rect.w
+        );
+        // Discriminating floor case: width="200" floors the wrapping
+        // min-content up to its outer width (200 + 40 padding = 240).
+        let l = layout_table_html(
+            &format!(
+                "{quirks_doctype}<table><tr><td nowrap width=\"200\">nowrap nowrap nowrap nowrap</td></tr></table>"
+            ),
+            css,
+        );
+        let table = &l.children[0].children[0];
+        assert!(
+            approx(table.rect.w, 240.0),
+            "quirks nowrap width-attr-200 table w {}, want 240 (floor on despite wrap reset)",
+            table.rect.w
+        );
+        // Percentage width attribute: not a length, no reset.
+        let l = layout_table_html(
+            &format!(
+                "{quirks_doctype}<table><tr><td nowrap width=\"50%\">nowrap nowrap nowrap nowrap</td></tr></table>"
+            ),
+            css,
+        );
+        let table = &l.children[0].children[0];
+        assert!(
+            approx(table.rect.w, 364.0),
+            "quirks nowrap %-width-attr table w {}, want 364 (still nowrap)",
+            table.rect.w
+        );
+        // Gate checks: limited-quirks and standards keep the hint.
+        let l = layout_table_html(
+            &format!(
+                "{limited_doctype}<table><tr><td nowrap width=\"50\">nowrap nowrap nowrap nowrap</td></tr></table>"
+            ),
+            css,
+        );
+        let table = &l.children[0].children[0];
+        assert!(
+            approx(table.rect.w, 364.0),
+            "limited-quirks nowrap width-attr table w {}, want 364 (no reset)",
+            table.rect.w
+        );
+        let l = layout_table_html(
+            "<!DOCTYPE html><table><tr><td nowrap width=\"50\">nowrap nowrap nowrap nowrap</td></tr></table>",
+            css,
+        );
+        let table = &l.children[0].children[0];
+        assert!(
+            approx(table.rect.w, 364.0),
+            "standards nowrap width-attr table w {}, want 364 (no reset)",
             table.rect.w
         );
     }

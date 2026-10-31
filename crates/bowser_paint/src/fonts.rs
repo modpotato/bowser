@@ -1970,18 +1970,22 @@ fn woff2_reconstruct_glyf(transformed: &[u8]) -> Option<(Vec<Woff2Glyph>, u16)> 
             i16::from_be_bytes([raw[0], raw[1]])
         };
         if number_of_contours == 0 {
-            // An empty glyph whose bbox bit is set consumes its 8
-            // explicit bytes, which must all be zero: skipping
-            // them would hand those bytes to the next glyph as
-            // its bbox and shift every later bbox in the stream.
+            // WOFF2 REC §5.1 "Decoding of Empty Glyphs" is
+            // unconditional: if the bboxBitmap flag indicates
+            // bbox values are explicitly encoded for an empty
+            // glyph, the decoder MUST reject the file as
+            // invalid. No conforming encoder emits the bit
+            // for an empty glyph, so reject immediately
+            // without consuming any bbox bytes. This check
+            // runs per glyph inside the loop, so glyphs
+            // parsed before this one already sit in the
+            // local vec; returning None discards that vec,
+            // so externally no glyph is emitted.
             let has_bbox = bbox_bitmap
                 .get(glyph_id >> 3)
                 .is_some_and(|b| b & (0x80 >> (glyph_id & 7)) != 0);
             if has_bbox {
-                let raw = bbox_stream.take(8)?;
-                if raw.iter().any(|b| *b != 0) {
-                    return None;
-                }
+                return None;
             }
             glyphs.push(Woff2Glyph {
                 data: Vec::new(),
@@ -4238,7 +4242,7 @@ mod tests {
     fn woff2_synth_composite_end_to_end() {
         // Composite glyph with an x/y-scale component, a 2x2-matrix
         // component, and instructions, plus a trailing empty glyph
-        // carrying a zero explicit bbox.
+        // with no explicit bbox.
         let bytes = include_bytes!("../tests/fixtures/woff2-synth-composite.woff2");
         let decoded = decode_webfont(bytes).expect("composite fixture must decode");
         let glyphs = parse_test_glyphs(&decoded);
@@ -4313,24 +4317,14 @@ mod tests {
     #[test]
     fn woff2_synth_empty_bbox_end_to_end() {
         // End-to-end counterpart of the stream-level empty-bbox
-        // checks: an empty glyph with an all-zero explicit bbox
-        // decodes (that accept is intentional), and the following
-        // simple glyph still reads its own bbox.
+        // checks: WOFF2 REC §5.1 makes any explicit bbox on an
+        // empty glyph a rejection, zero or nonzero alike, so
+        // the zero fixture is now a second reject case
+        // alongside the nonzero one.
         let bytes = include_bytes!("../tests/fixtures/woff2-synth-empty-bbox-zero.woff2");
-        let decoded = decode_webfont(bytes).expect("zero empty bbox must decode");
-        let glyphs = parse_test_glyphs(&decoded);
-        assert_eq!(glyphs.len(), 2);
-        assert!(matches!(glyphs[0], TestGlyph::Empty));
         assert!(
-            matches!(
-                glyphs[1],
-                TestGlyph::Simple {
-                    bbox: (3, 4, 10, 5),
-                    ..
-                }
-            ),
-            "simple glyph must read its own bbox, got {:?}",
-            glyphs[1]
+            decode_webfont(bytes).is_none(),
+            "zero empty bbox must reject"
         );
         // Same input with a nonzero explicit bbox on the empty
         // glyph must reject end to end, not just at stream level.
@@ -4338,6 +4332,35 @@ mod tests {
         assert!(
             decode_webfont(bytes).is_none(),
             "nonzero empty bbox must reject"
+        );
+    }
+
+    #[test]
+    fn woff2_synth_simple_explicit_bbox_end_to_end() {
+        // Positive counterpart of the empty-bbox rejects: the
+        // old glyph order with the empty glyph's bbox bit
+        // cleared, so the empty glyph consumes no bbox bytes
+        // and the following simple glyph reads its own
+        // explicit bbox. (3, 4, 10, 5) differs from the
+        // points' own bounds (0, 0, 10, 5), so a decoder
+        // that recomputed the bbox from the points instead
+        // of taking the explicit 8 bytes would fail here.
+        let bytes = include_bytes!("../tests/fixtures/woff2-synth-simple-explicit-bbox.woff2");
+        let decoded = decode_webfont(bytes).expect("simple explicit bbox must decode");
+        assert_eq!(
+            parse_test_glyphs(&decoded),
+            vec![
+                TestGlyph::Empty,
+                TestGlyph::Simple {
+                    contours: 1,
+                    bbox: (3, 4, 10, 5),
+                    end_pts: vec![1],
+                    coords: vec![(0, 0), (10, 5)],
+                    on_curve: vec![true, true],
+                    overlap: false,
+                },
+            ],
+            "simple glyph must read its own explicit bbox"
         );
     }
 
@@ -4479,9 +4502,7 @@ mod tests {
             "zero glyphs must reject"
         );
         // Empty glyph with a nonzero explicit bbox rejects even
-        // when the bbox stream holds nothing else: the old code
-        // let the following simple glyph consume the empty
-        // glyph's bbox as its own and accept.
+        // when the bbox stream holds nothing else.
         let bbox_bitmap = [0xC0u8, 0, 0, 0];
         let mut bbox = bbox_bitmap.to_vec();
         bbox.extend_from_slice(&[0, 1, 0, 2, 0, 3, 0, 4]);
@@ -4500,9 +4521,10 @@ mod tests {
             woff2_reconstruct_glyf(&stream).is_none(),
             "nonzero empty bbox must reject"
         );
-        // Empty glyph with a zero explicit bbox, then a simple
-        // glyph with its own explicit bbox: both bboxes must be
-        // consumed in order.
+        // Empty glyph with a zero explicit bbox rejects too:
+        // WOFF2 REC §5.1 rejects any explicit bbox on an empty
+        // glyph, so the font rejects before any glyph is
+        // consumed and no stream shift can occur.
         let mut bbox = bbox_bitmap.to_vec();
         bbox.extend_from_slice(&[0; 8]);
         bbox.extend_from_slice(&[0, 3, 0, 4, 0, 10, 0, 5]);
@@ -4517,8 +4539,10 @@ mod tests {
             &bbox,
             &[],
         );
-        let (glyphs, _) = woff2_reconstruct_glyf(&stream).expect("zero empty bbox must decode");
-        assert_eq!(glyphs[1].x_min, 3, "simple glyph must read its own bbox");
+        assert!(
+            woff2_reconstruct_glyf(&stream).is_none(),
+            "zero empty bbox must reject"
+        );
     }
 
     #[test]

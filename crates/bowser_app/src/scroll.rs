@@ -6308,12 +6308,25 @@ struct StickyBand {
     /// Resolved border widths `(top, right, bottom, left)` in px of the
     /// constraining scroller's box, `None` when any side is unresolvable
     /// app-side (or the scroller is the viewport, which never folds).
-    /// The fold models positions against the border-box scrollport, but
-    /// layout sticks against the padding box: any nonzero (or
-    /// unresolvable) border makes the model unsound, so
-    /// [`ScrollTree::sticky_band_fold`] falls back to re-bake then (see
-    /// `scroller_borders_unsound`).
+    /// The fold models positions in the border-box frame against the
+    /// padding-box scrollport extent (w79: layout's sticky view
+    /// rectangle size is the padding-box size), so any nonzero (or
+    /// unresolvable) border makes the model unsound and
+    /// [`ScrollTree::sticky_band_fold`] falls back to re-bake then
+    /// (see `scroller_borders_unsound`).
     scroller_border: Option<(f32, f32, f32, f32)>,
+    /// Resolved paddings `(top, right, bottom, left)` in px of the
+    /// constraining scroller's box, `None` when any side is unresolvable
+    /// app-side (or the scroller is the viewport, which never folds).
+    /// Layout's sticky pins are measured from the scroller's content
+    /// origin (border-box origin plus border plus near padding), while
+    /// the fold's positions are border-box-frame, so the near padding
+    /// offsets every pin and transition the fold computes (see
+    /// [`ScrollTree::sticky_axis_fold`]). An unresolvable padding makes
+    /// that offset unprovable and the fold falls back to re-bake then
+    /// (see `scroller_padding_unsound`); a nonzero resolvable padding
+    /// folds exactly.
+    scroller_padding: Option<(f32, f32, f32, f32)>,
 }
 
 impl StickyBand {
@@ -6332,9 +6345,9 @@ impl StickyBand {
     }
 
     /// Whether the scroller has nonzero (or unresolvable) borders: the
-    /// fold models against the border-box scrollport, but layout sticks
-    /// against the padding box, so the fold is unsound and must fall
-    /// back to re-bake.
+    /// fold models in the border-box frame against the padding-box
+    /// scrollport extent, but a nonzero border separates the two
+    /// frames, so the fold is unsound and must fall back to re-bake.
     fn scroller_borders_unsound(&self) -> bool {
         match self.scroller_border {
             Some((t, r, b, l)) => t != 0.0 || r != 0.0 || b != 0.0 || l != 0.0,
@@ -6342,6 +6355,14 @@ impl StickyBand {
             // conservative.
             None => true,
         }
+    }
+
+    /// Whether the scroller's padding is unresolvable app-side (or the
+    /// scroller is the viewport, which never folds): the near-padding
+    /// offset of every pin is then unprovable, so the fold must fall
+    /// back to re-bake. A resolved padding of any size is sound.
+    fn scroller_padding_unsound(&self) -> bool {
+        self.scroller_padding.is_none()
     }
 }
 
@@ -6472,14 +6493,20 @@ fn used_border_px(
 /// Exact band-frame content-box end of the scroller's own box along one
 /// axis, or `None` when unprovable app-side. `Some(INFINITY)` when the
 /// size is indefinite (`auto`/absent): layout then applies no
-/// containing-block clamp. The scrollport is the border box, so the
-/// content end is the scrollport extent minus the far border and both
-/// paddings; any non-px component bails to `None` (conservative).
+/// containing-block clamp. The band frame's origin is the scrollport
+/// frame's (border-box) origin and the scrollport extent is the
+/// border-box extent, so the content-box end is the extent minus
+/// only the FAR padding and the FAR border: the near border and
+/// near padding sit between the frame origin and the content box
+/// and are part of the end, not subtracted from it. (Pre-w79 this
+/// subtracted both paddings, understating the end by the near
+/// padding for padded scrollers and making the fold re-bake where
+/// it could have folded exactly.) Any non-px component bails to
+/// `None` (conservative).
 fn scroller_cb_end(
     cb: &LayoutBox,
     scrollport_extent: f32,
     size_prop: &str,
-    pad_before: &str,
     pad_after: &str,
     border_after: &str,
 ) -> Option<f32> {
@@ -6492,10 +6519,9 @@ fn scroller_cb_end(
     if !definite {
         return Some(f32::INFINITY);
     }
-    let pt = strict_px(s.get(pad_before))?;
     let pb = strict_px(s.get(pad_after))?;
     let bb = strict_px(s.get(border_after))?;
-    Some(scrollport_extent - pt - pb - bb)
+    Some(scrollport_extent - pb - bb)
 }
 
 /// Mirror of `bowser_layout`'s sticky containing-block candidate test:
@@ -6565,22 +6591,8 @@ impl ScrollTree {
         let (cb_end_x, cb_end_y) = if cb_is_scroller {
             match cb {
                 Some(c) => (
-                    scroller_cb_end(
-                        c,
-                        sp_w,
-                        "width",
-                        "padding-left",
-                        "padding-right",
-                        "border-right-width",
-                    ),
-                    scroller_cb_end(
-                        c,
-                        sp_h,
-                        "height",
-                        "padding-top",
-                        "padding-bottom",
-                        "border-bottom-width",
-                    ),
+                    scroller_cb_end(c, sp_w, "width", "padding-right", "border-right-width"),
+                    scroller_cb_end(c, sp_h, "height", "padding-bottom", "border-bottom-width"),
                 ),
                 None => (None, None),
             }
@@ -6643,8 +6655,8 @@ impl ScrollTree {
             margin_near_y: used_margin_px(style, "margin-top"),
             margin_near_x: used_margin_px(style, "margin-left"),
             // Resolved border widths of the constraining scroller's box
-            // (the fold models against the border-box scrollport; layout
-            // sticks against the padding box). `None` when any side is
+            // (the fold models in the border-box frame against the
+            // padding-box scrollport extent). `None` when any side is
             // unresolvable app-side — the fold then stays conservative.
             scroller_border: self.containers[scroller]
                 .node
@@ -6658,6 +6670,22 @@ impl ScrollTree {
                         used_border_px(s, "border-left-width", "border-left-style")?,
                     ))
                 }),
+            // Resolved paddings of the constraining scroller's box
+            // (the fold's near-padding offset per axis). `None` when
+            // any side is unresolvable app-side — the fold then stays
+            // conservative. Same lookup as the border above.
+            scroller_padding: self.containers[scroller]
+                .node
+                .and_then(|n| find_box(root, n))
+                .and_then(|scroller_box| {
+                    let s = scroller_box.style.as_deref()?;
+                    Some((
+                        strict_px(s.get("padding-top"))?,
+                        strict_px(s.get("padding-right"))?,
+                        strict_px(s.get("padding-bottom"))?,
+                        strict_px(s.get("padding-left"))?,
+                    ))
+                }),
         })
     }
 
@@ -6667,7 +6695,8 @@ impl ScrollTree {
     /// `pos`/`bake` are the baked scrollport-relative position and the
     /// bake-time offset; `size`/`sp` the box and scrollport extents;
     /// `near`/`far` the resolved near/far insets (`None` = no
-    /// constraint on that side); `marg_far` the used far margin in px
+    /// constraint on that side); `near_pad` the scroller's near
+    /// padding on this axis; `marg_far` the used far margin in px
     /// (`None` = not a simple length, so the block end is unprovable);
     /// `cb_is_scroller` whether the containing block is the scroller's
     /// own box; `cb_end` the block's exact band-frame content-box end
@@ -6676,6 +6705,18 @@ impl ScrollTree {
     /// border-box end (conservative upper bound), used only for foreign
     /// blocks.
     ///
+    /// Frame note: `pos` is border-box-frame (baked rect minus the
+    /// scroller's border-box origin), but layout's pins are measured
+    /// from the scroller's content origin, which sits `near_pad`
+    /// inside the border-box frame (borders are zero for every
+    /// runnable band, so no border term appears). The near pin is
+    /// therefore `near_pad + o1 + near` and the far pin
+    /// `near_pad + o1 + sp - far - size` in this frame, and every
+    /// detection, guard, and free-interval bound below carries that
+    /// offset — except where it cancels: the block-start guards
+    /// compare a pin against the block start, which is itself the
+    /// content origin, so `near_pad` drops out of those two.
+    ///
     /// A box stuck to the near edge at bake time rides that edge, so
     /// its extra shift is exactly the scroll delta — but only forward:
     /// scrolling back unsticks it at its natural position, which is
@@ -6683,11 +6724,11 @@ impl ScrollTree {
     /// sticky shift), so backward motion re-bakes. Forward motion stays
     /// stuck until the containing-block end pushes the box off; with
     /// the scroller's own content as the block and a provable end that
-    /// edge is exactly `cb_end - size - near - marg_far`, otherwise it
-    /// is unprovable and the fold bails. The far edge is symmetric
-    /// (backward only). A box within float slack of the edge at bake
-    /// time counts as stuck: misclassification that close errs by at
-    /// most the slack, transiently.
+    /// edge is exactly `cb_end - size - near - marg_far - near_pad`,
+    /// otherwise it is unprovable and the fold bails. The far edge is
+    /// symmetric (backward only). A box within float slack of the edge
+    /// at bake time counts as stuck: misclassification that close errs
+    /// by at most the slack, transiently.
     ///
     /// A box at the block end with the scroller's own content as the
     /// block is either stuck-but-clamped (the bake offset is past the
@@ -6698,14 +6739,14 @@ impl ScrollTree {
     /// uses the free interval.
     ///
     /// A free box needs no extra shift while the offset stays clear of
-    /// both stick transitions: `[pos + size + far - sp, pos - near]`,
-    /// shrunk by slack so the transition itself re-bakes. The interval
-    /// is exact for a truly free box, and sound for a
-    /// block-start-clamped one (there the interval's upper bound is
-    /// exactly the unclamp point, and it only errs conservative going
-    /// back). Within slack of a foreign block's end the box may be
-    /// block-end-clamped — undetectable without the exact end — so
-    /// that zone re-bakes.
+    /// both stick transitions: `[pos - near_pad + size + far - sp,
+    /// pos - near_pad - near]`, shrunk by slack so the transition
+    /// itself re-bakes. The interval is exact for a truly free box, and
+    /// sound for a block-start-clamped one (there the interval's upper
+    /// bound is exactly the unclamp point, and it only errs
+    /// conservative going back). Within slack of a foreign block's end
+    /// the box may be block-end-clamped — undetectable without the
+    /// exact end — so that zone re-bakes.
     ///
     /// The stuck fold is band-independent: the plateau provably
     /// outlasts the band, so a box tracked past the band edge keeps
@@ -6720,13 +6761,14 @@ impl ScrollTree {
         sp: f32,
         near: Option<f32>,
         far: Option<f32>,
+        near_pad: f32,
         marg_far: Option<f32>,
         cb_is_scroller: bool,
         cb_end: Option<f32>,
         cb_hi: f32,
     ) -> Option<f32> {
         if let Some(t) = near
-            && (pos - (bake + t)).abs() <= STICKY_BAND_SLACK
+            && (pos - (bake + near_pad + t)).abs() <= STICKY_BAND_SLACK
         {
             if o1 < bake - STICKY_BAND_SLACK {
                 return None;
@@ -6739,7 +6781,10 @@ impl ScrollTree {
                         if pos >= e - size - m - STICKY_BAND_SLACK {
                             return Some(0.0);
                         }
-                        if o1 > e - size - t - m + STICKY_BAND_SLACK {
+                        // The near pin in this frame is
+                        // `near_pad + o1 + t`; the block-end pin is
+                        // `e - size - m`.
+                        if o1 > e - size - t - m - near_pad + STICKY_BAND_SLACK {
                             return None;
                         }
                     }
@@ -6767,18 +6812,23 @@ impl ScrollTree {
             (Some(t), Some(b)) => t + b + size <= sp,
             _ => true,
         };
-        let at_block_start = cb_is_scroller && pos <= STICKY_BAND_SLACK;
+        // The block start in this frame is the content origin,
+        // `near_pad` (borders are zero for runnable bands), not 0.
+        let at_block_start = cb_is_scroller && pos <= near_pad + STICKY_BAND_SLACK;
         if !at_block_start
             && far_wins
             && let Some(b) = far
-            && (pos - (bake + sp - b - size)).abs() <= STICKY_BAND_SLACK
+            && (pos - (bake + near_pad + sp - b - size)).abs() <= STICKY_BAND_SLACK
         {
             if o1 > bake + STICKY_BAND_SLACK {
                 return None;
             }
             if cb_is_scroller {
-                // The block's start is the scrollport origin here; the
-                // guard errs toward re-baking (no near-margin credit).
+                // The block's start is the scrollport origin here: the
+                // far pin (`near_pad + o1 + sp - b - size`) crosses it
+                // when `o1 = b + size - sp`, with `near_pad` cancelling
+                // against the start. The guard errs toward re-baking
+                // (no near-margin credit).
                 if o1 < b + size - sp - STICKY_BAND_SLACK {
                     return None;
                 }
@@ -6794,7 +6844,10 @@ impl ScrollTree {
             if let (Some(e), Some(m)) = (cb_end, marg_far) {
                 let end = e - size - m;
                 if (pos - end).abs() <= STICKY_BAND_SLACK {
-                    if near.is_some_and(|t| bake > end - t + STICKY_BAND_SLACK) {
+                    // Stuck-but-clamped when the near pin at bake
+                    // (`near_pad + bake + t`) already passes the block
+                    // end.
+                    if near.is_some_and(|t| bake > end - t - near_pad + STICKY_BAND_SLACK) {
                         // Stuck-but-clamped: pinned to the block end
                         // going forward, transition going back.
                         return if o1 >= bake - STICKY_BAND_SLACK {
@@ -6804,20 +6857,23 @@ impl ScrollTree {
                         };
                     }
                     // Truly free at the block end: the free interval is
-                    // exact (the near-stick transition is at `pos -
-                    // near`).
-                    return Self::sticky_free_fold(pos, o1, size, sp, near, far);
+                    // exact (the near-stick transition is at
+                    // `pos - near_pad - near`).
+                    return Self::sticky_free_fold(pos, o1, size, sp, near, far, near_pad);
                 }
             }
             // Clamped to the block start: the far-stick position at
-            // bake is below the start, so the box is pinned at 0. It
-            // stays pinned until the far-stick rises above the start
-            // (at `far + size - sp`). Any other box at ~0 is ambiguous
-            // (far-stuck vs natural-clamped need different folds), so
-            // it re-bakes except for the no-op.
+            // bake is below the start, so the box is pinned at the
+            // content origin (`near_pad` in this frame). It stays
+            // pinned until the far-stick rises above the start (at
+            // `far + size - sp`, with `near_pad` cancelling against
+            // the start, as in the far-stuck guard above). Any other
+            // box at ~`near_pad` is ambiguous (far-stuck vs
+            // natural-clamped need different folds), so it re-bakes
+            // except for the no-op.
             // (Near-side start-clamp only happens at bake=0,t=0, which
             // the near-stuck check already classified.)
-            if pos <= STICKY_BAND_SLACK {
+            if pos <= near_pad + STICKY_BAND_SLACK {
                 if let Some(b) = far
                     && bake + sp - b - size < -STICKY_BAND_SLACK
                 {
@@ -6835,7 +6891,7 @@ impl ScrollTree {
             }
             // Strictly inside the block (or end unprovable): the free
             // interval below.
-            return Self::sticky_free_fold(pos, o1, size, sp, near, far);
+            return Self::sticky_free_fold(pos, o1, size, sp, near, far, near_pad);
         }
         // Foreign block: within slack of the block end the box may be
         // block-clamped (undetectable — the stored end is only an
@@ -6843,13 +6899,19 @@ impl ScrollTree {
         if pos >= cb_hi - size - STICKY_BAND_SLACK {
             return None;
         }
-        Self::sticky_free_fold(pos, o1, size, sp, near, far)
+        Self::sticky_free_fold(pos, o1, size, sp, near, far, near_pad)
     }
 
     /// Zero shift for a free box while the offset stays inside the
-    /// provable no-transition interval `[pos + size + far - sp, pos -
-    /// near]` (unbounded on a side with no inset), shrunk by slack so
-    /// the transition itself re-bakes; `None` outside it.
+    /// provable no-transition interval `[pos - near_pad + size + far -
+    /// sp, pos - near_pad - near]` (unbounded on a side with no inset),
+    /// shrunk by slack so the transition itself re-bakes; `None`
+    /// outside it. The `near_pad` terms are the content-origin offset:
+    /// layout's stick transitions are at `pos - near_pad - near` and
+    /// `pos - near_pad + size + far - sp` in this frame, not at the
+    /// unpadded positions (w79fix: the old interval was a full
+    /// near-padding too high on both ends, so a padded scroller's free
+    /// box folded zero shift past its near transition).
     fn sticky_free_fold(
         pos: f32,
         o1: f32,
@@ -6857,9 +6919,10 @@ impl ScrollTree {
         sp: f32,
         near: Option<f32>,
         far: Option<f32>,
+        near_pad: f32,
     ) -> Option<f32> {
-        let lo = far.map_or(f32::NEG_INFINITY, |b| pos + size + b - sp);
-        let hi = near.map_or(f32::INFINITY, |t| pos - t);
+        let lo = far.map_or(f32::NEG_INFINITY, |b| pos - near_pad + size + b - sp);
+        let hi = near.map_or(f32::INFINITY, |t| pos - near_pad - t);
         if o1 >= lo + STICKY_BAND_SLACK && o1 <= hi - STICKY_BAND_SLACK {
             Some(0.0)
         } else {
@@ -6871,13 +6934,30 @@ impl ScrollTree {
     /// offset, or `None` when any axis needs a re-bake.
     fn sticky_band_fold(&self, b: &StickyBand, x: f32, y: f32) -> Option<(f32, f32)> {
         // Border-box vs margin-box/padding-box: layout sticks the margin
-        // box against the scroller's padding box, but the fold below
-        // models border-box positions against the border-box scrollport.
-        // Any nonzero (or unresolvable) used margin on the box, or any
-        // nonzero (or unresolvable) border on the scroller, makes the
-        // model unsound (sawtooth stutter + layout thrash) — fall back
-        // to re-bake.
-        if b.margins_unsound() || b.scroller_borders_unsound() {
+        // box against the scroller's padding box, and the fold below
+        // models border-box positions in the border-box frame against
+        // that same padding-box scrollport extent (w79: layout's
+        // `sticky_scrollport_axis` size term is the padding-box size
+        // per CSS Overflow 3 §2.3, and the fold's `sp` must match
+        // it). The container's stored scrollport rect is its border
+        // box, so the padding-box extent is derived here by
+        // subtracting the scroller's borders. When the fold runs
+        // those borders are zero (any nonzero — or unresolvable —
+        // border bails to re-bake just below), so the derivation is
+        // the identity for every runnable band and only makes the
+        // model explicit; it does not change any folded value.
+        // Matching the size term alone is not matching layout: layout's
+        // pins are measured from the content origin, a near padding
+        // inside the border-box frame, so the fold offsets every pin
+        // and transition by the scroller's near padding per axis
+        // (w79fix: the w79 claim that the fold matched layout was
+        // false for padded scrollers, whose stuck boxes folded
+        // through the free interval instead). Any nonzero (or
+        // unresolvable) used margin on the box, any nonzero (or
+        // unresolvable) border on the scroller, or any unresolvable
+        // scroller padding makes the model unsound (sawtooth stutter
+        // + layout thrash) — fall back to re-bake.
+        if b.margins_unsound() || b.scroller_borders_unsound() || b.scroller_padding_unsound() {
             return None;
         }
         let top = sticky_inset_opt(b.top)?;
@@ -6886,14 +6966,22 @@ impl ScrollTree {
         let right = sticky_inset_opt(b.right)?;
         let c = &self.containers[b.scroller];
         let sp = c.scrollport;
+        let (sp_w, sp_h) = match b.scroller_border {
+            Some((t, r, bb, l)) => ((sp.w - l - r).max(0.0), (sp.h - t - bb).max(0.0)),
+            // Unreachable: `scroller_borders_unsound` above already
+            // bailed for `None` — kept as a defensive re-bake.
+            None => return None,
+        };
+        let (pad_t, _pad_r, _pad_b, pad_l) = b.scroller_padding?;
         let dx = Self::sticky_axis_fold(
             b.pos_x,
             b.bake_x,
             x,
             b.w,
-            sp.w,
+            sp_w,
             left,
             right,
+            pad_l,
             b.margin_far_x,
             b.cb_is_scroller,
             b.cb_end_x,
@@ -6904,9 +6992,10 @@ impl ScrollTree {
             b.bake_y,
             y,
             b.h,
-            sp.h,
+            sp_h,
             top,
             bottom,
+            pad_t,
             b.margin_far_y,
             b.cb_is_scroller,
             b.cb_end_y,
@@ -16186,7 +16275,7 @@ mod tests {
     /// A sticky box with nonzero used margins, or a scroller with
     /// nonzero borders, is not foldable: layout sticks the margin box
     /// against the padding box, but the fold models border-box positions
-    /// against the border-box scrollport. Both fall back to re-bake.
+    /// in the border-box frame. Both fall back to re-bake.
     #[test]
     fn sticky_fold_bails_on_margins_and_scroller_borders() {
         // Margined sticky box: baked stuck at 150, ticking to 200 would
@@ -16231,5 +16320,337 @@ mod tests {
             tree.sticky_shifts_at(io, 0.0, 200.0).is_none(),
             "bordered scroller is not foldable"
         );
+    }
+
+    /// Near-stuck folding in a near-padded scroller (w79fix): layout's
+    /// near pin is the content origin plus the offset, so a scroller
+    /// with 20px top padding sticks a `top: 0` box at offset + 20, not
+    /// at the offset. Pre-fix the fold's near detection (`pos ~=
+    /// bake + t`) missed the baked stuck box by exactly the padding
+    /// and the box fell through to the free interval, which folded
+    /// zero shift past the near transition. Geometry: content origin
+    /// 20, `#st` natural at 120, stuck from 100; baked stuck at 150,
+    /// so the baked border-box-frame position is 170.
+    #[test]
+    fn sticky_fold_near_stuck_with_scroller_padding() {
+        let css = "#outer { overflow-y: auto; height: 400px; padding-top: 20px; } \
+            #pad { height: 100px; } \
+            #st { position: sticky; top: 0; height: 50px; } \
+            #tall { height: 2000px; }";
+        let (doc, root) = layout_html_nested_at(STICKY_NESTED_HTML, css, "outer", 0.0, 150.0);
+        let (_doc_state, _elements, tree) = build_tree_nested_at(&doc, &root, "outer", 0.0, 150.0);
+        let outer = doc.get_element_by_id("outer").expect("outer");
+        let st = doc.get_element_by_id("st").expect("st");
+        let io = tree.index_of(outer).expect("outer container");
+        let sp_y = tree.container(io).scrollport.y;
+        let band = tree
+            .sticky_bands
+            .iter()
+            .find(|b| b.scroller == io)
+            .expect("band for #st");
+        assert!(approx_eq(band.pos_y, 170.0), "pos_y={}", band.pos_y);
+        assert!(approx_eq(band.bake_y, 150.0), "bake_y={}", band.bake_y);
+        assert_eq!(band.scroller_padding, Some((20.0, 0.0, 0.0, 0.0)));
+        // Tick further along the plateau: exactly foldable, shift is
+        // the scroll delta (pre-fix this re-baked: no stuck match).
+        let shifts = tree.sticky_shifts_at(io, 0.0, 200.0).expect("foldable");
+        assert_eq!(shifts.len(), 1, "exactly the sticky box");
+        assert_eq!(shifts[0].node, st);
+        assert!(approx_eq(shifts[0].dy, 50.0));
+        // Behavior equivalence: independent layout at 200 agrees the
+        // box is stuck at the content origin plus the offset.
+        let (ref_doc, ref_root) =
+            layout_html_nested_at(STICKY_NESTED_HTML, css, "outer", 0.0, 200.0);
+        let ref_st = ref_doc.get_element_by_id("st").expect("ref st");
+        let ref_box = find_box(&ref_root, ref_st).expect("#st box");
+        assert!(
+            approx_eq(ref_box.rect.y - sp_y, 220.0),
+            "layout agrees the box is stuck at 220, got {}",
+            ref_box.rect.y - sp_y
+        );
+        // Scrolling back from the plateau is the conservative re-bake
+        // path, not a zero shift: pre-fix the free interval folded
+        // `Some(0)` here while the box was still stuck.
+        assert!(tree.sticky_shifts_at(io, 0.0, 120.0).is_none());
+        // Free-baked twin: baked at 0 with the box still free
+        // (natural 120), the near transition is at 100, not 120.
+        let (doc, root) = layout_html(STICKY_NESTED_HTML, css);
+        let (_doc_state, _elements, tree) = build_tree(&doc, &root);
+        let outer = doc.get_element_by_id("outer").expect("outer");
+        let io = tree.index_of(outer).expect("outer container");
+        assert!(!tree.sticky_constrained_at(io, 0.0, 50.0));
+        assert!(
+            tree.sticky_shifts_at(io, 0.0, 50.0)
+                .expect("foldable")
+                .is_empty(),
+            "free box needs no extra shift"
+        );
+        assert!(
+            tree.sticky_shifts_at(io, 0.0, 110.0).is_none(),
+            "past the padded near transition must re-bake, not fold zero"
+        );
+    }
+
+    /// Far-stuck folding in a near-padded scroller with no far padding
+    /// (w79fix): layout's far pin is `near_pad + bake + sp_pad - far
+    /// - size`. Pre-fix the fold's far detection missed the baked
+    /// stuck box by the near padding and the box fell through to the
+    /// free interval, which folded zero shift on forward ticks while
+    /// the box was still stuck. Geometry: content origin 20,
+    /// padding-box height 220, `#st` natural at 1020, far pin at bake
+    ///   500 is 690; ticking back rides the far edge.
+    #[test]
+    fn sticky_fold_far_stuck_with_scroller_padding() {
+        let css = "#outer { overflow-y: auto; height: 200px; padding-top: 20px; } \
+            #pad { height: 1000px; } \
+            #st { position: sticky; bottom: 0; height: 50px; } \
+            #tall { height: 2000px; }";
+        let (doc, root) = layout_html_nested_at(STICKY_NESTED_HTML, css, "outer", 0.0, 500.0);
+        let (_doc_state, _elements, tree) = build_tree_nested_at(&doc, &root, "outer", 0.0, 500.0);
+        let outer = doc.get_element_by_id("outer").expect("outer");
+        let st = doc.get_element_by_id("st").expect("st");
+        let io = tree.index_of(outer).expect("outer container");
+        let sp_y = tree.container(io).scrollport.y;
+        let band = tree
+            .sticky_bands
+            .iter()
+            .find(|b| b.scroller == io)
+            .expect("band for #st");
+        assert!(approx_eq(band.pos_y, 690.0), "pos_y={}", band.pos_y);
+        assert!(approx_eq(band.bake_y, 500.0), "bake_y={}", band.bake_y);
+        assert_eq!(band.scroller_padding, Some((20.0, 0.0, 0.0, 0.0)));
+        // Ticking back rides the far edge: shift is the scroll delta
+        // (pre-fix this re-baked: no far-stuck match).
+        let shifts = tree.sticky_shifts_at(io, 0.0, 450.0).expect("foldable");
+        assert_eq!(shifts.len(), 1, "exactly the sticky box");
+        assert_eq!(shifts[0].node, st);
+        assert!(approx_eq(shifts[0].dy, -50.0));
+        // Behavior equivalence: independent layout at 450 agrees the
+        // box is far-stuck at the content origin plus offset plus
+        // padding-box height minus the box.
+        let (ref_doc, ref_root) =
+            layout_html_nested_at(STICKY_NESTED_HTML, css, "outer", 0.0, 450.0);
+        let ref_st = ref_doc.get_element_by_id("st").expect("ref st");
+        let ref_box = find_box(&ref_root, ref_st).expect("#st box");
+        assert!(
+            approx_eq(ref_box.rect.y - sp_y, 640.0),
+            "layout agrees the box is far-stuck at 640, got {}",
+            ref_box.rect.y - sp_y
+        );
+        // Forward ticks from a far-stuck bake are the conservative
+        // re-bake path, not a zero shift: pre-fix the free interval
+        // folded `Some(0)` at 530 (its lower bound was
+        // `bake + near_pad`), letting the stuck box scroll away.
+        assert!(tree.sticky_shifts_at(io, 0.0, 530.0).is_none());
+    }
+
+    /// Near-stuck folding on the horizontal axis (w79fix round 2):
+    /// the mirror of `sticky_fold_near_stuck_with_scroller_padding`,
+    /// which covered only `padding-top`. The fold passes `pad_l`
+    /// on the x-axis, and the near pin is the content origin plus
+    /// the offset, so a `pad_l`/`pad_r` mix-up is caught only when
+    /// the two paddings differ: here left is 20 and right is 30, so
+    /// swapping them would pin at 180, not 170, and the stuck match
+    /// would miss. Geometry: content origin 20, `#pad` is an
+    /// inline-block 100 wide so `#st`'s natural x is 120, stuck
+    /// from 100; baked stuck at 150, so the baked
+    /// border-box-frame position is 170.
+    #[test]
+    fn sticky_fold_near_stuck_with_scroller_padding_horizontal() {
+        let css = "#outer { overflow-x: auto; width: 400px; padding-left: 20px; padding-right: 30px; white-space: nowrap; } \
+            #pad { display: inline-block; width: 100px; height: 10px; } \
+            #st { position: sticky; left: 0; width: 50px; height: 50px; display: inline-block; } \
+            #tall { width: 2000px; height: 10px; }";
+        let (doc, root) = layout_html_nested_at(STICKY_NESTED_HTML, css, "outer", 150.0, 0.0);
+        let (_doc_state, _elements, tree) = build_tree_nested_at(&doc, &root, "outer", 150.0, 0.0);
+        let outer = doc.get_element_by_id("outer").expect("outer");
+        let st = doc.get_element_by_id("st").expect("st");
+        let io = tree.index_of(outer).expect("outer container");
+        let sp_x = tree.container(io).scrollport.x;
+        let band = tree
+            .sticky_bands
+            .iter()
+            .find(|b| b.scroller == io)
+            .expect("band for #st");
+        assert!(approx_eq(band.pos_x, 170.0), "pos_x={}", band.pos_x);
+        assert!(approx_eq(band.bake_x, 150.0), "bake_x={}", band.bake_x);
+        assert_eq!(band.scroller_padding, Some((0.0, 30.0, 0.0, 20.0)));
+        // Tick further along the plateau: exactly foldable, shift is
+        // the scroll delta.
+        let shifts = tree.sticky_shifts_at(io, 200.0, 0.0).expect("foldable");
+        assert_eq!(shifts.len(), 1, "exactly the sticky box");
+        assert_eq!(shifts[0].node, st);
+        assert!(approx_eq(shifts[0].dx, 50.0));
+        assert!(approx_eq(shifts[0].dy, 0.0));
+        // Behavior equivalence: independent layout at 200 agrees the
+        // box is stuck at the content origin plus the offset.
+        let (ref_doc, ref_root) =
+            layout_html_nested_at(STICKY_NESTED_HTML, css, "outer", 200.0, 0.0);
+        let ref_st = ref_doc.get_element_by_id("st").expect("ref st");
+        let ref_box = find_box(&ref_root, ref_st).expect("#st box");
+        assert!(
+            approx_eq(ref_box.rect.x - sp_x, 220.0),
+            "layout agrees the box is stuck at 220, got {}",
+            ref_box.rect.x - sp_x
+        );
+        // Scrolling back from the plateau is the conservative re-bake
+        // path, not a zero shift.
+        assert!(tree.sticky_shifts_at(io, 120.0, 0.0).is_none());
+        // Free-baked twin: baked at 0 with the box still free
+        // (natural 120), the near transition is at 100, not 120.
+        let (doc, root) = layout_html(STICKY_NESTED_HTML, css);
+        let (_doc_state, _elements, tree) = build_tree(&doc, &root);
+        let outer = doc.get_element_by_id("outer").expect("outer");
+        let io = tree.index_of(outer).expect("outer container");
+        assert!(!tree.sticky_constrained_at(io, 50.0, 0.0));
+        assert!(
+            tree.sticky_shifts_at(io, 50.0, 0.0)
+                .expect("foldable")
+                .is_empty(),
+            "free box needs no extra shift"
+        );
+        assert!(
+            tree.sticky_shifts_at(io, 110.0, 0.0).is_none(),
+            "past the padded near transition must re-bake, not fold zero"
+        );
+    }
+
+    /// Far-stuck folding on the horizontal axis (w79fix round 2):
+    /// the mirror of `sticky_fold_far_stuck_with_scroller_padding`.
+    /// Geometry: content origin 20, padding-box width 220, `#st`
+    /// natural at 1020 (`nowrap` keeps the 1000-wide inline-block
+    /// `#pad` on the same line), far pin at bake 500 is 690;
+    /// ticking back rides the far edge.
+    #[test]
+    fn sticky_fold_far_stuck_with_scroller_padding_horizontal() {
+        let css = "#outer { overflow-x: auto; width: 200px; padding-left: 20px; white-space: nowrap; } \
+            #pad { display: inline-block; width: 1000px; height: 10px; } \
+            #st { position: sticky; right: 0; width: 50px; height: 50px; display: inline-block; } \
+            #tall { width: 2000px; height: 10px; }";
+        let (doc, root) = layout_html_nested_at(STICKY_NESTED_HTML, css, "outer", 500.0, 0.0);
+        let (_doc_state, _elements, tree) = build_tree_nested_at(&doc, &root, "outer", 500.0, 0.0);
+        let outer = doc.get_element_by_id("outer").expect("outer");
+        let st = doc.get_element_by_id("st").expect("st");
+        let io = tree.index_of(outer).expect("outer container");
+        let sp_x = tree.container(io).scrollport.x;
+        let band = tree
+            .sticky_bands
+            .iter()
+            .find(|b| b.scroller == io)
+            .expect("band for #st");
+        assert!(approx_eq(band.pos_x, 690.0), "pos_x={}", band.pos_x);
+        assert!(approx_eq(band.bake_x, 500.0), "bake_x={}", band.bake_x);
+        assert_eq!(band.scroller_padding, Some((0.0, 0.0, 0.0, 20.0)));
+        // Ticking back rides the far edge: shift is the scroll delta.
+        let shifts = tree.sticky_shifts_at(io, 450.0, 0.0).expect("foldable");
+        assert_eq!(shifts.len(), 1, "exactly the sticky box");
+        assert_eq!(shifts[0].node, st);
+        assert!(approx_eq(shifts[0].dx, -50.0));
+        // Behavior equivalence: independent layout at 450 agrees the
+        // box is far-stuck at the content origin plus offset plus
+        // padding-box width minus the box.
+        let (ref_doc, ref_root) =
+            layout_html_nested_at(STICKY_NESTED_HTML, css, "outer", 450.0, 0.0);
+        let ref_st = ref_doc.get_element_by_id("st").expect("ref st");
+        let ref_box = find_box(&ref_root, ref_st).expect("#st box");
+        assert!(
+            approx_eq(ref_box.rect.x - sp_x, 640.0),
+            "layout agrees the box is far-stuck at 640, got {}",
+            ref_box.rect.x - sp_x
+        );
+        // Forward ticks from a far-stuck bake are the conservative
+        // re-bake path, not a zero shift.
+        assert!(tree.sticky_shifts_at(io, 530.0, 0.0).is_none());
+    }
+
+    /// Far-stuck folding with far padding on the horizontal axis
+    /// (w79fix round 2): layout's hybrid interval is the content
+    /// origin plus the padding-box size, and the padding-box size
+    /// includes the far padding (CSS Overflow 3 §2.3: the scrollport
+    /// is the padding box, borders only are subtracted). With
+    /// `padding-right: 30px` the padding-box width is 250 (200 +
+    /// 20 + 30), so the far pin at bake 500 is 20 + 500 + 250 - 50
+    /// = 720. Deriving `sp` from the content box instead would pin
+    /// at 690, and swapping `pad_l`/`pad_r` would pin at 730, so
+    /// both errors fail here.
+    #[test]
+    fn sticky_fold_far_stuck_with_scroller_far_padding_horizontal() {
+        let css = "#outer { overflow-x: auto; width: 200px; padding-left: 20px; padding-right: 30px; white-space: nowrap; } \
+            #pad { display: inline-block; width: 1000px; height: 10px; } \
+            #st { position: sticky; right: 0; width: 50px; height: 50px; display: inline-block; } \
+            #tall { width: 2000px; height: 10px; }";
+        let (doc, root) = layout_html_nested_at(STICKY_NESTED_HTML, css, "outer", 500.0, 0.0);
+        let (_doc_state, _elements, tree) = build_tree_nested_at(&doc, &root, "outer", 500.0, 0.0);
+        let outer = doc.get_element_by_id("outer").expect("outer");
+        let st = doc.get_element_by_id("st").expect("st");
+        let io = tree.index_of(outer).expect("outer container");
+        let sp_x = tree.container(io).scrollport.x;
+        let sp_w = tree.container(io).scrollport.w;
+        assert!(approx_eq(sp_w, 250.0), "padding-box width sp_w={}", sp_w);
+        let band = tree
+            .sticky_bands
+            .iter()
+            .find(|b| b.scroller == io)
+            .expect("band for #st");
+        assert!(approx_eq(band.pos_x, 720.0), "pos_x={}", band.pos_x);
+        assert!(approx_eq(band.bake_x, 500.0), "bake_x={}", band.bake_x);
+        assert_eq!(band.scroller_padding, Some((0.0, 30.0, 0.0, 20.0)));
+        let shifts = tree.sticky_shifts_at(io, 450.0, 0.0).expect("foldable");
+        assert_eq!(shifts.len(), 1, "exactly the sticky box");
+        assert_eq!(shifts[0].node, st);
+        assert!(approx_eq(shifts[0].dx, -50.0));
+        let (ref_doc, ref_root) =
+            layout_html_nested_at(STICKY_NESTED_HTML, css, "outer", 450.0, 0.0);
+        let ref_st = ref_doc.get_element_by_id("st").expect("ref st");
+        let ref_box = find_box(&ref_root, ref_st).expect("#st box");
+        assert!(
+            approx_eq(ref_box.rect.x - sp_x, 670.0),
+            "layout agrees the box is far-stuck at 670, got {}",
+            ref_box.rect.x - sp_x
+        );
+        assert!(tree.sticky_shifts_at(io, 530.0, 0.0).is_none());
+    }
+
+    /// Far-stuck folding with far padding on the vertical axis
+    /// (w79fix round 2): the vertical twin of the horizontal
+    /// far-padding case above. Padding-box height is 250 (200 + 20
+    /// + 30), so the far pin at bake 500 is 20 + 500 + 250 - 50 =
+    ///   720; a content-box `sp` would pin at 690.
+    #[test]
+    fn sticky_fold_far_stuck_with_scroller_far_padding() {
+        let css = "#outer { overflow-y: auto; height: 200px; padding-top: 20px; padding-bottom: 30px; } \
+            #pad { height: 1000px; } \
+            #st { position: sticky; bottom: 0; height: 50px; } \
+            #tall { height: 2000px; }";
+        let (doc, root) = layout_html_nested_at(STICKY_NESTED_HTML, css, "outer", 0.0, 500.0);
+        let (_doc_state, _elements, tree) = build_tree_nested_at(&doc, &root, "outer", 0.0, 500.0);
+        let outer = doc.get_element_by_id("outer").expect("outer");
+        let st = doc.get_element_by_id("st").expect("st");
+        let io = tree.index_of(outer).expect("outer container");
+        let sp_y = tree.container(io).scrollport.y;
+        let sp_h = tree.container(io).scrollport.h;
+        assert!(approx_eq(sp_h, 250.0), "padding-box height sp_h={}", sp_h);
+        let band = tree
+            .sticky_bands
+            .iter()
+            .find(|b| b.scroller == io)
+            .expect("band for #st");
+        assert!(approx_eq(band.pos_y, 720.0), "pos_y={}", band.pos_y);
+        assert!(approx_eq(band.bake_y, 500.0), "bake_y={}", band.bake_y);
+        assert_eq!(band.scroller_padding, Some((20.0, 0.0, 30.0, 0.0)));
+        let shifts = tree.sticky_shifts_at(io, 0.0, 450.0).expect("foldable");
+        assert_eq!(shifts.len(), 1, "exactly the sticky box");
+        assert_eq!(shifts[0].node, st);
+        assert!(approx_eq(shifts[0].dy, -50.0));
+        let (ref_doc, ref_root) =
+            layout_html_nested_at(STICKY_NESTED_HTML, css, "outer", 0.0, 450.0);
+        let ref_st = ref_doc.get_element_by_id("st").expect("ref st");
+        let ref_box = find_box(&ref_root, ref_st).expect("#st box");
+        assert!(
+            approx_eq(ref_box.rect.y - sp_y, 670.0),
+            "layout agrees the box is far-stuck at 670, got {}",
+            ref_box.rect.y - sp_y
+        );
+        assert!(tree.sticky_shifts_at(io, 0.0, 530.0).is_none());
     }
 }

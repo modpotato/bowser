@@ -12385,7 +12385,7 @@ mod tests {
 
         // Synchronous path: blocking `navigation::navigate`.
         let mut sync_tab = Tab::new(Size { w: 800.0, h: 600.0 });
-        let sync_jar = Mutex::new(CookieJar::new());
+        let sync_jar = Arc::new(Mutex::new(CookieJar::new()));
         crate::navigation::navigate(
             &mut sync_tab,
             &sync_jar,
@@ -13839,6 +13839,403 @@ mod tests {
         assert!(
             (width - 300.0).abs() < 1.0,
             "geometry getter saw the same-turn mutation via sync reflow, got {width}"
+        );
+    }
+
+    /// w79 W-D repro (production path): sticky GBCR across a script
+    /// scroll, mirroring WPT
+    /// `position-sticky-get-bounding-client-rect` test 1. The
+    /// production getter subtracts every ancestor scroller's offset
+    /// (`scroll_shift`), so a tree baked at scroll 100 must still read
+    /// viewport top 50, relative must read -50, and re-sticking must
+    /// read 50 again.
+    #[test]
+    fn repro_production_sticky_gbcr_after_scroll() {
+        // Inline styles only: `refresh` re-lays out from
+        // `tab.author`, and this path never harvested the `<style>`
+        // sheet into it, so a stylesheet-driven fixture would read
+        // unstyled boxes (all zeros) for a harness reason, not a
+        // product reason.
+        let (doc, _) = Document::parse_html(
+            b"<html><head></head><body style=\"margin:0\"> \
+              <div id=\"scroller1\" style=\"overflow:scroll;width:200px;height:200px\"> \
+              <div id=\"sticky1\" style=\"position:sticky;top:50px;left:20px;width:100px;height:100px\"></div> \
+              <div style=\"width:2000px;height:2000px\"></div></div></body></html>",
+        );
+        let doc = Rc::new(RefCell::new(doc));
+        let url = bowser_url::parse("http://example.com/", None).expect("test url");
+        let page_vm = crate::script::PageVm::new_for_document(doc.clone(), &url, "test", &[])
+            .expect("install web apis");
+        let mut tab = test_tab();
+        if let Some(ctx) = page_vm.web_api_context() {
+            bowser_js::share_scroll_state(ctx, Rc::clone(tab.scroll()));
+            bowser_js::share_element_scroll_states(ctx, Rc::clone(tab.element_scroll()));
+        }
+        tab.install_document(doc, page_vm);
+        let fonts = test_fonts();
+        mark_all_dirty(&mut tab);
+        refresh(&mut tab, &fonts);
+        let out = {
+            let (_guard, page_vm) = tab.reenter_page(&fonts).expect("reenter page");
+            page_vm
+                .eval(
+                    "var s=document.getElementById('sticky1'); \
+                     var a=s.getBoundingClientRect().top; \
+                     document.getElementById('scroller1').scrollTop=100; \
+                     var b=s.getBoundingClientRect().top; \
+                     s.style.position='relative'; \
+                     var c=s.getBoundingClientRect().top; \
+                     s.style.position='sticky'; \
+                     var d=s.getBoundingClientRect().top; \
+                     [a,b,c,d].join('|')",
+                )
+                .expect("eval")
+        };
+        let out = match out {
+            bowser_js::Value::Str(s) => s.as_wtf8().to_utf8_lossy().into_owned(),
+            v => panic!("expected a string, got {v:?}"),
+        };
+        assert_eq!(out, "50|50|-50|50", "production sticky GBCR after scroll");
+    }
+
+    /// w79 W-D repro (production path): dynamic `position: fixed`
+    /// on a laid-out in-flow element, mirroring WPT
+    /// `position-absolute-dynamic-formatting-context` (block case).
+    /// Also records which layout path the getter's sync reflow took.
+    #[test]
+    fn repro_production_dynamic_fixed() {
+        let (doc, _) = Document::parse_html(
+            b"<html><head></head><body><div id=\"c\" style=\"position:relative;width:300px;height:300px\"> \
+              <div id=\"e\" style=\"width:50px;height:60px;left:80px;top:70px\">x</div></div></body></html>",
+        );
+        let doc = Rc::new(RefCell::new(doc));
+        let url = bowser_url::parse("http://example.com/", None).expect("test url");
+        let page_vm = crate::script::PageVm::new_for_document(doc.clone(), &url, "test", &[])
+            .expect("install web apis");
+        let mut tab = test_tab();
+        if let Some(ctx) = page_vm.web_api_context() {
+            bowser_js::share_scroll_state(ctx, Rc::clone(tab.scroll()));
+            bowser_js::share_element_scroll_states(ctx, Rc::clone(tab.element_scroll()));
+        }
+        tab.install_document(doc, page_vm);
+        let fonts = test_fonts();
+        mark_all_dirty(&mut tab);
+        refresh(&mut tab, &fonts);
+        let (partial_before, full_before) = (tab.layout_partial_passes, tab.layout_full_passes);
+        let out = {
+            let (_guard, page_vm) = tab.reenter_page(&fonts).expect("reenter page");
+            page_vm
+                .eval(
+                    "var e=document.getElementById('e'); \
+                     var r0=e.getBoundingClientRect(); \
+                     e.style.position='fixed'; \
+                     var r=e.getBoundingClientRect(); \
+                     [r0.left,r0.top,r.left,r.top,r.width,r.height].join('|')",
+                )
+                .expect("eval")
+        };
+        let (partial_after, full_after) = (tab.layout_partial_passes, tab.layout_full_passes);
+        let out = match out {
+            bowser_js::Value::Str(s) => s.as_wtf8().to_utf8_lossy().into_owned(),
+            v => panic!("expected a string, got {v:?}"),
+        };
+        assert_eq!(
+            (partial_after - partial_before, full_after - full_before),
+            (0, 1),
+            "dynamic fixed must take the full path (position change breaks splice); got rects {out}"
+        );
+        assert_eq!(
+            out, "0|0|80|70|50|60",
+            "dynamic fixed must land at viewport (80,70) at 50x60"
+        );
+    }
+
+    /// Rendered body text for the mid-parse repros below, skipping
+    /// `<script>` subtrees (their source is not rendered output);
+    /// `document.write` output is included.
+    fn w79_body_text(document: &Document) -> String {
+        let body = document.query_selector("body").unwrap().unwrap();
+        fn walk(document: &Document, node: NodeId, out: &mut String) {
+            match document.kind(node) {
+                NodeKind::Text(text) => out.push_str(text),
+                NodeKind::Element(data) if data.tag_name == "script" => {}
+                _ => {
+                    let mut cursor = document.first_child(node);
+                    while let Some(child) = cursor {
+                        walk(document, child, out);
+                        cursor = document.next_sibling(child);
+                    }
+                }
+            }
+        }
+        let mut out = String::new();
+        walk(document, body, &mut out);
+        out
+    }
+
+    /// Drive `html` through the app's scripted full-page parse (the
+    /// path real page loads take: parser-inserted scripts run via the
+    /// parse shim) and return the body text.
+    fn w79_run_full_page(html: &str) -> String {
+        let mut page_vm = crate::script::PageVm::new();
+        let base = bowser_url::parse("https://example.com/", None).unwrap();
+        let prefetch = HashMap::new();
+        let (document, _outcome) = {
+            let mut executor =
+                crate::script_executor::ParserExecutor::new(&mut page_vm, &base, &prefetch, None);
+            let (document, _quirks) =
+                Document::parse_html_with_executor(html.as_bytes(), true, &mut executor);
+            (document, executor.outcome())
+        };
+        w79_body_text(&document)
+    }
+
+    /// w79 W-D repro (mid-parse shim path): the exact WPT sticky
+    /// test 1 sequence, run as a parser-inserted script.
+    #[test]
+    fn repro_shim_sticky_gbcr_after_scroll() {
+        let html = concat!(
+            "<html><head><style>body{margin:0} ",
+            ".container{overflow:scroll;width:200px;height:200px} ",
+            ".box{width:100px;height:100px} ",
+            ".sticky{position:sticky;top:50px;left:20px} ",
+            ".spacer{width:2000px;height:2000px}</style></head><body>",
+            "<div id=\"scroller1\" class=\"container\">",
+            "<div id=\"sticky1\" class=\"sticky box\"></div>",
+            "<div class=\"spacer\"></div></div>",
+            "<script>",
+            "var s=document.getElementById('sticky1');",
+            "var a=s.getBoundingClientRect().top;",
+            "document.getElementById('scroller1').scrollTop=100;",
+            "var b=s.getBoundingClientRect().top;",
+            "s.style.position='relative';",
+            "var c=s.getBoundingClientRect().top;",
+            "s.style.position='sticky';",
+            "var d=s.getBoundingClientRect().top;",
+            "document.write([a,b,c,d].join('|'));",
+            "</script>",
+            "</body></html>",
+        );
+        assert_eq!(
+            w79_run_full_page(html),
+            "50|50|-50|50",
+            "shim sticky GBCR after scroll"
+        );
+    }
+
+    /// w79 W-D repro (mid-parse shim path): dynamic `position:
+    /// fixed` on a laid-out in-flow block, mirroring WPT
+    /// `position-absolute-dynamic-formatting-context` (block case).
+    #[test]
+    fn repro_shim_dynamic_fixed() {
+        let html = concat!(
+            "<html><head></head><body><script>",
+            "var container=document.createElement('div');",
+            "container.style.position='relative';",
+            "container.style.width='300px';",
+            "container.style.height='300px';",
+            "document.body.appendChild(container);",
+            "var e=document.createElement('div');",
+            "e.style.display='block';",
+            "e.style.width='50px';",
+            "e.style.height='60px';",
+            "e.style.left='80px';",
+            "e.style.top='70px';",
+            "container.appendChild(e);",
+            "var r0=e.getBoundingClientRect();",
+            "e.style.position='fixed';",
+            "var r=e.getBoundingClientRect();",
+            "document.write([r0.left,r0.top,r.left,r.top,r.width,r.height].join('|'));",
+            "</script></body></html>",
+        );
+        assert_eq!(
+            w79_run_full_page(html),
+            "0|0|80|70|50|60",
+            "shim dynamic fixed must land at viewport (80,70) at 50x60"
+        );
+    }
+
+    /// w79 W-D repro (mid-parse shim path): a STATIC fixed element
+    /// in markup must also read its viewport offsets — this
+    /// separates "dynamic fixed is broken" from "element-rooted
+    /// fixed reads are broken in general".
+    #[test]
+    fn repro_shim_static_fixed() {
+        let html = concat!(
+            "<html><head></head><body>",
+            "<div id=\"e\" style=\"position:fixed;left:80px;top:70px;width:50px;height:60px\">x</div>",
+            "<script>",
+            "var r=document.getElementById('e').getBoundingClientRect();",
+            "document.write([r.left,r.top,r.width,r.height].join('|'));",
+            "</script></body></html>",
+        );
+        // Body text is the div's own "x" plus the script's
+        // `document.write` output.
+        assert_eq!(
+            w79_run_full_page(html),
+            "x80|70|50|60",
+            "shim static fixed must read viewport (80,70) at 50x60"
+        );
+    }
+
+    /// w79 W-D repro (mid-parse shim path): WPT sticky tests 2 and
+    /// 3 — scroll written before the sticky box is inserted, and a
+    /// script-inserted sibling shifting the sticky box's in-flow
+    /// position. Both assert differentially (sticky minus scroller),
+    /// so they pin the scroll subtraction, not just the bake.
+    #[test]
+    fn repro_shim_sticky_gbcr_after_insertion() {
+        let style = concat!(
+            "<style>body{margin:0} ",
+            ".container{overflow:scroll;width:200px;height:200px} ",
+            ".box{width:100px;height:100px} ",
+            ".sticky{position:sticky;top:50px;left:20px} ",
+            ".spacer{width:2000px;height:2000px}</style>",
+        );
+        // Test 2: scroll first, insert sticky second.
+        let html2 = format!(
+            "<html><head>{style}</head><body>\
+            <div id=\"scroller2\" class=\"container\"><div class=\"spacer\"></div></div>\
+            <script>\
+            var scroller=document.getElementById('scroller2');\
+            scroller.scrollTop=100; scroller.scrollLeft=75;\
+            var sticky=document.createElement('div');\
+            sticky.className='sticky box';\
+            scroller.insertBefore(sticky, scroller.querySelector('.spacer'));\
+            var sb=sticky.getBoundingClientRect();\
+            var cb=scroller.getBoundingClientRect();\
+            document.write([(sb.top-cb.top),(sb.left-cb.left)].join('|'));\
+            </script></body></html>"
+        );
+        assert_eq!(
+            w79_run_full_page(&html2),
+            "50|20",
+            "shim sticky GBCR after script insertion"
+        );
+        // Test 3: script-inserted sibling before the sticky box.
+        let html3 = format!(
+            "<html><head>{style}</head><body>\
+            <div id=\"scroller3\" class=\"container\">\
+            <div id=\"sticky3\" class=\"sticky box\"></div>\
+            <div class=\"spacer\"></div></div>\
+            <script>\
+            var scroller=document.getElementById('scroller3');\
+            var sticky=document.getElementById('sticky3');\
+            scroller.scrollTop=100; scroller.scrollLeft=75;\
+            var div=document.createElement('div');\
+            div.style.height='65px';\
+            scroller.insertBefore(div, sticky);\
+            var sb=sticky.getBoundingClientRect();\
+            var cb=scroller.getBoundingClientRect();\
+            document.write([(sb.top-cb.top),(sb.left-cb.left)].join('|'));\
+            </script></body></html>"
+        );
+        assert_eq!(
+            w79_run_full_page(&html3),
+            "50|20",
+            "shim sticky GBCR after script-caused layout"
+        );
+    }
+
+    /// w79 W-D regression (mid-parse shim path): a plain in-flow
+    /// child of a scrolled container reads content minus scroll,
+    /// not raw content coordinates.
+    #[test]
+    fn repro_shim_gbcr_subtracts_nested_scroll() {
+        let html = concat!(
+            "<html><head></head><body>",
+            "<div id=\"sc\" style=\"overflow:scroll;width:200px;height:200px\">",
+            "<div id=\"inner\" style=\"width:100px;height:100px\">x</div>",
+            "<div style=\"height:2000px\"></div></div>",
+            "<script>",
+            "var sc=document.getElementById('sc'); sc.scrollTop=100;",
+            "document.write(document.getElementById('inner').getBoundingClientRect().top);",
+            "</script></body></html>",
+        );
+        // Body text is the inner div's "x" plus the write output.
+        assert_eq!(
+            w79_run_full_page(html),
+            "x-100",
+            "shim GBCR of scrolled content must subtract the scroll"
+        );
+    }
+
+    /// w79 W-D regression (mid-parse shim path): the absolute
+    /// containing-block gate. An absolute box whose containing block
+    /// is outside its scroller does NOT move with the scroller
+    /// (doc-rooted pass: the scroller's offset must be skipped),
+    /// while one whose containing block IS the scrolled scroller
+    /// moves with it (scroller-rooted pass: the root's offset must
+    /// come off).
+    #[test]
+    fn repro_shim_absolute_gbcr_scroller_gate() {
+        // CB outside the scroller (no positioned ancestor): the box
+        // stays at viewport (80, 70) despite scrollTop=100.
+        let html_outside = concat!(
+            "<html><head></head><body>",
+            "<div id=\"sc\" style=\"overflow:scroll;width:200px;height:200px\">",
+            "<div id=\"e\" style=\"position:absolute;left:80px;top:70px;width:50px;height:60px\">x</div>",
+            "<div style=\"height:2000px\"></div></div>",
+            "<script>",
+            "var sc=document.getElementById('sc'); sc.scrollTop=100;",
+            "var r=document.getElementById('e').getBoundingClientRect();",
+            "document.write([r.left,r.top].join('|'));",
+            "</script></body></html>",
+        );
+        assert_eq!(
+            w79_run_full_page(html_outside),
+            "x80|70",
+            "absolute with CB outside the scroller ignores its scroll"
+        );
+        // CB is the scroller itself (position:relative): the box
+        // scrolls with it, so viewport top is 70-100=-30.
+        let html_inside = concat!(
+            "<html><head></head><body>",
+            "<div id=\"sc\" style=\"position:relative;overflow:scroll;width:200px;height:200px\">",
+            "<div id=\"e\" style=\"position:absolute;left:80px;top:70px;width:50px;height:60px\">x</div>",
+            "<div style=\"height:2000px\"></div></div>",
+            "<script>",
+            "var sc=document.getElementById('sc'); sc.scrollTop=100;",
+            "var r=document.getElementById('e').getBoundingClientRect();",
+            "document.write([r.left,r.top].join('|'));",
+            "</script></body></html>",
+        );
+        assert_eq!(
+            w79_run_full_page(html_inside),
+            "x80|-30",
+            "absolute with CB inside the scroller scrolls with it"
+        );
+    }
+
+    /// w79 W-D regression (mid-parse shim path): dynamic fixed on
+    /// a flex formatting context, mirroring WPT
+    /// `position-absolute-dynamic-formatting-context` (flex case).
+    #[test]
+    fn repro_shim_dynamic_fixed_flex() {
+        let html = concat!(
+            "<html><head></head><body><script>",
+            "var container=document.createElement('div');",
+            "container.style.position='relative';",
+            "container.style.width='300px';",
+            "container.style.height='300px';",
+            "document.body.appendChild(container);",
+            "var e=document.createElement('div');",
+            "e.style.display='flex';",
+            "e.style.width='50px';",
+            "e.style.height='60px';",
+            "e.style.left='80px';",
+            "e.style.top='70px';",
+            "container.appendChild(e);",
+            "var r0=e.getBoundingClientRect();",
+            "e.style.position='fixed';",
+            "var r=e.getBoundingClientRect();",
+            "document.write([r0.left,r0.top,r.left,r.top,r.width,r.height].join('|'));",
+            "</script></body></html>",
+        );
+        assert_eq!(
+            w79_run_full_page(html),
+            "0|0|80|70|50|60",
+            "shim dynamic fixed (flex) must land at viewport (80,70)"
         );
     }
 }

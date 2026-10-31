@@ -26,12 +26,40 @@ use crate::kwatom::Keyword;
 use crate::token::Token;
 
 /// A parsed CSS property value.
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, Debug)]
 pub enum CssValue {
     Keyword(Keyword),
     Length(f32, LengthUnit),
     Percentage(f32),
     Color(Color),
+    /// A color authored as a keyword (`aqua`, `red`, `transparent`):
+    /// the sRGB color plus the authored keyword, lowercased. Only the
+    /// single-ident parse site produces this (see `parse_item`); hex
+    /// and functional colors stay plain [`CssValue::Color`], and the
+    /// cascade strips this to `Color` at computed-value time (see
+    /// `Styler::compute_prop`), so computed style, layout, and paint
+    /// never see it — only the specified-style serializer does (see
+    /// `decl_value_preserving_math` in `bowser_js`), which is what
+    /// lets a shorthand-expanded longhand (`border-color: aqua` ->
+    /// four `border-*-color` decls) read back as `aqua` instead of
+    /// `rgb()`. `var()`-substituted colors do NOT gain a keyword:
+    /// substitution re-parses the custom property's token stream,
+    /// which does produce this variant for a bare keyword — but a
+    /// `var()`-bearing shorthand stays deferred on the specified
+    /// surface (it reads back as the `var()` text, not the
+    /// substituted value), so the specified surface legitimately
+    /// shows the substituted color as rgb() only after the cascade
+    /// strips it; no silent "fix" is attempted for that path.
+    /// Equality is keyword-INSENSITIVE by design (see the manual
+    /// `PartialEq` below): `NamedColor` compares equal to the
+    /// `Color` with the same channels and to another `NamedColor`
+    /// with the same channels, whatever keyword each carries, so
+    /// `aqua` and `cyan` (same rgb) are cascade-equal and existing
+    /// `Color`-based assertions keep passing.
+    NamedColor {
+        color: Color,
+        keyword: Keyword,
+    },
     String(String),
     Url(String),
     Number(f32),
@@ -237,6 +265,101 @@ pub enum CssValue {
     Counter(Box<CounterData>),
 }
 
+/// Manual `PartialEq` for [`CssValue`]: identical to the derived
+/// form except that [`CssValue::NamedColor`] compares
+/// keyword-insensitively — against [`CssValue::Color`] and against
+/// another `NamedColor` it compares only the channels. Rationale:
+/// the keyword is specified-surface authorship, not a computed
+/// distinction; cascade equality (and every existing test asserting
+/// a parsed named color equals its `Color`) must not change when
+/// the author wrote `aqua` instead of `cyan` or `#00ffff`. Nested
+/// values inherit the rule through the recursive `List`/`MinMax`/
+/// `Repeat`/`Shadows` arms. Keep this in sync with any new variant.
+impl PartialEq for CssValue {
+    fn eq(&self, other: &Self) -> bool {
+        use CssValue::*;
+        match (self, other) {
+            (Color(a), Color(b)) => a == b,
+            (Color(a), NamedColor { color: b, .. }) => a == b,
+            (NamedColor { color: a, .. }, Color(b)) => a == b,
+            (NamedColor { color: a, .. }, NamedColor { color: b, .. }) => a == b,
+            (Keyword(a), Keyword(b)) => a == b,
+            (Length(a, au), Length(b, bu)) => a == b && au == bu,
+            (Percentage(a), Percentage(b)) => a == b,
+            (String(a), String(b)) => a == b,
+            (Url(a), Url(b)) => a == b,
+            (Number(a), Number(b)) => a == b,
+            (List(a), List(b)) => a == b,
+            (Var(a, af), Var(b, bf)) => a == b && af == bf,
+            (Math(a), Math(b)) => a == b,
+            (
+                MathDeferred {
+                    pct: ap,
+                    px: ax,
+                    had_pct: ah,
+                    affine: aa,
+                },
+                MathDeferred {
+                    pct: bp,
+                    px: bx,
+                    had_pct: bh,
+                    affine: ba,
+                },
+            ) => ap == bp && ax == bx && ah == bh && aa == ba,
+            (Fr(a), Fr(b)) => a == b,
+            (MinMax(a1, a2), MinMax(b1, b2)) => a1 == b1 && a2 == b2,
+            (
+                CalcSize {
+                    basis: ab,
+                    calc: ac,
+                },
+                CalcSize {
+                    basis: bb,
+                    calc: bc,
+                },
+            ) => ab == bb && ac == bc,
+            (
+                Repeat {
+                    mode: am,
+                    tracks: at,
+                },
+                Repeat {
+                    mode: bm,
+                    tracks: bt,
+                },
+            ) => am == bm && at == bt,
+            (Tokens(a), Tokens(b)) => a == b,
+            (
+                AspectRatio {
+                    ratio: ar,
+                    auto_preferred: aa,
+                },
+                AspectRatio {
+                    ratio: br,
+                    auto_preferred: ba,
+                },
+            ) => ar == br && aa == ba,
+            (Transform(a), Transform(b)) => a == b,
+            (Filter(a), Filter(b)) => a == b,
+            (ClipPath(a), ClipPath(b)) => a == b,
+            (Shadows(a), Shadows(b)) => a == b,
+            (
+                Gradient {
+                    name: an,
+                    source: asn,
+                },
+                Gradient {
+                    name: bn,
+                    source: bsn,
+                },
+            ) => an == bn && asn == bsn,
+            (Attr(a), Attr(b)) => a == b,
+            (Counter(a), Counter(b)) => a == b,
+            _ => false,
+        }
+    }
+}
+
 /// Payload of [`CssValue::Attr`]: an `attr()` reference in `content`.
 #[derive(Clone, Debug, PartialEq)]
 pub struct AttrData {
@@ -340,7 +463,7 @@ impl Shadow {
                     return None;
                 }
                 inset = true;
-            } else if matches!(item, CssValue::Color(_))
+            } else if matches!(item, CssValue::Color(_) | CssValue::NamedColor { .. })
                 || matches!(item, CssValue::Keyword(k) if k == "currentcolor")
             {
                 if color.is_some() {
@@ -395,8 +518,10 @@ impl Shadow {
             && Self::is_shadow_length(&self.blur)
             && !Self::is_negative_computed(&self.blur)
             && Self::is_shadow_length(&self.spread)
-            && (matches!(&self.color, CssValue::Color(_))
-                || matches!(&self.color, CssValue::Keyword(k) if k == "currentcolor"))
+            && (matches!(
+                &self.color,
+                CssValue::Color(_) | CssValue::NamedColor { .. }
+            ) || matches!(&self.color, CssValue::Keyword(k) if k == "currentcolor"))
     }
 }
 
@@ -3122,6 +3247,73 @@ impl CssValue {
         }
     }
 
+    /// The sRGB color this value holds, if it is a color at all:
+    /// [`CssValue::Color`] as-is, [`CssValue::NamedColor`] with its
+    /// keyword dropped. `currentcolor` (a `Keyword`) is NOT a color
+    /// and returns `None` — callers must never mistake a named
+    /// color for `currentcolor` or vice versa.
+    pub fn as_color(&self) -> Option<Color> {
+        match self {
+            CssValue::Color(c) => Some(*c),
+            CssValue::NamedColor { color, .. } => Some(*color),
+            _ => None,
+        }
+    }
+
+    /// The authored keyword of a [`CssValue::NamedColor`], if any.
+    pub fn authored_color_keyword(&self) -> Option<&str> {
+        match self {
+            CssValue::NamedColor { keyword, .. } => Some(keyword.as_str()),
+            _ => None,
+        }
+    }
+
+    /// Strip every [`CssValue::NamedColor`] in this value (recursively
+    /// through lists, `minmax()`/`repeat()` tracks, shadow colors,
+    /// and `var()`/`attr()` fallbacks) to plain [`CssValue::Color`].
+    /// This is the computed-value canonicalization: computed style
+    /// must never carry authorship, so layout/paint keep matching
+    /// plain `Color` (and `currentcolor` keeps its own keyword path).
+    pub fn strip_named_colors(self) -> CssValue {
+        match self {
+            CssValue::NamedColor { color, .. } => CssValue::Color(color),
+            CssValue::List(items) => CssValue::List(
+                items
+                    .into_iter()
+                    .map(CssValue::strip_named_colors)
+                    .collect(),
+            ),
+            CssValue::MinMax(a, b) => CssValue::MinMax(
+                Box::new(a.strip_named_colors()),
+                Box::new(b.strip_named_colors()),
+            ),
+            CssValue::Repeat { mode, tracks } => CssValue::Repeat {
+                mode,
+                tracks: tracks
+                    .into_iter()
+                    .map(CssValue::strip_named_colors)
+                    .collect(),
+            },
+            CssValue::Shadows(shadows) => CssValue::Shadows(
+                shadows
+                    .into_iter()
+                    .map(|mut s| {
+                        s.color = s.color.strip_named_colors();
+                        s
+                    })
+                    .collect(),
+            ),
+            CssValue::Var(name, fallback) => {
+                CssValue::Var(name, fallback.map(|f| Box::new(f.strip_named_colors())))
+            }
+            CssValue::Attr(data) => CssValue::Attr(Box::new(AttrData {
+                name: data.name,
+                fallback: data.fallback.map(|f| Box::new(f.strip_named_colors())),
+            })),
+            other => other,
+        }
+    }
+
     /// Serialize a [`CssValue::Math`] expression tree back to its CSS
     /// `calc()` source form (operators keep CSS spacing, parens only
     /// where precedence demands). Returns `None` for non-`Math` values.
@@ -3413,25 +3605,32 @@ fn parse_item(tokens: &[Token], depth: u32, preserve_case: bool) -> Result<CssVa
             if lower == "currentcolor" {
                 return Ok(CssValue::Keyword(lower.into()));
             }
-            // Named colors and `transparent` fold to RGBA here on
-            // purpose: the cascade and computed style consume plain
-            // `Color` (see `is_valid_for_property`), so the keyword
-            // is not carried in the value. Specified-style
-            // serialization recovers it from the raw declaration
-            // text instead (see `specified_color_keyword` in
-            // `bowser_js`, used by `decl_value_preserving_math`):
-            // that keeps `el.style` keyword-faithful while computed
-            // style keeps the rgb()/rgba() form.
+            // Named colors and `transparent` fold to a
+            // [`CssValue::NamedColor`] here on purpose: the cascade
+            // strips the keyword at computed-value time (so computed
+            // style keeps rgb()/rgba()), while the specified-style
+            // serializer prefers the keyword — which is what lets
+            // shorthand-expanded longhands (`border-color: aqua`)
+            // read back as `aqua`. The old raw-text recovery in
+            // `bowser_js` (`specified_color_keyword`) is kept as a
+            // fallback for plain `Color` values (hex/functional
+            // authorship) and for values built outside this parser.
             if lower == "transparent" {
-                return Ok(CssValue::Color(Color {
-                    r: 0,
-                    g: 0,
-                    b: 0,
-                    a: 0,
-                }));
+                return Ok(CssValue::NamedColor {
+                    color: Color {
+                        r: 0,
+                        g: 0,
+                        b: 0,
+                        a: 0,
+                    },
+                    keyword: lower.into(),
+                });
             }
             if let Some((r, g, b)) = named_color(&lower) {
-                return Ok(CssValue::Color(Color { r, g, b, a: 255 }));
+                return Ok(CssValue::NamedColor {
+                    color: Color { r, g, b, a: 255 },
+                    keyword: lower.into(),
+                });
             }
             Ok(CssValue::Keyword(lower.into()))
         }
