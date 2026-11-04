@@ -1474,24 +1474,28 @@ fn as_list(value: &CssValue) -> Vec<CssValue> {
 ///   emitting ALL longhands with omitted ones reset to initial values,
 ///   preserving `important`.
 ///
-/// One `transition` layer's four shorthand longhands (CSS Transitions
+/// One `transition` layer's shorthand longhands (CSS Transitions
 /// 2 §2): omitted components reset to their initials (`all` / `0s` /
-/// `0s` / `ease`). `transition-behavior` is NOT a shorthand longhand
-/// and never appears here.
+/// `0s` / `ease` / `normal`). `transition-behavior` IS a shorthand
+/// component in Transitions 2 (w82: previously rejected here, which
+/// dropped the whole declaration for the canonical discrete
+/// form `transition: overlay 2s allow-discrete, display 2s
+/// allow-discrete` used by overlay-transition-dialog.html).
 struct TransitionLayer {
     property: CssValue,
     duration: CssValue,
     delay: CssValue,
     timing: CssValue,
+    behavior: CssValue,
 }
 
 /// Classify one `<single-transition>` layer's components (in any
 /// order): at most one property ident, at most one timing function,
-/// at most two times (duration, then delay). `None` for any invalid
-/// shape: a duplicate component, a CSS-wide keyword (only valid as
-/// the whole value), a `transition-behavior` keyword (`normal` /
-/// `allow-discrete` are not shorthand components), a negative
-/// duration (invalid at computed-value time; rejecting it here drops
+/// at most two times (duration, then delay), at most one behavior
+/// keyword (`normal` / `allow-discrete`, CSS Transitions 2).
+/// `None` for any invalid shape: a duplicate component, a CSS-wide
+/// keyword (only valid as the whole value), a negative duration
+/// (invalid at computed-value time; rejecting it here drops
 /// the whole shorthand instead of leaving a half-applied longhand
 /// set), or any non-component value.
 fn classify_transition_layer(items: &[CssValue]) -> Option<TransitionLayer> {
@@ -1499,21 +1503,23 @@ fn classify_transition_layer(items: &[CssValue]) -> Option<TransitionLayer> {
     let mut duration = None;
     let mut delay = None;
     let mut timing = None;
+    let mut behavior = None;
     for item in items {
         match item {
             CssValue::Keyword(kw) => {
                 let k = kw.as_str();
                 if matches!(
                     k,
-                    "inherit"
-                        | "initial"
-                        | "unset"
-                        | "revert"
-                        | "revert-layer"
-                        | "allow-discrete"
-                        | "normal"
+                    "inherit" | "initial" | "unset" | "revert" | "revert-layer"
                 ) {
                     return None;
+                }
+                if matches!(k, "allow-discrete" | "normal") {
+                    if behavior.is_some() {
+                        return None;
+                    }
+                    behavior = Some(item.clone());
+                    continue;
                 }
                 if matches!(
                     k,
@@ -1576,6 +1582,7 @@ fn classify_transition_layer(items: &[CssValue]) -> Option<TransitionLayer> {
         duration: duration.unwrap_or(CssValue::Time(0.0)),
         delay: delay.unwrap_or(CssValue::Time(0.0)),
         timing: timing.unwrap_or_else(|| CssValue::Keyword("ease".into())),
+        behavior: behavior.unwrap_or_else(|| CssValue::Keyword("normal".into())),
     })
 }
 
@@ -1603,6 +1610,10 @@ fn emit_transition_layers(layers: &[TransitionLayer]) -> Vec<(String, CssValue)>
         (
             "transition-timing-function".to_string(),
             one(&|l| l.timing.clone()),
+        ),
+        (
+            "transition-behavior".to_string(),
+            one(&|l| l.behavior.clone()),
         ),
     ]
 }
@@ -1634,6 +1645,7 @@ pub(crate) fn expand_transition_value(value: CssValue) -> Vec<(String, CssValue)
             "transition-duration",
             "transition-delay",
             "transition-timing-function",
+            "transition-behavior",
         ]
         .iter()
         .map(|p| (p.to_string(), value.clone()))
@@ -1709,6 +1721,7 @@ fn parse_transition(toks: &[Token], important: bool) -> Option<Vec<Declaration>>
                 "transition-duration",
                 "transition-delay",
                 "transition-timing-function",
+                "transition-behavior",
             ]
             .iter()
             .map(|p| decl(PropertyName::intern(p), v.clone(), important))
@@ -4463,7 +4476,7 @@ mod tests {
         use crate::value::{StepPosition, TimingFunction};
         // Single layer, components in grammar order.
         let d = decls("p { transition: overlay 2s; }");
-        assert_eq!(d.len(), 4);
+        assert_eq!(d.len(), 5);
         assert_eq!(
             get(&d, "transition-property"),
             &CssValue::Keyword("overlay".into())
@@ -4473,6 +4486,12 @@ mod tests {
         assert_eq!(
             get(&d, "transition-timing-function"),
             &CssValue::Keyword("ease".into())
+        );
+        // Omitted behavior resets to `normal` (w82: behavior is
+        // the fifth shorthand longhand).
+        assert_eq!(
+            get(&d, "transition-behavior"),
+            &CssValue::Keyword("normal".into())
         );
         // Any component order; ms normalizes to seconds; delay is the
         // second time.
@@ -4538,20 +4557,44 @@ mod tests {
                 CssValue::Keyword("color".into()),
             ])
         );
-        // Wide keyword sets all four longhands.
+        // Wide keyword sets all five longhands.
         let d = decls("p { transition: inherit; }");
-        assert_eq!(d.len(), 4);
+        assert_eq!(d.len(), 5);
         assert!(
             d.iter()
                 .all(|x| x.value == CssValue::Keyword("inherit".into()))
         );
+        // w82: a behavior keyword IS a shorthand component
+        // (CSS Transitions 2): the dialog shorthand shape parses
+        // to per-layer behaviors, defaulting omitted layers to
+        // `normal`.
+        let d = decls("p { transition: overlay 2s allow-discrete, display 2s allow-discrete; }");
+        assert_eq!(
+            get(&d, "transition-behavior"),
+            &CssValue::List(vec![
+                CssValue::Keyword("allow-discrete".into()),
+                CssValue::Keyword("allow-discrete".into()),
+            ])
+        );
+        assert_eq!(
+            get(&d, "transition-property"),
+            &CssValue::List(vec![
+                CssValue::Keyword("overlay".into()),
+                CssValue::Keyword("display".into()),
+            ])
+        );
+        let d = decls("p { transition: overlay 1s allow-discrete; }");
+        assert_eq!(
+            get(&d, "transition-behavior"),
+            &CssValue::Keyword("allow-discrete".into())
+        );
         // Invalid layers drop the whole declaration: negative
-        // duration, three times, a duplicate property, a behavior
-        // keyword (not a shorthand component), a bad bezier.
+        // duration, three times, a duplicate property, a
+        // duplicate behavior keyword, a bad bezier.
         assert!(decls("p { transition: overlay -1s; }").is_empty());
         assert!(decls("p { transition: overlay 1s 2s 3s; }").is_empty());
         assert!(decls("p { transition: overlay color 1s; }").is_empty());
-        assert!(decls("p { transition: overlay 1s allow-discrete; }").is_empty());
+        assert!(decls("p { transition: overlay 1s allow-discrete normal; }").is_empty());
         assert!(decls("p { transition: opacity 1s cubic-bezier(0, 0, 2, 1); }").is_empty());
         assert!(decls("p { transition: overlay 1s,; }").is_empty());
         // Longhands parse directly, including negative delays

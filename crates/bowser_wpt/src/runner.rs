@@ -184,6 +184,41 @@ impl TestOutcome {
             | TestOutcome::DriverTimeout { .. } => false,
         }
     }
+
+    /// One-line diff detail for a reftest outcome, for the console
+    /// reporter and the wptreport export: per reference, its `rel`,
+    /// the differing pixel count and fraction, and whether the check
+    /// went the way its `rel` demands. `None` for non-reftest
+    /// outcomes. A reftest with no checks (browser died or hung
+    /// before any comparison) still returns a line saying so, rather
+    /// than silently dropping the failure's cause — there is no diff
+    /// to report in that case.
+    pub fn reftest_detail(&self) -> Option<String> {
+        let TestOutcome::Reftest { checks, .. } = self else {
+            return None;
+        };
+        if checks.is_empty() {
+            return Some("no comparisons (render failed before comparison)".to_owned());
+        }
+        let parts: Vec<String> = checks
+            .iter()
+            .map(|c| {
+                let rel = match c.rel {
+                    RefRel::Match => "match",
+                    RefRel::Mismatch => "mismatch",
+                };
+                format!(
+                    "{} {}: diff={} pixels ({:.6} fraction) {}",
+                    rel,
+                    c.reference,
+                    c.comparison.diff_pixels,
+                    c.comparison.diff_fraction,
+                    if c.ok { "ok" } else { "FAIL" }
+                )
+            })
+            .collect();
+        Some(parts.join("; "))
+    }
 }
 
 /// One reference checked during a reftest.
@@ -1433,6 +1468,40 @@ mod tests {
             "a reference the driver cannot serve must be FilesystemFailure, got: {outcome:?}"
         );
         assert!(!outcome.passed());
+    }
+
+    #[test]
+    fn reftest_detail_reports_diff_pixels_and_fraction() {
+        let outcome = TestOutcome::Reftest {
+            passed: false,
+            checks: vec![RefCheck {
+                reference: "/css/ref.html".into(),
+                rel: RefRel::Match,
+                comparison: Comparison {
+                    equal: false,
+                    diff_pixels: 42,
+                    diff_fraction: 0.0007,
+                },
+                ok: false,
+            }],
+        };
+        assert_eq!(
+            outcome.reftest_detail().as_deref(),
+            Some("match /css/ref.html: diff=42 pixels (0.000700 fraction) FAIL")
+        );
+        assert_eq!(
+            TestOutcome::Reftest {
+                passed: false,
+                checks: Vec::new(),
+            }
+            .reftest_detail()
+            .as_deref(),
+            Some("no comparisons (render failed before comparison)")
+        );
+        assert_eq!(
+            TestOutcome::Crashtest { passed: true }.reftest_detail(),
+            None
+        );
     }
 
     #[test]

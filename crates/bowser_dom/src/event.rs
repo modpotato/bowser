@@ -67,6 +67,15 @@ pub struct Event {
     /// surfaces the `snapTargetBlock`/`snapTargetInline` accessors on
     /// `SnapEvent.prototype`, which read this through the stored event.
     pub snap_targets: Option<(Option<NodeId>, Option<NodeId>)>,
+    /// Toggle state pair for `ToggleEvent` (popover `toggle` /
+    /// `beforetoggle`, HTML §6.12): `(oldState, newState)` DOM
+    /// strings, browser-fired values `"open"` / `"closed"` (the
+    /// `ToggleEventInit` defaults are `""`). `None` for events that
+    /// are not toggle events: the JS wrapper only surfaces the
+    /// `oldState`/`newState` accessors on `ToggleEvent.prototype`,
+    /// which read this through the stored event. The `source`
+    /// member is not carried (out of scope: popover state only).
+    pub toggle_states: Option<(String, String)>,
 }
 
 impl Event {
@@ -80,6 +89,7 @@ impl Event {
             key: None,
             pointer: None,
             snap_targets: None,
+            toggle_states: None,
         }
     }
 
@@ -99,6 +109,17 @@ impl Event {
     /// this event, making it a `SnapEvent` payload carrier.
     pub fn with_snap_targets(mut self, block: Option<NodeId>, inline: Option<NodeId>) -> Self {
         self.snap_targets = Some((block, inline));
+        self
+    }
+
+    /// Attach a toggle state pair (logical `(oldState, newState)`)
+    /// to this event, making it a `ToggleEvent` payload carrier.
+    pub fn with_toggle_states(
+        mut self,
+        old_state: impl Into<String>,
+        new_state: impl Into<String>,
+    ) -> Self {
+        self.toggle_states = Some((old_state.into(), new_state.into()));
         self
     }
 

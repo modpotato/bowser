@@ -250,7 +250,15 @@ fn main() {
                 )
             }
             bowser_wpt::runner::TestOutcome::Reftest { passed, .. } => {
-                format!("reftest {}", if *passed { "PASS" } else { "FAIL" })
+                // Diff detail rides in the outcome's checks (pixel
+                // counts from `reftest::compare`); surface it here so
+                // a reftest failure names its magnitude instead of
+                // just FAIL.
+                let detail = r.outcome.reftest_detail().unwrap_or_default();
+                format!(
+                    "reftest {} ({detail})",
+                    if *passed { "PASS" } else { "FAIL" }
+                )
             }
             bowser_wpt::runner::TestOutcome::Crashtest { passed } => {
                 format!("crashtest {}", if *passed { "PASS" } else { "FAIL" })

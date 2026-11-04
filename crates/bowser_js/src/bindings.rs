@@ -1819,6 +1819,10 @@ struct GcRoots {
     /// linked by [`wrap_snap_event`] and the `SnapEvent` constructor;
     /// carries the `snapTargetBlock`/`snapTargetInline` accessors.
     snap_event_proto: Option<Gc<Object>>,
+    /// `ToggleEvent.prototype` (whose prototype is `Event.prototype`),
+    /// linked by [`wrap_toggle_event`] and the `ToggleEvent`
+    /// constructor; carries the `oldState`/`newState` accessors.
+    toggle_event_proto: Option<Gc<Object>>,
     /// `onscrollsnapchange` / `onscrollsnapchanging` handler values,
     /// keyed by (target node, interned event-type id): the current
     /// callback assigned through the `on*` IDL attributes (see
@@ -2531,6 +2535,9 @@ unsafe impl Trace for GcRoots {
         if let Some(p) = self.snap_event_proto {
             t.mark_object(p);
         }
+        if let Some(p) = self.toggle_event_proto {
+            t.mark_object(p);
+        }
         for cb in self.event_handlers.values() {
             t.mark_value(*cb);
         }
@@ -2866,16 +2873,17 @@ fn resolve_shim_record(doc: &Document, rec: &ParseShimElementRecord) -> Option<N
 }
 
 fn adopt_shim_top_layer(ctx: ContextId, roots: &RefCell<ParseShimRoots>) {
-    let (show_order, dialog_modal, return_values, records) = {
+    let (show_order, dialog_modal, return_values, records, retained) = {
         let roots = roots.borrow();
         (
             roots.top_layer_show_ordered(),
             roots.dialog_modal.clone(),
             roots.dialog_return.clone(),
             roots.element_wrappers.clone(),
+            roots.exit_retained_live(),
         )
     };
-    if show_order.is_empty() && return_values.is_empty() {
+    if show_order.is_empty() && return_values.is_empty() && retained.is_empty() {
         return;
     }
     let Some(apis_rc) = web_apis(ctx) else { return };
@@ -2914,9 +2922,7 @@ fn adopt_shim_top_layer(ctx: ContextId, roots: &RefCell<ParseShimRoots>) {
                 }
             }
             TopLayerShowKind::ModalDialog => {
-                if doc.is_dialog_element(node)
-                    && doc.get_attribute(node, "open").is_some()
-                {
+                if doc.is_dialog_element(node) && doc.get_attribute(node, "open").is_some() {
                     doc.promote_to_top_layer(node);
                     doc.mark_dialog_modal(node);
                 }
@@ -2939,6 +2945,38 @@ fn adopt_shim_top_layer(ctx: ContextId, roots: &RefCell<ParseShimRoots>) {
         {
             doc.promote_to_top_layer(node);
             doc.mark_dialog_modal(node);
+        }
+    }
+    // w82: adopt exit retentions as retentions, not live
+    // members — a dialog closed mid-parse with an exit
+    // transition must still render in the production document
+    // until the transition finishes, even though its `open`
+    // attribute is gone and the live loop above skipped it.
+    // Same detached / attribute-stripped backstops as live
+    // adoption (a retained modal dialog needs no `open`
+    // attribute — that is the point — but a retained popover
+    // still needs its `popover` attribute).
+    for (arena, kind, remaining) in &retained {
+        let Some(rec) = records
+            .iter()
+            .find(|rec| rec.el.arena_index() == *arena && !rec.detached)
+        else {
+            continue;
+        };
+        let Some(node) = resolve_shim_record(&doc, rec) else {
+            continue;
+        };
+        match kind {
+            TopLayerShowKind::Popover => {
+                if doc.get_attribute(node, "popover").is_some() {
+                    doc.retain_top_layer_for_exit(node, *remaining, false);
+                }
+            }
+            TopLayerShowKind::ModalDialog => {
+                if doc.is_dialog_element(node) {
+                    doc.retain_top_layer_for_exit(node, *remaining, true);
+                }
+            }
         }
     }
     // w81 phase 2: adopt stored dialog `returnValue`s (set via
@@ -9823,6 +9861,41 @@ fn wrap_snap_event(
     wrap_event_with_proto(heap, apis, event, trusted, proto)
 }
 
+/// `new ToggleEvent(type, init?)`: the `Event` shape plus the
+/// `ToggleEventInit` state pair, linked to `ToggleEvent.prototype`
+/// (whose prototype is `Event.prototype`). `source` is not carried
+/// (see `dom::Event::toggle_states`).
+fn n_toggle_event_ctor(
+    heap: &mut Heap,
+    _this: Value,
+    args: &[Value],
+) -> Result<Value, NativeError> {
+    let rc = ctor_apis(heap, "ToggleEvent")?;
+    let etype = match args.first() {
+        Some(v) if !v.is_undefined() => arg_to_string(heap, *v)?,
+        _ => return Err(err_type("ToggleEvent: type argument required")),
+    };
+    let (bubbles, cancelable) = read_event_init(heap, args.get(1).copied())?;
+    let (old_state, new_state) = {
+        let g = rc.borrow();
+        read_toggle_init(heap, &g, args.get(1).copied())?
+    };
+    let mut g = rc.borrow_mut();
+    let proto = {
+        let fallback = g.gc_roots.borrow().toggle_event_proto;
+        ctor_proto(heap, fallback)
+    };
+    let (v, _) = wrap_toggle_event(
+        heap,
+        &mut g,
+        dom::Event::new(etype, bubbles, cancelable).with_toggle_states(old_state, new_state),
+        false,
+        proto,
+    )
+    .map_err(|_| NativeError::OutOfMemory)?;
+    Ok(v)
+}
+
 /// `new SnapEvent(type, init?)`: the `Event` shape plus the
 /// `SnapEventInit` target pair, linked to `SnapEvent.prototype`
 /// (whose prototype is `Event.prototype`).
@@ -9851,6 +9924,110 @@ fn n_snap_event_ctor(heap: &mut Heap, _this: Value, args: &[Value]) -> Result<Va
     )
     .map_err(|_| NativeError::OutOfMemory)?;
     Ok(v)
+}
+
+// ---------------------------------------------------------------------------
+// Toggle events (`ToggleEvent`)
+// ---------------------------------------------------------------------------
+//
+// The popover `toggle` payload (HTML §6.12) follows the snap pattern:
+/// the state pair lives on the stored [`dom::Event`] (see
+/// `dom::Event::toggle_states`) and surfaces through accessors on
+/// `ToggleEvent.prototype`, so constructor-built, plain-object
+/// dispatched, and re-dispatched wrappers all read the same fields,
+/// and [`event_of`]'s stored-clone path preserves them. The states
+/// are DOM strings (the `ToggleEventInit` defaults are `""`);
+/// browser-fired values are `"open"` / `"closed"`. `source` is not
+/// carried.
+///
+/// Read a `ToggleEventInit` dictionary: the `oldState` /
+/// `newState` members (DOM strings, default `""`). Per WebIDL only
+/// `undefined`/`null` (and an absent argument) mean "empty
+/// dictionary": any other non-object value throws a `TypeError`.
+/// A present member stringifies per DOMString conversion, so an
+/// explicit `null` reads as `"null"` (no
+/// `LegacyNullToEmptyString` on these members); an absent or
+/// `undefined` member reads as `""`.
+fn read_toggle_init(
+    heap: &mut Heap,
+    _apis: &WebApis,
+    init: Option<Value>,
+) -> Result<(String, String), NativeError> {
+    let obj = match init {
+        None | Some(Value::Undefined) | Some(Value::Null) => {
+            return Ok((String::new(), String::new()));
+        }
+        Some(Value::Object(obj)) => obj,
+        Some(_) => return Err(err_type("ToggleEventInit must be an object")),
+    };
+    let mut member = |name: &str| -> Result<String, NativeError> {
+        match dict_get(heap, obj, name)? {
+            Some(v) => arg_to_string(heap, v),
+            None => Ok(String::new()),
+        }
+    };
+    Ok((member("oldState")?, member("newState")?))
+}
+
+/// The toggle state pair behind a toggle-event wrapper (`this`), or
+/// `("", "")` when the stored event carries none.
+fn toggle_states_of(
+    heap: &Heap,
+    rc: &Rc<RefCell<WebApis>>,
+    this: Value,
+) -> Result<(String, String), NativeError> {
+    let handle = event_handle_of(heap, this)?;
+    Ok(rc
+        .borrow()
+        .events
+        .get(&handle)
+        .and_then(|e| e.toggle_states.clone())
+        .unwrap_or_default())
+}
+
+/// Shared body of the `oldState`/`newState` getters: read the stored
+/// [`dom::Event`]'s pair.
+fn toggle_state_get(heap: &mut Heap, this: Value, old: bool) -> Result<Value, NativeError> {
+    let rc = apis_rc(heap, this)?;
+    let (old_state, new_state) = toggle_states_of(heap, &rc, this)?;
+    let s = if old { old_state } else { new_state };
+    Ok(Value::Str(
+        heap.alloc_str(&s).map_err(|_| NativeError::OutOfMemory)?,
+    ))
+}
+
+/// `ToggleEvent.prototype.oldState` getter.
+fn n_toggle_old_state_get(
+    heap: &mut Heap,
+    this: Value,
+    _args: &[Value],
+) -> Result<Value, NativeError> {
+    toggle_state_get(heap, this, true)
+}
+
+/// `ToggleEvent.prototype.newState` getter.
+fn n_toggle_new_state_get(
+    heap: &mut Heap,
+    this: Value,
+    _args: &[Value],
+) -> Result<Value, NativeError> {
+    toggle_state_get(heap, this, false)
+}
+
+/// Build a toggle event wrapper: the [`wrap_event`] shape linked to
+/// `proto` (`ToggleEvent.prototype`, or a subclass prototype). The
+/// states are not copied onto the wrapper — the prototype accessors
+/// read the stored [`dom::Event`]. Shared by the `ToggleEvent`
+/// constructor and plain-object dispatches carrying the pair (see
+/// [`dispatch_event_inner`]).
+fn wrap_toggle_event(
+    heap: &mut Heap,
+    apis: &mut WebApis,
+    event: dom::Event,
+    trusted: bool,
+    proto: Option<Gc<Object>>,
+) -> Result<(Value, u32), AllocError> {
+    wrap_event_with_proto(heap, apis, event, trusted, proto)
 }
 
 /// The `(bubbles, cancelable)` pair the UI Events / Pointer Events
@@ -10321,6 +10498,44 @@ fn install_event_classes(
         def(heap, global, "SnapEvent", Value::Object(snap_ctor))?;
         Ok(())
     })?;
+    // `ToggleEvent.prototype` extends `Event.prototype` and carries
+    // the toggle-state accessors (the values live on the stored
+    // [`dom::Event`]; see the toggle-event section docs).
+    let toggle_ctor =
+        heap.alloc_object(Object::new(ObjectKind::NativeFunction(n_toggle_event_ctor)))?;
+    // `ToggleEvent` is a constructor (WebIDL `IsConstructor`).
+    heap.mark_native_constructor(n_toggle_event_ctor);
+    let toggle_proto = heap.alloc_object(Object::new(ObjectKind::Ordinary))?;
+    with_temp_root(heap, Value::Object(toggle_ctor), |heap| {
+        with_temp_root(heap, Value::Object(toggle_proto), |heap| {
+            heap.set_prototype(toggle_proto, Value::Object(event_proto));
+            def(
+                heap,
+                toggle_proto,
+                "constructor",
+                Value::Object(toggle_ctor),
+            )?;
+            def_accessor(
+                heap,
+                toggle_proto,
+                "oldState",
+                n_toggle_old_state_get,
+                n_readonly_set,
+            )?;
+            def_accessor(
+                heap,
+                toggle_proto,
+                "newState",
+                n_toggle_new_state_get,
+                n_readonly_set,
+            )?;
+            Ok(())
+        })?;
+        def(heap, toggle_ctor, "prototype", Value::Object(toggle_proto))?;
+        def(heap, toggle_ctor, CTX_KEY, Value::Int(ctx_id as i32))?;
+        def(heap, global, "ToggleEvent", Value::Object(toggle_ctor))?;
+        Ok(())
+    })?;
     // Stash the prototypes where `wrap_event`/`wrap_wheel_event` read
     // them; the `Trace` impl keeps them alive (see `GcRoots`).
     let mut roots = gc_roots.borrow_mut();
@@ -10332,6 +10547,7 @@ fn install_event_classes(
     roots.mouse_event_proto = Some(mouse_proto);
     roots.pointer_event_proto = Some(pointer_proto);
     roots.snap_event_proto = Some(snap_proto);
+    roots.toggle_event_proto = Some(toggle_proto);
     Ok(())
 }
 
@@ -11111,6 +11327,29 @@ fn event_of(heap: &mut Heap, apis: &WebApis, v: Value) -> Result<dom::Event, Nat
             None => None,
         };
         event = event.with_snap_targets(block, inline);
+    }
+    // Toggle states (HTML §6.12): a plain-object dispatch argument
+    // may carry `oldState` / `newState` DOM-string members (the
+    // `ToggleEventInit` shape). Either member present attaches the
+    // pair, with the absent member defaulting to `""`; an
+    // `undefined`/`null` member reads as absent here (unlike the
+    // constructor's DOMString conversion), matching the `key`
+    // handling above. Absent members leave the event without a
+    // toggle payload.
+    let old_prop = heap.get_property(o, Wtf8::from_str("oldState"));
+    let new_prop = heap.get_property(o, Wtf8::from_str("newState"));
+    if old_prop.is_some() || new_prop.is_some() {
+        let mut state = |prop: Option<Property>| -> Result<String, NativeError> {
+            match prop {
+                Some(p) if !p.value.is_undefined() && !p.value.is_null() => {
+                    arg_to_string(&mut *heap, p.value)
+                }
+                _ => Ok(String::new()),
+            }
+        };
+        let old_state = state(old_prop)?;
+        let new_state = state(new_prop)?;
+        event = event.with_toggle_states(old_state, new_state);
     }
     Ok(event)
 }
@@ -12238,6 +12477,44 @@ fn n_matches(heap: &mut Heap, this: Value, args: &[Value]) -> Result<Value, Nati
     Ok(Value::Bool(hit))
 }
 
+/// Fire a trusted, non-bubbling popover `toggle` event at
+/// `node` with the given states, through the same dispatch
+/// core as [`n_close_dialog`]'s `close` event — except the
+/// wrapper links `ToggleEvent.prototype`, so listeners read
+/// `oldState` / `newState` off the stored pair. The document
+/// borrow is dropped before dispatch, so a listener that
+/// re-shows or re-hides re-enters a clean state. Fires for
+/// script-API visibility changes (show/hide/toggle) exactly
+/// when the visibility changed; no-op calls fire nothing.
+/// Auto-closed victims fire first (`open` -> `closed`), then
+/// the newly shown target (`closed` -> `open`): the closes
+/// happened inside the show, before the promotion.
+fn dispatch_popover_toggle(
+    heap: &mut Heap,
+    rc: &Rc<RefCell<WebApis>>,
+    node: dom::NodeId,
+    old_state: &str,
+    new_state: &str,
+) -> Result<(), NativeError> {
+    let (event_val, handle) = {
+        let mut g = rc.borrow_mut();
+        let proto = g.gc_roots.borrow().toggle_event_proto;
+        wrap_toggle_event(
+            heap,
+            &mut g,
+            dom::Event::new("toggle", false, false).with_toggle_states(old_state, new_state),
+            true,
+            proto,
+        )
+        .map_err(|_| NativeError::OutOfMemory)?
+    };
+    let base = heap.protect(event_val);
+    let r = run_event_dispatch(heap, rc, node, event_val, handle);
+    heap.release_temp(base);
+    r?;
+    Ok(())
+}
+
 /// `HTMLElement.showPopover()` (HTML §6.12, w80): promote the
 /// receiver to the document's top layer. Errors surface as
 /// `TypeError`s whose message carries the DOM name (the engine has
@@ -12245,7 +12522,14 @@ fn n_matches(heap: &mut Heap, this: Value, args: &[Value]) -> Result<Value, Nati
 /// `createElementNS`'s `InvalidCharacterError`): `NotSupportedError`
 /// without a `popover` attribute, `InvalidStateError` when detached
 /// or already showing. Auto-close of other `auto` popovers lives in
-/// [`Document::show_popover`].
+/// [`Document::show_popover`], which returns them so this native
+/// can fire their `toggle` events (`open` -> `closed`) before
+/// firing the target's own (`closed` -> `open`). A successful
+/// show also stores the element's exit-transition duration
+/// (measured now, while it is open) in the document, so the
+/// window/testdriver dismissal paths — which cannot run
+/// `compute_style` — can defer the demotion through the same
+/// transition (see [`Document::store_exit_duration`]).
 fn n_show_popover(heap: &mut Heap, this: Value, _args: &[Value]) -> Result<Value, NativeError> {
     let rc = apis_rc(heap, this)?;
     let node = {
@@ -12253,27 +12537,124 @@ fn n_show_popover(heap: &mut Heap, this: Value, _args: &[Value]) -> Result<Value
         target_node(heap, this, &g)?
     };
     let doc_rc = rc.borrow().live_document()?;
-    doc_rc
+    let closed = doc_rc
         .borrow_mut()
         .show_popover(node)
         .map_err(|e| err_type(format!("showPopover: {e}")))?;
+    // Measure-while-open for the window/testdriver paths.
+    if let Some(d) = production_exit_transition_duration(&rc, node) {
+        doc_rc
+            .borrow_mut()
+            .store_exit_duration(node, d + EXIT_RETENTION_GRACE_S);
+    } else {
+        doc_rc.borrow_mut().store_exit_duration(node, 0.0);
+    }
+    for victim in closed {
+        dispatch_popover_toggle(heap, &rc, victim, "open", "closed")?;
+    }
+    dispatch_popover_toggle(heap, &rc, node, "closed", "open")?;
     Ok(Value::Undefined)
+}
+
+/// The exit-transition duration for a production element,
+/// read from its CURRENT (pre-close / pre-hide) computed style:
+/// `overlay`, `display`, and the `transition-*` longhands,
+/// through the same cascade and serializer the
+/// `getComputedStyle` surface uses, then
+/// [`crate::transition::exit_transition_duration`]. `None`
+/// means no exit transition applies and the caller demotes
+/// synchronously. Must be called BEFORE the close/hide
+/// mutation: after it, the values are the post-close ones and
+/// the transition is invisible. Fail-closed (`None`) when the
+/// document or cascade is unavailable, so a style failure can
+/// never turn a close into a stuck retention.
+/// Exit-retention grace, in seconds (w82): added to every
+/// measured exit-transition duration before it becomes a
+/// retention, in both the production and the parse-shim close /
+/// hide paths. Rationale: the retention's job is to keep the
+/// element painted *while its exit transition runs*, and the
+/// paint that proves it is the display-list build from the last
+/// layout-baked tree — which runs a full render cycle (font
+/// resolution, image mapping, adapter probe, display-list build)
+/// after that tree was baked. Measured on this box, the
+/// close-to-screenshot pipeline for a reftest whose screenshot
+/// is triggered by two RAFs runs 2.5-3s wall-clock for a 2s
+/// transition: the 2s dialog reftest fails without grace (the
+/// baked tree still holds the dialog but the display-list build
+/// sees an expired retention and drops its backdrop), while
+/// 3s and 5s variants pass pixel-identically. The grace covers
+/// that bake-to-screenshot lag, not the transition itself: the
+/// closed state, the `close` event, and `:open` are unaffected
+/// (they change at close time), and the DOM retention primitive
+/// itself stays exact — only these rendering call sites add
+/// the grace. 1.5s clears the measured ~0.5-1s overshoot with
+/// headroom under load; if a future gate still flakes on a
+/// short exit transition, this constant — not the retention
+/// mechanism — is the knob to turn.
+const EXIT_RETENTION_GRACE_S: f64 = 1.5;
+
+fn production_exit_transition_duration(
+    rc: &Rc<RefCell<WebApis>>,
+    node: dom::NodeId,
+) -> Option<f64> {
+    let g = rc.borrow();
+    let doc_rc = g.live_document().ok()?;
+    let doc = doc_rc.borrow();
+    let author: Vec<&Stylesheet> = g.author_stylesheets.iter().collect();
+    let computed = compute_style(&doc, node, &author, &g.ua_stylesheet, &g.viewport);
+    let mut props = HashMap::new();
+    for prop in [
+        "overlay",
+        "display",
+        "transition-property",
+        "transition-duration",
+        "transition-delay",
+        "transition-timing-function",
+        "transition-behavior",
+    ] {
+        if let Some(v) = computed.get(prop) {
+            props.insert(prop.to_string(), cssom_computed_value(prop, v));
+        }
+    }
+    crate::transition::exit_transition_duration(&props)
 }
 
 /// `HTMLElement.hidePopover()` (w80): demote from the top layer.
 /// `NotSupportedError` without a `popover` attribute; hiding a
-/// popover that is not showing is a no-op.
+/// popover that is not showing is a no-op. A live popover that
+/// is hidden fires a trusted `toggle` event (`open` ->
+/// `closed`) at hide time — even when the demotion is deferred
+/// into an exit retention, the event fires now (retention
+/// delays rendering only, like a dialog's `close` event);
+/// a retained or never-shown popover fires nothing, and its
+/// retention (if any) is left alone.
 fn n_hide_popover(heap: &mut Heap, this: Value, _args: &[Value]) -> Result<Value, NativeError> {
     let rc = apis_rc(heap, this)?;
     let node = {
         let g = rc.borrow();
         target_node(heap, this, &g)?
     };
+    // w82: measure the exit transition BEFORE hiding (the
+    // pre-hide values are the exit's start values); a positive
+    // duration defers the demotion, otherwise this is the old
+    // synchronous hide.
+    let exit = production_exit_transition_duration(&rc, node);
     let doc_rc = rc.borrow().live_document()?;
-    doc_rc
-        .borrow_mut()
-        .hide_popover(node)
-        .map_err(|e| err_type(format!("hidePopover: {e}")))?;
+    let was_live = doc_rc.borrow().top_layer().contains(&node);
+    let result = match exit {
+        Some(d) => doc_rc
+            .borrow_mut()
+            .hide_popover_deferred(node, d + EXIT_RETENTION_GRACE_S),
+        None => doc_rc.borrow_mut().hide_popover(node),
+    };
+    result.map_err(|e| err_type(format!("hidePopover: {e}")))?;
+    if was_live {
+        // The hide consumed any stored exit duration: the
+        // retention (if one was created) now holds it, and a
+        // later show re-measures.
+        doc_rc.borrow_mut().take_stored_exit_duration(node);
+        dispatch_popover_toggle(heap, &rc, node, "open", "closed")?;
+    }
     Ok(Value::Undefined)
 }
 
@@ -12282,6 +12663,15 @@ fn n_hide_popover(heap: &mut Heap, this: Value, _args: &[Value]) -> Result<Value
 /// present one forces, with the already-in-target-state case a
 /// no-op (see [`Document::toggle_popover`]). Truthiness follows the
 /// JS value: objects are truthy, `0`/`""`/`null`/`false` are falsy.
+/// A visibility change fires a trusted `toggle` event with the
+/// matching states — a show fires `closed` -> `open` for the
+/// target after firing `open` -> `closed` for every popover it
+/// auto-closed, a hide fires `open` -> `closed` for the target
+/// (at hide time, even when deferred into a retention); a
+/// no-op (already in the forced state, or a retained popover
+/// toggled closed) fires nothing. A show branch also stores
+/// the freshly measured exit duration for the
+/// window/testdriver paths, like [`n_show_popover`].
 fn n_toggle_popover(heap: &mut Heap, this: Value, args: &[Value]) -> Result<Value, NativeError> {
     let rc = apis_rc(heap, this)?;
     let node = {
@@ -12298,10 +12688,38 @@ fn n_toggle_popover(heap: &mut Heap, this: Value, args: &[Value]) -> Result<Valu
         _ => Some(true),
     };
     let doc_rc = rc.borrow().live_document()?;
-    let open = doc_rc
-        .borrow_mut()
-        .toggle_popover(node, force)
-        .map_err(|e| err_type(format!("togglePopover: {e}")))?;
+    let was_live = doc_rc.borrow().top_layer().contains(&node);
+    // w82: same pre-hide measurement as `hidePopover` for the
+    // hide branches; show branches are unaffected.
+    let exit = production_exit_transition_duration(&rc, node);
+    let (open, closed) = match exit {
+        Some(d) => {
+            doc_rc
+                .borrow_mut()
+                .toggle_popover_deferred(node, force, d + EXIT_RETENTION_GRACE_S)
+        }
+        None => doc_rc.borrow_mut().toggle_popover(node, force),
+    }
+    .map_err(|e| err_type(format!("togglePopover: {e}")))?;
+    if open && !was_live {
+        // Show branch: measure-while-open for the
+        // window/testdriver paths, then fire the auto-closed
+        // toggles before the target's own.
+        if let Some(d) = production_exit_transition_duration(&rc, node) {
+            doc_rc
+                .borrow_mut()
+                .store_exit_duration(node, d + EXIT_RETENTION_GRACE_S);
+        } else {
+            doc_rc.borrow_mut().store_exit_duration(node, 0.0);
+        }
+        for victim in closed {
+            dispatch_popover_toggle(heap, &rc, victim, "open", "closed")?;
+        }
+        dispatch_popover_toggle(heap, &rc, node, "closed", "open")?;
+    } else if !open && was_live {
+        doc_rc.borrow_mut().take_stored_exit_duration(node);
+        dispatch_popover_toggle(heap, &rc, node, "open", "closed")?;
+    }
     Ok(Value::Bool(open))
 }
 
@@ -12322,6 +12740,13 @@ fn n_show_dialog(heap: &mut Heap, this: Value, _args: &[Value]) -> Result<Value,
         .borrow_mut()
         .show_dialog(node)
         .map_err(|e| err_type(format!("show: {e}")))?;
+    // Show-time focus snapshot (w82 fix): the bindings run at
+    // show time, the embedder's focus sync only at the next pump,
+    // so only the bindings can capture the previously-focused
+    // element before any later statement in the same task moves
+    // focus. The mirrored host focus (maintained by the embedder)
+    // is snapshotted here; the sync consumes it.
+    doc_rc.borrow_mut().note_dialog_show(node);
     Ok(Value::Undefined)
 }
 
@@ -12343,6 +12768,17 @@ fn n_show_dialog_modal(
         .borrow_mut()
         .show_dialog_modal(node)
         .map_err(|e| err_type(format!("showModal: {e}")))?;
+    // Show-time focus snapshot, as in `n_show_dialog` above.
+    doc_rc.borrow_mut().note_dialog_show(node);
+    // Measure-while-open for the window/testdriver Escape
+    // paths, like `n_show_popover` (see there).
+    if let Some(d) = production_exit_transition_duration(&rc, node) {
+        doc_rc
+            .borrow_mut()
+            .store_exit_duration(node, d + EXIT_RETENTION_GRACE_S);
+    } else {
+        doc_rc.borrow_mut().store_exit_duration(node, 0.0);
+    }
     Ok(Value::Undefined)
 }
 
@@ -12365,13 +12801,28 @@ fn n_close_dialog(heap: &mut Heap, this: Value, args: &[Value]) -> Result<Value,
         v => Some(arg_to_string(&mut *heap, v)?),
     };
     let doc_rc = rc.borrow().live_document()?;
-    let closed = doc_rc
-        .borrow_mut()
-        .close_dialog(node, return_value.as_deref())
-        .map_err(|e| err_type(format!("close: {e}")))?;
+    // w82: measure the exit transition BEFORE closing (the
+    // pre-close values are the exit's start values); a positive
+    // duration defers only the top-layer demotion — the dialog
+    // is closed and the `close` event below still fires now.
+    let exit = production_exit_transition_duration(&rc, node);
+    let closed = match exit {
+        Some(d) => doc_rc.borrow_mut().close_dialog_deferred(
+            node,
+            return_value.as_deref(),
+            d + EXIT_RETENTION_GRACE_S,
+        ),
+        None => doc_rc
+            .borrow_mut()
+            .close_dialog(node, return_value.as_deref()),
+    }
+    .map_err(|e| err_type(format!("close: {e}")))?;
     if !closed {
         return Ok(Value::Undefined);
     }
+    // The close consumed any stored exit duration, as in
+    // `n_hide_popover` (a retention, if created, now holds it).
+    doc_rc.borrow_mut().take_stored_exit_duration(node);
     let (event_val, handle) = {
         let mut g = rc.borrow_mut();
         wrap_event(heap, &mut g, dom::Event::new("close", false, false), true)
@@ -13630,12 +14081,19 @@ fn dispatch_event_inner(
         let (event_val, event_handle) = {
             let mut g = rc.borrow_mut();
             let event = event_of(heap, &g, arg)?;
-            // An event carrying a snap payload (a constructed
-            // `SnapEvent` re-dispatched through its stored clone, or a
-            // plain object with `snapTarget*` members) wraps with
-            // `SnapEvent.prototype` so the target accessors are on the
-            // delivered wrapper's chain.
-            let (event_val, event_handle) = if event.snap_targets.is_some() {
+            // An event carrying a toggle payload (a constructed
+            // `ToggleEvent` re-dispatched through its stored clone, or
+            // a plain object with `oldState`/`newState` members)
+            // wraps with `ToggleEvent.prototype` so the state
+            // accessors are on the delivered wrapper's chain; a snap
+            // payload does the same with `SnapEvent.prototype`. A
+            // (nonsensical) event carrying both takes the toggle
+            // prototype.
+            let (event_val, event_handle) = if event.toggle_states.is_some() {
+                let proto = g.gc_roots.borrow().toggle_event_proto;
+                wrap_event_with_proto(heap, &mut g, event.clone(), trusted, proto)
+                    .map_err(|_| NativeError::OutOfMemory)?
+            } else if event.snap_targets.is_some() {
                 let proto = g.gc_roots.borrow().snap_event_proto;
                 wrap_event_with_proto(heap, &mut g, event.clone(), trusted, proto)
                     .map_err(|_| NativeError::OutOfMemory)?
@@ -18720,13 +19178,15 @@ fn cssom_computed_value(prop: &str, value: &CssValue) -> String {
     // engine splits on top-level commas, so a space-joined
     // serialization parses as one layer and kills the transition
     // (duration) or silently falls back to `ease` (timing).
-    // `transition-behavior` is a single keyword, never a list.
+    // `transition-behavior` joins too (w82: the shorthand emits
+    // a per-layer behavior list for multi-layer declarations).
     if matches!(
         prop,
         "transition-property"
             | "transition-duration"
             | "transition-delay"
             | "transition-timing-function"
+            | "transition-behavior"
     ) && let CssValue::List(items) = value
         && !items.is_empty()
     {
@@ -19702,9 +20162,7 @@ fn n_animation_play_state_get(
 /// colons, so both misspellings silently queried the backdrop.
 fn is_backdrop_pseudo_arg(arg: &str) -> bool {
     let t = arg.trim();
-    let rest = t
-        .strip_prefix("::")
-        .or_else(|| t.strip_prefix(':'));
+    let rest = t.strip_prefix("::").or_else(|| t.strip_prefix(':'));
     rest.is_some_and(|r| r.eq_ignore_ascii_case("backdrop"))
 }
 
@@ -20086,7 +20544,19 @@ fn n_get_computed_style(
         // originator's keyed values must not leak into them.
         if !is_backdrop {
             let anim_key = format!("prod:{node:?}");
-            crate::transition::apply_transitions(&anim_key, &mut props);
+            // w82fix JS-M1: an exit-retained node must NOT run
+            // the transition engine (its cascade still reports
+            // the held values, so a normal read would seed
+            // `last_cascaded` with them and the first
+            // post-expiry read would start a phantom exit
+            // transition). Retained reads pin the baseline to
+            // the post-close values instead; see
+            // `crate::transition::apply_transitions_retained`.
+            if doc.is_exit_retained(node) {
+                crate::transition::apply_transitions_retained(&anim_key, &mut props);
+            } else {
+                crate::transition::apply_transitions(&anim_key, &mut props);
+            }
             crate::animation::apply_animations(&anim_key, &mut props);
             // w81fix (F-E): re-synthesize shorthands after
             // animation/transition application, so an animated
@@ -20591,6 +21061,12 @@ pub(crate) struct ParseShimRoots {
     /// so `instanceof SnapEvent` holds across parser-inserted
     /// scripts. Traced like `node_list_proto`.
     snap_event_proto: Option<Gc<Object>>,
+    /// The parse's shared `ToggleEvent` prototype (w82fix
+    /// JS-m3): the `SnapEvent` mirror above, for `ToggleEvent`
+    /// — built once per document load and linked by every shim
+    /// `ToggleEvent`, so `instanceof ToggleEvent` holds across
+    /// parser-inserted scripts. Traced like `snap_event_proto`.
+    toggle_event_proto: Option<Gc<Object>>,
     /// The parse's shared `DOMRect` prototype (see the parse-shim
     /// `DOMRect` mirror in [`install_parse_document_shim`]): built
     /// once per document load and linked by every shim
@@ -20687,6 +21163,18 @@ pub(crate) struct ParseShimRoots {
     dialog_open: HashSet<usize>,
     dialog_modal: HashSet<usize>,
     dialog_return: HashMap<usize, String>,
+    /// Mid-parse exit-transition retentions (w82): arenas
+    /// whose shim `close()` / `hidePopover()` measured a
+    /// positive exit transition, mapped to (expiry, kind).
+    /// The arena leaves the live top-layer sets at close/hide
+    /// but stays rendering until expiry: the shim's computed
+    /// style rebuild (`build_style_data`) and the production
+    /// adoption (`adopt_shim_top_layer`) both promote these
+    /// arenas as exit retentions (not live members) in their
+    /// rebuilt/production documents. Expiry is lazy (checked
+    /// on read); a re-show clears the record. Plain data: no
+    /// tracing needed.
+    exit_retained: HashMap<usize, (Instant, TopLayerShowKind)>,
 }
 
 /// One entry of [`ParseShimRoots::top_layer_show_order`]: which
@@ -20730,6 +21218,39 @@ impl ParseShimRoots {
             }
         } else {
             self.top_layer_show_order.retain(|(a, _)| *a != arena);
+        }
+    }
+
+    /// Unexpired exit retentions as (arena, kind, seconds
+    /// remaining), for the style rebuild and the production
+    /// adoption. Expired records read as absent (they are
+    /// pruned lazily by the next mutation that touches them).
+    fn exit_retained_live(&self) -> Vec<(usize, TopLayerShowKind, f64)> {
+        let now = Instant::now();
+        self.exit_retained
+            .iter()
+            .filter_map(|(&arena, &(expiry, kind))| {
+                expiry
+                    .checked_duration_since(now)
+                    .map(|d| (arena, kind, d.as_secs_f64()))
+            })
+            .collect()
+    }
+
+    /// Record an exit retention for `arena` (see the field
+    /// docs). A non-positive duration records nothing. The
+    /// exit-retention grace ([`EXIT_RETENTION_GRACE_S`]) is
+    /// added here, so the shim path matches the production
+    /// close / hide paths.
+    fn exit_retain(&mut self, arena: usize, kind: TopLayerShowKind, duration_s: f64) {
+        if duration_s.is_finite() && duration_s > 0.0 {
+            self.exit_retained.insert(
+                arena,
+                (
+                    Instant::now() + Duration::from_secs_f64(duration_s + EXIT_RETENTION_GRACE_S),
+                    kind,
+                ),
+            );
         }
     }
 
@@ -20865,6 +21386,10 @@ unsafe impl Trace for ParseShimRoots {
         }
         // The shared shim `SnapEvent` prototype: same reasoning.
         if let Some(p) = self.snap_event_proto {
+            t.mark_object(p);
+        }
+        // The shared shim `ToggleEvent` prototype: same reasoning.
+        if let Some(p) = self.toggle_event_proto {
             t.mark_object(p);
         }
         // The shared shim `DOMRect` prototype: same reasoning.
@@ -21248,6 +21773,88 @@ fn n_parse_snap_event_ctor(
     Ok(Value::Object(obj))
 }
 
+/// The parse shim's minimal `ToggleEvent` constructor (w82fix
+/// JS-m3): the shim `SnapEvent` mirror, for `ToggleEvent`.
+/// The built object is a plain object linked to the shim's
+/// shared `ToggleEvent.prototype`, with own data properties
+/// `type`, `bubbles`/`cancelable` (from the init dict, default
+/// `false`), and `oldState`/`newState` storing the init values
+/// as DOM strings (default `""`, like production
+/// [`read_toggle_init`]; an absent or `undefined` member reads
+/// `""`, a present member stringifies — `dict_get` already
+/// maps `undefined` to absent). No dispatch support; the
+/// production install replaces the global with the real
+/// constructor after the parse.
+fn n_parse_toggle_event_ctor(
+    heap: &mut Heap,
+    _this: Value,
+    args: &[Value],
+) -> Result<Value, NativeError> {
+    let etype = match args.first() {
+        Some(v) if !v.is_undefined() => arg_to_string(heap, *v)?,
+        _ => return Err(err_type("ToggleEvent: type argument required")),
+    };
+    let (bubbles, cancelable) = read_event_init(heap, args.get(1).copied())?;
+    let (old_state, new_state) = match args.get(1).copied() {
+        None | Some(Value::Undefined) | Some(Value::Null) => (String::new(), String::new()),
+        Some(Value::Object(o)) => {
+            let mut member = |name: &str| -> Result<String, NativeError> {
+                match dict_get(heap, o, name)? {
+                    Some(v) => arg_to_string(heap, v),
+                    None => Ok(String::new()),
+                }
+            };
+            (member("oldState")?, member("newState")?)
+        }
+        Some(_) => return Err(err_type("ToggleEventInit must be an object")),
+    };
+    // The prototype `new.target` names (the shim constructor's
+    // `prototype`, stashed in `ParseShimRoots` at install).
+    let proto = match crate::vm::active_new_target() {
+        Some(Value::Object(ctor)) => match heap.get_property(ctor, Wtf8::from_str("prototype")) {
+            Some(p) => match p.value {
+                Value::Object(o) => Some(o),
+                _ => None,
+            },
+            None => None,
+        },
+        _ => None,
+    };
+    let obj = heap
+        .alloc_object(Object::new(ObjectKind::Ordinary))
+        .map_err(|_| NativeError::OutOfMemory)?;
+    with_temp_root(
+        heap,
+        Value::Object(obj),
+        |heap| -> Result<(), NativeError> {
+            if let Some(p) = proto {
+                heap.set_prototype(obj, Value::Object(p));
+            }
+            let type_val = Value::Str(
+                heap.alloc_str(&etype)
+                    .map_err(|_| NativeError::OutOfMemory)?,
+            );
+            def(heap, obj, "type", type_val).map_err(|_| NativeError::OutOfMemory)?;
+            def(heap, obj, "bubbles", Value::Bool(bubbles))
+                .map_err(|_| NativeError::OutOfMemory)?;
+            def(heap, obj, "cancelable", Value::Bool(cancelable))
+                .map_err(|_| NativeError::OutOfMemory)?;
+            let old_val = Value::Str(
+                heap.alloc_str(&old_state)
+                    .map_err(|_| NativeError::OutOfMemory)?,
+            );
+            def(heap, obj, "oldState", old_val).map_err(|_| NativeError::OutOfMemory)?;
+            let new_val = Value::Str(
+                heap.alloc_str(&new_state)
+                    .map_err(|_| NativeError::OutOfMemory)?,
+            );
+            def(heap, obj, "newState", new_val).map_err(|_| NativeError::OutOfMemory)?;
+            Ok(())
+        },
+    )?;
+    Ok(Value::Object(obj))
+}
+
 /// Resolve the parse-shim roots for a `window.onload` access on the page
 /// global: the live installation's table while a parser-inserted script
 /// runs, else the heap's shim trace root. The table outlives each
@@ -21504,6 +22111,39 @@ pub fn install_parse_document_shim(
             })
             .map_err(|_| ApiError::OutOfMemory)?;
             shim_roots.borrow_mut().snap_event_proto = Some(snap_proto);
+        }
+        // `ToggleEvent` for mid-parse scripts (w82fix JS-m3):
+        // the `SnapEvent` mirror above, for `ToggleEvent` (see
+        // [`n_parse_toggle_event_ctor`]) — one constructor +
+        // prototype per document load, stashed in the shared
+        // shim roots. The production install replaces the
+        // global with the real constructor after the parse.
+        if shim_roots.borrow().toggle_event_proto.is_none() {
+            let heap = vm.heap_mut();
+            let toggle_ctor = heap
+                .alloc_object(Object::new(ObjectKind::NativeFunction(
+                    n_parse_toggle_event_ctor,
+                )))
+                .map_err(|_| ApiError::OutOfMemory)?;
+            heap.mark_native_constructor(n_parse_toggle_event_ctor);
+            let toggle_proto = heap
+                .alloc_object(Object::new(ObjectKind::Ordinary))
+                .map_err(|_| ApiError::OutOfMemory)?;
+            with_temp_root(heap, Value::Object(toggle_ctor), |heap| {
+                with_temp_root(heap, Value::Object(toggle_proto), |heap| {
+                    def(
+                        heap,
+                        toggle_proto,
+                        "constructor",
+                        Value::Object(toggle_ctor),
+                    )?;
+                    def(heap, toggle_ctor, "prototype", Value::Object(toggle_proto))?;
+                    def(heap, global, "ToggleEvent", Value::Object(toggle_ctor))?;
+                    Ok::<(), AllocError>(())
+                })
+            })
+            .map_err(|_| ApiError::OutOfMemory)?;
+            shim_roots.borrow_mut().toggle_event_proto = Some(toggle_proto);
         }
         // `DOMRect` for mid-parse scripts (see [`build_dom_rect`]):
         // one constructor + prototype per document load, stashed in
@@ -22934,7 +23574,9 @@ fn mark_shim_record_detached(id: u64, el: ScriptElement, detached: bool) {
 fn drop_shim_top_layer_arena(id: u64, arena: usize) {
     let roots = PARSE_HOSTS.with(|hosts| hosts.borrow().get(&id).map(|e| e.listeners.clone()));
     let Some(roots) = roots else { return };
-    roots.borrow_mut().top_layer_remove(arena);
+    let mut g = roots.borrow_mut();
+    g.top_layer_remove(arena);
+    g.exit_retained.remove(&arena);
 }
 
 /// Drop every top-layer arena in the subtree rooted at `root`
@@ -22963,6 +23605,7 @@ fn prune_shim_top_layer_subtree(
     let mut g = roots.borrow_mut();
     for arena in arenas {
         g.top_layer_remove(arena);
+        g.exit_retained.remove(&arena);
     }
 }
 
@@ -22976,7 +23619,9 @@ fn prune_shim_top_layer_subtree(
 fn drop_shim_dialog_arena(id: u64, arena: usize) {
     let roots = PARSE_HOSTS.with(|hosts| hosts.borrow().get(&id).map(|e| e.listeners.clone()));
     let Some(roots) = roots else { return };
-    roots.borrow_mut().dialog_open_remove(arena);
+    let mut g = roots.borrow_mut();
+    g.dialog_open_remove(arena);
+    g.exit_retained.remove(&arena);
 }
 
 /// Drop every dialog open/modal arena in the subtree rooted at
@@ -23004,6 +23649,7 @@ fn prune_shim_dialog_subtree(
     let mut g = roots.borrow_mut();
     for arena in arenas {
         g.dialog_open_remove(arena);
+        g.exit_retained.remove(&arena);
     }
 }
 
@@ -24371,14 +25017,15 @@ fn decl_value_preserving_math(
     // parse-shim store and production `el.style`); the generic
     // list serializer would space-join them, corrupting the layer
     // structure exactly as on the computed surface (see
-    // `cssom_computed_value`). `transition-behavior` is a single
-    // keyword, never a list.
+    // `cssom_computed_value`). `transition-behavior` joins too
+    // (w82: multi-layer shorthand behavior lists).
     if matches!(
         prop,
         "transition-property"
             | "transition-duration"
             | "transition-delay"
             | "transition-timing-function"
+            | "transition-behavior"
     ) && let CssValue::List(items) = value
         && !items.is_empty()
     {
@@ -25310,48 +25957,61 @@ const FONT_SHORTHAND_LONGHANDS: &[&str] = &[
 /// The three longhands `flex` expands to, in serialization order.
 const FLEX_SHORTHAND_LONGHANDS: &[&str] = &["flex-grow", "flex-shrink", "flex-basis"];
 
-/// The four longhands `transition` expands to, in shorthand
-/// grammar order (property, duration, delay, timing-function).
-/// `transition-behavior` is NOT a shorthand longhand: it is a
-/// separate longhand and never appears in the synthesis.
+/// The five longhands `transition` synthesis reads, in shorthand
+/// grammar order (property, duration, delay, timing-function,
+/// behavior). `transition-behavior` IS a shorthand longhand in
+/// Transitions 2 (w82, see the parser), and w82fix JS-M2 threads
+/// it through synthesis: dropping it made a shorthand-set
+/// behavior fail to round-trip through `el.style.transition` /
+/// computed `transition`, so a read-modify-write silently reset
+/// behavior to `normal` and killed the `display` transition.
 const TRANSITION_LONGHANDS: &[&str] = &[
     "transition-property",
     "transition-duration",
     "transition-delay",
     "transition-timing-function",
+    "transition-behavior",
 ];
 
-/// Serialize one `transition` shorthand from its four longhand
+/// Serialize one `transition` shorthand from its five longhand
 /// serializations, dropping initial components (delay `0s`,
-/// timing `ease`) so `transition: overlay 1s` round-trips as
-/// `overlay 1s` and an unset element reads `all 0s`. Duration is
-/// always kept, even when `0s`. Serialization order is property,
-/// duration, timing (when non-`ease`), delay (when non-zero) —
-/// the CSS Transitions serialization order. Multi-layer longhands
-/// (comma-joined layer strings) synthesize per layer and re-join
-/// with `", "`; a shorter list repeats to the longest layer count
-/// (CSS list repetition). A lone CSS-wide keyword on every
-/// longhand reads back as that keyword; differing wide keywords
-/// yield `None`, like the `border` forms. Used by both the
-/// specified-style synthesis and the computed-style synthesis, so
-/// the two surfaces cannot drift.
+/// timing `ease`, behavior `normal`) so `transition: overlay 1s`
+/// round-trips as `overlay 1s` and an unset element reads
+/// `all 0s`. Duration is always kept, even when `0s`.
+/// Serialization order is property, duration, timing (when
+/// non-`ease`), delay (when non-zero), behavior (when
+/// non-`normal`) — the CSS Transitions serialization order.
+/// Multi-layer longhands (comma-joined layer strings)
+/// synthesize per layer and re-join with `", "`; a shorter list
+/// repeats to the longest layer count (CSS list repetition,
+/// same `i % len` cycling for behavior as for the other four).
+/// A lone CSS-wide keyword on every longhand reads back as
+/// that keyword; differing wide keywords yield `None`, like
+/// the `border` forms. Used by both the specified-style
+/// synthesis and the computed-style synthesis, so the two
+/// surfaces cannot drift.
 fn transition_shorthand_string(
     property: &str,
     duration: &str,
     delay: &str,
     timing: &str,
+    behavior: &str,
 ) -> Option<String> {
-    if [property, duration, delay, timing]
+    if [property, duration, delay, timing, behavior]
         .iter()
         .any(|v| is_css_wide_keyword_str(v))
     {
-        return if property == duration && property == delay && property == timing {
+        return if property == duration
+            && property == delay
+            && property == timing
+            && property == behavior
+        {
             Some(property.to_string())
         } else {
             None
         };
     }
-    let layers: Vec<Vec<String>> = [property, duration, delay, timing]
+    let layers: Vec<Vec<String>> = [property, duration, delay, timing, behavior]
         .iter()
         .map(|v| split_top_level_commas(v))
         .collect();
@@ -25359,7 +26019,7 @@ fn transition_shorthand_string(
     let mut out = Vec::with_capacity(count);
     for i in 0..count {
         let at = |j: usize| layers[j][i % layers[j].len()].as_str();
-        let (p, d, dl, t) = (at(0), at(1), at(2), at(3));
+        let (p, d, dl, t, b) = (at(0), at(1), at(2), at(3), at(4));
         let mut parts = vec![p.to_string(), d.to_string()];
         if t != "ease" {
             parts.push(t.to_string());
@@ -25367,24 +26027,40 @@ fn transition_shorthand_string(
         if dl != "0s" && dl != "0" {
             parts.push(dl.to_string());
         }
+        if b != "normal" && !b.is_empty() {
+            parts.push(b.to_string());
+        }
         out.push(parts.join(" "));
     }
     Some(out.join(", "))
 }
 
 /// Specified-style `transition` synthesis from the expanded
-/// longhand declarations (the parser always emits all four for a
+/// longhand declarations (the parser always emits all five for a
 /// shorthand set, resetting omitted ones to their initials, so a
-/// missing longhand yields `None`).
+/// missing longhand yields `None` — except `transition-behavior`,
+/// which longhand-only declarations never set: it defaults to
+/// its initial `normal` rather than failing the synthesis, or
+/// setting longhands individually would stop `transition` from
+/// reading back at all).
 fn synthesize_transition_shorthand(decls: &[(String, String)], prop: &str) -> Option<String> {
     if prop != "transition" {
         return None;
     }
-    let vals: Vec<&str> = TRANSITION_LONGHANDS
+    let vals: Option<Vec<&str>> = TRANSITION_LONGHANDS
         .iter()
         .map(|lh| decl_value(decls, lh))
-        .collect::<Option<Vec<_>>>()?;
-    transition_shorthand_string(vals[0], vals[1], vals[2], vals[3])
+        .collect();
+    match vals {
+        Some(vals) => transition_shorthand_string(vals[0], vals[1], vals[2], vals[3], vals[4]),
+        None => {
+            let vals: Vec<&str> = TRANSITION_LONGHANDS[..4]
+                .iter()
+                .map(|lh| decl_value(decls, lh))
+                .collect::<Option<Vec<_>>>()?;
+            transition_shorthand_string(vals[0], vals[1], vals[2], vals[3], "normal")
+        }
+    }
 }
 
 fn decl_value<'a>(decls: &'a [(String, String)], prop: &str) -> Option<&'a str> {
@@ -26223,16 +26899,18 @@ fn synthesize_computed_shorthands(props: &mut HashMap<String, String>) {
         }
     }
     // w80: `transition` in initial-dropping form (same core as the
-    // specified synthesis, so the surfaces agree): delay `0s` and
-    // timing `ease` drop, duration is always kept. This only fires
-    // when the props map carries all four longhands.
+    // specified synthesis, so the surfaces agree): delay `0s`,
+    // timing `ease`, and behavior `normal` drop, duration is
+    // always kept. This only fires when the props map carries
+    // all five longhands (the computed tables always do).
     {
         let vals: Option<Vec<String>> = TRANSITION_LONGHANDS
             .iter()
             .map(|lh| props.get(*lh).cloned())
             .collect();
         if let Some(vals) = vals
-            && let Some(short) = transition_shorthand_string(&vals[0], &vals[1], &vals[2], &vals[3])
+            && let Some(short) =
+                transition_shorthand_string(&vals[0], &vals[1], &vals[2], &vals[3], &vals[4])
         {
             props.insert("transition".to_string(), short);
         }
@@ -28829,8 +29507,9 @@ impl ParseLayoutHook {
         el: ScriptElement,
         top_layer: &[(usize, TopLayerShowKind)],
         dialog_modal: &HashSet<usize>,
+        exit_retained: &[(usize, TopLayerShowKind, f64)],
     ) -> Option<HashMap<String, String>> {
-        let data = self.style_data(host, top_layer, dialog_modal)?;
+        let data = self.style_data(host, top_layer, dialog_modal, exit_retained)?;
         let node = *data.arena_node.get(&el.arena_index())?;
         let sheet_refs: Vec<&Stylesheet> = data.sheets.iter().collect();
         let viewport = Viewport {
@@ -29212,8 +29891,9 @@ impl ParseLayoutHook {
         el: ScriptElement,
         top_layer: &[(usize, TopLayerShowKind)],
         dialog_modal: &HashSet<usize>,
+        exit_retained: &[(usize, TopLayerShowKind, f64)],
     ) -> Option<HashMap<String, String>> {
-        let data = self.style_data(host, top_layer, dialog_modal)?;
+        let data = self.style_data(host, top_layer, dialog_modal, exit_retained)?;
         let node = *data.arena_node.get(&el.arena_index())?;
         let sheet_refs: Vec<&Stylesheet> = data.sheets.iter().collect();
         let viewport = Viewport {
@@ -29280,12 +29960,13 @@ impl ParseLayoutHook {
         host: &mut ScriptHost<'_, '_, '_>,
         top_layer: &[(usize, TopLayerShowKind)],
         dialog_modal: &HashSet<usize>,
+        exit_retained: &[(usize, TopLayerShowKind, f64)],
     ) -> Option<Rc<ParseStyleData>> {
         let count = host.mutation_count();
         if let Some((_, data)) = self.style_cache.iter().find(|(c, _)| *c == count) {
             return Some(Rc::clone(data));
         }
-        let data = Rc::new(self.build_style_data(host, top_layer, dialog_modal)?);
+        let data = Rc::new(self.build_style_data(host, top_layer, dialog_modal, exit_retained)?);
         // `build_style_data`'s snapshot may have flushed buffered
         // text (bumping the count); key the entry by the post-build
         // count, exactly like the layout entries.
@@ -29312,6 +29993,7 @@ impl ParseLayoutHook {
         host: &mut ScriptHost<'_, '_, '_>,
         top_layer: &[(usize, TopLayerShowKind)],
         dialog_modal: &HashSet<usize>,
+        exit_retained: &[(usize, TopLayerShowKind, f64)],
     ) -> Option<ParseStyleData> {
         let root_el = host.document_element()?;
         let mut rec = SnapshotRecorder::new();
@@ -29354,9 +30036,7 @@ impl ParseLayoutHook {
                     }
                 }
                 TopLayerShowKind::ModalDialog => {
-                    if doc.is_dialog_element(*node)
-                        && doc.get_attribute(*node, "open").is_some()
-                    {
+                    if doc.is_dialog_element(*node) && doc.get_attribute(*node, "open").is_some() {
                         doc.promote_to_top_layer(*node);
                         doc.mark_dialog_modal(*node);
                     }
@@ -29376,6 +30056,32 @@ impl ParseLayoutHook {
             {
                 doc.promote_to_top_layer(*node);
                 doc.mark_dialog_modal(*node);
+            }
+        }
+        // w82: exit retentions promote as retentions, not live
+        // members — the rebuilt cascade must see the closing
+        // dialog/popover as top-layer (for the overlay
+        // exemption, `:modal` / `:popover-open`, and the
+        // retained-dialog display suppression) even though its
+        // `open` attribute is gone and the live loop above
+        // skipped it. Same attribute backstops as the live
+        // loop: a detached or attribute-stripped arena never
+        // retains.
+        for &(arena, kind, remaining) in exit_retained {
+            let Some(node) = arena_node.get(&arena) else {
+                continue;
+            };
+            match kind {
+                TopLayerShowKind::Popover => {
+                    if doc.get_attribute(*node, "popover").is_some() {
+                        doc.retain_top_layer_for_exit(*node, remaining, false);
+                    }
+                }
+                TopLayerShowKind::ModalDialog => {
+                    if doc.is_dialog_element(*node) {
+                        doc.retain_top_layer_for_exit(*node, remaining, true);
+                    }
+                }
             }
         }
         let sheets: Vec<Stylesheet> = self.harvested_sheets(&rec);
@@ -31703,6 +32409,23 @@ fn parse_popover_state(
 /// after a show in the same script would serve the pre-show
 /// document (the open -> auto, close -> none, reopen -> auto
 /// sequence in overlay-transition.html runs exactly this way).
+/// Reconciled retention rule (w82 final review, same as
+/// production [`Document::hide_popover`] /
+/// [`Document::toggle_popover`]): an exit-retained popover is
+/// already hidden for API purposes, so `hidePopover`, a bare
+/// `togglePopover`, and `togglePopover(false)` on it are all
+/// no-ops that leave the retention alone; only a show —
+/// `showPopover` or `togglePopover(true)` — cancels the
+/// retention and re-opens it. Pre-existing divergence, NOT
+/// covered by that reconciliation (and not by the B1
+/// victim-toggle fix, which is a production click-path fix):
+/// the shim fires no `toggle` events at all — a mid-parse
+/// auto-close silently demotes the victim, where production
+/// fires a `toggle` for every auto-closed popover. The shim
+/// has no event-dispatch path mid-parse, so that gap stays
+/// until a shim dispatch exists; it is not a state-machine
+/// difference and must not be "fixed" by inventing events
+/// here.
 fn parse_popover_apply(
     id: u64,
     host: *mut ScriptHost<'static, 'static, 'static>,
@@ -31732,6 +32455,26 @@ fn parse_popover_apply(
             .get(&id)
             .is_some_and(|entry| entry.listeners.borrow().dialog_modal.contains(&arena))
     });
+    // w82: an exit-retained popover is closing, not live-open.
+    // Reconciled rule (w82 final review, same as production):
+    // it counts as hidden for API purposes, so a hide, a bare
+    // toggle, and a forced-false toggle are no-ops that leave
+    // the retention alone; only a show (a forced-true toggle
+    // or a `showPopover`) re-opens it, cancelling the
+    // retention. It still counts as open for show validation
+    // only in the sense that a live show is impossible — the
+    // show branch below cancels the retention first, like
+    // production `show_popover`.
+    let is_retained = PARSE_HOSTS.with(|hosts| {
+        hosts.borrow().get(&id).is_some_and(|entry| {
+            entry
+                .listeners
+                .borrow()
+                .exit_retained
+                .get(&arena)
+                .is_some_and(|(expiry, _)| *expiry > Instant::now())
+        })
+    });
     // w80fix: the forced no-op arms come BEFORE validity, like
     // production `Document::toggle_popover`: open-ness is
     // well-defined without the attribute (not in the shim set
@@ -31740,7 +32483,16 @@ fn parse_popover_apply(
     // `togglePopover(true)` on an open popover returns true.
     match (op, force) {
         ("togglePopover", Some(true)) if is_open => return Ok(true),
+        // Reconciled retention rule (w82 final review):
+        // retained counts as hidden, so a forced-false or bare
+        // toggle on it is a no-op returning false, before
+        // validity like the other forced arms. A forced-true
+        // toggle is NOT a no-op here: it falls through to the
+        // show branch below, which cancels the retention and
+        // re-opens.
+        ("togglePopover", Some(false)) if is_retained => return Ok(false),
         ("togglePopover", Some(false)) if !is_open => return Ok(false),
+        ("togglePopover", None) if is_retained => return Ok(false),
         _ => {}
     }
     let state = parse_popover_state(host_ref, el).ok_or_else(|| {
@@ -31748,11 +32500,22 @@ fn parse_popover_apply(
             "{op}: NotSupportedError: element has no popover attribute"
         ))
     })?;
-    let show = match op {
-        "showPopover" => true,
-        "hidePopover" => false,
+    let show = match (op, force) {
+        ("showPopover", _) => true,
+        ("hidePopover", _) => false,
+        ("togglePopover", Some(true)) => true,
+        ("togglePopover", Some(false)) => false,
         _ => !is_open,
     };
+    // Reconciled retention rule, hide arm: `hidePopover` on a
+    // retained popover is a no-op that leaves the retention
+    // alone (the toggle arms already returned above). This
+    // sits AFTER validity on purpose: production
+    // `hide_popover` throws NotSupportedError for a
+    // non-popover, retained or not.
+    if !show && is_retained {
+        return Ok(false);
+    }
     if show {
         if !host_element_connected(host_ref, el) {
             return Err(err_type(format!(
@@ -31770,6 +32533,20 @@ fn parse_popover_apply(
             )));
         }
     }
+    // w82: measure BEFORE the mutation when hiding a shown
+    // popover (the pre-hide values are the exit's start values).
+    // A retained popover never reaches here (the no-op return
+    // above), so it is never re-measured into a fresh
+    // retention. Auto-closed others (below)
+    // demote synchronously: their exits are not measured
+    // here (the production `show_popover` path retains a
+    // live victim with a stored exit duration instead, but
+    // the shim has no stored durations to consult).
+    let exit = if !show && is_open {
+        shim_exit_transition_duration(id, host, el)
+    } else {
+        None
+    };
     PARSE_HOSTS.with(|hosts| {
         let mut hosts = hosts.borrow_mut();
         let entry = hosts
@@ -31777,6 +32554,8 @@ fn parse_popover_apply(
             .ok_or_else(|| err_type("document is not available outside the parser"))?;
         let mut roots = entry.listeners.borrow_mut();
         if show {
+            // Re-showing during an exit transition cancels it.
+            roots.exit_retained.remove(&arena);
             // Auto-close (same rule as `Document::show_popover`):
             // showing an `auto` popover closes every other open
             // `auto` popover except ancestors of this one. Ancestors
@@ -31808,6 +32587,9 @@ fn parse_popover_apply(
             roots.top_layer_insert(arena);
         } else {
             roots.top_layer_remove(arena);
+            if let Some(d) = exit {
+                roots.exit_retain(arena, TopLayerShowKind::Popover, d);
+            }
         }
         // Drop this installation's style/layout caches (see the fn
         // docs): the next computed-style read rebuilds with the new
@@ -31884,7 +32666,10 @@ fn parse_dialog_is_dialog(
         return false;
     }
     let ns = PARSE_HOSTS.with(|hosts| {
-        let entry = hosts.borrow().get(&id).map(|e| (e.host, e.enum_cache.clone()))?;
+        let entry = hosts
+            .borrow()
+            .get(&id)
+            .map(|e| (e.host, e.enum_cache.clone()))?;
         let (host_ptr, cache) = entry;
         if host_ptr.is_null() {
             return None;
@@ -31973,6 +32758,12 @@ fn parse_dialog_show(
         let entry = hosts
             .get_mut(&id)
             .ok_or_else(|| err_type("document is not available outside the parser"))?;
+        // Re-showing during an exit transition cancels it.
+        entry
+            .listeners
+            .borrow_mut()
+            .exit_retained
+            .remove(&el.arena_index());
         entry
             .listeners
             .borrow_mut()
@@ -31984,6 +32775,34 @@ fn parse_dialog_show(
     Ok(())
 }
 
+/// The exit-transition duration for a shim element, read from
+/// its CURRENT (pre-close / pre-hide) computed style through
+/// the shim's whole-tree rebuild — the production helper's
+/// parse-phase twin. `None` means no exit transition applies
+/// and the caller demotes synchronously. Must be called
+/// BEFORE the close/hide mutation; fail-closed (`None`) when
+/// the rebuild is unavailable, so a style failure can never
+/// turn a close into a stuck retention.
+fn shim_exit_transition_duration(
+    id: u64,
+    host: *mut ScriptHost<'static, 'static, 'static>,
+    el: ScriptElement,
+) -> Option<f64> {
+    PARSE_HOSTS.with(|hosts| {
+        let mut hosts = hosts.borrow_mut();
+        let entry = hosts.get_mut(&id)?;
+        let top = entry.listeners.borrow().top_layer_show_ordered();
+        let dialog_modal = entry.listeners.borrow().dialog_modal.clone();
+        let retained = entry.listeners.borrow().exit_retained_live();
+        let host_ref = deref_parse_host(host);
+        let props =
+            entry
+                .layout_hook
+                .computed_props(host_ref, el, &top, &dialog_modal, &retained)?;
+        crate::transition::exit_transition_duration(&props)
+    })
+}
+
 /// Shared close core for the shim dialog native: returns `true`
 /// when the dialog was open and is now closed (the caller fires
 /// the `close` event exactly then), `false` for a closed dialog
@@ -31991,7 +32810,14 @@ fn parse_dialog_show(
 /// one before closing; `None` keeps it. Closing removes the
 /// `open` attribute from the parser's tree and drops the
 /// method-open / modal records (the stored `returnValue`
-/// survives, as in production).
+/// survives, as in production). When the pre-close computed
+/// style measured a positive exit transition and the dialog
+/// was in the live top layer in either capacity (modal, or
+/// popover via `showPopover()` — w82fix JS-m4), the close
+/// additionally records an exit retention (w82): the dialog
+/// leaves the live top-layer sets but keeps rendering until
+/// the transition finishes, and the production adoption
+/// promotes the retention (see [`adopt_shim_top_layer`]).
 fn parse_dialog_close(
     id: u64,
     host: *mut ScriptHost<'static, 'static, 'static>,
@@ -32007,6 +32833,29 @@ fn parse_dialog_close(
     if !parse_dialog_is_open(id, host_ref, el) {
         return Ok(false);
     }
+    // w82: measure BEFORE the mutation (the pre-close values
+    // are the exit's start values). w82fix JS-m4: retain
+    // whenever the dialog is in the live top layer in EITHER
+    // capacity, like production `close_dialog_deferred`
+    // (which retains for any live top-layer member and only
+    // records `was_modal`): a dialog opened via `show()` and
+    // then top-layered via `showPopover()` sits in the shim
+    // `top_layer` set but not in `dialog_modal`, and the old
+    // `was_modal`-only gate dropped its exit transition. The
+    // kind follows `was_modal` (a non-modal top-layer dialog
+    // retains as a popover, so `:modal` stays unmatched during
+    // retention, matching production's recorded flag).
+    let exit = shim_exit_transition_duration(id, host, el);
+    let (was_modal, in_top_layer) = PARSE_HOSTS.with(|hosts| {
+        hosts.borrow().get(&id).map_or((false, false), |entry| {
+            let roots = entry.listeners.borrow();
+            (
+                roots.dialog_modal.contains(&el.arena_index()),
+                roots.dialog_modal.contains(&el.arena_index())
+                    || roots.top_layer.contains(&el.arena_index()),
+            )
+        })
+    });
     host_ref.remove_attribute(el, "open");
     PARSE_HOSTS.with(|hosts| {
         let mut hosts = hosts.borrow_mut();
@@ -32018,6 +32867,14 @@ fn parse_dialog_close(
             roots.dialog_return.insert(el.arena_index(), v);
         }
         roots.dialog_open_remove(el.arena_index());
+        if in_top_layer && let Some(d) = exit {
+            let kind = if was_modal {
+                TopLayerShowKind::ModalDialog
+            } else {
+                TopLayerShowKind::Popover
+            };
+            roots.exit_retain(el.arena_index(), kind, d);
+        }
         entry.layout_hook.style_cache.clear();
         entry.layout_hook.entries.clear();
         Ok::<(), NativeError>(())
@@ -32117,10 +32974,7 @@ fn parse_dialog_fire_close(heap: &mut Heap, this: Value, id: u64, el: ScriptElem
                 )
             } else {
                 Some(rec.listeners.iter().any(|l| {
-                    l.etype == "close"
-                        && l.callback == cb
-                        && l.capture == capture
-                        && l.seq == seq
+                    l.etype == "close" && l.callback == cb && l.capture == capture && l.seq == seq
                 }))
             }
         });
@@ -32314,10 +33168,11 @@ fn n_parse_el_matches(heap: &mut Heap, this: Value, args: &[Value]) -> Result<Va
         let entry = hosts.get_mut(&id)?;
         let top = entry.listeners.borrow().top_layer_show_ordered();
         let dialog_modal = entry.listeners.borrow().dialog_modal.clone();
+        let retained = entry.listeners.borrow().exit_retained_live();
         let host_ref = deref_parse_host(entry.host);
         let data = entry
             .layout_hook
-            .style_data(host_ref, &top, &dialog_modal)?;
+            .style_data(host_ref, &top, &dialog_modal, &retained)?;
         let node = *data.arena_node.get(&el.arena_index())?;
         Some(data.doc.matches(node, &sel))
     });
@@ -33036,14 +33891,15 @@ fn n_parse_get_computed_style(
         let host_ref = deref_parse_host(host);
         let top = entry.listeners.borrow().top_layer_show_ordered();
         let dialog_modal = entry.listeners.borrow().dialog_modal.clone();
+        let retained = entry.listeners.borrow().exit_retained_live();
         if is_backdrop {
             entry
                 .layout_hook
-                .backdrop_computed_props(host_ref, el, &top, &dialog_modal)
+                .backdrop_computed_props(host_ref, el, &top, &dialog_modal, &retained)
         } else {
             entry
                 .layout_hook
-                .computed_props(host_ref, el, &top, &dialog_modal)
+                .computed_props(host_ref, el, &top, &dialog_modal, &retained)
         }
     });
     let mut values = match cascaded {
@@ -33087,7 +33943,25 @@ fn n_parse_get_computed_style(
     // originator's keyed values must not leak into them.
     if !is_backdrop {
         let key = format!("parse:{id}:{}", el.arena_index());
-        crate::transition::apply_transitions(&key, &mut values);
+        // w82fix JS-M1, shim half of the production branch
+        // above: an exit-retained arena pins the transition
+        // baseline instead of running the engine (same phantom
+        // post-expiry transition otherwise).
+        let shim_retained = PARSE_HOSTS.with(|hosts| {
+            hosts.borrow().get(&id).is_some_and(|entry| {
+                entry
+                    .listeners
+                    .borrow()
+                    .exit_retained
+                    .get(&el.arena_index())
+                    .is_some_and(|(expiry, _)| *expiry > Instant::now())
+            })
+        });
+        if shim_retained {
+            crate::transition::apply_transitions_retained(&key, &mut values);
+        } else {
+            crate::transition::apply_transitions(&key, &mut values);
+        }
         // w81: same hook as production (see `crate::animation`):
         // discrete keyframed properties step and numeric ones
         // interpolate at the current time, overwriting the
@@ -38804,6 +39678,17 @@ mod tests {
             cssom_computed_value("transition-behavior", &CssValue::Keyword("normal".into())),
             "normal"
         );
+        // w82: a per-layer behavior list comma-joins too.
+        assert_eq!(
+            cssom_computed_value(
+                "transition-behavior",
+                &list(vec![
+                    CssValue::Keyword("allow-discrete".into()),
+                    CssValue::Keyword("allow-discrete".into()),
+                ])
+            ),
+            "allow-discrete, allow-discrete"
+        );
     }
 
     #[test]
@@ -38832,6 +39717,101 @@ mod tests {
         );
         assert_eq!(find(&prod, "transition-duration"), "1s, 100s");
         assert_eq!(find(&prod, "transition-timing-function"), "linear, ease");
+    }
+
+    #[test]
+    fn transition_shorthand_round_trips_behavior() {
+        // w82fix JS-M2: `transition-behavior` threads through
+        // synthesis as a fifth component, or a read-modify-write
+        // round-trip silently resets it to `normal` and kills
+        // the `display` transition.
+        assert_eq!(
+            transition_shorthand_string(
+                "overlay, display",
+                "2s, 2s",
+                "0s, 0s",
+                "ease, ease",
+                "allow-discrete, allow-discrete",
+            ),
+            Some("overlay 2s allow-discrete, display 2s allow-discrete".to_string())
+        );
+        // Initial behavior drops, like initial timing/delay.
+        assert_eq!(
+            transition_shorthand_string("overlay", "2s", "0s", "ease", "normal"),
+            Some("overlay 2s".to_string())
+        );
+        // A single behavior keyword cycles to every layer,
+        // like the other four components.
+        assert_eq!(
+            transition_shorthand_string(
+                "overlay, display",
+                "2s, 2s",
+                "0s, 0s",
+                "ease, ease",
+                "allow-discrete",
+            ),
+            Some("overlay 2s allow-discrete, display 2s allow-discrete".to_string())
+        );
+        // Non-ease timing + non-zero delay + behavior keep
+        // their serialization order (timing, delay, behavior).
+        assert_eq!(
+            transition_shorthand_string("opacity", "1s", "0.5s", "linear", "allow-discrete"),
+            Some("opacity 1s linear 0.5s allow-discrete".to_string())
+        );
+        // All-wide-keyword case: all five equal -> single keyword.
+        assert_eq!(
+            transition_shorthand_string("inherit", "inherit", "inherit", "inherit", "inherit"),
+            Some("inherit".to_string())
+        );
+        assert_eq!(
+            transition_shorthand_string("inherit", "inherit", "inherit", "inherit", "normal"),
+            None
+        );
+        // Specified synthesis from the parser's five longhands.
+        let decls = vec![
+            (
+                "transition-property".to_string(),
+                "overlay, display".to_string(),
+            ),
+            ("transition-duration".to_string(), "2s, 2s".to_string()),
+            ("transition-delay".to_string(), "0s, 0s".to_string()),
+            (
+                "transition-timing-function".to_string(),
+                "ease, ease".to_string(),
+            ),
+            (
+                "transition-behavior".to_string(),
+                "allow-discrete, allow-discrete".to_string(),
+            ),
+        ];
+        assert_eq!(
+            synthesize_transition_shorthand(&decls, "transition"),
+            Some("overlay 2s allow-discrete, display 2s allow-discrete".to_string())
+        );
+        // Longhand-only declarations (no behavior set) default
+        // to `normal` instead of failing the synthesis.
+        let decls_no_behavior = decls[..4].to_vec();
+        assert_eq!(
+            synthesize_transition_shorthand(&decls_no_behavior, "transition"),
+            Some("overlay 2s, display 2s".to_string())
+        );
+        // Computed synthesis uses the same core: a props map
+        // carrying all five longhands reads the dialog shape.
+        let mut props: HashMap<String, String> = [
+            ("transition-property", "overlay, display"),
+            ("transition-duration", "2s, 2s"),
+            ("transition-delay", "0s, 0s"),
+            ("transition-timing-function", "ease, ease"),
+            ("transition-behavior", "allow-discrete, allow-discrete"),
+        ]
+        .iter()
+        .map(|(k, v)| (k.to_string(), v.to_string()))
+        .collect();
+        synthesize_computed_shorthands(&mut props);
+        assert_eq!(
+            props.get("transition").map(String::as_str),
+            Some("overlay 2s allow-discrete, display 2s allow-discrete")
+        );
     }
 
     #[test]
@@ -40842,8 +41822,9 @@ mod tests {
     // the backdrop call reads `""` for it.
     #[test]
     fn get_computed_style_backdrop_missing_style_is_empty_not_element_style() {
-        let mut fx =
-            setup("<html><body><div id=\"d\" style=\"background-color: red;\">x</div></body></html>");
+        let mut fx = setup(
+            "<html><body><div id=\"d\" style=\"background-color: red;\">x</div></body></html>",
+        );
         fx.apis.borrow_mut().ua_stylesheet = parse_stylesheet("");
         let el = call_get_element_by_id(&mut fx, "d");
         let global = Value::Object(fx.global);
@@ -40857,7 +41838,10 @@ mod tests {
         let pseudo = str_val(&mut fx, "::backdrop");
         let decl = n_get_computed_style(&mut fx.heap, global, &[el, pseudo]).unwrap();
         assert_eq!(prop(&mut fx, decl, "background-color"), "");
-        assert_eq!(computed_prop(&mut fx, el, "background-color"), "rgb(255, 0, 0)");
+        assert_eq!(
+            computed_prop(&mut fx, el, "background-color"),
+            "rgb(255, 0, 0)"
+        );
     }
 
     #[test]
@@ -44820,13 +45804,7 @@ mod tests {
             .unwrap();
         def(&mut fx.heap, neg_obj, "duration", Value::Int(-250)).unwrap();
         def(&mut fx.heap, neg_obj, "iterations", Value::Float(-3.0)).unwrap();
-        def(
-            &mut fx.heap,
-            neg_obj,
-            "iterationStart",
-            Value::Float(-0.5),
-        )
-        .unwrap();
+        def(&mut fx.heap, neg_obj, "iterationStart", Value::Float(-0.5)).unwrap();
         let neg_opts = parse_animation_options(&mut fx.heap, Value::Object(neg_obj)).unwrap();
         assert_eq!(neg_opts.duration_ms, -250.0);
         assert_eq!(neg_opts.iterations, 0.0);
@@ -46331,6 +47309,30 @@ mod tests {
                  && (ev instanceof SnapEvent) \
                  && window.onscrollsnapchange === null \
                  && window.onscrollsnapchanging === null;",
+            )
+            .unwrap();
+        assert_eq!(ok, Value::Bool(true));
+        drop(guard);
+    }
+
+    #[test]
+    fn parse_shim_toggle_event_mirror() {
+        // w82fix JS-m3: mid-parse, `new ToggleEvent(...)`
+        // works through the shim mirror, like `SnapEvent`:
+        // init states read as DOM strings (default `""`),
+        // and `instanceof ToggleEvent` holds.
+        let mut vm = Vm::new();
+        let guard = install_parse_document_shim(&mut vm, std::ptr::null_mut(), None).unwrap();
+        assert!(vm.eval("new ToggleEvent();").is_err());
+        let ok = vm
+            .eval(
+                "var ev = new ToggleEvent('toggle', \
+                     {oldState: 'closed', newState: 'open'}); \
+                 ev.oldState === 'closed' && ev.newState === 'open' \
+                 && ev.type === 'toggle' && ev.bubbles === false \
+                 && (ev instanceof ToggleEvent) \
+                 && new ToggleEvent('toggle').oldState === '' \
+                 && new ToggleEvent('toggle').newState === '';",
             )
             .unwrap();
         assert_eq!(ok, Value::Bool(true));
@@ -48165,6 +49167,44 @@ mod tests {
         remove_context(ContextId(ctx));
     }
 
+    #[test]
+    fn parse_shim_dialog_show_plus_show_popover_close_retains() {
+        // w82fix JS-m4: a dialog opened via `show()` and then
+        // top-layered via `showPopover()` is in the shim
+        // `top_layer` set but not in `dialog_modal`; closing
+        // it must still retain its exit transition (like
+        // production `close_dialog_deferred`, which retains
+        // for any live top-layer member), as a popover
+        // retention — `:modal` stays unmatched.
+        let (mut probe, doc, ctx) = captured_install(
+            b"<html><body><dialog id=\"d\" popover>hi</dialog><script>\
+              globalThis.__d = document.getElementById('d');\
+              __d.style.transition = 'overlay 2s allow-discrete, display 2s allow-discrete';\
+              __d.show();\
+              try { __d.showPopover(); globalThis.__popErr = 'no-throw'; }\
+              catch (e) { globalThis.__popErr = String(e); }\
+              globalThis.__inTop = String(__d.matches(':popover-open'));\
+              __d.close();\
+              </script></body></html>",
+        );
+        assert_eq!(
+            node_list_str(&mut probe.vm, "globalThis.__popErr;"),
+            "no-throw"
+        );
+        assert_eq!(node_list_str(&mut probe.vm, "globalThis.__inTop;"), "true");
+        let d_node = doc.borrow().get_element_by_id("d").expect("dialog#d");
+        assert!(
+            doc.borrow().is_exit_retained(d_node),
+            "show()+showPopover() dialog close must retain (top-layer in popover capacity)"
+        );
+        assert!(doc.borrow().is_in_top_layer(d_node));
+        assert!(
+            !doc.borrow().is_dialog_modal(d_node),
+            "a non-modal top-layer dialog retains as a popover, not as modal"
+        );
+        remove_context(ContextId(ctx));
+    }
+
     // w81fix (JS L5 / whole L7): a foreign-namespace element
     // named `dialog` is not a dialog on the shim either — the
     // old tag-only check let an SVG `dialog` through `showModal`
@@ -48216,10 +49256,7 @@ mod tests {
               __d.close();\
               </script></body></html>",
         );
-        assert_eq!(
-            node_list_str(&mut probe.vm, "__seen.join(';');"),
-            "first"
-        );
+        assert_eq!(node_list_str(&mut probe.vm, "__seen.join(';');"), "first");
         remove_context(ContextId(ctx));
     }
 
@@ -48471,6 +49508,81 @@ mod tests {
         assert_eq!(
             node_list_str(&mut probe.vm, "__out.join(';');"),
             "false;false;false;true;true;notsupported"
+        );
+        remove_context(ContextId(ctx));
+    }
+
+    // w82 final review (reconciled retention rule): a
+    // mid-parse popover hidden with a positive exit transition
+    // is exit-retained (`:popover-open` still matches), and a
+    // further `hidePopover`, bare `togglePopover`, or
+    // `togglePopover(false)` on it is a no-op that leaves the
+    // retention alone — the old shim ended the retention
+    // here, contradicting production `hide_popover` /
+    // `toggle_popover`. Adoption carries the retention into
+    // production intact.
+    #[test]
+    fn parse_shim_popover_retained_hide_and_toggle_are_noops() {
+        let (mut probe, doc, ctx) = captured_install(
+            b"<html><body><div id=\"p\" popover>hi</div><script>\
+              globalThis.__p = document.getElementById('p');\
+              __p.style.transition = 'overlay 2s allow-discrete, display 2s allow-discrete';\
+              globalThis.__out = [];\
+              __p.showPopover();\
+              __out.push(String(__p.matches(':popover-open')));\
+              __p.hidePopover();\
+              __out.push(String(__p.matches(':popover-open')));\
+              __p.hidePopover();\
+              __out.push(String(__p.matches(':popover-open')));\
+              __out.push(String(__p.togglePopover()));\
+              __out.push(String(__p.matches(':popover-open')));\
+              __out.push(String(__p.togglePopover(false)));\
+              __out.push(String(__p.matches(':popover-open')));\
+              </script></body></html>",
+        );
+        assert_eq!(
+            node_list_str(&mut probe.vm, "__out.join(';');"),
+            "true;true;true;false;true;false;true"
+        );
+        let p_node = doc.borrow().get_element_by_id("p").expect("div#p");
+        assert!(
+            doc.borrow().is_exit_retained(p_node),
+            "retention must survive the no-op hide/toggle arms into adoption"
+        );
+        assert!(doc.borrow().is_popover_open(p_node));
+        remove_context(ContextId(ctx));
+    }
+
+    // w82 final review (reconciled retention rule, show arm):
+    // `togglePopover(true)` on an exit-retained popover
+    // cancels the retention and re-opens it live — a second
+    // `showPopover` then throws InvalidStateError, proving the
+    // re-open is live rather than a retained no-op or a hide.
+    #[test]
+    fn parse_shim_popover_retained_forced_true_reopens() {
+        let (mut probe, doc, ctx) = captured_install(
+            b"<html><body><div id=\"p\" popover>hi</div><script>\
+              globalThis.__p = document.getElementById('p');\
+              __p.style.transition = 'overlay 2s allow-discrete, display 2s allow-discrete';\
+              globalThis.__out = [];\
+              __p.showPopover();\
+              __p.hidePopover();\
+              __out.push(String(__p.matches(':popover-open')));\
+              __out.push(String(__p.togglePopover(true)));\
+              try { __p.showPopover(); __out.push('no-throw'); }\
+              catch (e) { __out.push(String(e).indexOf('InvalidStateError') >= 0 ? 'invalidstate' : 'other:' + String(e)); }\
+              __out.push(String(__p.matches(':popover-open')));\
+              </script></body></html>",
+        );
+        assert_eq!(
+            node_list_str(&mut probe.vm, "__out.join(';');"),
+            "true;true;invalidstate;true"
+        );
+        let p_node = doc.borrow().get_element_by_id("p").expect("div#p");
+        assert!(doc.borrow().is_popover_open(p_node));
+        assert!(
+            !doc.borrow().is_exit_retained(p_node),
+            "forced-true re-open must cancel the retention, not leave it live"
         );
         remove_context(ContextId(ctx));
     }
@@ -48877,6 +49989,68 @@ mod tests {
             Value::Bool(false)
         );
         assert_eq!(computed_prop(&mut fx, p2, "overlay"), "none");
+    }
+
+    #[test]
+    fn production_popover_natives_fire_toggle_only_on_change() {
+        // w82 fixpaths B1: show/hide/toggle fire a `toggle`
+        // event exactly when visibility changes, with the
+        // auto-closed victim's event before the new target's.
+        let mut fx = setup(
+            "<html><body><div id=\"p\" popover=\"auto\"></div><div id=\"p2\" popover=\"auto\"></div></body></html>",
+        );
+        let p = call_get_element_by_id(&mut fx, "p");
+        let p2 = call_get_element_by_id(&mut fx, "p2");
+        let listener = probe_listener(&mut fx.heap);
+        add_listener(&mut fx, p, "toggle", listener, false);
+        add_listener(&mut fx, p2, "toggle", listener, false);
+        let targets = |fx: &Fixture| -> Vec<Option<String>> {
+            dispatch_log(fx).into_iter().map(|(_, id)| id).collect()
+        };
+        // Show p: one toggle, on p.
+        n_show_popover(&mut fx.heap, p, &[]).unwrap();
+        assert_eq!(targets(&fx), vec![Some("p".to_string())]);
+        fx.invoker.borrow().calls.borrow_mut().clear();
+        // Show p2: auto-closes p first, then p2's own toggle.
+        n_show_popover(&mut fx.heap, p2, &[]).unwrap();
+        assert_eq!(
+            targets(&fx),
+            vec![Some("p".to_string()), Some("p2".to_string())]
+        );
+        fx.invoker.borrow().calls.borrow_mut().clear();
+        // Double-show throws and fires nothing.
+        assert!(n_show_popover(&mut fx.heap, p2, &[]).is_err());
+        assert!(targets(&fx).is_empty());
+        // Hide p2, then hide again (no-op): one toggle total.
+        n_hide_popover(&mut fx.heap, p2, &[]).unwrap();
+        assert_eq!(targets(&fx), vec![Some("p2".to_string())]);
+        fx.invoker.borrow().calls.borrow_mut().clear();
+        n_hide_popover(&mut fx.heap, p2, &[]).unwrap();
+        assert!(targets(&fx).is_empty());
+        // Toggle on, forced-true no-op (no event), toggle off,
+        // forced-false no-op (no event).
+        assert_eq!(
+            n_toggle_popover(&mut fx.heap, p2, &[]).unwrap(),
+            Value::Bool(true)
+        );
+        assert_eq!(targets(&fx), vec![Some("p2".to_string())]);
+        fx.invoker.borrow().calls.borrow_mut().clear();
+        assert_eq!(
+            n_toggle_popover(&mut fx.heap, p2, &[Value::Bool(true)]).unwrap(),
+            Value::Bool(true)
+        );
+        assert!(targets(&fx).is_empty());
+        assert_eq!(
+            n_toggle_popover(&mut fx.heap, p2, &[]).unwrap(),
+            Value::Bool(false)
+        );
+        assert_eq!(targets(&fx), vec![Some("p2".to_string())]);
+        fx.invoker.borrow().calls.borrow_mut().clear();
+        assert_eq!(
+            n_toggle_popover(&mut fx.heap, p2, &[Value::Bool(false)]).unwrap(),
+            Value::Bool(false)
+        );
+        assert!(targets(&fx).is_empty());
     }
 
     // w81 phase 2: dialog production natives — show / showModal /

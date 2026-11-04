@@ -40,6 +40,7 @@ use std::fmt;
 use std::rc::Rc;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU32, Ordering};
+use std::time::{Duration, Instant};
 
 #[cfg(test)]
 mod tests;
@@ -592,6 +593,52 @@ impl fmt::Display for DialogError {
     }
 }
 
+/// One exit-transition retention (w82): the wall-clock instant
+/// the exit transition finishes, and whether the retained
+/// element was a modal dialog (so `:modal` keeps matching
+/// during retention, via [`Document::is_dialog_modal`]).
+/// `seq` is the element's original top-layer promotion
+/// sequence (w82fix Whole-M7): the paint order
+/// ([`Document::top_layer_with_retained`]) sorts live and
+/// retained members by it, so a retained element interleaves
+/// at its original position instead of painting above every
+/// live member (appending retentions in map order inverted a
+/// retained dialog below a still-live popover, and varied run
+/// to run). Assigned at promotion time, not at retention
+/// time: the retention creators demote from the live vec
+/// before inserting the record, so by then the live position
+/// is gone — the sequence survives in
+/// [`Document::top_layer_seq`].
+#[derive(Clone, Copy, Debug)]
+struct ExitRetention {
+    expires: Instant,
+    was_modal: bool,
+    seq: u64,
+}
+
+/// One dialog show/close event for the embedder's focus sync
+/// (w82 fix, HTML §4.11.4). The DOM records the *order* of dialog
+/// state changes, because the embedder only observes the document
+/// once per event-loop turn: a show and a close (or a close and a
+/// re-show) inside one turn are invisible to a final-state diff,
+/// yet each step has focus effects (move in on show, restore on
+/// close) that the next step depends on. The embedder drains this
+/// journal with [`Document::take_dialog_focus_events`] and replays
+/// it in order; events the journal does not cover (direct
+/// `open`-attribute removal, element removal, the parse shim's
+/// replayed dialog methods) are still caught by the embedder's
+/// final-state diff fallback. Only the production dialog methods
+/// append here; a failed show/close (error, or closing an already
+/// closed dialog) appends nothing.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum DialogFocusEvent {
+    /// `show()` (`modal: false`) or `showModal()` (`modal: true`).
+    Shown { node: NodeId, modal: bool },
+    /// `close()` (sync or deferred — the dialog is closed at close
+    /// time either way; retention delays rendering only).
+    Closed { node: NodeId },
+}
+
 /// An HTML document: the arena that owns every node.
 #[derive(Clone, Debug)]
 pub struct Document {
@@ -671,6 +718,26 @@ pub struct Document {
     /// attribute that was never shown is not in it, and an element
     /// whose `popover` attribute is removed while open is demoted.
     top_layer: Vec<NodeId>,
+    /// Promotion sequence per live top-layer member (w82fix
+    /// Whole-M7): assigned by [`Document::promote_to_top_layer`]
+    /// from [`Document::next_top_layer_seq`] on every real
+    /// push (a deduped no-op keeps the original sequence, a
+    /// re-show after a demotion gets a fresh one, so a
+    /// re-shown element paints topmost again). The retention
+    /// creators' direct vec edits deliberately do NOT clear
+    /// this map — the sequence must survive demotion into a
+    /// retention — so only the explicit demotion
+    /// ([`Document::remove_from_top_layer`], which the
+    /// subtree demotion funnels through) drops an entry.
+    /// Stale entries for expired retentions are inert (the
+    /// node is neither live nor retained) and bounded by the
+    /// arena size, like the other node-keyed maps.
+    top_layer_seq: HashMap<NodeId, u64>,
+    /// Next promotion sequence (monotonic; wrapping is
+    /// harmless — order is what matters, and two promotions
+    /// never share a value within one document's lifetime in
+    /// practice).
+    next_top_layer_seq: u64,
     /// Modal dialogs (HTML §4.11.4, w81 phase 2): the subset of
     /// open dialogs shown via `showModal` (or adopted as such from
     /// the parse shim). Membership is what makes `:modal` match
@@ -688,7 +755,81 @@ pub struct Document {
     /// here rather than on the element: it survives close and
     /// re-show, and defaults to `""` when absent (see
     /// [`Document::dialog_return_value`]).
+    /// Exit-transition retentions (w82, overlay-transition-dialog):
+    /// top-layer elements whose close/hide started an
+    /// `overlay` / `display` exit transition, keyed by node.
+    /// The element is already closed (its `open` attribute is
+    /// gone, its live top-layer membership is gone) but it must
+    /// keep rendering — in the top layer, with `:modal` /
+    /// `:popover-open` still matching — until `expires`, when
+    /// the exit transition finishes. Expiry is evaluated
+    /// lazily by wall clock on every read
+    /// ([`Document::is_exit_retained`]), so no timer or frame
+    /// hook is needed: a layout/paint pass before expiry sees
+    /// the element as top-layer, a pass after expiry does not.
+    /// Stale (expired) records are inert and are pruned by the
+    /// next `&mut` top-layer operation. Retention is created
+    /// only by the close/hide callers that measured an exit
+    /// transition (see [`Document::close_dialog_deferred`]);
+    /// `Document` itself knows nothing about CSS, so it cannot
+    /// decide on its own — a plain `close_dialog` /
+    /// `hide_popover` always demotes synchronously, exactly as
+    /// before. Limits, stated not hidden: a dialog re-opened
+    /// during retention cancels it (the show paths clear the
+    /// record); a direct `removeAttribute("open")` never
+    /// retains (it is not `close()`); and a non-modal dialog
+    /// close never retains (it was never in the top layer, so
+    /// there is no top-layer demotion to defer — its `display`
+    /// exit transition, if any, is not rendered by this
+    /// mechanism).
+    exit_retained: HashMap<NodeId, ExitRetention>,
+    /// Exit-transition durations measured at show time (w82
+    /// fixpaths): the seconds a live top-layer member's exit
+    /// transition runs, keyed by node, WITHOUT the bindings'
+    /// grace (callers that consume it add their own grace, or
+    /// — for the window/testdriver paths — use the value the
+    /// bindings stored, which already includes the grace; see
+    /// [`Document::store_exit_duration`]). The DOM knows
+    /// nothing about CSS, so it cannot measure this itself:
+    /// the JS bindings measure the open element's computed
+    /// style after a successful show and store the result
+    /// here, and the window/testdriver dismissal paths — which
+    /// cannot run the bindings' `compute_style` — read it
+    /// back through [`Document::take_stored_exit_duration`].
+    /// That single store is the centralized mechanism that
+    /// lets every demotion (script close/hide, Escape,
+    /// light-dismiss, invoker hide, auto-close) render the
+    /// same exit transition instead of each path measuring
+    /// (or skipping) it on its own. A show through a path
+    /// that does not measure (invoker, parse adoption) leaves
+    /// whatever value a previous JS show stored — the best
+    /// available estimate — or nothing, in which case the
+    /// dismissal demotes synchronously, exactly as before.
+    /// Consumed (taken) by a dismissal, so a stale value is
+    /// never reused for a later incarnation.
+    exit_transition_durations: HashMap<NodeId, f64>,
     dialog_return_values: HashMap<NodeId, String>,
+    /// Ordered dialog show/close journal (see
+    /// [`DialogFocusEvent`]). Drained, never merely read, by the
+    /// embedder's focus sync.
+    dialog_focus_events: Vec<DialogFocusEvent>,
+    /// The host's current keyboard focus, mirrored here by the
+    /// embedder on every focus change (window input path and
+    /// testdriver executor; see `bowser_app`'s mirror helper).
+    /// The JS bindings snapshot this at `show()`/`showModal()`
+    /// time into [`Document::dialog_show_previous`]: the DOM has
+    /// no view of host focus on its own, so the mirror is the
+    /// only channel by which a show-time record can exist — the
+    /// embedder's later sync can only see post-task focus.
+    host_focused: Option<NodeId>,
+    /// Previously-focused element recorded at show time, per
+    /// dialog, written by the bindings (see `note_dialog_show`)
+    /// and consumed by the embedder's focus sync. `Some` outer =
+    /// a record exists; the inner value is the focus at show
+    /// time (`None` = nothing was focused). Absent = the dialog
+    /// was shown without the bindings (tests, parse shim,
+    /// markup-open), and the sync falls back to current focus.
+    dialog_show_previous: HashMap<NodeId, Option<NodeId>>,
     /// Scratch walk stack for [`Document::set_subtree_flags`], cleared
     /// and reused on every call so the flag walk never allocates. A
     /// plain `Vec` keeps [`Document`] `Send + Sync`.
@@ -791,8 +932,15 @@ impl Document {
             dirty_style_subtrees: HashSet::new(),
             shadow_hosts: HashMap::new(),
             top_layer: Vec::new(),
+            top_layer_seq: HashMap::new(),
+            next_top_layer_seq: 0,
             dialog_modal: HashSet::new(),
             dialog_return_values: HashMap::new(),
+            dialog_focus_events: Vec::new(),
+            host_focused: None,
+            dialog_show_previous: HashMap::new(),
+            exit_retained: HashMap::new(),
+            exit_transition_durations: HashMap::new(),
             flag_stack: Vec::new(),
             clone_stack: Vec::new(),
             text_cache: HashSet::new(),
@@ -1942,6 +2090,21 @@ impl Document {
     /// Removing the `id` attribute updates the
     /// [`Document::get_element_by_id`] index.
     pub fn remove_attribute(&mut self, el: NodeId, name: &str) {
+        self.remove_attribute_inner(el, name, false);
+    }
+
+    /// Remove an attribute like [`Document::remove_attribute`],
+    /// except that removing `open` from a dialog does NOT
+    /// demote it from the top layer (the modal flag is still
+    /// cleared). Only [`Document::close_dialog_deferred`] uses
+    /// this: the demotion it skips is replaced by an exit
+    /// retention, so a plain call here would leak a top-layer
+    /// member — never call it from any other path.
+    fn remove_attribute_retaining_top_layer(&mut self, el: NodeId, name: &str) {
+        self.remove_attribute_inner(el, name, true);
+    }
+
+    fn remove_attribute_inner(&mut self, el: NodeId, name: &str, retain_top_layer: bool) {
         // Shared-borrow pre-pass (see `set_attribute`): the removed id's
         // atom, clone-free.
         let (ns, removed_id_atom) = match self.element_data(el) {
@@ -1996,9 +2159,14 @@ impl Document {
             // only by [`Document::close_dialog`] (the spec warns
             // that toggling `open` directly skips the event, and
             // direct attribute removal is the same shape).
+            // The retaining variant (deferred close only) keeps
+            // the top-layer membership: the caller replaces the
+            // demotion with an exit retention immediately after.
             if name.eq_ignore_ascii_case("open") && self.is_dialog_element(el) {
                 self.dialog_modal.remove(&el);
-                self.remove_from_top_layer(el);
+                if !retain_top_layer {
+                    self.remove_from_top_layer(el);
+                }
             }
             // As in `set_attribute`: any attribute can take part in
             // selector matching, so removal re-runs the style stage.
@@ -2018,13 +2186,18 @@ impl Document {
     /// detaches before re-linking, and a popover moved within its
     /// document stays in the top layer.
     fn demote_top_layer_subtree(&mut self, root: NodeId) {
-        if self.top_layer.is_empty() {
+        if self.top_layer.is_empty() && self.exit_retained.is_empty() {
             return;
         }
         let mut stack = vec![root];
         let mut members = Vec::new();
         while let Some(n) = stack.pop() {
-            if self.top_layer.contains(&n) {
+            // Retained nodes count too: removing a subtree
+            // removes its retentions with it (per HTML,
+            // removing a top-layer element from its document
+            // removes it from the top layer — retention is no
+            // exception, it is top-layer rendering).
+            if self.top_layer.contains(&n) || self.exit_retained.contains_key(&n) {
                 members.push(n);
             }
             let mut child = self.first_child(n);
@@ -2043,14 +2216,209 @@ impl Document {
         }
     }
 
-    /// The top layer, in promotion order.
+    /// The top layer, in promotion order. Live members only:
+    /// exit-retained elements (see [`Document::is_exit_retained`])
+    /// are NOT in this slice — they are closed, so Escape,
+    /// focus-trap, and stacking queries that walk this slice
+    /// must not see them — but they DO count for
+    /// [`Document::is_in_top_layer`] and therefore for cascade
+    /// and paint. Callers that need the paint/render order
+    /// including retentions use
+    /// [`Document::top_layer_with_retained`].
     pub fn top_layer(&self) -> &[NodeId] {
         &self.top_layer
     }
 
+    /// The top layer in promotion order, with unexpired
+    /// exit-retained elements interleaved by their original
+    /// promotion sequence (w82fix Whole-M7): a retained
+    /// element paints at the position it held when live, never
+    /// above a live member promoted after it, and the order is
+    /// deterministic across runs (the old shape appended
+    /// retentions in `HashMap` iteration order after all live
+    /// members, which inverted a retained dialog below a
+    /// still-live popover and varied run to run). Paint uses
+    /// this for its top-layer pass and backdrop collection.
+    /// A live member with no recorded sequence (unreachable:
+    /// every push assigns one) sorts last, preserving the old
+    /// append behavior for that case rather than dropping it.
+    pub fn top_layer_with_retained(&self) -> Vec<NodeId> {
+        let now = Instant::now();
+        let mut ordered: Vec<(u64, NodeId)> = self
+            .top_layer
+            .iter()
+            .map(|&n| (self.top_layer_seq.get(&n).copied().unwrap_or(u64::MAX), n))
+            .collect();
+        for (&n, r) in &self.exit_retained {
+            if r.expires > now && !self.top_layer.contains(&n) {
+                ordered.push((r.seq, n));
+            }
+        }
+        // Stable sort: equal sequences (unreachable in
+        // practice — sequences are unique per promotion) keep
+        // live-before-retained insertion order.
+        ordered.sort_by_key(|(seq, _)| *seq);
+        ordered.into_iter().map(|(_, n)| n).collect()
+    }
+
+    /// The earliest expiry among unexpired exit retentions,
+    /// if any (w82fix Whole-M1): the windowed event loop arms
+    /// a wakeup at this instant so an idle page repaints
+    /// promptly when the last retention lapses, instead of
+    /// leaving an overlay-only element visible until the next
+    /// unrelated event. `None` when no retention is live.
+    pub fn earliest_exit_retention_expiry(&self) -> Option<Instant> {
+        let now = Instant::now();
+        self.exit_retained
+            .values()
+            .filter(|r| r.expires > now)
+            .map(|r| r.expires)
+            .min()
+    }
+
+    /// True when any live top-layer member or any unexpired
+    /// exit retention exists. Paint's per-box top-layer gates
+    /// use this instead of `top_layer().is_empty()`, so a
+    /// retained dialog with an empty live top layer still gets
+    /// its paint-last pass and backdrop. Cheap when no
+    /// retention exists (the map is empty on the fast path).
+    pub fn has_top_layer_or_retained(&self) -> bool {
+        !self.top_layer.is_empty()
+            || (!self.exit_retained.is_empty()
+                && self
+                    .exit_retained
+                    .values()
+                    .any(|r| r.expires > Instant::now()))
+    }
+
     /// True when `node` is currently in the top layer.
+    /// An unexpired exit retention counts: the element is
+    /// closed but still rendering as top-layer until its exit
+    /// transition finishes, so cascade (the UA `overlay: none`
+    /// exemption, `:popover-open`) and paint treat it as
+    /// top-layer. Expired retentions do not count.
     pub fn is_in_top_layer(&self, node: NodeId) -> bool {
-        self.top_layer.contains(&node)
+        self.top_layer.contains(&node) || self.is_exit_retained(node)
+    }
+
+    /// True when `node` is retained for an exit transition
+    /// that has not yet expired (wall clock, read-only: no
+    /// timer or mutation is involved, so `&self` queries can
+    /// evaluate expiry). Also the cascade hook: the Styler
+    /// asks this to suppress the UA `dialog:not([open])`
+    /// `display: none` rule for retained dialogs.
+    pub fn is_exit_retained(&self, node: NodeId) -> bool {
+        self.exit_retained
+            .get(&node)
+            .is_some_and(|r| r.expires > Instant::now())
+    }
+
+    /// Drop expired retention records. Expired records are
+    /// already inert (every read checks the clock), so this is
+    /// bookkeeping, not behavior: it bounds the map after many
+    /// closes. Called by the `&mut` top-layer operations.
+    pub fn prune_expired_exit_retentions(&mut self) {
+        if self.exit_retained.is_empty() {
+            return;
+        }
+        let now = Instant::now();
+        self.exit_retained.retain(|_, r| r.expires > now);
+    }
+
+    /// Retain `node` in the top layer for an exit transition
+    /// of `duration_s` seconds from now (see the field docs on
+    /// `exit_retained`). The node is demoted from the live top
+    /// layer first — retention, not live membership, is what
+    /// keeps it rendering — and `was_modal` records whether it
+    /// was a modal dialog, for `:modal` matching during
+    /// retention. No-op for unknown nodes and non-positive
+    /// durations. Re-opening the node cancels the retention
+    /// (the show paths call [`Document::cancel_exit_retention`]).
+    pub fn retain_top_layer_for_exit(&mut self, node: NodeId, duration_s: f64, was_modal: bool) {
+        if !self.owns(node) || !duration_s.is_finite() || duration_s <= 0.0 {
+            return;
+        }
+        // Capture the promotion sequence BEFORE the demotion
+        // below: the direct vec edit must not clear the
+        // sequence map (see the `top_layer_seq` field docs),
+        // and a caller that already demoted through its own
+        // direct edit (`hide_popover_deferred`) still finds
+        // its sequence here. A node with no recorded sequence
+        // (unreachable for the live-member callers) gets a
+        // fresh one, so it sorts after existing members
+        // rather than colliding with sequence 0.
+        let seq = match self.top_layer_seq.get(&node).copied() {
+            Some(seq) => seq,
+            None => {
+                let seq = self.next_top_layer_seq;
+                self.next_top_layer_seq = seq.wrapping_add(1);
+                self.top_layer_seq.insert(node, seq);
+                seq
+            }
+        };
+        self.prune_expired_exit_retentions();
+        // Direct vec edit, NOT `remove_from_top_layer`: that
+        // method cancels retentions, which would erase the
+        // record inserted below (and drops the sequence this
+        // record must carry).
+        if self.top_layer.contains(&node) {
+            self.top_layer.retain(|n| *n != node);
+            self.mark_dirty(node, true);
+        }
+        self.exit_retained.insert(
+            node,
+            ExitRetention {
+                expires: Instant::now() + Duration::from_secs_f64(duration_s),
+                was_modal,
+                seq,
+            },
+        );
+        self.mark_dirty(node, true);
+    }
+
+    /// Cancel any exit retention for `node` (re-show during
+    /// an exit transition, or an explicit demotion). The node
+    /// keeps whatever live top-layer state it has; this only
+    /// drops the retention record.
+    pub fn cancel_exit_retention(&mut self, node: NodeId) {
+        self.exit_retained.remove(&node);
+    }
+
+    /// The exit-transition duration stored for `node` at show
+    /// time (see the field docs on
+    /// [`Document::exit_transition_durations`]), if any.
+    /// Read-only: the consumer takes it (see
+    /// [`Document::take_stored_exit_duration`]) so it is
+    /// never reused for a later incarnation.
+    pub fn stored_exit_duration(&self, node: NodeId) -> Option<f64> {
+        self.exit_transition_durations.get(&node).copied()
+    }
+
+    /// Store `node`'s exit-transition duration, measured at
+    /// show time by the caller (the JS bindings, after a
+    /// successful show, with their grace already included).
+    /// A non-finite or non-positive duration clears any
+    /// stored value instead: there is no exit transition to
+    /// defer, and a stale positive value must not survive a
+    /// re-show whose style no longer transitions.
+    pub fn store_exit_duration(&mut self, node: NodeId, duration_s: f64) {
+        if !self.owns(node) {
+            return;
+        }
+        if duration_s.is_finite() && duration_s > 0.0 {
+            self.exit_transition_durations.insert(node, duration_s);
+        } else {
+            self.exit_transition_durations.remove(&node);
+        }
+    }
+
+    /// Take (remove and return) `node`'s stored exit
+    /// duration, if any. Dismissal paths consume the value
+    /// exactly once: a deferred demotion is built from it,
+    /// and a synchronous demotion has no use for it — either
+    /// way the next show re-measures and re-stores.
+    pub fn take_stored_exit_duration(&mut self, node: NodeId) -> Option<f64> {
+        self.exit_transition_durations.remove(&node)
     }
 
     /// Promote `node` to the top layer (append, deduped). Callers
@@ -2065,6 +2433,13 @@ impl Document {
     /// the subtree links in.
     pub fn promote_to_top_layer(&mut self, node: NodeId) {
         if self.owns(node) && !self.top_layer.contains(&node) {
+            // A fresh sequence on every real push (see the
+            // `top_layer_seq` field docs): a re-show after a
+            // demotion — including a re-show that cancels a
+            // retention — paints topmost again.
+            let seq = self.next_top_layer_seq;
+            self.next_top_layer_seq = seq.wrapping_add(1);
+            self.top_layer_seq.insert(node, seq);
             self.top_layer.push(node);
             self.mark_dirty(node, true);
         }
@@ -2075,10 +2450,29 @@ impl Document {
     /// the same reason); removing a non-member is a no-op that
     /// dirties nothing. Demotions of already-detached subtrees
     /// (see [`Document::demote_top_layer_subtree`]) record nothing,
-    /// since the nodes are no longer attached.
+    /// since the nodes are no longer attached. An explicit
+    /// demotion also cancels any exit retention for the node:
+    /// retention is a rendering grace period for a close/hide,
+    /// not a second membership — anything that deliberately
+    /// demotes the element ends it (the retention creator,
+    /// [`Document::retain_top_layer_for_exit`], edits the vec
+    /// directly for exactly this reason). Cancelling a
+    /// retention is itself a state change (the element stops
+    /// rendering as top-layer), so it dirties even when the
+    /// node was not a live member — a retained-only demotion
+    /// used to cancel silently and leave the next paint
+    /// reading a stale tree.
     pub fn remove_from_top_layer(&mut self, node: NodeId) {
+        let had_retention = self.exit_retained.remove(&node).is_some();
+        // The one place a sequence dies with its membership:
+        // the retention creators' direct vec edits must NOT
+        // come here (they would erase the sequence the
+        // retention record needs to carry).
+        self.top_layer_seq.remove(&node);
         if self.top_layer.contains(&node) {
             self.top_layer.retain(|n| *n != node);
+            self.mark_dirty(node, true);
+        } else if had_retention {
             self.mark_dirty(node, true);
         }
     }
@@ -2113,17 +2507,38 @@ impl Document {
     /// popover ancestor" rule, simplified to the ancestor chain:
     /// `manual`/`hint` popovers are never auto-closed, and an
     /// `auto` popover nested inside another stays open).
-    pub fn show_popover(&mut self, node: NodeId) -> Result<(), PopoverError> {
+    /// Returns the auto-closed set, in live promotion order
+    /// followed by retained victims in arena order: the caller
+    /// fires a `toggle` event (`open` -> `closed`) for each,
+    /// since this method itself fires nothing. Victims are
+    /// not only the live members — an exit-retained `auto`
+    /// popover is also closed by the show (its retention
+    /// ends, dirtied like any demotion), because a retained
+    /// popover still renders as open and the new popover
+    /// must not stack above a closing one. A live victim
+    /// with a stored exit duration is not demoted
+    /// synchronously: it is retained for that duration
+    /// (its `toggle` still fires now, at close time, like a
+    /// script hide's), so its exit transition renders;
+    /// victims without a stored duration demote at once.
+    pub fn show_popover(&mut self, node: NodeId) -> Result<Vec<NodeId>, PopoverError> {
         let state = self.popover_state(node).ok_or(PopoverError::NotSupported)?;
         if !self.is_attached(node) {
             return Err(PopoverError::InvalidState);
         }
+        // Re-showing during an exit transition cancels it: the
+        // retention is dropped BEFORE the already-showing
+        // check, or a retained popover (which still counts as
+        // top-layer via `is_in_top_layer`) could never re-show.
+        self.cancel_exit_retention(node);
         if self.is_in_top_layer(node) {
             return Err(PopoverError::InvalidState);
         }
+        let mut closed: Vec<NodeId> = Vec::new();
         if state == PopoverState::Auto {
+            self.prune_expired_exit_retentions();
             let ancestors = self.ancestors(node);
-            let others: Vec<NodeId> = self
+            let live: Vec<NodeId> = self
                 .top_layer
                 .iter()
                 .copied()
@@ -2133,14 +2548,39 @@ impl Document {
                         && self.popover_state(*n) == Some(PopoverState::Auto)
                 })
                 .collect();
-            for n in others {
+            let mut retained: Vec<NodeId> = self
+                .exit_retained
+                .keys()
+                .copied()
+                .filter(|n| {
+                    *n != node
+                        && !ancestors.contains(n)
+                        && self.popover_state(*n) == Some(PopoverState::Auto)
+                })
+                .collect();
+            // HashMap order is arbitrary; arena order keeps
+            // the returned set (and therefore event order)
+            // deterministic.
+            retained.sort_by_key(|n| n.index());
+            for n in live {
+                closed.push(n);
+                match self.take_stored_exit_duration(n) {
+                    Some(d) if d > 0.0 => {
+                        let was_modal = self.dialog_modal.contains(&n);
+                        self.retain_top_layer_for_exit(n, d, was_modal);
+                    }
+                    _ => self.remove_from_top_layer(n),
+                }
+            }
+            for n in retained {
+                closed.push(n);
                 self.remove_from_top_layer(n);
             }
         }
         // Via the set op, so the show dirties the document (and the
         // auto-closed others above were dirtied by their removals).
         self.promote_to_top_layer(node);
-        Ok(())
+        Ok(closed)
     }
 
     /// `HTMLElement.hidePopover()`: demote from the top layer.
@@ -2148,43 +2588,151 @@ impl Document {
     /// `NotSupported` when the element has no `popover` attribute;
     /// hiding a popover that is not showing is a no-op (the spec's
     /// hide algorithm returns early there, it does not throw).
+    /// Reconciled retention rule (w82 fixpaths): an
+    /// exit-retained popover counts as hidden for API purposes
+    /// — it is already closed, only its paint lingers — so
+    /// hiding it is a no-op that must NOT end the retention.
+    /// Only a live top-layer member is demoted here; ending a
+    /// retention is a show's job (re-show cancels it), a
+    /// removal's job, or expiry's job.
     pub fn hide_popover(&mut self, node: NodeId) -> Result<(), PopoverError> {
         self.popover_state(node).ok_or(PopoverError::NotSupported)?;
+        if self.is_exit_retained(node) {
+            return Ok(());
+        }
         self.remove_from_top_layer(node);
+        Ok(())
+    }
+
+    /// `HTMLElement.hidePopover()` with an exit transition:
+    /// like [`Document::hide_popover`], except that when the
+    /// popover is showing and `exit_duration_s` is positive,
+    /// the demotion is deferred — the popover leaves the live
+    /// top layer but stays exit-retained (rendering, with
+    /// `:popover-open` still matching) until the transition
+    /// finishes. A non-positive duration behaves exactly like
+    /// `hide_popover`. A popover that is not a live member —
+    /// already hidden, or already exit-retained — is a no-op
+    /// that must NOT end an existing retention (same
+    /// reconciled rule as [`Document::hide_popover`]): the old
+    /// fall-through to `remove_from_top_layer` silently
+    /// cancelled the retention it was supposed to leave alone.
+    /// Callers measure `exit_duration_s` before hiding (see
+    /// `bowser_js::transition::exit_transition_duration`).
+    pub fn hide_popover_deferred(
+        &mut self,
+        node: NodeId,
+        exit_duration_s: f64,
+    ) -> Result<(), PopoverError> {
+        self.popover_state(node).ok_or(PopoverError::NotSupported)?;
+        if !self.top_layer.contains(&node) {
+            return Ok(());
+        }
+        if exit_duration_s <= 0.0 {
+            self.remove_from_top_layer(node);
+            return Ok(());
+        }
+        let was_modal = self.dialog_modal.contains(&node);
+        // Direct vec edit (see `retain_top_layer_for_exit`):
+        // `remove_from_top_layer` would cancel the retention
+        // inserted below.
+        self.top_layer.retain(|n| *n != node);
+        self.mark_dirty(node, true);
+        self.retain_top_layer_for_exit(node, exit_duration_s, was_modal);
         Ok(())
     }
 
     /// `HTMLElement.togglePopover(force)`: show when hidden, hide
     /// when showing, returning whether the popover is open after the
-    /// call. A forced direction that already holds is a no-op that
-    /// returns the forced state without touching validity (so
+    /// call plus the auto-closed set from any show branch (see
+    /// [`Document::show_popover`]: the caller fires a `toggle`
+    /// event for each auto-closed popover, and for the target
+    /// itself exactly when its visibility changed). A forced
+    /// direction that already holds is a no-op that returns
+    /// the forced state without touching validity (so
     /// `togglePopover(false)` on a hidden non-popover returns
     /// `false`); otherwise this delegates to
     /// [`Document::show_popover`] / [`Document::hide_popover`] and
-    /// propagates their errors.
+    /// propagates their errors. Reconciled retention rule (w82
+    /// fixpaths, same as [`Document::hide_popover`]): an
+    /// exit-retained popover is hidden for API purposes, so
+    /// `togglePopover(false)` on it and a bare toggle on it
+    /// are both no-ops that leave the retention alone — the
+    /// bare toggle does NOT hide it (and therefore does not
+    /// end the retention), it reports `false` while the paint
+    /// still renders the exit. An explicit open —
+    /// `togglePopover(true)`, or a show — is the one direction
+    /// that re-opens a retained popover: it cancels the
+    /// retention and promotes, keyed on live membership (not
+    /// `is_popover_open`, which also reads true for a retained
+    /// popover).
     pub fn toggle_popover(
         &mut self,
         node: NodeId,
         force: Option<bool>,
-    ) -> Result<bool, PopoverError> {
+    ) -> Result<(bool, Vec<NodeId>), PopoverError> {
         match force {
-            Some(true) if self.is_popover_open(node) => Ok(true),
-            Some(false) if !self.is_popover_open(node) => Ok(false),
+            Some(true) if self.top_layer.contains(&node) => Ok((true, Vec::new())),
+            Some(false) if !self.is_popover_open(node) => Ok((false, Vec::new())),
+            // Retained: already hidden for API purposes.
+            Some(false) if self.is_exit_retained(node) => Ok((false, Vec::new())),
             Some(true) => {
-                self.show_popover(node)?;
-                Ok(true)
+                let closed = self.show_popover(node)?;
+                Ok((true, closed))
             }
             Some(false) => {
                 self.hide_popover(node)?;
-                Ok(false)
+                Ok((false, Vec::new()))
             }
             None => {
-                if self.is_popover_open(node) {
+                if self.is_exit_retained(node) {
+                    Ok((false, Vec::new()))
+                } else if self.is_popover_open(node) {
                     self.hide_popover(node)?;
-                    Ok(false)
+                    Ok((false, Vec::new()))
                 } else {
-                    self.show_popover(node)?;
-                    Ok(true)
+                    let closed = self.show_popover(node)?;
+                    Ok((true, closed))
+                }
+            }
+        }
+    }
+
+    /// [`Document::toggle_popover`] with an exit transition:
+    /// identical, except live hide branches use
+    /// [`Document::hide_popover_deferred`] with
+    /// `exit_duration_s`, and the retained no-op rule above
+    /// applies: a bare or forced-false toggle on a retained
+    /// popover leaves the retention alone; a forced-true
+    /// toggle re-shows it (live-membership key, like the sync
+    /// path).
+    pub fn toggle_popover_deferred(
+        &mut self,
+        node: NodeId,
+        force: Option<bool>,
+        exit_duration_s: f64,
+    ) -> Result<(bool, Vec<NodeId>), PopoverError> {
+        match force {
+            Some(true) if self.top_layer.contains(&node) => Ok((true, Vec::new())),
+            Some(false) if !self.is_popover_open(node) => Ok((false, Vec::new())),
+            Some(false) if self.is_exit_retained(node) => Ok((false, Vec::new())),
+            Some(true) => {
+                let closed = self.show_popover(node)?;
+                Ok((true, closed))
+            }
+            Some(false) => {
+                self.hide_popover_deferred(node, exit_duration_s)?;
+                Ok((false, Vec::new()))
+            }
+            None => {
+                if self.is_exit_retained(node) {
+                    Ok((false, Vec::new()))
+                } else if self.is_popover_open(node) {
+                    self.hide_popover_deferred(node, exit_duration_s)?;
+                    Ok((false, Vec::new()))
+                } else {
+                    let closed = self.show_popover(node)?;
+                    Ok((true, closed))
                 }
             }
         }
@@ -2220,11 +2768,54 @@ impl Document {
         self.is_dialog_element(node) && self.has_attribute(node, "open")
     }
 
+    /// Mirror the host's current keyboard focus (see the
+    /// [`Document::host_focused`] field docs). Called by the
+    /// embedder on every focus change; the bindings never write
+    /// this directly.
+    pub fn set_host_focus(&mut self, focused: Option<NodeId>) {
+        self.host_focused = focused;
+    }
+
+    /// Record the show-time focus snapshot for `node`: the
+    /// mirrored host focus at the moment the bindings ran
+    /// `show()`/`showModal()`. Called by the bindings immediately
+    /// after a successful show; the embedder's sync consumes the
+    /// record (see [`Document::take_dialog_show_previous`]).
+    /// A later focus move cannot overwrite it — that is the
+    /// point: the record is show-time, not sync-time.
+    pub fn note_dialog_show(&mut self, node: NodeId) {
+        self.dialog_show_previous.insert(node, self.host_focused);
+    }
+
+    /// Take the show-time focus record for `node`, if the
+    /// bindings recorded one. `Some(inner)` = recorded (inner
+    /// may be `None`, nothing focused at show time); `None` =
+    /// no record (non-bindings show path).
+    pub fn take_dialog_show_previous(&mut self, node: NodeId) -> Option<Option<NodeId>> {
+        self.dialog_show_previous.remove(&node)
+    }
+
+    /// Drain the dialog show/close journal (see
+    /// [`DialogFocusEvent`]). The journal is empty after the
+    /// call, so a second sync replays nothing.
+    pub fn take_dialog_focus_events(&mut self) -> Vec<DialogFocusEvent> {
+        std::mem::take(&mut self.dialog_focus_events)
+    }
+
     /// True when `node` is a modal dialog: open via `showModal`
     /// (or adopted as modal from the parse shim) and not since
-    /// demoted. This is exactly what `:modal` matches.
+    /// demoted. This is exactly what `:modal` matches. A modal
+    /// dialog retained for its exit transition also matches:
+    /// it is closed (`open` is gone) but still rendering as a
+    /// modal top-layer element until the transition finishes,
+    /// so the UA `dialog:modal` rules (fixed centering,
+    /// `overlay: auto`, backdrop dim) must keep applying —
+    /// without this arm the retained dialog would render as a
+    /// non-modal absolute box and lose its backdrop.
     pub fn is_dialog_modal(&self, node: NodeId) -> bool {
-        self.is_dialog_open(node) && self.dialog_modal.contains(&node)
+        (self.is_dialog_open(node) && self.dialog_modal.contains(&node))
+            || (self.is_exit_retained(node)
+                && self.exit_retained.get(&node).is_some_and(|r| r.was_modal))
     }
 
     /// True when `node` is in an open state for `:open` matching:
@@ -2297,15 +2888,24 @@ impl Document {
         if !self.is_attached(node) || self.is_dialog_open(node) {
             return Err(DialogError::InvalidState);
         }
+        // Re-showing during an exit transition cancels it.
+        self.cancel_exit_retention(node);
         self.set_attribute(node, "open", "");
+        self.dialog_focus_events
+            .push(DialogFocusEvent::Shown { node, modal: false });
         Ok(())
     }
 
     /// `HTMLDialogElement.showModal()`: open modally. Sets the
     /// `open` attribute, promotes to the top layer, and marks the
     /// dialog modal. Same errors as [`Document::show_dialog`].
-    /// Focus handling (previously-focused element, focus trap)
-    /// is deliberately NOT here: later workers (W4/W5) own it.
+    /// Focus handling (previously-focused element, focus move
+    /// and restore) is deliberately NOT here: the DOM has no
+    /// view of window focus, so the window owns it — it diffs
+    /// the tab document's live top layer against its focus
+    /// stack once per script pump (w82, see
+    /// `bowser_app::window`'s focus sync), and the Tab trap
+    /// there confines sequential navigation while modal.
     pub fn show_dialog_modal(&mut self, node: NodeId) -> Result<(), DialogError> {
         if !self.is_dialog_element(node) {
             return Err(DialogError::NotSupported);
@@ -2313,6 +2913,8 @@ impl Document {
         if !self.is_attached(node) || self.is_dialog_open(node) {
             return Err(DialogError::InvalidState);
         }
+        // Re-showing during an exit transition cancels it.
+        self.cancel_exit_retention(node);
         self.set_attribute(node, "open", "");
         self.dialog_modal.insert(node);
         // Move to the end, not just promote: a dialog already in
@@ -2322,6 +2924,8 @@ impl Document {
         // members promoted after its popover show.
         self.remove_from_top_layer(node);
         self.promote_to_top_layer(node);
+        self.dialog_focus_events
+            .push(DialogFocusEvent::Shown { node, modal: true });
         Ok(())
     }
 
@@ -2352,6 +2956,55 @@ impl Document {
             self.dialog_return_values.insert(node, v.to_string());
         }
         self.remove_attribute(node, "open");
+        self.dialog_focus_events
+            .push(DialogFocusEvent::Closed { node });
+        Ok(true)
+    }
+
+    /// `HTMLDialogElement.close(returnValue)` with an exit
+    /// transition (w82): like [`Document::close_dialog`], except
+    /// that when the dialog is modal (in the live top layer)
+    /// and `exit_duration_s` is positive, the top-layer
+    /// demotion is deferred — the dialog leaves the live top
+    /// layer but stays exit-retained (rendering as a modal
+    /// top-layer element, with the UA `dialog:not([open])`
+    /// hiding suppressed by the cascade) until the transition
+    /// finishes, then drops out on the next read. The `close`
+    /// event still fires at close time (the caller fires it
+    /// exactly when this returns `true`, as for the sync
+    /// path): retention delays rendering only, not the event
+    /// or the closed state (`open` is gone immediately either
+    /// way). A non-positive duration, or a non-modal dialog,
+    /// behaves exactly like `close_dialog`. Callers measure
+    /// `exit_duration_s` before closing (see
+    /// `bowser_js::transition::exit_transition_duration`).
+    pub fn close_dialog_deferred(
+        &mut self,
+        node: NodeId,
+        return_value: Option<&str>,
+        exit_duration_s: f64,
+    ) -> Result<bool, DialogError> {
+        if !self.is_dialog_element(node) {
+            return Err(DialogError::NotSupported);
+        }
+        if !self.is_dialog_open(node) {
+            return Ok(false);
+        }
+        if !self.top_layer.contains(&node) || exit_duration_s <= 0.0 {
+            return self.close_dialog(node, return_value);
+        }
+        if let Some(v) = return_value {
+            self.dialog_return_values.insert(node, v.to_string());
+        }
+        let was_modal = self.dialog_modal.contains(&node);
+        self.dialog_focus_events
+            .push(DialogFocusEvent::Closed { node });
+        // Remove `open` without demoting: the demotion is what
+        // retention replaces. The modal flag moves into the
+        // retention record (see `retain_top_layer_for_exit`),
+        // so it is cleared here like the sync path clears it.
+        self.remove_attribute_retaining_top_layer(node, "open");
+        self.retain_top_layer_for_exit(node, exit_duration_s, was_modal);
         Ok(true)
     }
 

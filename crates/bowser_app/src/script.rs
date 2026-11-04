@@ -2366,6 +2366,148 @@ impl crate::window::JsDispatch for PageEventDispatch {
         page_vm.pump();
         tab.sync_dirty_flags();
     }
+
+    fn dispatch_cancel(&mut self, tab: &mut crate::tab::Tab, target: NodeId) -> bool {
+        // Dialog `cancel` (HTML §4.11.4 / close-watcher close request):
+        // non-bubbling, cancelable. The caller (window `handle_escape`,
+        // testdriver `execute_escape`) already honors the return value:
+        // `true` keeps the dialog open. Fail closed with no installed
+        // document, exactly like `dispatch_click` above.
+        let inline = tab
+            .document_ref()
+            .and_then(|doc| doc.get_attribute(target, "oncancel").map(|s| s.to_owned()));
+        let Some(installed) = tab.installed_mut() else {
+            return false;
+        };
+        // Disjoint field borrow: the DOM handle and the realm, with no
+        // `Rc` clone — the tab keeps the sole strong owner.
+        let (doc, page_vm) = installed.document_and_vm_mut();
+        // Reentrancy gate (see `InstalledDocument::assert_no_live_borrow`):
+        // the inline source and the `dispatchEvent` eval re-enter the
+        // page VM, whose natives re-borrow the document through the
+        // registry `Weak` — so no `Ref`/`RefMut` may be alive across
+        // either eval.
+        crate::tab::InstalledDocument::assert_no_live_borrow(doc);
+        // One eval: the inline handler runs with the dispatched event
+        // object bound as `event`, then the same object goes to the
+        // listeners via `dispatchEvent`.
+        let prevented = self.dispatch_typed_with_inline(
+            doc,
+            page_vm,
+            target,
+            "{type:'cancel',bubbles:false,cancelable:true}",
+            inline.as_deref(),
+        );
+        page_vm.pump();
+        tab.sync_dirty_flags();
+        prevented
+    }
+
+    fn dispatch_close(&mut self, tab: &mut crate::tab::Tab, target: NodeId) {
+        // Dialog `close` (HTML §4.11.4): non-bubbling, non-cancelable,
+        // fired after the dialog has actually closed — so the return
+        // value of the typed dispatch (always false for a
+        // non-cancelable event) is discarded, and no caller gates a
+        // state change on it. Same fail-closed / reentrancy / pump
+        // discipline as `dispatch_cancel`; the inline attribute is
+        // `onclose`.
+        let inline = tab
+            .document_ref()
+            .and_then(|doc| doc.get_attribute(target, "onclose").map(|s| s.to_owned()));
+        let Some(installed) = tab.installed_mut() else {
+            return;
+        };
+        let (doc, page_vm) = installed.document_and_vm_mut();
+        crate::tab::InstalledDocument::assert_no_live_borrow(doc);
+        let _ = self.dispatch_typed_with_inline(
+            doc,
+            page_vm,
+            target,
+            "{type:'close',bubbles:false,cancelable:false}",
+            inline.as_deref(),
+        );
+        page_vm.pump();
+        tab.sync_dirty_flags();
+    }
+
+    fn dispatch_toggle(&mut self, tab: &mut crate::tab::Tab, target: NodeId) {
+        // Popover `toggle` (HTML §6.12): non-bubbling, non-cancelable.
+        // (a) Bubbling: the spec's "fire an event named `toggle` ...
+        // using `ToggleEvent`, with `oldState`/`newState`" supplies no
+        // bubbles flag, so the DOM "fire an event" default (false)
+        // applies — the same non-bubbling shape as the `<details>`
+        // toggle, which this hook deliberately does not serve (all
+        // production call sites fire it only after a popover
+        // visibility change).
+        //
+        // Direction without a trait argument: the `JsDispatch`
+        // trait carries no old/new state, but every production call
+        // site dispatches *after* the visibility change (Escape /
+        // light-dismiss hide, invoker activation show-or-hide), so
+        // the post-transition state is the new state and its opposite
+        // is the old state. Read it here, before borrowing the VM:
+        // a currently-open popover just showed (`closed` -> `open`),
+        // a currently-hidden one just hid (`open` -> `closed`). A
+        // target that is not an open popover reads as hidden, so a
+        // spurious toggle on a never-open element would mislabel as
+        // `open` -> `closed`; the call sites guarantee a real change.
+        // Exception (w82 fixpaths B3): an exit-retained popover
+        // still reads as open (`:popover-open` keeps matching
+        // while its exit renders), but it just HID — its
+        // demotion was deferred, not its event. A retained
+        // target therefore infers `open` -> `closed`, never
+        // `closed` -> `open`: a live member is the only
+        // just-shown shape.
+        //
+        // (b) `ToggleEvent.oldState` / `newState`: these members are
+        // carried in the init literal below, so the inline `ontoggle`
+        // handler — which runs on that very object — sees them. The
+        // `addEventListener` listeners see them too: the eval path
+        // hands the object to `dispatchEvent`, and
+        // `dispatch_event_inner` (`bowser_js::bindings`) rebuilds it
+        // via `event_of`, which reads `oldState`/`newState` into the
+        // `dom::Event` `toggle_states` payload (modeled on
+        // `snap_targets`) and wraps it with
+        // `ToggleEvent.prototype`, whose accessors read the stored
+        // pair back. A constructed `ToggleEvent` re-dispatched
+        // through its stored clone keeps the pair the same way.
+        //
+        // (c) Trusted vs untrusted: deliberately kept on the eval /
+        // public-`dispatchEvent` path, like clicks, keys, and scrolls,
+        // so the delivered event is untrusted (`isTrusted` false).
+        // A trusted `toggle` would need a new per-type `Vm` native
+        // (modeled on `dispatch_snap_event`, with its own stash-key
+        // native) plus a separate inline-handler mechanism — not a
+        // small generic addition — and is not required for the
+        // state members to be visible to listeners.
+        let (inline, is_open, is_retained) = match tab.document_ref() {
+            Some(doc) => (
+                doc.get_attribute(target, "ontoggle").map(|s| s.to_owned()),
+                doc.is_popover_open(target),
+                doc.is_exit_retained(target),
+            ),
+            None => return,
+        };
+        let Some(installed) = tab.installed_mut() else {
+            return;
+        };
+        let (doc, page_vm) = installed.document_and_vm_mut();
+        crate::tab::InstalledDocument::assert_no_live_borrow(doc);
+        let (old_state, new_state) = if is_retained {
+            ("open", "closed")
+        } else if is_open {
+            ("closed", "open")
+        } else {
+            ("open", "closed")
+        };
+        let event_init = format!(
+            "{{type:'toggle',bubbles:false,cancelable:false,oldState:'{old_state}',newState:'{new_state}'}}"
+        );
+        let _ =
+            self.dispatch_typed_with_inline(doc, page_vm, target, &event_init, inline.as_deref());
+        page_vm.pump();
+        tab.sync_dirty_flags();
+    }
 }
 
 impl Default for PageEventDispatch {
@@ -3613,6 +3755,444 @@ mod tests {
             prevented,
             "preventDefault() in a listener must report the default action prevented"
         );
+    }
+
+    #[test]
+    fn page_event_dispatch_cancel_prevented_returns_true() {
+        use crate::window::JsDispatch;
+
+        let (mut tab, dialog) =
+            dispatch_tab("<html><body><dialog id=\"t\">x</dialog></body></html>");
+        tab.page_vm_mut()
+            .expect("page vm")
+            .eval("document.getElementById('t').addEventListener('cancel', function(e) { e.preventDefault(); });")
+            .expect("register listener");
+
+        let mut dispatch = PageEventDispatch::new();
+        let prevented = dispatch.dispatch_cancel(&mut tab, dialog);
+
+        assert!(
+            prevented,
+            "preventDefault() in a cancel listener must keep the dialog open"
+        );
+    }
+
+    #[test]
+    fn page_event_dispatch_cancel_unprevented_returns_false() {
+        use crate::window::JsDispatch;
+
+        let (mut tab, dialog) =
+            dispatch_tab("<html><body><dialog id=\"t\">x</dialog></body></html>");
+        tab.page_vm_mut()
+            .expect("page vm")
+            .eval("ran = false; document.getElementById('t').addEventListener('cancel', function(e) { ran = true; gotBubbles = e.bubbles; gotCancelable = e.cancelable; });")
+            .expect("register listener");
+
+        let mut dispatch = PageEventDispatch::new();
+        let prevented = dispatch.dispatch_cancel(&mut tab, dialog);
+
+        assert!(
+            !prevented,
+            "no preventDefault: Escape must close the dialog"
+        );
+        let vm = tab.page_vm_mut().expect("page vm");
+        assert!(js_is_true(vm, "ran"), "cancel listener still ran");
+        assert!(
+            !js_is_true(vm, "gotBubbles"),
+            "dialog cancel does not bubble"
+        );
+        assert!(
+            js_is_true(vm, "gotCancelable"),
+            "dialog cancel is cancelable"
+        );
+    }
+
+    #[test]
+    fn page_event_dispatch_cancel_inline_return_false_prevents() {
+        use crate::window::JsDispatch;
+
+        let (mut tab, dialog) = dispatch_tab(
+            "<html><body><dialog id=\"t\" oncancel=\"seenCancelType = event.type; return false;\">x</dialog></body></html>",
+        );
+
+        let mut dispatch = PageEventDispatch::new();
+        let prevented = dispatch.dispatch_cancel(&mut tab, dialog);
+
+        assert!(
+            prevented,
+            "oncancel returning false must report the default prevented"
+        );
+        let seen = tab
+            .page_vm_mut()
+            .expect("page vm")
+            .eval("seenCancelType")
+            .expect("read seenCancelType");
+        assert!(
+            matches!(seen, Value::Str(ref s) if s.as_wtf8().to_utf8_lossy() == "cancel"),
+            "inline oncancel saw event.type, got: {seen:?}"
+        );
+    }
+
+    #[test]
+    fn page_event_dispatch_close_delivers_to_listeners_and_inline() {
+        use crate::window::JsDispatch;
+
+        let (mut tab, dialog) = dispatch_tab(
+            "<html><body><dialog id=\"t\" onclose=\"seenCloseType = event.type;\">x</dialog></body></html>",
+        );
+        tab.page_vm_mut()
+            .expect("page vm")
+            .eval("ran = false; document.getElementById('t').addEventListener('close', function(e) { ran = true; gotBubbles = e.bubbles; gotCancelable = e.cancelable; });")
+            .expect("register listener");
+
+        let mut dispatch = PageEventDispatch::new();
+        dispatch.dispatch_close(&mut tab, dialog);
+
+        let vm = tab.page_vm_mut().expect("page vm");
+        assert!(js_is_true(vm, "ran"), "close listener ran");
+        assert!(!js_is_true(vm, "gotBubbles"), "close does not bubble");
+        assert!(!js_is_true(vm, "gotCancelable"), "close is not cancelable");
+        let seen = vm.eval("seenCloseType").expect("read seenCloseType");
+        assert!(
+            matches!(seen, Value::Str(ref s) if s.as_wtf8().to_utf8_lossy() == "close"),
+            "inline onclose saw event.type, got: {seen:?}"
+        );
+    }
+
+    #[test]
+    fn page_event_dispatch_toggle_show_delivers_states_to_inline() {
+        use crate::window::JsDispatch;
+
+        let (mut tab, pop) = dispatch_tab(
+            "<html><body><div id=\"t\" popover=\"auto\" ontoggle=\"seenOld = event.oldState; seenNew = event.newState;\">hi</div></body></html>",
+        );
+        // Production call sites dispatch after the visibility change:
+        // show first, so the dispatch must read closed -> open.
+        tab.installed_mut()
+            .expect("installed document")
+            .document()
+            .borrow_mut()
+            .show_popover(pop)
+            .expect("show popover");
+        tab.page_vm_mut()
+            .expect("page vm")
+            .eval("ran = false; document.getElementById('t').addEventListener('toggle', function(e) { ran = true; gotType = e.type; gotBubbles = e.bubbles; gotOld = e.oldState; gotNew = e.newState; gotToggle = e instanceof ToggleEvent; });")
+            .expect("register listener");
+
+        let mut dispatch = PageEventDispatch::new();
+        dispatch.dispatch_toggle(&mut tab, pop);
+
+        let vm = tab.page_vm_mut().expect("page vm");
+        assert!(js_is_true(vm, "ran"), "toggle listener ran on show");
+        assert!(!js_is_true(vm, "gotBubbles"), "toggle does not bubble");
+        assert!(
+            js_is_true(vm, "gotToggle"),
+            "listener event is a ToggleEvent"
+        );
+        let got_type = vm.eval("gotType").expect("read gotType");
+        assert!(
+            matches!(got_type, Value::Str(ref s) if s.as_wtf8().to_utf8_lossy() == "toggle"),
+            "listener saw toggle type, got: {got_type:?}"
+        );
+        // Listeners receive the bindings wrapper, whose
+        // `ToggleEvent.prototype` accessors read the stored pair —
+        // the same states the inline handler sees on the init object.
+        let listener_old = vm.eval("gotOld").expect("read gotOld");
+        let listener_new = vm.eval("gotNew").expect("read gotNew");
+        assert!(
+            matches!(listener_old, Value::Str(ref s) if s.as_wtf8().to_utf8_lossy() == "closed"),
+            "listener show: oldState closed, got: {listener_old:?}"
+        );
+        assert!(
+            matches!(listener_new, Value::Str(ref s) if s.as_wtf8().to_utf8_lossy() == "open"),
+            "listener show: newState open, got: {listener_new:?}"
+        );
+        let old = vm.eval("seenOld").expect("read seenOld");
+        let new = vm.eval("seenNew").expect("read seenNew");
+        assert!(
+            matches!(old, Value::Str(ref s) if s.as_wtf8().to_utf8_lossy() == "closed"),
+            "show: oldState closed, got: {old:?}"
+        );
+        assert!(
+            matches!(new, Value::Str(ref s) if s.as_wtf8().to_utf8_lossy() == "open"),
+            "show: newState open, got: {new:?}"
+        );
+    }
+
+    #[test]
+    fn page_event_dispatch_toggle_hide_delivers_states_to_inline() {
+        use crate::window::JsDispatch;
+
+        let (mut tab, pop) = dispatch_tab(
+            "<html><body><div id=\"t\" popover=\"auto\" ontoggle=\"seenOld = event.oldState; seenNew = event.newState;\">hi</div></body></html>",
+        );
+        tab.installed_mut()
+            .expect("installed document")
+            .document()
+            .borrow_mut()
+            .show_popover(pop)
+            .expect("show popover");
+        tab.installed_mut()
+            .expect("installed document")
+            .document()
+            .borrow_mut()
+            .hide_popover(pop)
+            .expect("hide popover");
+        tab.page_vm_mut()
+            .expect("page vm")
+            .eval("ran = false; document.getElementById('t').addEventListener('toggle', function(e) { ran = true; gotOld = e.oldState; gotNew = e.newState; gotToggle = e instanceof ToggleEvent; });")
+            .expect("register listener");
+
+        let mut dispatch = PageEventDispatch::new();
+        dispatch.dispatch_toggle(&mut tab, pop);
+
+        let vm = tab.page_vm_mut().expect("page vm");
+        assert!(js_is_true(vm, "ran"), "toggle listener ran on hide");
+        assert!(
+            js_is_true(vm, "gotToggle"),
+            "listener event is a ToggleEvent"
+        );
+        let listener_old = vm.eval("gotOld").expect("read gotOld");
+        let listener_new = vm.eval("gotNew").expect("read gotNew");
+        assert!(
+            matches!(listener_old, Value::Str(ref s) if s.as_wtf8().to_utf8_lossy() == "open"),
+            "listener hide: oldState open, got: {listener_old:?}"
+        );
+        assert!(
+            matches!(listener_new, Value::Str(ref s) if s.as_wtf8().to_utf8_lossy() == "closed"),
+            "listener hide: newState closed, got: {listener_new:?}"
+        );
+        let old = vm.eval("seenOld").expect("read seenOld");
+        let new = vm.eval("seenNew").expect("read seenNew");
+        assert!(
+            matches!(old, Value::Str(ref s) if s.as_wtf8().to_utf8_lossy() == "open"),
+            "hide: oldState open, got: {old:?}"
+        );
+        assert!(
+            matches!(new, Value::Str(ref s) if s.as_wtf8().to_utf8_lossy() == "closed"),
+            "hide: newState closed, got: {new:?}"
+        );
+    }
+
+    #[test]
+    fn js_native_popover_methods_fire_toggle_with_states() {
+        // w82 fixpaths B1: the JS natives themselves fire
+        // `toggle` — show, hide, toggle, and the auto-closed
+        // victim of a show — with the matching state pairs,
+        // and no-op calls fire nothing.
+        use crate::tab::Tab;
+        use bowser_layout::Size;
+
+        let doc = Rc::new(RefCell::new(parse(
+            "<html><body><div id=\"t\" popover=\"auto\">t</div><div id=\"u\" popover=\"auto\">u</div></body></html>",
+        )));
+        let base_url = base();
+        let page = PageVm::new_for_document(doc.clone(), &base_url, "TestBrowser/9.9", &[])
+            .expect("install");
+        let mut tab = Tab::new(Size { w: 800.0, h: 600.0 });
+        tab.install_document(doc, page);
+        let vm = tab.page_vm_mut().expect("page vm");
+        vm.eval(
+            "tLog = ''; uLog = ''; \
+             document.getElementById('t').addEventListener('toggle', function(e) { tLog += e.oldState + '>' + e.newState + ';'; }); \
+             document.getElementById('u').addEventListener('toggle', function(e) { uLog += e.oldState + '>' + e.newState + ';'; });",
+        )
+        .expect("register listeners");
+        let log = |tab: &mut Tab, name: &str| -> String {
+            match tab.page_vm_mut().expect("page vm").eval(name) {
+                Ok(Value::Str(s)) => s.as_wtf8().to_string(),
+                other => panic!("{name} must be a string log, got: {other:?}"),
+            }
+        };
+        let run = |tab: &mut Tab, src: &str| {
+            tab.page_vm_mut()
+                .expect("page vm")
+                .eval(src)
+                .unwrap_or_else(|e| panic!("eval {src} failed: {e:?}"));
+        };
+        run(&mut tab, "document.getElementById('t').showPopover();");
+        assert_eq!(log(&mut tab, "tLog"), "closed>open;");
+        assert_eq!(log(&mut tab, "uLog"), "");
+        run(&mut tab, "document.getElementById('u').showPopover();");
+        assert_eq!(log(&mut tab, "tLog"), "closed>open;open>closed;");
+        assert_eq!(log(&mut tab, "uLog"), "closed>open;");
+        run(&mut tab, "document.getElementById('u').hidePopover();");
+        assert_eq!(log(&mut tab, "uLog"), "closed>open;open>closed;");
+        run(&mut tab, "document.getElementById('u').hidePopover();");
+        assert_eq!(log(&mut tab, "uLog"), "closed>open;open>closed;");
+        run(&mut tab, "document.getElementById('t').togglePopover();");
+        assert_eq!(
+            log(&mut tab, "tLog"),
+            "closed>open;open>closed;closed>open;"
+        );
+        run(
+            &mut tab,
+            "document.getElementById('t').togglePopover(true);",
+        );
+        assert_eq!(
+            log(&mut tab, "tLog"),
+            "closed>open;open>closed;closed>open;"
+        );
+        run(&mut tab, "document.getElementById('t').togglePopover();");
+        assert_eq!(
+            log(&mut tab, "tLog"),
+            "closed>open;open>closed;closed>open;open>closed;"
+        );
+        run(
+            &mut tab,
+            "document.getElementById('t').togglePopover(false);",
+        );
+        assert_eq!(
+            log(&mut tab, "tLog"),
+            "closed>open;open>closed;closed>open;open>closed;"
+        );
+    }
+
+    #[test]
+    fn page_event_dispatch_toggle_on_retained_popover_is_a_close() {
+        // w82 fixpaths B3: a deferred (retained) popover still
+        // reads as `:popover-open`, but a toggle dispatched
+        // for it must read `open` -> `closed`, not the
+        // just-shown `closed` -> `open` a live member gets.
+        use crate::window::JsDispatch;
+
+        let (mut tab, pop) =
+            dispatch_tab("<html><body><div id=\"t\" popover=\"auto\">hi</div></body></html>");
+        tab.installed_mut()
+            .expect("installed document")
+            .document()
+            .borrow_mut()
+            .show_popover(pop)
+            .expect("show popover");
+        tab.installed_mut()
+            .expect("installed document")
+            .document()
+            .borrow_mut()
+            .hide_popover_deferred(pop, 60.0)
+            .expect("defer hide");
+        assert!(
+            tab.document_ref().expect("document").is_exit_retained(pop),
+            "precondition: popover is retained"
+        );
+        tab.page_vm_mut()
+            .expect("page vm")
+            .eval("ran = false; document.getElementById('t').addEventListener('toggle', function(e) { ran = true; gotOld = e.oldState; gotNew = e.newState; });")
+            .expect("register listener");
+        let mut dispatch = PageEventDispatch::new();
+        dispatch.dispatch_toggle(&mut tab, pop);
+        let vm = tab.page_vm_mut().expect("page vm");
+        assert!(js_is_true(vm, "ran"), "toggle listener ran on retained");
+        let old = vm.eval("gotOld").expect("read gotOld");
+        let new = vm.eval("gotNew").expect("read gotNew");
+        assert!(
+            matches!(old, Value::Str(ref s) if s.as_wtf8().to_utf8_lossy() == "open"),
+            "retained toggle: oldState open, got: {old:?}"
+        );
+        assert!(
+            matches!(new, Value::Str(ref s) if s.as_wtf8().to_utf8_lossy() == "closed"),
+            "retained toggle: newState closed, got: {new:?}"
+        );
+    }
+
+    #[test]
+    fn page_event_dispatch_toggle_constructor_and_plain_object_carry_states() {
+        let (mut tab, pop) =
+            dispatch_tab("<html><body><div id=\"t\" popover=\"auto\">hi</div></body></html>");
+        let _ = pop;
+        tab.page_vm_mut()
+            .expect("page vm")
+            .eval("ran = 0; document.getElementById('t').addEventListener('toggle', function(e) { ran += 1; if (ran === 1) { gotOld = e.oldState; gotNew = e.newState; gotToggle = e instanceof ToggleEvent; } else { plainOld = e.oldState; plainNew = e.newState; plainToggle = e instanceof ToggleEvent; } });")
+            .expect("register listener");
+        // Constructor-built ToggleEvent, re-dispatched: the stored
+        // clone must keep the pair.
+        tab.page_vm_mut()
+            .expect("page vm")
+            .eval("document.getElementById('t').dispatchEvent(new ToggleEvent('toggle', {oldState: 'closed', newState: 'open'}));")
+            .expect("dispatch constructed ToggleEvent");
+        // Plain-object dispatch: event_of must read the pair.
+        tab.page_vm_mut()
+            .expect("page vm")
+            .eval("document.getElementById('t').dispatchEvent({type: 'toggle', oldState: 'open', newState: 'closed'});")
+            .expect("dispatch plain toggle object");
+        let vm = tab.page_vm_mut().expect("page vm");
+        let ran = vm.eval("ran").expect("read ran");
+        assert!(
+            matches!(ran, Value::Int(2)),
+            "both toggle dispatches ran, got: {ran:?}"
+        );
+        assert!(
+            js_is_true(vm, "gotToggle"),
+            "constructed event is a ToggleEvent"
+        );
+        let old = vm.eval("gotOld").expect("read gotOld");
+        let new = vm.eval("gotNew").expect("read gotNew");
+        assert!(
+            matches!(old, Value::Str(ref s) if s.as_wtf8().to_utf8_lossy() == "closed"),
+            "constructed: oldState closed, got: {old:?}"
+        );
+        assert!(
+            matches!(new, Value::Str(ref s) if s.as_wtf8().to_utf8_lossy() == "open"),
+            "constructed: newState open, got: {new:?}"
+        );
+        assert!(
+            js_is_true(vm, "plainToggle"),
+            "plain-object event wraps as a ToggleEvent"
+        );
+        let plain_old = vm.eval("plainOld").expect("read plainOld");
+        let plain_new = vm.eval("plainNew").expect("read plainNew");
+        assert!(
+            matches!(plain_old, Value::Str(ref s) if s.as_wtf8().to_utf8_lossy() == "open"),
+            "plain: oldState open, got: {plain_old:?}"
+        );
+        assert!(
+            matches!(plain_new, Value::Str(ref s) if s.as_wtf8().to_utf8_lossy() == "closed"),
+            "plain: newState closed, got: {plain_new:?}"
+        );
+    }
+
+    #[test]
+    fn page_event_dispatch_toggle_constructor_defaults_to_empty_states() {
+        let (mut tab, _pop) =
+            dispatch_tab("<html><body><div id=\"t\" popover=\"auto\">hi</div></body></html>");
+        tab.page_vm_mut()
+            .expect("page vm")
+            .eval("document.getElementById('t').addEventListener('toggle', function(e) { gotOld = e.oldState; gotNew = e.newState; });")
+            .expect("register listener");
+        tab.page_vm_mut()
+            .expect("page vm")
+            .eval("document.getElementById('t').dispatchEvent(new ToggleEvent('toggle'));")
+            .expect("dispatch default ToggleEvent");
+        let vm = tab.page_vm_mut().expect("page vm");
+        let old = vm.eval("gotOld").expect("read gotOld");
+        let new = vm.eval("gotNew").expect("read gotNew");
+        assert!(
+            matches!(old, Value::Str(ref s) if s.as_wtf8().to_utf8_lossy().is_empty()),
+            "default oldState is empty, got: {old:?}"
+        );
+        assert!(
+            matches!(new, Value::Str(ref s) if s.as_wtf8().to_utf8_lossy().is_empty()),
+            "default newState is empty, got: {new:?}"
+        );
+    }
+
+    #[test]
+    fn page_event_dispatch_cancel_close_toggle_fail_closed_without_document() {
+        use crate::window::JsDispatch;
+        use bowser_layout::Size;
+
+        let doc = parse("<html><body><dialog id=\"t\">x</dialog></body></html>");
+        let target = doc.get_element_by_id("t").expect("target dialog");
+        let mut tab = crate::tab::Tab::new(Size { w: 800.0, h: 600.0 });
+        let mut dispatch = PageEventDispatch::new();
+
+        assert!(
+            !dispatch.dispatch_cancel(&mut tab, target),
+            "no document installed: nothing can be prevented"
+        );
+        // Close and toggle return nothing and must not run script or
+        // panic without an installed document.
+        dispatch.dispatch_close(&mut tab, target);
+        dispatch.dispatch_toggle(&mut tab, target);
     }
 
     #[test]

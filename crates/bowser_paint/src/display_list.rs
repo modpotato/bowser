@@ -4012,7 +4012,10 @@ pub fn collect_backdrop_styles(
         h: viewport.h,
     };
     let mut styles = HashMap::new();
-    for &node in doc.top_layer() {
+    // w82: retentions count — a retained dialog's backdrop
+    // style (the `:modal` dim) must be collected even though
+    // the live top layer is empty after its close.
+    for node in doc.top_layer_with_retained() {
         if let Some(style) = bowser_css::compute_pseudo_style(
             doc,
             node,
@@ -4304,7 +4307,11 @@ fn build_display_list_inner<'a>(
     // list of boxes the normal walk must skip and the paint-last
     // pass below must emit. Empty (and the whole pass skipped) for
     // ordinary trees, so their paint is untouched.
-    let top_layer_nodes: Vec<NodeId> = doc.top_layer().to_vec();
+    // w82: include exit retentions, or a retained dialog
+    // (live top layer empty) would never reach the
+    // paint-last pass and would paint in place — or, with
+    // the suppression gate below, not at all as top-layer.
+    let top_layer_nodes: Vec<NodeId> = doc.top_layer_with_retained();
     let mut top_layer_entries: Vec<TopLayerEntry<'a>> = Vec::new();
     if !top_layer_nodes.is_empty() {
         collect_top_layer(root, doc, None, uctx, false, &mut top_layer_entries);
@@ -4527,7 +4534,7 @@ fn build_box<'a>(
 ) {
     // Gated on a non-empty top layer so ordinary trees pay one
     // slice-length check per box, not a membership scan per child.
-    let suppress_top_layer = suppress_top_layer && !doc.top_layer().is_empty();
+    let suppress_top_layer = suppress_top_layer && doc.has_top_layer_or_retained();
     // Nearest style for inherited text properties (text boxes have none).
     let style = box_.style.as_deref().or(parent_style);
 
@@ -4577,9 +4584,10 @@ fn build_box<'a>(
     // `::backdrop` (w81 backdrop, W4): directly below this box's
     // own items, before any of its groups open — see
     // [`paint_backdrop`] for the ordering proof and caveats.
-    // Gated on a non-empty top layer so ordinary trees pay one
-    // slice-length check, not a membership scan, per box.
-    if !doc.top_layer().is_empty() {
+    // Gated on a non-empty top layer (retentions included, w82)
+    // so ordinary trees pay one slice-length check, not a
+    // membership scan, per box.
+    if doc.has_top_layer_or_retained() {
         paint_backdrop(
             b,
             box_,

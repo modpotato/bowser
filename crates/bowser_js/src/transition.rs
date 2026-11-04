@@ -8,10 +8,10 @@
 //! engine cannot satisfy that pattern: the read happens ~0ms after
 //! the set, so only the delay math puts progress at 0.5.
 //!
-//! Scope: discrete properties only, and in this wave only `overlay`
-//! is routed through [`apply_transitions`] (see `DISCRETE_PROPS`).
-//! Numeric interpolation is future work; the flip rules below are
-//! the full discrete behavior.
+//! Scope: discrete properties only, and in this wave `overlay`
+//! and `display` are routed through [`apply_transitions`] (see
+//! `DISCRETE_PROPS`). Numeric interpolation is future work; the
+//! flip rules below are the full discrete behavior.
 //!
 //! `overlay` rules (CSS Position 4, as pinned by
 //! `overlay-interpolation.html`):
@@ -39,6 +39,13 @@
 //!   overshooting bezier flips once eased crosses 1; that is the
 //!   timing function operating, not a hold violation (see
 //!   `overlay_end_flip_is_keyed_on_eased_progress`).
+//! * `display` follows the same asymmetry as `overlay`, over
+//!   `none` vs any shown value (w82): a shown -> `none` exit
+//!   holds until eased progress reaches 1, a `none` -> shown
+//!   entry flips as soon as eased progress exceeds 0, and a
+//!   shown -> shown change flips at 0.5. Unlike `overlay` it is
+//!   NOT exempt from the behavior gate: it requires
+//!   `transition-behavior: allow-discrete` at its layer.
 //! * Any other discrete property follows the generic discrete rule
 //!   (flip when the eased progress reaches 0.5) and additionally
 //!   requires `transition-behavior: allow-discrete`; without it the
@@ -84,10 +91,14 @@ use std::cell::RefCell;
 use std::collections::HashMap;
 use std::time::Instant;
 
-/// Discrete properties routed through the engine. Only `overlay`
-/// today: it is the only discrete property with computed slots,
-/// transition plumbing, and WPT coverage in this wave.
-const DISCRETE_PROPS: &[&str] = &["overlay"];
+/// Discrete properties routed through the engine. `overlay` (w80)
+/// and `display` (w82, overlay-transition-dialog): `display` uses
+/// the same asymmetric flip as `overlay`, generalized over
+/// `none` vs any shown value — a shown -> `none` exit holds the
+/// shown value until eased progress reaches 1, a `none` -> shown
+/// entry flips as soon as eased progress exceeds 0, and a
+/// shown -> shown change flips at eased 0.5 (see `eval_discrete`).
+const DISCRETE_PROPS: &[&str] = &["overlay", "display"];
 
 /// A parsed `<timing-function>` for evaluation. Named functions map
 /// to their cubic-bezier equivalents (CSS Easing Functions 2);
@@ -379,32 +390,49 @@ struct ResolvedParams {
 /// so the shorthand arm of the spec rule does not apply here.
 fn resolve_params(props: &HashMap<String, String>, prop: &str) -> Option<ResolvedParams> {
     let property_list = split_layers(props.get("transition-property")?);
-    let allow_discrete =
-        props.get("transition-behavior").map(String::as_str) == Some("allow-discrete");
+    // w82: `transition-behavior` is per-layer (CSS list repetition:
+    // a shorter list cycles, like duration/delay/timing), so the
+    // `allow-discrete` gate is evaluated at the candidate layer's
+    // index, not once for the whole declaration. A shorthand such
+    // as `transition: overlay 2s allow-discrete, display 2s
+    // allow-discrete` serializes behavior as `allow-discrete,
+    // allow-discrete`; a single keyword cycles to every layer.
+    let behavior_layers: Vec<String> = props
+        .get("transition-behavior")
+        .map(|b| split_layers(b))
+        .unwrap_or_default();
+    let behavior_allows = |idx: usize| -> bool {
+        behavior_layers
+            .get(idx % behavior_layers.len().max(1))
+            .is_some_and(|b| b == "allow-discrete")
+    };
     // w81 (see the doc comment above): last matching item wins.
     // `all` counts as a match only with `allow-discrete` for a
     // discrete property; with `normal` behavior it does not call
     // for animating it, so it is excluded rather than merely
-    // losing to an explicit listing.
-    let explicit_idx = property_list.iter().rposition(|p| p == prop);
-    let all_idx = if allow_discrete {
-        property_list.iter().rposition(|p| p == "all")
-    } else {
-        None
-    };
+    // losing to an explicit listing. `overlay` is exempt from
+    // the behavior gate (an explicit `overlay` transitions even
+    // under `normal`); every other discrete property needs
+    // `allow-discrete` at its own layer.
+    let explicit_idx = property_list
+        .iter()
+        .rposition(|p| p == prop)
+        .filter(|&i| prop == "overlay" || behavior_allows(i));
+    // The `all` arm never inherits the `overlay` exemption: `all`
+    // with `normal` behavior excludes every discrete property
+    // (pinned by `transition_all_allow_discrete_matches_overlay_
+    // at_layer_zero`), so it needs `allow-discrete` at its layer
+    // even for `overlay`.
+    let all_idx = property_list
+        .iter()
+        .rposition(|p| p == "all")
+        .filter(|&i| behavior_allows(i));
     let idx = match (explicit_idx, all_idx) {
         (Some(explicit), Some(all)) => explicit.max(all),
         (Some(explicit), None) => explicit,
         (None, Some(all)) => all,
         (None, None) => return None,
     };
-    if prop != "overlay" && !allow_discrete {
-        // An explicitly listed non-`overlay` discrete property
-        // still needs `allow-discrete`; `overlay` is exempt. (Via
-        // the `all` arm above, `allow_discrete` is true by
-        // construction, so this only fires for explicit listings.)
-        return None;
-    }
     let at = |name: &str| -> Option<String> {
         let layers = split_layers(props.get(name)?);
         if layers.is_empty() {
@@ -491,6 +519,38 @@ fn eval_discrete(
                 }
             }
             ("none", "auto") => {
+                if eased > 0.0 {
+                    to.to_string()
+                } else {
+                    from.to_string()
+                }
+            }
+            _ => {
+                if eased >= 0.5 {
+                    to.to_string()
+                } else {
+                    from.to_string()
+                }
+            }
+        }
+    } else if property == "display" {
+        // Same asymmetry as `overlay`, over `none` vs shown:
+        // an exit (shown -> `none`) holds the shown value for
+        // the whole transition so the element keeps rendering,
+        // an entry (`none` -> shown) flips at once so it renders
+        // for the whole transition, and shown -> shown flips
+        // at the generic discrete midpoint.
+        let from_none = from.eq_ignore_ascii_case("none");
+        let to_none = to.eq_ignore_ascii_case("none");
+        match (from_none, to_none) {
+            (false, true) => {
+                if eased >= 1.0 {
+                    to.to_string()
+                } else {
+                    from.to_string()
+                }
+            }
+            (true, false) => {
                 if eased > 0.0 {
                     to.to_string()
                 } else {
@@ -622,6 +682,101 @@ pub fn apply_transitions(key: &str, props: &mut HashMap<String, String>) {
             state.last_cascaded.insert(prop.to_string(), cascaded);
         }
     });
+}
+
+/// The exit-retained read path (w82fix JS-M1): call this INSTEAD
+/// of [`apply_transitions`] for a node the document reports as
+/// exit-retained. During retention the cascade still reports the
+/// held values (`display: block`, `overlay: auto` — the UA
+/// `display: none` / `overlay: none` rules are suppressed for
+/// retained elements), so the props map already holds the value
+/// paint renders and this function leaves it untouched: no
+/// transition is started, continued, or retargeted here. It does
+/// two bookkeeping things the next post-expiry read depends on:
+///
+/// * it clears any running `overlay` / `display` transition
+///   (e.g. an entry transition still in flight at close time):
+///   left in place, the post-expiry read would see
+///   `active.to != cascaded` and retarget into a fresh
+///   transition instead of reading `none`;
+/// * it pins `last_cascaded[overlay|display]` to the post-close
+///   values (`none` for both: a closed dialog/popover gets
+///   `display: none` from the UA `dialog:not([open])` /
+///   popover rules and `overlay: none` from the UA top-layer
+///   rule once retention lapses). The first post-expiry read
+///   then sees `prev == cascaded == none` and starts nothing —
+///   without this pin, it would see `prev = block/auto`,
+///   `cascaded = none` and start a brand-new exit transition,
+///   holding `block`/`auto` for another full duration while
+///   paint had already dropped the element (GCS disagreeing
+///   with paint for a full extra transition).
+///
+/// Seeding the pin at close time alone would NOT work: the
+/// per-read `last_cascaded.insert` in [`apply_transitions`]
+/// would overwrite it with the held value on the next
+/// retained read, so the pin must be re-applied on every
+/// retained read. Only properties present in `props` are
+/// pinned (computed maps always carry both).
+pub fn apply_transitions_retained(key: &str, props: &mut HashMap<String, String>) {
+    STATES.with(|states| {
+        let mut states = states.borrow_mut();
+        if states.len() >= 4096 {
+            states.retain(|_, s| !s.active.is_empty());
+        }
+        let state = states
+            .entry(key.to_string())
+            .or_insert_with(|| ElementState {
+                last_cascaded: HashMap::new(),
+                active: HashMap::new(),
+            });
+        for prop in DISCRETE_PROPS {
+            if props.contains_key(*prop) {
+                state.active.remove(*prop);
+                state
+                    .last_cascaded
+                    .insert(prop.to_string(), "none".to_string());
+            }
+        }
+    });
+}
+
+/// The exit-transition time a closing top-layer element must be
+/// retained for, from its pre-close computed props (`overlay`,
+/// `display`, and the `transition-*` longhands): the longest
+/// `delay + duration` among the `overlay` / `display` exit
+/// transitions that actually apply. `overlay` counts only when
+/// it currently reads `auto` (it is about to leave the top
+/// layer) and `display` only when it currently reads a shown
+/// value; a property with no resolving transition, or a total
+/// at or below zero (a fully negative-delay fast-forward),
+/// contributes nothing. `None` when nothing contributes: the
+/// caller then demotes synchronously, with no behavior change.
+/// Callers read this BEFORE closing (the pre-close values are
+/// the exit's start values); reading it after the close would
+/// see the post-close values and miss the transition.
+pub fn exit_transition_duration(props: &HashMap<String, String>) -> Option<f64> {
+    let mut best: Option<f64> = None;
+    if props
+        .get("overlay")
+        .is_some_and(|v| v.eq_ignore_ascii_case("auto"))
+        && let Some(params) = resolve_params(props, "overlay")
+    {
+        let total = params.delay_s + params.duration_s;
+        if total > 0.0 {
+            best = Some(total);
+        }
+    }
+    if props
+        .get("display")
+        .is_some_and(|v| !v.eq_ignore_ascii_case("none"))
+        && let Some(params) = resolve_params(props, "display")
+    {
+        let total = params.delay_s + params.duration_s;
+        if total > 0.0 {
+            best = Some(best.map_or(total, |b: f64| b.max(total)));
+        }
+    }
+    best
 }
 
 #[cfg(test)]
@@ -929,6 +1084,278 @@ mod tests {
         };
         assert!(eval_timing(overshoot, 0.5) > 1.0);
         assert_eq!(at("auto", "none", overshoot, 50.0), "none");
+    }
+
+    #[test]
+    fn display_flip_rules_mirror_overlay_asymmetry() {
+        // w82: `display` uses `overlay`'s asymmetry over
+        // `none` vs any shown value; shown -> shown flips at 0.5.
+        let at = |from: &str, to: &str, elapsed: f64| {
+            eval_discrete(from, to, "display", 100.0, 0.0, Timing::Linear, elapsed).0
+        };
+        // Exit holds the shown value until the end.
+        assert_eq!(at("block", "none", 10.0), "block");
+        assert_eq!(at("block", "none", 99.0), "block");
+        assert_eq!(at("block", "none", 100.0), "none");
+        assert_eq!(at("flex", "none", 50.0), "flex");
+        // Entry flips as soon as progress exceeds 0.
+        assert_eq!(at("none", "block", 0.0), "none");
+        assert_eq!(at("none", "block", 10.0), "block");
+        assert_eq!(at("none", "flex", 1.0), "flex");
+        // Shown -> shown flips at the generic midpoint.
+        assert_eq!(at("block", "flex", 49.0), "block");
+        assert_eq!(at("block", "flex", 50.0), "flex");
+        // `none` -> `none` is a no-op flip (stays `none`).
+        assert_eq!(at("none", "none", 50.0), "none");
+    }
+
+    #[test]
+    fn display_resolve_params_requires_allow_discrete_per_layer() {
+        // Explicit `display` under `normal` behavior: no transition.
+        let mut p = props(&[
+            ("transition-property", "display"),
+            ("transition-duration", "2s"),
+            ("transition-delay", "0s"),
+            ("transition-timing-function", "linear"),
+            ("transition-behavior", "normal"),
+        ]);
+        assert!(resolve_params(&p, "display").is_none());
+        // Same with `allow-discrete`: resolves.
+        p.insert(
+            "transition-behavior".to_string(),
+            "allow-discrete".to_string(),
+        );
+        assert_eq!(
+            resolve_params(&p, "display")
+                .expect("display + allow-discrete")
+                .duration_s,
+            2.0
+        );
+        // `all` + `normal`: no transition for `display` either.
+        let p = props(&[
+            ("transition-property", "all"),
+            ("transition-duration", "2s"),
+            ("transition-delay", "0s"),
+            ("transition-timing-function", "linear"),
+            ("transition-behavior", "normal"),
+        ]);
+        assert!(resolve_params(&p, "display").is_none());
+        // Per-layer behavior (the dialog shorthand shape):
+        // `overlay, display` with `allow-discrete,
+        // allow-discrete` resolves both layers at their own
+        // durations; with `allow-discrete, normal` only
+        // `overlay` (exempt) resolves, `display` does not.
+        let p = props(&[
+            ("transition-property", "overlay, display"),
+            ("transition-duration", "2s, 3s"),
+            ("transition-delay", "0s, 0s"),
+            ("transition-timing-function", "linear, linear"),
+            ("transition-behavior", "allow-discrete, allow-discrete"),
+        ]);
+        assert_eq!(
+            resolve_params(&p, "display")
+                .expect("display layer")
+                .duration_s,
+            3.0
+        );
+        let p = props(&[
+            ("transition-property", "overlay, display"),
+            ("transition-duration", "2s, 3s"),
+            ("transition-delay", "0s, 0s"),
+            ("transition-timing-function", "linear, linear"),
+            ("transition-behavior", "allow-discrete, normal"),
+        ]);
+        assert!(resolve_params(&p, "display").is_none());
+        assert!(resolve_params(&p, "overlay").is_some());
+    }
+
+    #[test]
+    fn apply_transitions_drives_display_from_clock() {
+        // First read seeds `block`; then a `block` -> `none`
+        // change with `display 100s allow-discrete` (progress
+        // 0.5 via delay -50s) must still read `block`.
+        let key = "w82-test-display-clock";
+        let mut p = props(&[
+            ("display", "block"),
+            ("transition-property", "none"),
+            ("transition-duration", "0s"),
+            ("transition-delay", "0s"),
+            ("transition-timing-function", "ease"),
+            ("transition-behavior", "normal"),
+        ]);
+        apply_transitions(key, &mut p);
+        assert_eq!(p["display"], "block");
+        p.insert("display".to_string(), "none".to_string());
+        p.insert("transition-property".to_string(), "display".to_string());
+        p.insert("transition-duration".to_string(), "100s".to_string());
+        p.insert("transition-delay".to_string(), "-50s".to_string());
+        p.insert(
+            "transition-timing-function".to_string(),
+            "linear".to_string(),
+        );
+        p.insert(
+            "transition-behavior".to_string(),
+            "allow-discrete".to_string(),
+        );
+        apply_transitions(key, &mut p);
+        assert_eq!(p["display"], "block");
+    }
+
+    #[test]
+    fn retained_reads_pin_baseline_so_post_expiry_reads_none() {
+        // w82fix JS-M1: the dialog shape, pre-close reads
+        // included. Without the retained-read pin, the first
+        // post-expiry read sees prev=block/auto vs
+        // cascaded=none and starts a phantom exit transition
+        // holding block/auto for another full duration; with
+        // the pin it reads none immediately.
+        let dialog_props = || {
+            props(&[
+                ("overlay", "auto"),
+                ("display", "block"),
+                ("transition-property", "overlay, display"),
+                ("transition-duration", "2s, 2s"),
+                ("transition-delay", "0s, 0s"),
+                ("transition-timing-function", "linear, linear"),
+                ("transition-behavior", "allow-discrete, allow-discrete"),
+            ])
+        };
+        // Pinned path: pre-close read, retained reads (held
+        // values untouched), then the post-expiry read.
+        let key = "w82fix-test-retained-pin";
+        let mut p = dialog_props();
+        apply_transitions(key, &mut p);
+        assert_eq!(p["overlay"], "auto");
+        assert_eq!(p["display"], "block");
+        // Retained reads return the suppressed cascaded
+        // values unchanged (paint's held values).
+        let mut p = dialog_props();
+        apply_transitions_retained(key, &mut p);
+        assert_eq!(p["overlay"], "auto");
+        assert_eq!(p["display"], "block");
+        let mut p = dialog_props();
+        apply_transitions_retained(key, &mut p);
+        assert_eq!(p["overlay"], "auto");
+        assert_eq!(p["display"], "block");
+        // Post-expiry: cascade flips to none; no phantom
+        // transition may hold the old values.
+        let mut p = dialog_props();
+        p.insert("overlay".to_string(), "none".to_string());
+        p.insert("display".to_string(), "none".to_string());
+        apply_transitions(key, &mut p);
+        assert_eq!(p["overlay"], "none");
+        assert_eq!(p["display"], "none");
+        // Control: the same sequence WITHOUT retained reads
+        // does start the phantom transition (this is the bug
+        // the pin fixes, pinned here so the test above is
+        // known to discriminate).
+        let key2 = "w82fix-test-retained-pin-control";
+        let mut p = dialog_props();
+        apply_transitions(key2, &mut p);
+        let mut p = dialog_props();
+        p.insert("overlay".to_string(), "none".to_string());
+        p.insert("display".to_string(), "none".to_string());
+        apply_transitions(key2, &mut p);
+        assert_eq!(
+            p["overlay"], "auto",
+            "control: unpinned post-expiry read must hold auto"
+        );
+        assert_eq!(
+            p["display"], "block",
+            "control: unpinned post-expiry read must hold block"
+        );
+        // A retained read also clears a transition already in
+        // flight at close time (e.g. an entry transition), so
+        // the post-expiry read cannot retarget from it.
+        let key3 = "w82fix-test-retained-pin-clears-active";
+        let mut p = props(&[
+            ("overlay", "none"),
+            ("display", "none"),
+            ("transition-property", "overlay, display"),
+            ("transition-duration", "100s, 100s"),
+            ("transition-delay", "0s, 0s"),
+            ("transition-timing-function", "linear, linear"),
+            ("transition-behavior", "allow-discrete, allow-discrete"),
+        ]);
+        apply_transitions(key3, &mut p);
+        let mut p = dialog_props();
+        apply_transitions(key3, &mut p);
+        // Entry at progress 0 has not flipped yet (still
+        // `none`), but the transition is now active — that
+        // active record is what the retained read must clear.
+        assert_eq!(p["display"], "none");
+        // Close during the entry transition: retained reads
+        // hold the values and clear the active transition.
+        let mut p = dialog_props();
+        apply_transitions_retained(key3, &mut p);
+        assert_eq!(p["display"], "block");
+        let mut p = dialog_props();
+        p.insert("overlay".to_string(), "none".to_string());
+        p.insert("display".to_string(), "none".to_string());
+        apply_transitions(key3, &mut p);
+        assert_eq!(p["overlay"], "none");
+        assert_eq!(p["display"], "none");
+    }
+
+    #[test]
+    fn exit_transition_duration_takes_longest_exit() {
+        // The dialog shape: both transitions 2s -> 2s.
+        let p = props(&[
+            ("overlay", "auto"),
+            ("display", "block"),
+            ("transition-property", "overlay, display"),
+            ("transition-duration", "2s, 2s"),
+            ("transition-delay", "0s, 0s"),
+            ("transition-timing-function", "ease, ease"),
+            ("transition-behavior", "allow-discrete, allow-discrete"),
+        ]);
+        assert_eq!(exit_transition_duration(&p), Some(2.0));
+        // Different durations: the longest wins (overlay 2s,
+        // display 5s with a 1s delay -> 6s).
+        let p = props(&[
+            ("overlay", "auto"),
+            ("display", "block"),
+            ("transition-property", "overlay, display"),
+            ("transition-duration", "2s, 5s"),
+            ("transition-delay", "0s, 1s"),
+            ("transition-timing-function", "ease, ease"),
+            ("transition-behavior", "allow-discrete, allow-discrete"),
+        ]);
+        assert_eq!(exit_transition_duration(&p), Some(6.0));
+        // No transition (behavior normal for display, and
+        // overlay not listed): None -> synchronous demotion.
+        let p = props(&[
+            ("overlay", "auto"),
+            ("display", "block"),
+            ("transition-property", "display"),
+            ("transition-duration", "2s"),
+            ("transition-delay", "0s"),
+            ("transition-timing-function", "ease"),
+            ("transition-behavior", "normal"),
+        ]);
+        assert_eq!(exit_transition_duration(&p), None);
+        // Already hidden values are not exits.
+        let p = props(&[
+            ("overlay", "none"),
+            ("display", "none"),
+            ("transition-property", "overlay, display"),
+            ("transition-duration", "2s, 2s"),
+            ("transition-delay", "0s, 0s"),
+            ("transition-timing-function", "ease, ease"),
+            ("transition-behavior", "allow-discrete, allow-discrete"),
+        ]);
+        assert_eq!(exit_transition_duration(&p), None);
+        // Overlay alone (exempt from the behavior gate) counts.
+        let p = props(&[
+            ("overlay", "auto"),
+            ("display", "block"),
+            ("transition-property", "overlay"),
+            ("transition-duration", "2s"),
+            ("transition-delay", "0s"),
+            ("transition-timing-function", "ease"),
+            ("transition-behavior", "normal"),
+        ]);
+        assert_eq!(exit_transition_duration(&p), Some(2.0));
     }
 
     #[test]

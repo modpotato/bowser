@@ -61,7 +61,7 @@ use bowser_css::{
     ComputedStyle, CssValue, ElementState as CssElementState, LengthUnit, Stylesheet,
     selectors_are_subtree_local,
 };
-use bowser_dom::{Document, EscapeTarget, Namespace, NodeId, NodeKind};
+use bowser_dom::{DialogFocusEvent, Document, EscapeTarget, Namespace, NodeId, NodeKind};
 use bowser_layout::{
     LayoutBox, Position, Size, layout_subtree_with_intrinsics_and_scroll_and_offsets,
     layout_with_intrinsics_and_scroll_and_offsets, position_of, ua_stylesheet,
@@ -70,8 +70,8 @@ use bowser_net::cookies::CookieJar;
 use bowser_net::fetch::FetchTrace;
 use bowser_paint::WgpuBackend;
 use bowser_paint::display_list::{
-    DecodedImage, DisplayList, DisplayListBuilder, ImageId, build_display_list_reused,
-    push_scrollbar,
+    DecodedImage, DisplayList, DisplayListBuilder, ImageId,
+    build_display_list_reused_with_backdrop_styles, collect_backdrop_styles, push_scrollbar,
 };
 use bowser_paint::fonts::{FontCache, FontKey, SwashFontMetrics};
 use bowser_paint::render::{css_font_family, css_font_style, css_font_weight};
@@ -82,7 +82,7 @@ use winit::dpi::PhysicalSize;
 use winit::event::{
     ElementState as WinitElementState, MouseButton, MouseScrollDelta, TouchPhase, WindowEvent,
 };
-use winit::event_loop::{ActiveEventLoop, EventLoop};
+use winit::event_loop::{ActiveEventLoop, ControlFlow, EventLoop};
 use winit::keyboard::{Key, ModifiersState, NamedKey};
 use winit::window::Window;
 
@@ -251,22 +251,24 @@ pub trait JsDispatch {
     /// it, in which case the dialog stays open. The default does
     /// nothing and reports nothing canceled, so hosts without a JS
     /// bridge keep the state change; the production dispatcher
-    /// ([`crate::script::PageEventDispatch`]) does not override
-    /// this yet (w81 W-LD gap: real pages do not observe `cancel`
-    /// / `close` / popover `toggle` from Escape or light-dismiss
-    /// until a script.rs worker wires these hooks up — the state
-    /// transitions themselves already happen, and the test double
-    /// below proves the app invokes the hooks in the right order).
+    /// ([`crate::script::PageEventDispatch`]) overrides this (w82
+    /// round 1 wired the production `cancel` / `close` / popover
+    /// `toggle` hooks up in `script.rs`, closing the w81 W-LD gap
+    /// this doc used to describe — real pages now observe all
+    /// three from Escape and light-dismiss), and the test double
+    /// below proves the app invokes the hooks in the right order.
     fn dispatch_cancel(&mut self, _tab: &mut Tab, _target: NodeId) -> bool {
         false
     }
     /// Dispatch a non-bubbling `close` event at `target` (dialog
-    /// closed by Escape). The default does nothing; see
-    /// [`JsDispatch::dispatch_cancel`] for the wiring gap.
+    /// closed by Escape). The default does nothing; the production
+    /// dispatcher ([`crate::script::PageEventDispatch`]) overrides
+    /// this (see [`JsDispatch::dispatch_cancel`]).
     fn dispatch_close(&mut self, _tab: &mut Tab, _target: NodeId) {}
     /// Dispatch a `toggle` event at `target` (popover hidden by
-    /// Escape or light-dismiss). The default does nothing; see
-    /// [`JsDispatch::dispatch_cancel`] for the wiring gap.
+    /// Escape or light-dismiss). The default does nothing; the
+    /// production dispatcher ([`crate::script::PageEventDispatch`])
+    /// overrides this (see [`JsDispatch::dispatch_cancel`]).
     fn dispatch_toggle(&mut self, _tab: &mut Tab, _target: NodeId) {}
 }
 
@@ -299,6 +301,36 @@ struct InputState {
     /// invoker) before release therefore dismisses nothing.
     /// Cleared on every primary-button release.
     light_dismiss_pending: Option<NodeId>,
+    /// Dialog focus stacks, keyed by tab (w82 showModal focus,
+    /// HTML §4.11.4; w82 fix: tab-keyed): one entry per dialog
+    /// the window has moved focus into (modal dialogs and, since
+    /// the w82 fix, non-modal dialogs too — see below), in show
+    /// order — `(dialog, previously-focused element at show
+    /// time, was-modal)`. Keying by tab is what makes tab
+    /// switching safe: syncing the newly active tab used to diff
+    /// its document against one window-global stack, popping the
+    /// background tab's entry (record lost) and re-adopting it on
+    /// return with a wrong previous element. Now a background
+    /// tab's entries simply sit under its own key, untouched,
+    /// until that tab is active again; keys for tabs no longer
+    /// in the arena are pruned by the next sync (a generation in
+    /// the key means a recycled slot never resurrects them).
+    /// The show-time record comes from the bindings (see
+    /// [`WindowApp::sync_modal_focus`]): `showModal` snapshots
+    /// the mirrored host focus into the document, and the sync
+    /// replays the document's ordered show/close journal plus a
+    /// final-state diff fallback for paths the journal does not
+    /// cover (`open`-attribute removal, element removal, the
+    /// parse shim). Closing an inner dialog pops its entry and
+    /// restores focus into the outer dialog (whose entry is still
+    /// below it); closing the outer dialog then restores the
+    /// page element recorded beneath it. Escape restores
+    /// synchronously in [`WindowApp::handle_escape`] instead of
+    /// waiting for the pump. A dialog the window never synced
+    /// (opened before this window observed it) has no entry, and
+    /// its close falls back to clearing focus inside it — the
+    /// record is never invented after the fact.
+    modal_focus_stack: HashMap<TabId, Vec<(NodeId, Option<NodeId>, bool)>>,
 }
 
 fn state_for(input: &mut InputState, node: NodeId) -> &mut CssElementState {
@@ -1039,9 +1071,9 @@ fn apply_focus_nav(input: &mut InputState, tab: &mut Tab, backward: bool) -> Vec
 /// Focus outside the scope (or no focus) starts at the first/last
 /// scope focusable, like the global path. When the scope has no
 /// focusable descendant, focus falls back to the scope itself
-/// (the spec's showModal fallback, applied lazily here: the engine
-/// has no showModal hook in the window — see the focus gap note
-/// on [`WindowApp::handle_escape`]).
+/// (the spec's showModal fallback, applied lazily here by the
+/// Tab trap; the eager showModal move itself lives in
+/// [`WindowApp::sync_modal_focus`]).
 fn apply_focus_nav_in_scope(
     input: &mut InputState,
     tab: &mut Tab,
@@ -1070,6 +1102,140 @@ fn apply_focus_nav_in_dialog(
     backward: bool,
 ) -> Vec<Option<NodeId>> {
     apply_focus_nav_in_scope(input, tab, dialog, backward)
+}
+
+/// Whether `node` can take the showModal initial focus: the
+/// sequential-focusable set, widened to script-focusable
+/// (`tabindex="-1"`) elements — an `autofocus` descendant with a
+/// negative `tabindex` is still the spec's focus target even
+/// though Tab never reaches it. Disabled elements and hidden
+/// inputs are never focusable, as in
+/// [`is_sequentially_focusable`].
+fn is_dialog_initial_focusable(doc: &Document, node: NodeId) -> bool {
+    if is_sequentially_focusable(doc, node) {
+        return true;
+    }
+    let NodeKind::Element(data) = doc.kind(node) else {
+        return false;
+    };
+    if data.tag_name == "input"
+        && matches!(doc.get_attribute(node, "type"), Some(t) if t.eq_ignore_ascii_case("hidden"))
+    {
+        return false;
+    }
+    if doc.has_attribute(node, "disabled") {
+        return false;
+    }
+    tab_index(doc, node).is_some_and(|index| index < 0)
+}
+
+/// The showModal initial focus target (HTML §4.11.4, w82): the
+/// first `autofocus` descendant in document order that can take
+/// focus, else the first focusable in the dialog's sequential
+/// order (the dialog itself counts, as in the Tab trap), else
+/// the dialog itself — the spec's fallback when the dialog has
+/// no focusable descendant at all.
+/// Sequential focus order over an explicit candidate list,
+/// like [`sort_focus_order`] but with the dialog-initial-focus
+/// predicate ([`is_dialog_initial_focusable`]): `tabindex="-1"`
+/// elements participate (in the zero group, in document order)
+/// instead of being filtered out. The Tab trap itself keeps the
+/// stricter predicate — Tab never reaches a `-1` element — but
+/// the showModal initial-focus target may be one (w82 fix M8).
+fn sort_dialog_initial_order(doc: &Document, candidates: Vec<NodeId>) -> Vec<NodeId> {
+    let mut positive: Vec<(i32, usize, NodeId)> = Vec::new();
+    let mut zero: Vec<NodeId> = Vec::new();
+    for (i, node) in candidates.iter().enumerate() {
+        if !is_dialog_initial_focusable(doc, *node) {
+            continue;
+        }
+        match tab_index(doc, *node) {
+            Some(index) if index > 0 => positive.push((index, i, *node)),
+            _ => zero.push(*node),
+        }
+    }
+    positive.sort_by(|a, b| a.0.cmp(&b.0).then(a.1.cmp(&b.1)));
+    positive
+        .into_iter()
+        .map(|(_, _, node)| node)
+        .chain(zero)
+        .collect()
+}
+
+pub(crate) fn dialog_initial_focus(doc: &Document, dialog: NodeId) -> NodeId {
+    // The dialog itself first, when it carries `autofocus`
+    // (w82 fix m9): the spec's focus step checks the dialog
+    // itself before its descendants (a focus-delegate step
+    // between them has no machinery here — no shadow-delegate
+    // focus support exists in this function — so the delegate
+    // step is skipped, not silently reordered).
+    if doc.has_attribute(dialog, "autofocus") && is_dialog_initial_focusable(doc, dialog) {
+        return dialog;
+    }
+    let descendants = doc.descendants(dialog);
+    if let Some(autofocus) = descendants.iter().copied().find(|&node| {
+        doc.has_attribute(node, "autofocus") && is_dialog_initial_focusable(doc, node)
+    }) {
+        return autofocus;
+    }
+    let mut candidates = vec![dialog];
+    candidates.extend(descendants);
+    if let Some(first) = sort_dialog_initial_order(doc, candidates)
+        .into_iter()
+        .next()
+    {
+        return first;
+    }
+    dialog
+}
+
+/// Mirror the window's current keyboard focus into the
+/// tab's document (w82 fix, show-time record): the JS bindings
+/// snapshot this mirror at `show()`/`showModal()` time (see
+/// `bowser_dom::Document::note_dialog_show`), because the
+/// embedder's focus sync runs only at the next pump and by then
+/// a same-task script focus move has already happened. Every
+/// window focus setter calls this (plus the press site, which
+/// owns no `&mut Tab` in `press_at` itself); a stale mirror can
+/// only survive a focus *clear* the mirror missed, and the
+/// sync's restore-validity check (previous still attached, not
+/// inside a closed dialog) neutralizes exactly that shape.
+fn mirror_focus(tab: &mut Tab, focused: Option<NodeId>) {
+    if let Some(installed) = tab.installed_mut() {
+        installed.document().borrow_mut().set_host_focus(focused);
+    }
+}
+
+/// Move keyboard focus to `target` unconditionally (the
+/// showModal move and the close restore, as opposed to the
+/// one-step Tab walk in [`move_focus_in_order`]): clear the old
+/// `:focus` state, set the new one, and reveal the target like
+/// Tab does. A no-op when `target` already has focus.
+fn set_focused(input: &mut InputState, tab: &mut Tab, target: NodeId) {
+    if Some(target) == input.focused {
+        return;
+    }
+    if let Some(old) = input.focused.take() {
+        state_for(input, old).focus = false;
+    }
+    state_for(input, target).focus = true;
+    input.focused = Some(target);
+    mirror_focus(tab, Some(target));
+    let scrolled = crate::navigation::scroll_to_node(
+        tab,
+        target,
+        crate::scroll::RevealAlign::Nearest,
+        crate::scroll::RevealAlign::Nearest,
+        bowser_js::ScrollBehavior::Auto,
+    );
+    sync_nested_paint(tab, &scrolled);
+}
+
+/// Clear keyboard focus entirely (no element holds `:focus`).
+fn clear_focus(input: &mut InputState) {
+    if let Some(old) = input.focused.take() {
+        state_for(input, old).focus = false;
+    }
 }
 
 fn move_focus_in_order(
@@ -1106,6 +1272,7 @@ fn move_focus_in_order(
     }
     state_for(input, next).focus = true;
     input.focused = Some(next);
+    mirror_focus(tab, Some(next));
     let scrolled = crate::navigation::scroll_to_node(
         tab,
         next,
@@ -2288,10 +2455,18 @@ fn refresh(tab: &mut Tab, fonts: &Mutex<FontCache>) {
                     let mut resolve_fonts = |style: &ComputedStyle| -> FontKey {
                         font_key_for_style(&mut fonts, style)
                     };
+                    // Author `::backdrop` styles for the windowed paint
+                    // path, collected from the tab's author sheets over
+                    // the top layer (same wiring as headless/WPT):
+                    // without them paint falls back to the UA modal dim
+                    // and author backdrop rules never render here.
+                    let author_refs: Vec<&Stylesheet> = tab.render.author.iter().collect();
+                    let backdrop_styles =
+                        collect_backdrop_styles(&doc, &author_refs, tab.render.viewport);
                     REUSED_BUILDER.with(|cell| {
                         let mut slot = cell.borrow_mut();
                         let builder = slot.get_or_insert_with(DisplayListBuilder::new);
-                        build_display_list_reused(
+                        build_display_list_reused_with_backdrop_styles(
                             builder,
                             &mut list,
                             root,
@@ -2300,6 +2475,7 @@ fn refresh(tab: &mut Tab, fonts: &Mutex<FontCache>) {
                             &mut resolve_images,
                             tab.render.viewport,
                             style_changed,
+                            backdrop_styles,
                         );
                     });
                     list
@@ -2497,6 +2673,47 @@ fn link_href(doc: &Document, node: NodeId) -> Option<String> {
     doc.get_attribute(node, "href").map(str::to_owned)
 }
 
+/// Deferred dismissal for user-initiated paths (w82 fixpaths
+/// B3): the ONE place that turns an Escape, light-dismiss, or
+/// invoker hide into an exit-retained demotion. The JS
+/// bindings measure the exit transition at show time and store
+/// it in the document (see [`Document::store_exit_duration`]);
+/// these paths cannot run the bindings' `compute_style`, so
+/// they consume that stored value instead of measuring (or
+/// skipping the transition) on their own. A stored duration
+/// defers the demotion — the element leaves the live top layer
+/// but keeps rendering until it expires, exactly like a script
+/// close/hide — while no stored duration demotes
+/// synchronously, as before. Returns true exactly when a live
+/// member was hidden or retained; a retained-only or hidden
+/// element returns false (no change, no event).
+pub(crate) fn deferred_hide_popover(doc: &mut Document, node: NodeId) -> bool {
+    if !doc.top_layer().contains(&node) {
+        return false;
+    }
+    match doc.take_stored_exit_duration(node) {
+        Some(d) if d > 0.0 => doc.hide_popover_deferred(node, d).is_ok(),
+        _ => doc.hide_popover(node).is_ok(),
+    }
+}
+
+/// Deferred dialog close for user-initiated paths (w82
+/// fixpaths B3): same stored-duration mechanism as
+/// [`deferred_hide_popover`], for Escape's modal-dialog arm.
+/// The `close` event itself still fires at close time (the
+/// caller fires it after restoring focus); only the top-layer
+/// demotion is deferred. Returns true exactly when an open
+/// dialog was closed.
+pub(crate) fn deferred_close_dialog(doc: &mut Document, node: NodeId) -> bool {
+    if !doc.is_dialog_open(node) {
+        return false;
+    }
+    match doc.take_stored_exit_duration(node) {
+        Some(d) if d > 0.0 => doc.close_dialog_deferred(node, None, d).unwrap_or(false),
+        _ => doc.close_dialog(node, None).unwrap_or(false),
+    }
+}
+
 /// Popover-target activation for a clicked element (HTML "popover
 /// target attribute activation behavior", 6.12.1), shared by the
 /// windowed click path and the testdriver click path. Callers run it
@@ -2565,22 +2782,60 @@ fn link_href(doc: &Document, node: NodeId) -> Option<String> {
 ///   one, toggle flipped it), so the caller can fire the `toggle`
 ///   event for exactly those changes; `None` for every no-op.
 ///   The caller fires the hook — this helper owns no dispatcher —
-///   and production delivery of that hook through `script.rs` is
-///   deferred, like the Escape / light-dismiss hooks.
+///   and production delivery of that hook runs through the
+///   `JsDispatch` implementation in `script.rs` (wired, not
+///   deferred: the click path calls `dispatch_toggle` for the
+///   changed target right after activation).
+/// * Show/hide arms key on LIVE top-layer membership, not
+///   `is_popover_open` (w82 fixpaths, same reconciled rule as
+///   [`Document::hide_popover`]): an exit-retained popover is
+///   hidden for API purposes, so a `show` re-opens it and a
+///   `hide` (or a toggle, which is a bare toggle on it) is a
+///   no-op that leaves the retention alone. Hide arms demote
+///   through [`deferred_hide_popover`], so an invoker hide
+///   renders the exit transition like a script hide.
 /// * Out of scope here, deliberately: `command`/`commandfor`
 ///   invokers (a separate follow-on) and keyboard activation.
+///
+/// [`activate_popover_target_full`] is the same activation
+/// plus the auto-closed set from any show branch (see
+/// [`Document::show_popover`]): click paths use it so they
+/// can fire a `toggle` for every auto-closed popover too.
+/// This wrapper keeps the primary-only shape the unit tests
+/// assert on. Test-only since the w82 final review: every
+/// production click path now uses the full form (the
+/// testdriver pointer-up path was the last primary-only
+/// caller), so a lib build would otherwise flag this as
+/// dead code.
+#[cfg(test)]
 pub(crate) fn activate_popover_target(
     doc: &mut Document,
     invoker: NodeId,
     event_target: NodeId,
 ) -> Option<NodeId> {
+    activate_popover_target_full(doc, invoker, event_target).0
+}
+
+/// Full form of [`activate_popover_target`]: the primary
+/// changed target (as there) plus every popover a show branch
+/// auto-closed, in [`Document::show_popover`] order. Hide and
+/// toggle-hide branches auto-close nothing.
+pub(crate) fn activate_popover_target_full(
+    doc: &mut Document,
+    invoker: NodeId,
+    event_target: NodeId,
+) -> (Option<NodeId>, Vec<NodeId>) {
     if !is_valid_popover_invoker(doc, invoker) {
-        return None;
+        return (None, Vec::new());
     }
-    let target_id = doc.get_attribute(invoker, "popovertarget")?;
-    let target = doc.get_element_by_id(target_id)?;
+    let Some(target_id) = doc.get_attribute(invoker, "popovertarget") else {
+        return (None, Vec::new());
+    };
+    let Some(target) = doc.get_element_by_id(target_id) else {
+        return (None, Vec::new());
+    };
     if target == invoker {
-        return None;
+        return (None, Vec::new());
     }
     // Descendant guard (inclusive both sides): the event target
     // inside the popover while the popover sits inside the invoker.
@@ -2588,35 +2843,53 @@ pub(crate) fn activate_popover_target(
     let event_inside_target =
         event_target == target || doc.descendants(target).contains(&event_target);
     if target_inside_invoker && event_inside_target {
-        return None;
+        return (None, Vec::new());
     }
     // Not a popover (including attribute-stripped): never resurrect.
-    doc.popover_state(target)?;
+    if doc.popover_state(target).is_none() {
+        return (None, Vec::new());
+    }
     let action = doc
         .get_attribute(invoker, "popovertargetaction")
         .unwrap_or("")
         .to_ascii_lowercase();
+    let live = doc.top_layer().contains(&target);
     match action.as_str() {
         "show" => {
-            if !doc.is_popover_open(target) {
-                doc.show_popover(target).ok()?;
-                Some(target)
+            if live {
+                (None, Vec::new())
             } else {
-                None
+                match doc.show_popover(target) {
+                    Ok(closed) => (Some(target), closed),
+                    Err(_) => (None, Vec::new()),
+                }
             }
         }
         "hide" => {
-            if doc.is_popover_open(target) {
-                doc.hide_popover(target).ok()?;
-                Some(target)
+            if live && deferred_hide_popover(doc, target) {
+                (Some(target), Vec::new())
             } else {
-                None
+                (None, Vec::new())
             }
         }
-        // Missing, invalid, or "toggle": toggle.
+        // Missing, invalid, or "toggle": toggle. Live flips
+        // (deferred hide), retained is a bare-toggle no-op,
+        // hidden shows (with its auto-closed set).
         _ => {
-            doc.toggle_popover(target, None).ok()?;
-            Some(target)
+            if live {
+                if deferred_hide_popover(doc, target) {
+                    (Some(target), Vec::new())
+                } else {
+                    (None, Vec::new())
+                }
+            } else if doc.is_exit_retained(target) {
+                (None, Vec::new())
+            } else {
+                match doc.show_popover(target) {
+                    Ok(closed) => (Some(target), closed),
+                    Err(_) => (None, Vec::new()),
+                }
+            }
         }
     }
 }
@@ -2773,6 +3046,34 @@ pub(crate) fn modal_press_blocked(doc: &Document, hit: Option<NodeId>) -> bool {
 /// modal dialog owns Tab while it is on top, because the modal
 /// below already traps and the popover is the topmost member of
 /// that trap; the modal regains it when the popover closes.
+/// Whether a popover scope above `dialog` blocks its
+/// showModal move-in (w82 fix): the top-layer focus scope is
+/// the topmost modal dialog or open popover; when that scope is
+/// a popover sitting above the dialog, sequential navigation
+/// belongs to the popover, and a late (sync-time) move-in would
+/// yank focus out of the popover's trap — e.g. a Tab that
+/// already landed inside the popover. The entry is still
+/// recorded (so the close pops cleanly); only the move is
+/// skipped. A dialog scope above does NOT block: nested
+/// dialogs replay in show order, and the inner dialog's own
+/// move-in is what lands focus at the end.
+pub(crate) fn popover_scope_blocks_dialog_move(doc: &Document, dialog: NodeId) -> bool {
+    let Some(scope) = top_layer_focus_scope(doc) else {
+        return false;
+    };
+    if scope == dialog || !doc.is_popover_open(scope) {
+        return false;
+    }
+    let layer = doc.top_layer();
+    let (Some(scope_pos), Some(dialog_pos)) = (
+        layer.iter().position(|&n| n == scope),
+        layer.iter().position(|&n| n == dialog),
+    ) else {
+        return false;
+    };
+    scope_pos > dialog_pos
+}
+
 pub(crate) fn top_layer_focus_scope(doc: &Document) -> Option<NodeId> {
     let top_layer = doc.top_layer();
     if !top_layer.iter().any(|n| doc.is_dialog_modal(*n)) {
@@ -4017,6 +4318,14 @@ struct WindowApp<'a> {
     /// Current window scale factor (physical px per CSS px).
     scale: f64,
     needs_redraw: bool,
+    /// The exit-retention expiry the event loop is currently
+    /// armed to wake at (w82fix Whole-M1), if any: set when
+    /// [`Document::earliest_exit_retention_expiry`] reports a
+    /// live retention, cleared when it passes (with one
+    /// redraw, below) or when the retention is cancelled.
+    /// `None` means no wakeup is armed and the loop runs on
+    /// its default [`ControlFlow::Wait`].
+    retention_wakeup: Option<Instant>,
     /// Init failures cannot propagate out of `ApplicationHandler`
     /// methods, so they are stashed here and returned after `run_app`.
     init_error: Option<WindowError>,
@@ -4536,6 +4845,14 @@ impl<'a> WindowApp<'a> {
                 Some(tab) => press_at(&mut self.input, tab, x, y),
                 None => None,
             };
+            // Mirror the press focus for the show-time snapshot
+            // (see `mirror_focus`): a click handler that calls
+            // `showModal()` must snapshot the pressed element,
+            // not the pre-press focus.
+            let focused_now = self.input.focused;
+            if let Some(tab) = self.tab_mut() {
+                mirror_focus(tab, focused_now);
+            }
             if hit.is_some() {
                 if let Some(tab) = self.tab_mut() {
                     // Style-only dirt: a partial-layout blocker in
@@ -4644,27 +4961,32 @@ impl<'a> WindowApp<'a> {
         // from the event target's ancestors — the target is the
         // deepest hit box, usually a child of the button — and the
         // original target is kept for the descendant guard. A
-        // visibility change fires the `toggle` hook (production
-        // delivery via `script.rs` is deferred, as for Escape /
-        // light-dismiss).
-        let changed = match self.tabs.get_mut(self.tab) {
+        // visibility change fires the `toggle` hook through the
+        // `JsDispatch` implementation in `script.rs` (wired):
+        // auto-closed popovers first (they closed inside the
+        // show), then the primary target.
+        let (changed, auto_closed) = match self.tabs.get_mut(self.tab) {
             Some(tab) => match tab.installed_mut() {
                 Some(installed) => {
                     let mut doc = installed.document().borrow_mut();
                     match resolve_popover_invoker(&doc, node) {
-                        Some(invoker) => activate_popover_target(&mut doc, invoker, node),
-                        None => None,
+                        Some(invoker) => activate_popover_target_full(&mut doc, invoker, node),
+                        None => (None, Vec::new()),
                     }
                 }
-                None => None,
+                None => (None, Vec::new()),
             },
-            None => None,
+            None => (None, Vec::new()),
         };
-        if let Some(target) = changed
-            && let Some(js) = self.js.as_mut()
+        if let Some(js) = self.js.as_mut()
             && let Some(tab) = self.tabs.get_mut(self.tab)
         {
-            js.dispatch_toggle(tab, target);
+            for victim in auto_closed {
+                js.dispatch_toggle(tab, victim);
+            }
+            if let Some(target) = changed {
+                js.dispatch_toggle(tab, target);
+            }
         }
         let href = self
             .tabs
@@ -5002,23 +5324,392 @@ impl<'a> WindowApp<'a> {
     /// existed — even when the page canceled the dialog's `cancel`
     /// event and the dialog stayed open — and false when nothing was
     /// dismissible. State changes happen here; event delivery goes
-    /// through the [`JsDispatch`] hooks, whose production wiring is
-    /// still pending (see [`JsDispatch::dispatch_cancel`]).
+    /// through the [`JsDispatch`] hooks (production wiring in
+    /// `script.rs`, see [`JsDispatch::dispatch_cancel`]).
     ///
-    /// Focus gap (deferred, not invented): the spec moves focus into
-    /// the dialog on `showModal` and restores the previously focused
-    /// element on close. This engine cannot do either yet, because
-    /// `showModal` runs in the JS bindings (`bowser_js`, which has no
-    /// access to this window's [`InputState`]) while focus lives here
-    /// — no record of the previously focused element exists anywhere
-    /// to restore from. What this worker does implement: Tab inside
-    /// a modal dialog is trapped to the dialog's focusables (see
-    /// [`apply_focus_nav_in_dialog`]), and closing a dialog/popover
-    /// clears focus that sat inside it instead of leaving `:focus`
-    /// on hidden content. A follow-up worker must thread a
-    /// previously-focused record through `Tab` (or notify the window
-    /// from the bindings) before true showModal focus move/restore
-    /// is possible.
+    /// Focus (w82): closing a modal dialog restores the
+    /// previously focused element recorded by
+    /// [`Self::sync_modal_focus`] (see the stack doc on
+    /// [`InputState::modal_focus_stack`]); a dialog with no
+    /// recorded entry — opened before this window observed it —
+    /// falls back to clearing focus inside it, as before. Tab
+    /// inside a modal dialog stays trapped to the dialog's
+    /// focusables (see [`apply_focus_nav_in_dialog`]).
+    ///
+    /// ShowModal focus move/restore (w82, HTML §4.11.4; w82
+    /// fix: journal replay + show-time snapshot + tab-keyed
+    /// stack). The bindings run `show()`/`showModal()`/`close()`
+    /// in `bowser_js`, which cannot see this window's
+    /// [`InputState`], so the window cannot be notified at show
+    /// time directly. Instead the record is threaded through the
+    /// document, in two pieces. First, the document's ordered
+    /// dialog journal (see
+    ///   `bowser_dom::DialogFocusEvent`): every production show
+    ///   and close appends, in order, so a show+close or a
+    ///   close+re-show inside one pump interval replays step by
+    ///   step instead of vanishing into a final-state diff;
+    /// Second, the show-time snapshot: the window mirrors its focus
+    ///   into the document on every focus change (see
+    ///   [`mirror_focus`]), and the bindings snapshot that mirror
+    ///   at show time (see `bowser_dom::Document::note_dialog_show`).
+    ///   A script focus move later in the same task therefore
+    ///   cannot overwrite the record — the sync reads the
+    ///   snapshot, not the post-task focus.
+    /// The sync replays the journal first, then diffs the live
+    /// state as a fallback for paths the journal does not cover
+    /// (`open`-attribute removal, element removal, the parse
+    /// shim, markup-open dialogs). The stack itself lives in
+    /// [`InputState::modal_focus_stack`], keyed by tab, so a
+    /// background tab's entries survive a tab switch untouched.
+    /// ORDERING (w82 fix M5), stated not hidden: Escape restores
+    /// *before* its `close` event is dispatched (see
+    /// [`Self::handle_escape`]), which is the spec order. JS
+    /// `close()` cannot: the bindings fire `close` synchronously
+    /// inside the script task, before any window sync runs, and
+    /// the bindings have no channel to the window's focus — so a
+    /// JS `close` listener still observes the pre-restore focus
+    /// (inside the dialog), and the restore lands at the next
+    /// pump sync. That divergence is architectural, not an
+    /// oversight: closing it would need a bindings-to-window
+    /// re-entrancy hook, which is deliberately not built here.
+    /// The two paths do restore to the same target; only the
+    /// listener-visible timing differs, and it is pinned by test.
+    fn sync_modal_focus(&mut self) {
+        let tab_id = self.tab;
+        let focused_before = self.input.focused;
+        // Prune keys for tabs no longer in the arena (a
+        // generation in the key means a recycled slot never
+        // resurrects them); live background tabs keep theirs.
+        self.input
+            .modal_focus_stack
+            .retain(|key, _| self.tabs.get(*key).is_some());
+        // 1. Replay the journal, in order. Each step sees the
+        // focus the previous step left, which is what makes
+        // same-interval sequences correct: show+close restores
+        // instead of leaving focus inside a closed dialog, and
+        // close+re-show drops the stale entry instead of
+        // keeping it.
+        let events: Vec<DialogFocusEvent> = match self.tabs.get_mut(tab_id) {
+            Some(tab) => match tab.installed_mut() {
+                Some(installed) => installed.document().borrow_mut().take_dialog_focus_events(),
+                None => Vec::new(),
+            },
+            None => Vec::new(),
+        };
+        // Whether a close was replayed earlier in this batch
+        // (w82 fix): a show after a replayed close must not use
+        // its snapshot — the snapshot predates the close
+        // restore (JS `close()` restores only at sync time, so
+        // at re-show time in the script task focus was still
+        // pre-restore). The post-restore focus (`cur` below)
+        // is what a real browser's synchronous close would
+        // have left for the re-show to record.
+        let mut saw_replayed_close = false;
+        for event in events {
+            match event {
+                DialogFocusEvent::Shown { node, modal } => {
+                    let stacked = self
+                        .input
+                        .modal_focus_stack
+                        .get(&tab_id)
+                        .is_some_and(|stack| stack.iter().any(|(stacked, _, _)| *stacked == node));
+                    if stacked {
+                        continue;
+                    }
+                    // Show-time snapshot, if the bindings
+                    // recorded one (consumed here, so a later
+                    // sync cannot reuse a stale record).
+                    let recorded: Option<Option<NodeId>> = match self.tabs.get_mut(tab_id) {
+                        Some(tab) => match tab.installed_mut() {
+                            Some(installed) => installed
+                                .document()
+                                .borrow_mut()
+                                .take_dialog_show_previous(node),
+                            None => None,
+                        },
+                        None => None,
+                    };
+                    let cur = self.input.focused;
+                    // Is focus inside a dialog already stacked
+                    // below this one? That is the previous
+                    // show's move-in having landed (nested
+                    // shows in one interval), not a script
+                    // move: the new dialog's previous is that
+                    // focus, and the move-in still runs.
+                    let inside_stacked = match cur {
+                        Some(focused) => {
+                            self.input
+                                .modal_focus_stack
+                                .get(&tab_id)
+                                .is_some_and(|stack| {
+                                    stack.iter().any(|(stacked, _, _)| {
+                                        focused == *stacked
+                                            || match self.tabs.get(tab_id) {
+                                                Some(tab) => match tab.document_ref() {
+                                                    Some(doc) => {
+                                                        doc.descendants(*stacked).contains(&focused)
+                                                    }
+                                                    None => false,
+                                                },
+                                                None => false,
+                                            }
+                                    })
+                                })
+                        }
+                        None => false,
+                    };
+                    let (previous, move_in) = if saw_replayed_close {
+                        (cur, modal)
+                    } else {
+                        match recorded {
+                            Some(rec) => {
+                                if cur == rec || inside_stacked {
+                                    (if inside_stacked { cur } else { rec }, modal)
+                                } else {
+                                    // A post-show script focus move:
+                                    // it wins (no move-in clobber),
+                                    // but the restore target stays
+                                    // the show-time record.
+                                    (rec, false)
+                                }
+                            }
+                            // Non-bindings show path (tests, parse
+                            // shim, markup): no snapshot exists, so
+                            // the old behaviour — record current
+                            // focus and move in — is the fallback.
+                            None => (cur, modal),
+                        }
+                    };
+                    // A popover scope above this dialog owns
+                    // sequential navigation: record the entry
+                    // but do not move focus into the dialog
+                    // below it (see `popover_scope_blocks_dialog_move`).
+                    let move_in = move_in
+                        && !match self.tabs.get(tab_id) {
+                            Some(tab) => match tab.document_ref() {
+                                Some(doc) => popover_scope_blocks_dialog_move(&doc, node),
+                                None => false,
+                            },
+                            None => false,
+                        };
+                    self.input
+                        .modal_focus_stack
+                        .entry(tab_id)
+                        .or_default()
+                        .push((node, previous, modal));
+                    if move_in {
+                        let target = match self.tabs.get(tab_id) {
+                            Some(tab) => match tab.document_ref() {
+                                Some(doc) => dialog_initial_focus(&doc, node),
+                                None => node,
+                            },
+                            None => node,
+                        };
+                        // Disjoint field borrows (`input` vs
+                        // `tabs`).
+                        if let Some(tab) = self.tabs.get_mut(tab_id) {
+                            set_focused(&mut self.input, tab, target);
+                        }
+                    }
+                }
+                DialogFocusEvent::Closed { node } => {
+                    let popped = self
+                        .input
+                        .modal_focus_stack
+                        .get_mut(&tab_id)
+                        .and_then(|stack| {
+                            stack
+                                .iter()
+                                .position(|(stacked, _, _)| *stacked == node)
+                                .map(|pos| stack.remove(pos))
+                        });
+                    // Already popped (Escape restores
+                    // synchronously): the journal event is a
+                    // no-op, never a double restore.
+                    if let Some((_, previous, was_modal)) = popped {
+                        saw_replayed_close = true;
+                        self.restore_focus_after_close(node, previous, was_modal);
+                    }
+                }
+            }
+        }
+        // 2. Final-state diff fallback, for paths the journal
+        // does not cover. Live modal dialogs, in top-layer
+        // (promotion) order. `open` is required alongside
+        // `modal`: an exit-retained dialog still reports
+        // `is_dialog_modal` while its transition runs, but it
+        // is already closed — its `close` event fired at close
+        // time, so focus restores then, not when the retention
+        // expires.
+        let current: Vec<NodeId> = match self.tabs.get(tab_id) {
+            Some(tab) => match tab.document_ref() {
+                Some(doc) => doc
+                    .top_layer()
+                    .iter()
+                    .copied()
+                    .filter(|&node| doc.is_dialog_open(node) && doc.is_dialog_modal(node))
+                    .collect(),
+                None => Vec::new(),
+            },
+            None => Vec::new(),
+        };
+        // Closes first, innermost first: a sync that observes
+        // both a close and a re-show restores the old previous
+        // focus before the new dialog records it as its own.
+        // Modal entries pop when no longer modal-open; non-modal
+        // entries (journal-only for adoption) pop when no longer
+        // open or no longer attached — element removal of a
+        // non-modal dialog leaves its `open` attribute in place,
+        // so the attached check is what catches it.
+        let snapshot = self
+            .input
+            .modal_focus_stack
+            .get(&tab_id)
+            .cloned()
+            .unwrap_or_default();
+        for (dialog, previous, was_modal) in snapshot.iter().rev() {
+            let still_open = match self.tabs.get(tab_id) {
+                Some(tab) => match tab.document_ref() {
+                    Some(doc) => {
+                        if *was_modal {
+                            current.contains(dialog)
+                        } else {
+                            doc.is_dialog_open(*dialog)
+                                && doc.propagation_path(*dialog).last() == Some(&doc.root())
+                        }
+                    }
+                    None => false,
+                },
+                None => false,
+            };
+            if still_open {
+                continue;
+            }
+            if let Some(stack) = self.input.modal_focus_stack.get_mut(&tab_id) {
+                stack.retain(|(stacked, _, _)| stacked != dialog);
+            }
+            self.restore_focus_after_close(*dialog, *previous, *was_modal);
+        }
+        // Opens, in top-layer order: each new dialog records the
+        // focus as it stands after earlier closes (and earlier
+        // opens in this same sync, which moved focus inside the
+        // dialog below it) — that ordering is what makes the
+        // nested stack restore into the outer dialog.
+        for dialog in current {
+            let stacked = self
+                .input
+                .modal_focus_stack
+                .get(&tab_id)
+                .is_some_and(|stack| stack.iter().any(|(stacked, _, _)| *stacked == dialog));
+            if stacked {
+                continue;
+            }
+            let previous = self.input.focused;
+            self.input
+                .modal_focus_stack
+                .entry(tab_id)
+                .or_default()
+                .push((dialog, previous, true));
+            let blocked = match self.tabs.get(tab_id) {
+                Some(tab) => match tab.document_ref() {
+                    Some(doc) => popover_scope_blocks_dialog_move(&doc, dialog),
+                    None => false,
+                },
+                None => false,
+            };
+            if blocked {
+                continue;
+            }
+            let target = match self.tabs.get(tab_id) {
+                Some(tab) => match tab.document_ref() {
+                    Some(doc) => dialog_initial_focus(&doc, dialog),
+                    None => dialog,
+                },
+                None => dialog,
+            };
+            // Disjoint field borrows (`input` vs `tabs`).
+            if let Some(tab) = self.tabs.get_mut(tab_id) {
+                set_focused(&mut self.input, tab, target);
+            }
+        }
+        if self.input.focused != focused_before {
+            self.needs_redraw = true;
+            if let Some(tab) = self.tabs.get_mut(tab_id) {
+                tab.dirty.style = true;
+            }
+        }
+    }
+
+    /// Restore focus after `dialog` closed, from the stack entry
+    /// [`Self::sync_modal_focus`] recorded for it.
+    /// `was_modal` selects the rule (HTML §4.11.4 close step
+    /// 12, w82 fix M1): a modal dialog restores unconditionally
+    /// — even when focus has since moved elsewhere, that move
+    /// belongs to no surviving scope once the dialog closes, so
+    /// the recorded previous wins. A non-modal dialog restores
+    /// only when focus currently sits inside it (the trapped
+    /// case) or nowhere; focus elsewhere belongs to another
+    /// scope and is left alone. Either way, a recorded previous
+    /// element is restored only when it is still attached and
+    /// not itself inside a closed dialog (a removed previous
+    /// element, or one inside the dialog just closed, cannot
+    /// take focus); when the previous is invalid, focus clears
+    /// only when it sits inside the dialog or nowhere — an
+    /// invalid previous never clobbers focus that lives
+    /// elsewhere.
+    fn restore_focus_after_close(
+        &mut self,
+        dialog: NodeId,
+        previous: Option<NodeId>,
+        was_modal: bool,
+    ) {
+        let (inside, valid_previous) = match self.tabs.get(self.tab) {
+            Some(tab) => match tab.document_ref() {
+                Some(doc) => {
+                    let focused = self.input.focused;
+                    let inside = match focused {
+                        None => true,
+                        Some(focused) => {
+                            focused == dialog || doc.descendants(dialog).contains(&focused)
+                        }
+                    };
+                    let valid = match previous {
+                        Some(prev) => {
+                            let attached =
+                                prev == doc.root() || doc.ancestors(prev).contains(&doc.root());
+                            let mut chain = vec![prev];
+                            chain.extend(doc.ancestors(prev));
+                            attached
+                                && !chain.iter().any(|&node| {
+                                    doc.is_dialog_element(node) && !doc.is_dialog_open(node)
+                                })
+                        }
+                        None => false,
+                    };
+                    (inside, valid)
+                }
+                None => (false, false),
+            },
+            None => (false, false),
+        };
+        match previous.filter(|_| valid_previous) {
+            Some(target) if was_modal || inside => {
+                if let Some(tab) = self.tabs.get_mut(self.tab) {
+                    set_focused(&mut self.input, tab, target);
+                }
+            }
+            _ => {
+                if inside {
+                    clear_focus(&mut self.input);
+                    let focused_now = self.input.focused;
+                    if let Some(tab) = self.tabs.get_mut(self.tab) {
+                        mirror_focus(tab, focused_now);
+                    }
+                }
+            }
+        }
+    }
+
     fn handle_escape(&mut self) -> bool {
         let target = match self.tabs.get(self.tab) {
             Some(tab) => match tab.document_ref() {
@@ -5042,13 +5733,16 @@ impl<'a> WindowApp<'a> {
                 if canceled {
                     return true;
                 }
+                // Deferred close (w82 fixpaths B3): a stored
+                // exit duration defers only the top-layer
+                // demotion — the dialog is closed now, and the
+                // focus restore below still runs before the
+                // `close` event, exactly as before.
                 let closed = match self.tabs.get_mut(self.tab) {
                     Some(tab) => match tab.installed_mut() {
-                        Some(installed) => installed
-                            .document()
-                            .borrow_mut()
-                            .close_dialog(dialog, None)
-                            .unwrap_or(false),
+                        Some(installed) => {
+                            deferred_close_dialog(&mut installed.document().borrow_mut(), dialog)
+                        }
                         None => false,
                     },
                     None => false,
@@ -5056,12 +5750,42 @@ impl<'a> WindowApp<'a> {
                 if !closed {
                     return true;
                 }
+                // Restore before the `close` event fires: a
+                // listener that re-opens the dialog (or another
+                // one) then observes the restored focus as the
+                // focus its own showModal records, and the next
+                // pump sync re-pushes the re-opened dialog.
+                // No stack entry (dialog opened before this
+                // window observed it): clear focus inside it, as
+                // before, so `:focus` never lingers on hidden
+                // content.
+                // Restore-hook only (w82 fix M1/M5): the entry
+                // carries its own was-modal flag, and the restore
+                // runs before `dispatch_close` below, so a close
+                // listener observes the restored focus. The
+                // dismissal itself (cancel gating, `close_dialog`)
+                // is untouched here.
+                let popped = self
+                    .input
+                    .modal_focus_stack
+                    .get_mut(&self.tab)
+                    .and_then(|stack| {
+                        stack
+                            .iter()
+                            .position(|(stacked, _, _)| *stacked == dialog)
+                            .map(|pos| stack.remove(pos))
+                    });
+                match popped {
+                    Some((_, previous, was_modal)) => {
+                        self.restore_focus_after_close(dialog, previous, was_modal);
+                    }
+                    None => self.clear_focus_inside(dialog),
+                }
                 if let Some(js) = self.js.as_mut()
                     && let Some(tab) = self.tabs.get_mut(self.tab)
                 {
                     js.dispatch_close(tab, dialog);
                 }
-                self.clear_focus_inside(dialog);
                 if let Some(tab) = self.tab_mut() {
                     tab.dirty.style = true;
                 }
@@ -5075,12 +5799,15 @@ impl<'a> WindowApp<'a> {
                 // `Ok` for an already-hidden popover too. An
                 // already-hidden popover consumes the key with no
                 // `toggle` event, mirroring a canceled `cancel`.
+                // Deferred hide (w82 fixpaths B3): a stored
+                // exit duration retains the popover for its
+                // transition; the `toggle` below still fires now.
                 let hidden = match self.tabs.get_mut(self.tab) {
                     Some(tab) => match tab.installed_mut() {
                         Some(installed) => {
                             let mut doc = installed.document().borrow_mut();
                             let was_open = doc.is_popover_open(pop);
-                            was_open && doc.hide_popover(pop).is_ok()
+                            was_open && deferred_hide_popover(&mut doc, pop)
                         }
                         None => false,
                     },
@@ -5145,12 +5872,23 @@ impl<'a> WindowApp<'a> {
         if release_target != Some(pop) {
             return false;
         }
+        // Deferred hide (w82 fixpaths B3): the recorded
+        // candidate is the popover to dismiss, and the release
+        // already resolved to it above, so this is the
+        // light-dismiss demotion itself — routed through the
+        // stored exit duration instead of the old synchronous
+        // `light_dismiss_popover` hide. The `toggle` below
+        // still fires now, at dismissal time.
         let dismissed = match self.tabs.get_mut(self.tab) {
             Some(tab) => match tab.installed_mut() {
-                Some(installed) => installed
-                    .document()
-                    .borrow_mut()
-                    .light_dismiss_popover(released),
+                Some(installed) => {
+                    let mut doc = installed.document().borrow_mut();
+                    if deferred_hide_popover(&mut doc, pop) {
+                        Some(pop)
+                    } else {
+                        None
+                    }
+                }
                 None => None,
             },
             None => None,
@@ -5187,6 +5925,12 @@ impl<'a> WindowApp<'a> {
         };
         if inside && let Some(old) = self.input.focused.take() {
             state_for(&mut self.input, old).focus = false;
+        }
+        if inside {
+            let focused_now = self.input.focused;
+            if let Some(tab) = self.tabs.get_mut(self.tab) {
+                mirror_focus(tab, focused_now);
+            }
         }
     }
 
@@ -5656,6 +6400,17 @@ impl<'a> WindowApp<'a> {
         if redrain_paint {
             self.needs_redraw = true;
         }
+        // w82 showModal focus: scripts ran above (timers, rAF,
+        // and any dispatch folded in), so a dialog shown or
+        // closed by script since the last turn is visible in
+        // the active tab's top layer now — diff it against the
+        // focus stack (move in on show, restore on close /
+        // removal) before the next input event observes focus.
+        // This is the only production sync point: input handlers
+        // deliberately do NOT sync, so a dialog opened before
+        // this window observed it is never retroactively
+        // adopted with its current (inside) focus as "previous".
+        self.sync_modal_focus();
     }
 
     /// One frame: refresh dirty pipeline stages, then present the tab's
@@ -6006,11 +6761,63 @@ impl<'a> ApplicationHandler for WindowApp<'a> {
         }
     }
 
-    fn about_to_wait(&mut self, _event_loop: &ActiveEventLoop) {
+    fn about_to_wait(&mut self, event_loop: &ActiveEventLoop) {
         self.poll_pending();
         // The script pump: fire the active tab's due JS timers and
         // macrotasks (`setTimeout` et al.) once per event-loop turn.
         self.pump_scripts();
+        // w82fix Whole-M1: exit-retention expiry wakeup.
+        // Retention expiry is lazy wall-clock, and the loop
+        // redraws only on demand — so without this, an idle
+        // page's overlay-only dialog would linger visibly past
+        // its transition + grace until the next unrelated
+        // event. While a retention is live, arm
+        // `ControlFlow::WaitUntil` at its earliest expiry; when
+        // the loop wakes at (or past) that instant, the redraw
+        // below drops the lapsed element from paint, and the
+        // flow returns to the default `Wait`. A retention
+        // cancelled before its expiry (re-show, removal)
+        // disarms without a redraw — the cancelling mutation
+        // already dirtied. Only the active tab renders
+        // windowed, so only its document is scanned. The
+        // grace constant (`EXIT_RETENTION_GRACE_S`, bindings)
+        // stays, and is now principled rather than
+        // load-dependent: it covers pipeline latency between
+        // the close-time measurement and paint, while expiry
+        // itself is observed promptly by this wakeup instead of
+        // whenever an unrelated event happens to arrive. The
+        // headless/WPT path needs no wakeup: every render
+        // rebuilds its display list from the live document, so
+        // a render after expiry observes the lapse directly
+        // (see `render_headless_pixels` in main.rs).
+        let now = Instant::now();
+        let mut expired_armed = false;
+        if let Some(armed) = self.retention_wakeup
+            && now >= armed
+        {
+            // One redraw drops the lapsed element(s); the
+            // re-arm below then picks up any still-live
+            // retention, or disarms back to `Wait`.
+            self.needs_redraw = true;
+            self.retention_wakeup = None;
+            expired_armed = true;
+        }
+        let earliest = self
+            .tabs
+            .get(self.tab)
+            .and_then(|tab| tab.document_ref())
+            .and_then(|doc| doc.earliest_exit_retention_expiry());
+        match earliest {
+            Some(exp) if self.retention_wakeup != Some(exp) => {
+                self.retention_wakeup = Some(exp);
+                event_loop.set_control_flow(ControlFlow::WaitUntil(exp));
+            }
+            None if self.retention_wakeup.is_some() || expired_armed => {
+                self.retention_wakeup = None;
+                event_loop.set_control_flow(ControlFlow::Wait);
+            }
+            _ => {}
+        }
         if self.needs_redraw {
             self.needs_redraw = false;
             if let Some(window) = self.window.as_ref() {
@@ -6101,6 +6908,7 @@ pub fn run_windowed_with_js(
         fonts: Arc::new(Mutex::new(FontCache::new())),
         scale: 1.0,
         needs_redraw: false,
+        retention_wakeup: None,
         init_error: None,
     };
     app.start_initial_load();
@@ -9809,6 +10617,57 @@ mod tests {
     }
 
     #[test]
+    fn refresh_paints_author_backdrop_in_windowed_path() {
+        // Windowed-path backdrop wiring: `refresh` must feed the
+        // display-list build with `collect_backdrop_styles` over
+        // `tab.author`, so an author `::backdrop` rule renders
+        // instead of the UA modal dim. A closed dialog paints no
+        // backdrop at all, so the modal promotion below is the
+        // precondition, not decoration.
+        use bowser_css::parse_stylesheet;
+        use bowser_paint::display_list::{Color, DisplayItem};
+        let (mut doc, _) =
+            Document::parse_html(b"<html><body><dialog id=\"d\">hi</dialog></body></html>");
+        let d = doc.get_element_by_id("d").expect("dialog");
+        doc.show_dialog_modal(d).expect("showModal");
+        let mut tab = test_tab();
+        tab.author.push(parse_stylesheet(
+            "body { margin: 0; } #d::backdrop { background-color: red; }",
+        ));
+        tab.install_test_document(Rc::new(RefCell::new(doc)));
+        mark_all_dirty(&mut tab);
+        refresh(&mut tab, &test_fonts());
+
+        let list = tab.display_list.as_ref().expect("display list built");
+        let viewport_rect = Rect {
+            x: 0.0,
+            y: 0.0,
+            w: 800.0,
+            h: 600.0,
+        };
+        let fills: Vec<Color> = list
+            .items
+            .iter()
+            .filter_map(|item| match item {
+                DisplayItem::FillRect { rect, color } if *rect == viewport_rect => Some(*color),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            fills
+                .iter()
+                .filter(|&&c| c == Color::rgba8(255, 0, 0, 255))
+                .count(),
+            1,
+            "author backdrop must paint once over the viewport, got {fills:?}"
+        );
+        assert!(
+            !fills.contains(&Color::rgba8(0, 0, 0, 26)),
+            "author backdrop must replace the UA modal dim, got {fills:?}"
+        );
+    }
+
+    #[test]
     fn image_id_map_mints_one_id_per_src() {
         use crate::loader::prime_image_cache;
         prime_image_cache(
@@ -10259,6 +11118,7 @@ mod tests {
             fonts: fonts.clone(),
             scale: 1.0,
             needs_redraw: false,
+            retention_wakeup: None,
             init_error: None,
         };
         // Pump 1: the timer scrolls, the fold reports the movement,
@@ -11398,6 +12258,7 @@ mod tests {
             fonts: Arc::new(Mutex::new(FontCache::new())),
             scale: 1.0,
             needs_redraw: false,
+            retention_wakeup: None,
             init_error: None,
         }
     }
@@ -15031,6 +15892,94 @@ mod tests {
     }
 
     #[test]
+    fn invoker_full_reports_auto_closed_and_retained_arms() {
+        // w82 fixpaths B1/M3: a show through an invoker
+        // returns the auto-closed set, a show re-opens a
+        // retained popover, and a hide/toggle on a retained
+        // popover is a no-op that leaves the retention alone.
+        let (mut doc, btn, pop) = popover_doc(
+            "<html><body><button id=\"btn\" popovertarget=\"pop\">t</button>\
+             <div id=\"pop\" popover>hi</div><div id=\"pop2\" popover>hi2</div></body></html>",
+        );
+        let pop2 = doc.get_element_by_id("pop2").expect("pop2");
+        doc.show_popover(pop2).expect("show pop2");
+        // btn targets pop only; showing pop auto-closes pop2.
+        let (changed, closed) = activate_popover_target_full(&mut doc, btn, btn);
+        assert_eq!(changed, Some(pop));
+        assert_eq!(closed, vec![pop2]);
+        assert!(!doc.is_popover_open(pop2));
+        // Retain pop, then: show re-opens, hide no-ops.
+        doc.hide_popover_deferred(pop, 60.0).expect("defer pop");
+        assert!(doc.is_exit_retained(pop));
+        doc.set_attribute(btn, "popovertargetaction", "hide");
+        assert_eq!(
+            activate_popover_target_full(&mut doc, btn, btn),
+            (None, Vec::new()),
+            "hide on retained must no-op"
+        );
+        assert!(doc.is_exit_retained(pop));
+        doc.set_attribute(btn, "popovertargetaction", "show");
+        let (changed, _) = activate_popover_target_full(&mut doc, btn, btn);
+        assert_eq!(changed, Some(pop), "show on retained must re-open");
+        assert!(!doc.is_exit_retained(pop));
+        assert!(doc.top_layer().contains(&pop));
+    }
+
+    #[test]
+    fn deferred_hide_and_close_use_stored_duration() {
+        // w82 fixpaths B3: the window/testdriver dismissal
+        // helpers consume the show-time stored duration, so a
+        // dismissal renders the exit transition (retention)
+        // instead of demoting synchronously; without a stored
+        // duration they demote synchronously, as before.
+        let (mut doc, _, pop) = popover_doc(
+            "<html><body><button id=\"btn\" popovertarget=\"pop\">t</button>\
+             <div id=\"pop\" popover>hi</div></body></html>",
+        );
+        doc.show_popover(pop).expect("show");
+        assert!(
+            deferred_hide_popover(&mut doc, pop),
+            "sync hide without storage"
+        );
+        assert!(!doc.is_exit_retained(pop));
+        doc.show_popover(pop).expect("re-show");
+        doc.store_exit_duration(pop, 60.0);
+        assert!(
+            deferred_hide_popover(&mut doc, pop),
+            "deferred hide with storage"
+        );
+        assert!(doc.is_exit_retained(pop), "stored duration must retain");
+        assert!(!doc.top_layer().contains(&pop));
+        assert!(
+            !deferred_hide_popover(&mut doc, pop),
+            "retained-only hide must no-op"
+        );
+        // Dialog: stored duration defers the modal demotion.
+        let mut doc2 = Document::new();
+        let host = doc2.create_element("div");
+        doc2.append_child(doc2.root(), host);
+        let dlg = doc2.create_element("dialog");
+        doc2.append_child(host, dlg);
+        doc2.show_dialog_modal(dlg).expect("showModal");
+        assert!(
+            deferred_close_dialog(&mut doc2, dlg),
+            "sync close without storage"
+        );
+        assert!(!doc2.is_exit_retained(dlg));
+        doc2.show_dialog_modal(dlg).expect("re-showModal");
+        doc2.store_exit_duration(dlg, 60.0);
+        assert!(
+            deferred_close_dialog(&mut doc2, dlg),
+            "deferred close with storage"
+        );
+        assert!(
+            doc2.is_exit_retained(dlg),
+            "stored duration must retain the dialog"
+        );
+        assert!(!doc2.is_dialog_open(dlg), "dialog is closed at close time");
+    }
+
+    #[test]
     fn popover_target_noops_and_invoker_rules() {
         // Missing id and non-popover target: no-op, no panic.
         let (mut doc, btn, _) = popover_doc(
@@ -15980,6 +16929,768 @@ mod tests {
             Some(inner),
             "Tab with a modal dialog open must stay inside it"
         );
+    }
+
+    // w82 showModal focus: helpers for the tests below.
+    /// Tab with a flat layout box per listed node (scroll
+    /// resolution only needs the node present in the tree).
+    fn focus_tab(doc: Document, nodes: &[NodeId]) -> Tab {
+        let mut tab = test_tab();
+        tab.install_test_document(Rc::new(RefCell::new(doc)));
+        tab.layout_root = Some(Rc::new(layout_box(
+            rect(0.0, 0.0, 800.0, 600.0),
+            None,
+            nodes
+                .iter()
+                .enumerate()
+                .map(|(i, &node)| {
+                    layout_box(rect(i as f32 * 100.0, 0.0, 90.0, 30.0), Some(node), vec![])
+                })
+                .collect(),
+        )));
+        tab
+    }
+
+    /// Tab-keyed stack size for `tab_id` (w82 fix): the
+    /// window's focus stack is a per-tab map, not a flat vec.
+    fn stack_len(app: &WindowApp, tab_id: TabId) -> usize {
+        app.input
+            .modal_focus_stack
+            .get(&tab_id)
+            .map_or(0, |stack| stack.len())
+    }
+
+    /// Simulate the bindings' show path in a window test (no JS
+    /// realm here): the production `show()`/`showModal()` plus
+    /// the show-time snapshot the bindings take right after a
+    /// successful show (see `bowser_dom::Document::note_dialog_show`).
+    /// The mirror value is set by the caller through
+    /// `with_installed_doc` + `set_host_focus` when the test
+    /// wants a snapshot distinct from current focus; otherwise
+    /// the mirror holds whatever the last focus setter wrote.
+    fn bindings_show_modal(app: &mut WindowApp, tab_id: TabId, dlg: NodeId) {
+        with_installed_doc(app, tab_id, |d| {
+            d.show_dialog_modal(dlg).expect("showModal");
+            d.note_dialog_show(dlg);
+        });
+    }
+
+    /// Bindings-simulated `show()` (non-modal), as above.
+    fn bindings_show(app: &mut WindowApp, tab_id: TabId, dlg: NodeId) {
+        with_installed_doc(app, tab_id, |d| {
+            d.show_dialog(dlg).expect("show");
+            d.note_dialog_show(dlg);
+        });
+    }
+
+    /// Mutate the installed document of `tab_id` (the
+    /// `showModal` / `close()` / `remove()` a script would run
+    /// through the bindings, simulated without a JS realm).
+    fn with_installed_doc(app: &mut WindowApp, tab_id: TabId, f: impl FnOnce(&mut Document)) {
+        // Reborrow through the app: it already holds the arena
+        // mutably, so the test cannot borrow `tabs` directly
+        // while the app lives.
+        let tabs = &mut *app.tabs;
+        let tab = tabs.get_mut(tab_id).expect("tab");
+        let mut doc = tab
+            .installed_mut()
+            .expect("installed")
+            .document()
+            .borrow_mut();
+        f(&mut doc);
+    }
+
+    #[test]
+    fn showmodal_moves_to_first_focusable_and_escape_restores_previous() {
+        let (doc, _) = Document::parse_html(
+            b"<html><body><button id=\"out\">o</button>\
+              <dialog id=\"dlg\"><button id=\"a\">a</button>\
+              <button id=\"b\">b</button></dialog></body></html>",
+        );
+        let id = |name: &str| doc.get_element_by_id(name).expect(name);
+        let (out, dlg, a, b) = (id("out"), id("dlg"), id("a"), id("b"));
+        let tab = focus_tab(doc, &[out, dlg, a, b]);
+        let mut tabs = TabArena::default();
+        let tab_id = tabs.insert(tab);
+        let jar = Arc::new(Mutex::new(CookieJar::new()));
+        let (mut app, _) = dismiss_app(
+            &mut tabs,
+            &jar,
+            tab_id,
+            StubDispatch {
+                prevent: false,
+                ..Default::default()
+            },
+        );
+        app.input.focused = Some(out);
+        with_installed_doc(&mut app, tab_id, |d| {
+            d.show_dialog_modal(dlg).expect("showModal");
+        });
+        app.sync_modal_focus();
+        assert_eq!(
+            app.input.focused,
+            Some(a),
+            "showModal moves to first focusable"
+        );
+        assert_eq!(stack_len(&app, tab_id), 1);
+        // A second sync is a no-op: the dialog is already stacked.
+        app.sync_modal_focus();
+        assert_eq!(app.input.focused, Some(a));
+        assert_eq!(stack_len(&app, tab_id), 1);
+        // The Tab trap still holds after the move.
+        app.on_key(&Key::Named(NamedKey::Tab), true);
+        assert_eq!(app.input.focused, Some(b));
+        app.on_key(&Key::Named(NamedKey::Tab), true);
+        assert_eq!(app.input.focused, Some(a));
+        // Escape closes and restores the page element, not None.
+        app.on_key(&Key::Named(NamedKey::Escape), true);
+        assert!(!check(&app, tab_id, |d| d.is_dialog_open(dlg)));
+        assert_eq!(
+            app.input.focused,
+            Some(out),
+            "Escape restores previous focus"
+        );
+        assert!(stack_len(&app, tab_id) == 0);
+    }
+
+    #[test]
+    fn showmodal_autofocus_wins_and_js_close_restores() {
+        let (doc, _) = Document::parse_html(
+            b"<html><body><button id=\"out\">o</button>\
+              <dialog id=\"dlg\"><button id=\"x\">x</button>\
+              <input id=\"af\" autofocus></dialog></body></html>",
+        );
+        let id = |name: &str| doc.get_element_by_id(name).expect(name);
+        let (out, dlg, x, af) = (id("out"), id("dlg"), id("x"), id("af"));
+        let tab = focus_tab(doc, &[out, dlg, x, af]);
+        let mut tabs = TabArena::default();
+        let tab_id = tabs.insert(tab);
+        let jar = Arc::new(Mutex::new(CookieJar::new()));
+        let (mut app, _) = dismiss_app(
+            &mut tabs,
+            &jar,
+            tab_id,
+            StubDispatch {
+                prevent: false,
+                ..Default::default()
+            },
+        );
+        app.input.focused = Some(out);
+        with_installed_doc(&mut app, tab_id, |d| {
+            d.show_dialog_modal(dlg).expect("showModal");
+        });
+        app.sync_modal_focus();
+        assert_eq!(
+            app.input.focused,
+            Some(af),
+            "autofocus descendant beats the first focusable"
+        );
+        // JS close(): the bindings close the dialog and fire
+        // `close`; the next pump sync restores previous focus.
+        with_installed_doc(&mut app, tab_id, |d| {
+            assert!(d.close_dialog(dlg, None).expect("close"));
+        });
+        app.sync_modal_focus();
+        assert_eq!(
+            app.input.focused,
+            Some(out),
+            "JS close() restores previous focus"
+        );
+        assert!(stack_len(&app, tab_id) == 0);
+    }
+
+    #[test]
+    fn showmodal_empty_dialog_falls_back_to_dialog_and_removal_restores() {
+        let (doc, _) = Document::parse_html(
+            b"<html><body><button id=\"out\">o</button>\
+              <dialog id=\"dlg\"><div id=\"txt\">text</div></dialog></body></html>",
+        );
+        let id = |name: &str| doc.get_element_by_id(name).expect(name);
+        let (out, dlg, txt) = (id("out"), id("dlg"), id("txt"));
+        let tab = focus_tab(doc, &[out, dlg, txt]);
+        let mut tabs = TabArena::default();
+        let tab_id = tabs.insert(tab);
+        let jar = Arc::new(Mutex::new(CookieJar::new()));
+        let (mut app, _) = dismiss_app(
+            &mut tabs,
+            &jar,
+            tab_id,
+            StubDispatch {
+                prevent: false,
+                ..Default::default()
+            },
+        );
+        app.input.focused = Some(out);
+        with_installed_doc(&mut app, tab_id, |d| {
+            d.show_dialog_modal(dlg).expect("showModal");
+        });
+        app.sync_modal_focus();
+        assert_eq!(
+            app.input.focused,
+            Some(dlg),
+            "no focusable descendant: focus falls back to the dialog itself"
+        );
+        // Element removal demotes the dialog; the next sync
+        // treats it as a close and restores previous focus.
+        with_installed_doc(&mut app, tab_id, |d| {
+            d.remove(dlg);
+        });
+        app.sync_modal_focus();
+        assert!(!check(&app, tab_id, |d| d.is_dialog_modal(dlg)));
+        assert_eq!(
+            app.input.focused,
+            Some(out),
+            "removal restores previous focus"
+        );
+        assert!(stack_len(&app, tab_id) == 0);
+    }
+
+    #[test]
+    fn nested_dialogs_restore_into_outer_then_page() {
+        let (doc, _) = Document::parse_html(
+            b"<html><body><button id=\"out\">o</button>\
+              <dialog id=\"dlg1\"><button id=\"a1\">a</button></dialog>\
+              <dialog id=\"dlg2\"><button id=\"b1\">b</button></dialog></body></html>",
+        );
+        let id = |name: &str| doc.get_element_by_id(name).expect(name);
+        let (out, dlg1, a1, dlg2, b1) = (id("out"), id("dlg1"), id("a1"), id("dlg2"), id("b1"));
+        let tab = focus_tab(doc, &[out, dlg1, a1, dlg2, b1]);
+        let mut tabs = TabArena::default();
+        let tab_id = tabs.insert(tab);
+        let jar = Arc::new(Mutex::new(CookieJar::new()));
+        let (mut app, _) = dismiss_app(
+            &mut tabs,
+            &jar,
+            tab_id,
+            StubDispatch {
+                prevent: false,
+                ..Default::default()
+            },
+        );
+        app.input.focused = Some(out);
+        with_installed_doc(&mut app, tab_id, |d| {
+            d.show_dialog_modal(dlg1).expect("showModal");
+        });
+        app.sync_modal_focus();
+        assert_eq!(app.input.focused, Some(a1));
+        with_installed_doc(&mut app, tab_id, |d| {
+            d.show_dialog_modal(dlg2).expect("showModal");
+        });
+        app.sync_modal_focus();
+        assert_eq!(app.input.focused, Some(b1), "inner dialog takes focus");
+        assert_eq!(stack_len(&app, tab_id), 2);
+        // Closing the inner dialog restores into the outer one.
+        with_installed_doc(&mut app, tab_id, |d| {
+            assert!(d.close_dialog(dlg2, None).expect("close"));
+        });
+        app.sync_modal_focus();
+        assert_eq!(
+            app.input.focused,
+            Some(a1),
+            "inner close restores focus into the outer dialog"
+        );
+        assert_eq!(stack_len(&app, tab_id), 1);
+        // Escape on the outer dialog restores the page element.
+        app.on_key(&Key::Named(NamedKey::Escape), true);
+        assert!(!check(&app, tab_id, |d| d.is_dialog_open(dlg1)));
+        assert_eq!(app.input.focused, Some(out));
+        assert!(stack_len(&app, tab_id) == 0);
+    }
+
+    #[test]
+    fn close_with_removed_previous_clears_focus_instead_of_restoring() {
+        let (doc, _) = Document::parse_html(
+            b"<html><body><button id=\"out\">o</button>\
+              <dialog id=\"dlg\"><button id=\"a\">a</button></dialog></body></html>",
+        );
+        let id = |name: &str| doc.get_element_by_id(name).expect(name);
+        let (out, dlg, a) = (id("out"), id("dlg"), id("a"));
+        let tab = focus_tab(doc, &[out, dlg, a]);
+        let mut tabs = TabArena::default();
+        let tab_id = tabs.insert(tab);
+        let jar = Arc::new(Mutex::new(CookieJar::new()));
+        let (mut app, _) = dismiss_app(
+            &mut tabs,
+            &jar,
+            tab_id,
+            StubDispatch {
+                prevent: false,
+                ..Default::default()
+            },
+        );
+        app.input.focused = Some(out);
+        with_installed_doc(&mut app, tab_id, |d| {
+            d.show_dialog_modal(dlg).expect("showModal");
+        });
+        app.sync_modal_focus();
+        assert_eq!(app.input.focused, Some(a));
+        // The previously focused element is removed before close:
+        // restoring to it would focus detached content, so focus
+        // clears instead.
+        with_installed_doc(&mut app, tab_id, |d| {
+            d.remove(out);
+            assert!(d.close_dialog(dlg, None).expect("close"));
+        });
+        app.sync_modal_focus();
+        assert_eq!(app.input.focused, None);
+        assert!(stack_len(&app, tab_id) == 0);
+    }
+
+    #[test]
+    fn modal_restore_is_unconditional_via_escape_and_js_close() {
+        // M1: focus deliberately moved outside the dialog before
+        // close must still restore to the show-time previous,
+        // on both the Escape path (restore before `close`) and
+        // the JS `close()` path (restore at the next sync).
+        for via_escape in [true, false] {
+            let (doc, _) = Document::parse_html(
+                b"<html><body><button id=\"out\">o</button>\
+                  <button id=\"out2\">o2</button>\
+                  <dialog id=\"dlg\"><button id=\"a\">a</button></dialog></body></html>",
+            );
+            let id = |name: &str| doc.get_element_by_id(name).expect(name);
+            let (out, out2, dlg, a) = (id("out"), id("out2"), id("dlg"), id("a"));
+            let tab = focus_tab(doc, &[out, out2, dlg, a]);
+            let mut tabs = TabArena::default();
+            let tab_id = tabs.insert(tab);
+            let jar = Arc::new(Mutex::new(CookieJar::new()));
+            let (mut app, log) = dismiss_app(
+                &mut tabs,
+                &jar,
+                tab_id,
+                StubDispatch {
+                    prevent: false,
+                    ..Default::default()
+                },
+            );
+            app.input.focused = Some(out);
+            with_installed_doc(&mut app, tab_id, |d| {
+                d.set_host_focus(Some(out));
+            });
+            bindings_show_modal(&mut app, tab_id, dlg);
+            app.sync_modal_focus();
+            assert_eq!(app.input.focused, Some(a));
+            // Focus moved outside before close.
+            app.input.focused = Some(out2);
+            if via_escape {
+                app.on_key(&Key::Named(NamedKey::Escape), true);
+                assert!(!check(&app, tab_id, |d| d.is_dialog_open(dlg)));
+                assert_eq!(
+                    log.borrow().closes,
+                    vec![dlg],
+                    "Escape must still dispatch close"
+                );
+            } else {
+                with_installed_doc(&mut app, tab_id, |d| {
+                    assert!(d.close_dialog(dlg, None).expect("close"));
+                });
+                app.sync_modal_focus();
+            }
+            assert_eq!(
+                app.input.focused,
+                Some(out),
+                "modal restore is unconditional (via_escape={via_escape})"
+            );
+            assert_eq!(stack_len(&app, tab_id), 0);
+        }
+    }
+
+    #[test]
+    fn show_time_snapshot_survives_post_show_script_focus_move() {
+        // M2: the bindings snapshot the show-time previous; a
+        // focus move later in the same task must not clobber
+        // the record, and the sync's late move-in must not
+        // clobber the move either. Window tests have no JS
+        // realm, so the bindings' two calls (show + snapshot)
+        // are simulated via `bindings_show_modal`, and the
+        // script focus move via a direct focus assignment (a
+        // production `focus()` would mirror too, but the
+        // snapshot is already taken by then, so the mirror
+        // value after the move is irrelevant here).
+        let (doc, _) = Document::parse_html(
+            b"<html><body><button id=\"out\">o</button>\
+              <button id=\"out2\">o2</button>\
+              <dialog id=\"dlg\"><button id=\"a\">a</button></dialog></body></html>",
+        );
+        let id = |name: &str| doc.get_element_by_id(name).expect(name);
+        let (out, out2, dlg, a) = (id("out"), id("out2"), id("dlg"), id("a"));
+        let tab = focus_tab(doc, &[out, out2, dlg, a]);
+        let mut tabs = TabArena::default();
+        let tab_id = tabs.insert(tab);
+        let jar = Arc::new(Mutex::new(CookieJar::new()));
+        let (mut app, _) = dismiss_app(
+            &mut tabs,
+            &jar,
+            tab_id,
+            StubDispatch {
+                prevent: false,
+                ..Default::default()
+            },
+        );
+        app.input.focused = Some(out);
+        with_installed_doc(&mut app, tab_id, |d| {
+            d.set_host_focus(Some(out));
+        });
+        bindings_show_modal(&mut app, tab_id, dlg);
+        // Script move after show, before any sync.
+        app.input.focused = Some(out2);
+        app.sync_modal_focus();
+        assert_eq!(
+            app.input.focused,
+            Some(out2),
+            "post-show script focus move must not be clobbered by the late move-in"
+        );
+        assert_eq!(stack_len(&app, tab_id), 1);
+        let entry = app.input.modal_focus_stack[&tab_id][0];
+        assert_eq!(entry, (dlg, Some(out), true));
+        // And the close still restores to the show-time record.
+        with_installed_doc(&mut app, tab_id, |d| {
+            assert!(d.close_dialog(dlg, None).expect("close"));
+        });
+        app.sync_modal_focus();
+        assert_eq!(app.input.focused, Some(out));
+    }
+
+    #[test]
+    fn same_task_open_close_does_not_leave_focus_inside_closed_dialog() {
+        // M3 (open+close): focus starts inside the (closed)
+        // dialog's subtree — reachable because sequential order
+        // does not check `open` — then show+close run with no
+        // sync between them. A final-state diff sees only
+        // "closed, no entry" and leaves focus inside; the
+        // journal replay moves in, then restores (previous
+        // inside a closed dialog is invalid, so focus clears).
+        let (doc, _) = Document::parse_html(
+            b"<html><body><button id=\"out\">o</button>\
+              <dialog id=\"dlg\"><button id=\"a\">a</button></dialog></body></html>",
+        );
+        let id = |name: &str| doc.get_element_by_id(name).expect(name);
+        let (out, dlg, a) = (id("out"), id("dlg"), id("a"));
+        let tab = focus_tab(doc, &[out, dlg, a]);
+        let mut tabs = TabArena::default();
+        let tab_id = tabs.insert(tab);
+        let jar = Arc::new(Mutex::new(CookieJar::new()));
+        let (mut app, _) = dismiss_app(
+            &mut tabs,
+            &jar,
+            tab_id,
+            StubDispatch {
+                prevent: false,
+                ..Default::default()
+            },
+        );
+        app.input.focused = Some(a);
+        with_installed_doc(&mut app, tab_id, |d| {
+            d.set_host_focus(Some(a));
+        });
+        with_installed_doc(&mut app, tab_id, |d| {
+            d.show_dialog_modal(dlg).expect("showModal");
+            d.note_dialog_show(dlg);
+            assert!(d.close_dialog(dlg, None).expect("close"));
+        });
+        app.sync_modal_focus();
+        assert_eq!(app.input.focused, None);
+        assert_eq!(stack_len(&app, tab_id), 0);
+    }
+
+    #[test]
+    fn same_task_close_reopen_moves_focus_in_with_fresh_previous() {
+        // M3 (close+reopen): after a synced show, close and
+        // re-show run with no sync between them. A final-state
+        // diff sees "still open, still stacked" and never moves
+        // focus; the journal replay restores on close, then
+        // records the restored focus and moves in on re-show.
+        let (doc, _) = Document::parse_html(
+            b"<html><body><button id=\"out\">o</button>\
+              <dialog id=\"dlg\"><button id=\"a\">a</button></dialog></body></html>",
+        );
+        let id = |name: &str| doc.get_element_by_id(name).expect(name);
+        let (out, dlg, a) = (id("out"), id("dlg"), id("a"));
+        let tab = focus_tab(doc, &[out, dlg, a]);
+        let mut tabs = TabArena::default();
+        let tab_id = tabs.insert(tab);
+        let jar = Arc::new(Mutex::new(CookieJar::new()));
+        let (mut app, _) = dismiss_app(
+            &mut tabs,
+            &jar,
+            tab_id,
+            StubDispatch {
+                prevent: false,
+                ..Default::default()
+            },
+        );
+        app.input.focused = Some(out);
+        with_installed_doc(&mut app, tab_id, |d| {
+            d.set_host_focus(Some(out));
+        });
+        bindings_show_modal(&mut app, tab_id, dlg);
+        app.sync_modal_focus();
+        assert_eq!(app.input.focused, Some(a));
+        with_installed_doc(&mut app, tab_id, |d| {
+            assert!(d.close_dialog(dlg, None).expect("close"));
+            // Focus moved (e.g. by a close listener) before the
+            // re-show; the mirror is what the bindings snapshot.
+            d.set_host_focus(Some(out));
+            d.show_dialog_modal(dlg).expect("re-show");
+            d.note_dialog_show(dlg);
+        });
+        // Simulate the post-close focus position: the replay's
+        // close step restores to `out` anyway, so the starting
+        // point here only matters for the stale-entry check.
+        app.input.focused = Some(out);
+        app.sync_modal_focus();
+        assert_eq!(
+            app.input.focused,
+            Some(a),
+            "re-show must move focus in again"
+        );
+        assert_eq!(stack_len(&app, tab_id), 1);
+        assert_eq!(
+            app.input.modal_focus_stack[&tab_id][0],
+            (dlg, Some(out), true),
+            "re-show must not keep a stale previous"
+        );
+    }
+
+    #[test]
+    fn js_close_listener_observes_pre_restore_focus_then_sync_restores() {
+        // M5, residual divergence pinned: JS `close()` fires
+        // `close` synchronously in the bindings, before any
+        // window sync — so at close-event time focus is still
+        // inside the dialog, and only the next sync restores
+        // it. Escape, by contrast, restores before dispatching
+        // `close` (see `handle_escape`). The targets agree;
+        // only the listener-visible timing differs.
+        let (doc, _) = Document::parse_html(
+            b"<html><body><button id=\"out\">o</button>\
+              <dialog id=\"dlg\"><button id=\"a\">a</button></dialog></body></html>",
+        );
+        let id = |name: &str| doc.get_element_by_id(name).expect(name);
+        let (out, dlg, a) = (id("out"), id("dlg"), id("a"));
+        let tab = focus_tab(doc, &[out, dlg, a]);
+        let mut tabs = TabArena::default();
+        let tab_id = tabs.insert(tab);
+        let jar = Arc::new(Mutex::new(CookieJar::new()));
+        let (mut app, _) = dismiss_app(
+            &mut tabs,
+            &jar,
+            tab_id,
+            StubDispatch {
+                prevent: false,
+                ..Default::default()
+            },
+        );
+        app.input.focused = Some(out);
+        with_installed_doc(&mut app, tab_id, |d| {
+            d.set_host_focus(Some(out));
+        });
+        bindings_show_modal(&mut app, tab_id, dlg);
+        app.sync_modal_focus();
+        assert_eq!(app.input.focused, Some(a));
+        with_installed_doc(&mut app, tab_id, |d| {
+            assert!(d.close_dialog(dlg, None).expect("close"));
+        });
+        assert_eq!(
+            app.input.focused,
+            Some(a),
+            "a JS close listener observes focus still inside the dialog"
+        );
+        app.sync_modal_focus();
+        assert_eq!(
+            app.input.focused,
+            Some(out),
+            "the next pump sync restores to the same target Escape would"
+        );
+    }
+
+    #[test]
+    fn tab_switch_preserves_modal_focus_stack() {
+        // M6: syncing tab B must not pop tab A's entry, and
+        // returning to A must not re-adopt it with a wrong
+        // previous — the entry sits under A's key throughout.
+        let (doc_a, _) = Document::parse_html(
+            b"<html><body><button id=\"out\">o</button>\
+              <dialog id=\"dlg\"><button id=\"a\">a</button></dialog></body></html>",
+        );
+        let id_a = |name: &str| doc_a.get_element_by_id(name).expect(name);
+        let (out_a, dlg_a, a_a) = (id_a("out"), id_a("dlg"), id_a("a"));
+        let (doc_b, _) =
+            Document::parse_html(b"<html><body><button id=\"outb\">ob</button></body></html>");
+        let out_b = doc_b.get_element_by_id("outb").expect("outb");
+        let tab_a = focus_tab(doc_a, &[out_a, dlg_a, a_a]);
+        let tab_b = focus_tab(doc_b, &[out_b]);
+        let mut tabs = TabArena::default();
+        let tab_a_id = tabs.insert(tab_a);
+        let tab_b_id = tabs.insert(tab_b);
+        let jar = Arc::new(Mutex::new(CookieJar::new()));
+        let (mut app, _) = dismiss_app(
+            &mut tabs,
+            &jar,
+            tab_a_id,
+            StubDispatch {
+                prevent: false,
+                ..Default::default()
+            },
+        );
+        app.input.focused = Some(out_a);
+        with_installed_doc(&mut app, tab_a_id, |d| {
+            d.set_host_focus(Some(out_a));
+        });
+        bindings_show_modal(&mut app, tab_a_id, dlg_a);
+        app.sync_modal_focus();
+        assert_eq!(app.input.focused, Some(a_a));
+        assert_eq!(stack_len(&app, tab_a_id), 1);
+        // Switch to B and sync: A's entry must survive.
+        app.tab = tab_b_id;
+        app.sync_modal_focus();
+        assert_eq!(
+            stack_len(&app, tab_a_id),
+            1,
+            "syncing another tab must not pop the background tab's entry"
+        );
+        assert_eq!(stack_len(&app, tab_b_id), 0);
+        // Switch back: no re-adoption, no invented previous.
+        app.tab = tab_a_id;
+        app.sync_modal_focus();
+        assert_eq!(stack_len(&app, tab_a_id), 1);
+        assert_eq!(
+            app.input.modal_focus_stack[&tab_a_id][0],
+            (dlg_a, Some(out_a), true)
+        );
+        // Closing A now restores A's previous, not B's focus.
+        with_installed_doc(&mut app, tab_a_id, |d| {
+            assert!(d.close_dialog(dlg_a, None).expect("close"));
+        });
+        app.sync_modal_focus();
+        assert_eq!(app.input.focused, Some(out_a));
+        assert_eq!(stack_len(&app, tab_a_id), 0);
+    }
+
+    #[test]
+    fn dialog_initial_focus_widened_to_negative_tabindex() {
+        // M8: the non-autofocus fallback must use the widened
+        // predicate, so a dialog whose only focusable is
+        // `tabindex="-1"` focuses it on show (Tab still never
+        // reaches it — only the showModal target is widened).
+        let (doc, _) = Document::parse_html(
+            b"<html><body><button id=\"out\">o</button>\
+              <dialog id=\"dlg\"><div id=\"neg\" tabindex=\"-1\">n</div></dialog></body></html>",
+        );
+        let id = |name: &str| doc.get_element_by_id(name).expect(name);
+        let (out, dlg, neg) = (id("out"), id("dlg"), id("neg"));
+        let tab = focus_tab(doc, &[out, dlg, neg]);
+        let mut tabs = TabArena::default();
+        let tab_id = tabs.insert(tab);
+        let jar = Arc::new(Mutex::new(CookieJar::new()));
+        let (mut app, _) = dismiss_app(
+            &mut tabs,
+            &jar,
+            tab_id,
+            StubDispatch {
+                prevent: false,
+                ..Default::default()
+            },
+        );
+        app.input.focused = Some(out);
+        with_installed_doc(&mut app, tab_id, |d| {
+            d.set_host_focus(Some(out));
+        });
+        bindings_show_modal(&mut app, tab_id, dlg);
+        app.sync_modal_focus();
+        assert_eq!(app.input.focused, Some(neg));
+    }
+
+    #[test]
+    fn dialog_self_autofocus_beats_descendant_autofocus() {
+        // m9: the dialog itself, when it carries `autofocus`,
+        // is the initial focus target ahead of any descendant.
+        let (doc, _) = Document::parse_html(
+            b"<html><body><button id=\"out\">o</button>\
+              <dialog id=\"dlg\" autofocus tabindex=\"-1\">\
+              <input id=\"af\" autofocus></dialog></body></html>",
+        );
+        let id = |name: &str| doc.get_element_by_id(name).expect(name);
+        let (out, dlg, af) = (id("out"), id("dlg"), id("af"));
+        let tab = focus_tab(doc, &[out, dlg, af]);
+        let mut tabs = TabArena::default();
+        let tab_id = tabs.insert(tab);
+        let jar = Arc::new(Mutex::new(CookieJar::new()));
+        let (mut app, _) = dismiss_app(
+            &mut tabs,
+            &jar,
+            tab_id,
+            StubDispatch {
+                prevent: false,
+                ..Default::default()
+            },
+        );
+        app.input.focused = Some(out);
+        with_installed_doc(&mut app, tab_id, |d| {
+            d.set_host_focus(Some(out));
+        });
+        bindings_show_modal(&mut app, tab_id, dlg);
+        app.sync_modal_focus();
+        assert_eq!(app.input.focused, Some(dlg));
+    }
+
+    #[test]
+    fn non_modal_dialog_restores_only_when_focus_inside() {
+        // m8: `show()` records an entry but never moves focus;
+        // closing restores only when focus sits inside the
+        // dialog (or nowhere) — unlike the modal unconditional
+        // rule, focus elsewhere is left alone.
+        let (doc, _) = Document::parse_html(
+            b"<html><body><button id=\"out\">o</button>\
+              <button id=\"out2\">o2</button>\
+              <dialog id=\"dlg\"><button id=\"a\">a</button></dialog></body></html>",
+        );
+        let id = |name: &str| doc.get_element_by_id(name).expect(name);
+        let (out, out2, dlg, a) = (id("out"), id("out2"), id("dlg"), id("a"));
+        let tab = focus_tab(doc, &[out, out2, dlg, a]);
+        let mut tabs = TabArena::default();
+        let tab_id = tabs.insert(tab);
+        let jar = Arc::new(Mutex::new(CookieJar::new()));
+        let (mut app, _) = dismiss_app(
+            &mut tabs,
+            &jar,
+            tab_id,
+            StubDispatch {
+                prevent: false,
+                ..Default::default()
+            },
+        );
+        app.input.focused = Some(out);
+        with_installed_doc(&mut app, tab_id, |d| {
+            d.set_host_focus(Some(out));
+        });
+        bindings_show(&mut app, tab_id, dlg);
+        app.sync_modal_focus();
+        assert_eq!(app.input.focused, Some(out), "show() must not move focus");
+        assert_eq!(stack_len(&app, tab_id), 1);
+        // Focus moves inside, then close restores.
+        app.input.focused = Some(a);
+        with_installed_doc(&mut app, tab_id, |d| {
+            assert!(d.close_dialog(dlg, None).expect("close"));
+        });
+        app.sync_modal_focus();
+        assert_eq!(app.input.focused, Some(out));
+        // Re-show, focus elsewhere, close leaves it alone.
+        with_installed_doc(&mut app, tab_id, |d| {
+            d.set_host_focus(Some(out));
+        });
+        bindings_show(&mut app, tab_id, dlg);
+        app.sync_modal_focus();
+        app.input.focused = Some(out2);
+        with_installed_doc(&mut app, tab_id, |d| {
+            assert!(d.close_dialog(dlg, None).expect("close"));
+        });
+        app.sync_modal_focus();
+        assert_eq!(
+            app.input.focused,
+            Some(out2),
+            "non-modal restore must not clobber focus elsewhere"
+        );
+        assert_eq!(stack_len(&app, tab_id), 0);
     }
 
     #[test]

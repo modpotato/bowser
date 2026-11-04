@@ -12904,6 +12904,146 @@ fn w81f_multicol_column2_after_split_laid_out() {
 }
 
 #[test]
+fn w82_multicol_top_layer_dialog_parent_laid_out() {
+    // w82: the laid-out multicol inline-block shape inside a
+    // top-layer parent. The parent is a modal dialog
+    // (`show_dialog_modal`): the only dialog form that is in the
+    // top layer — `show_dialog` (non-modal) deliberately does
+    // not promote, so it would not pin this shape at all. The
+    // dialog's UA style is `position: fixed` with all four
+    // insets 0 and `width` / `height: fit-content` plus auto
+    // margins, so it centers in the 800x600 viewport and sizes
+    // from the item's multicol intrinsics: a kids-max intrinsic
+    // failure would size it 50 wide (and the item would
+    // overflow it), a stacked fallback would make it 50x100.
+    // The item itself must stay an unpromoted `InlineBlock`:
+    // no flex/grid/table promotion fires for an inline-block
+    // child of a block dialog, so only `layout_block`'s
+    // multicol gate (`InlineBlock` branch) can lay it out.
+    // This passes at introduction with no layout change: the
+    // w79 joint gate already covers it, so this is a pin.
+    let (mut doc, _) = bowser_dom::Document::parse_html(
+        b"<!DOCTYPE html><html><body><dialog id=\"d\"><div class=\"i\"><div class=\"a\"></div><div class=\"b\"></div></div></dialog></body></html>"
+            .as_slice(),
+    );
+    let dlg = doc.get_element_by_id("d").expect("dialog");
+    doc.show_dialog_modal(dlg).expect("show modal dialog");
+    assert!(
+        doc.is_in_top_layer(dlg),
+        "dialog must be in the top layer after showModal"
+    );
+    let ss = bowser_css::parse_stylesheet(
+        &[TABLE_TEST_RESET_CSS, "body { margin: 0; } ", W81F_ITEM_CSS].concat(),
+    );
+    let l = layout(&doc, &[&ss], VP, &FixedFontMetrics);
+    let dlg_box = find_box(&l, dlg).expect("dialog box");
+    assert!(
+        approx(dlg_box.rect.w, 120.0),
+        "dialog: parent w={} != 120 (multicol max-content)",
+        dlg_box.rect.w
+    );
+    // Parent height is the 50px item plus a line-box baseline
+    // strut below the inline-block (3.84 on this build's font,
+    // 53.84 total). This is generic inline-block-in-block
+    // behavior, not a multicol or top-layer failure: a plain
+    // non-multicol 50x50 inline-block under a plain block
+    // parent measures the same strut on this build, and the
+    // multicol item itself is the canonical 120x50. w82fix
+    // (cheap minor): the strut height is font-metric
+    // dependent, so the test tolerates it (50 <= h < 70)
+    // instead of pinning 53.84, and checks centering against
+    // the actual height rather than a baked 273.08 — a font
+    // change must not fail a multicol test. The hard pins
+    // stay: parent width 120 (multicol max-content) and the
+    // item's 120x50 shape below.
+    assert!(
+        dlg_box.rect.h >= 50.0 && dlg_box.rect.h < 70.0,
+        "dialog: parent h={} must be the 50px item plus a modest line-box strut",
+        dlg_box.rect.h
+    );
+    assert!(
+        approx(dlg_box.rect.x, 340.0),
+        "dialog: parent x={} != 340 (not viewport-centered)",
+        dlg_box.rect.x
+    );
+    assert!(
+        approx(dlg_box.rect.y, (600.0 - dlg_box.rect.h) / 2.0),
+        "dialog: parent y={} != centered for h={}",
+        dlg_box.rect.y,
+        dlg_box.rect.h
+    );
+    let item = w81f_find_item(&l).expect("dialog: item not found");
+    assert_eq!(
+        item.box_type,
+        BoxType::InlineBlock,
+        "dialog: item must stay unpromoted"
+    );
+    w81f_assert_laid_out(item, "dialog-top-layer");
+}
+
+#[test]
+fn w82_multicol_top_layer_popover_parent_laid_out() {
+    // w82: same pin with a popover parent (`show_popover`
+    // promotes to the top layer). The popover UA style is
+    // `position: fixed` with all four insets 0 and `width` /
+    // `height: fit-content` plus auto margins, so — like the
+    // modal dialog above — it centers in the viewport and
+    // sizes from the item's multicol intrinsics (50 wide on a
+    // kids-max failure, 50x100 on a stacked fallback). The
+    // item stays an unpromoted `InlineBlock` for the same
+    // reason as in the dialog case. This passes at
+    // introduction with no layout change: a pin, not a fix.
+    let (mut doc, _) = bowser_dom::Document::parse_html(
+        b"<!DOCTYPE html><html><body><div popover id=\"p\"><div class=\"i\"><div class=\"a\"></div><div class=\"b\"></div></div></div></body></html>"
+            .as_slice(),
+    );
+    let pop = doc.get_element_by_id("p").expect("popover");
+    doc.show_popover(pop).expect("show popover");
+    assert!(
+        doc.is_in_top_layer(pop),
+        "popover must be in the top layer after showPopover"
+    );
+    let ss = bowser_css::parse_stylesheet(
+        &[TABLE_TEST_RESET_CSS, "body { margin: 0; } ", W81F_ITEM_CSS].concat(),
+    );
+    let l = layout(&doc, &[&ss], VP, &FixedFontMetrics);
+    let pop_box = find_box(&l, pop).expect("popover box");
+    assert!(
+        approx(pop_box.rect.w, 120.0),
+        "popover: parent w={} != 120 (multicol max-content)",
+        pop_box.rect.w
+    );
+    // Parent height: same baseline-strut tolerance as the
+    // dialog test above (w82fix cheap minor — font-metric
+    // dependent, so 50 <= h < 70, with centering checked
+    // against the actual height); the multicol pin below is
+    // the canonical 120x50 shape.
+    assert!(
+        pop_box.rect.h >= 50.0 && pop_box.rect.h < 70.0,
+        "popover: parent h={} must be the 50px item plus a modest line-box strut",
+        pop_box.rect.h
+    );
+    assert!(
+        approx(pop_box.rect.x, 340.0),
+        "popover: parent x={} != 340 (not viewport-centered)",
+        pop_box.rect.x
+    );
+    assert!(
+        approx(pop_box.rect.y, (600.0 - pop_box.rect.h) / 2.0),
+        "popover: parent y={} != centered for h={}",
+        pop_box.rect.y,
+        pop_box.rect.h
+    );
+    let item = w81f_find_item(&l).expect("popover: item not found");
+    assert_eq!(
+        item.box_type,
+        BoxType::InlineBlock,
+        "popover: item must stay unpromoted"
+    );
+    w81f_assert_laid_out(item, "popover-top-layer");
+}
+
+#[test]
 fn w80fix_blockification_probe_replaced_table_cell_float_abspos() {
     // w80fix R2-F6, probe only (no code change): CSS 2.1 §9.7
     // blockification escape for remapped boxes. `display_of`'s

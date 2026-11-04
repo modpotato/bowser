@@ -915,15 +915,15 @@ pub fn animation_count() -> usize {
 /// Discrete properties `apply_animations` routes through the
 /// discrete engine.
 ///
-/// This is deliberately the same single-property scope
-/// `transition.rs` routes (`DISCRETE_PROPS` there): `overlay` is
-/// the only property whose WAAPI value is discrete-only. Every
-/// other keyframed property goes through
-/// [`animated_numeric_value`], which interpolates numeric and
-/// color values and falls back to the generic discrete flip for
-/// anything else; a later engine extends that function, it does
-/// not change this list or the discrete logic.
-const ANIMATED_DISCRETE_PROPS: &[&str] = &["overlay"];
+/// This mirrors `transition.rs`'s `DISCRETE_PROPS`: `overlay`
+/// and (w82) `display` are the properties whose WAAPI value is
+/// discrete-only with asymmetric flips. Every other keyframed
+/// property goes through [`animated_numeric_value`], which
+/// interpolates numeric and color values and falls back to the
+/// generic discrete flip for anything else; a later engine
+/// extends that function, it does not change this list or the
+/// discrete logic.
+const ANIMATED_DISCRETE_PROPS: &[&str] = &["overlay", "display"];
 
 /// Normalize keyframe offsets per the WAAPI keyframe-processing
 /// algorithm (Web Animations 1 §5.3.3, "compute missing keyframe
@@ -1004,7 +1004,22 @@ pub fn normalize_offsets(keyframes: &[Keyframe]) -> Vec<f64> {
 /// the rules below are written to be correct for those too):
 /// * `overlay` `auto -> none` flips only at `t >= 1`;
 /// * `overlay` `none -> auto` flips at `t > 0`;
+/// * `display` mirrors that asymmetry over `none` vs shown:
+///   shown -> `none` flips only at `t >= 1`, `none` -> shown
+///   flips at `t > 0`, shown -> shown flips at `t >= 0.5`;
 /// * every other discrete pair flips at `t >= 0.5`.
+///
+/// UNVERIFIED (w82fix JS-m1): no spec or WPT citation for
+/// the WAAPI `display` asymmetry was found — the local WPT
+/// checkout is sparse (css-position, CSS2, css-tables only;
+/// no web-animations display tests) and no in-repo spec note
+/// covers it. The branch is deliberately KEPT, not removed:
+/// the transition path depends on the same asymmetry and
+/// the overlay-transition-dialog reftest passes with it, and
+/// removing it would change WAAPI `display` segments to the
+/// generic 0.5 flip. If a Chrome datum or a WPT WAAPI display
+/// test contradicts the asymmetry, this branch is the place
+/// to revisit — not the transition engine.
 fn discrete_segment_value<'a>(from: &'a str, to: &'a str, prop: &str, t: f64) -> &'a str {
     if prop == "overlay" {
         match (from, to) {
@@ -1016,6 +1031,32 @@ fn discrete_segment_value<'a>(from: &'a str, to: &'a str, prop: &str, t: f64) ->
                 }
             }
             ("none", "auto") => {
+                if t > 0.0 {
+                    to
+                } else {
+                    from
+                }
+            }
+            _ => {
+                if t >= 0.5 {
+                    to
+                } else {
+                    from
+                }
+            }
+        }
+    } else if prop == "display" {
+        let from_none = from.eq_ignore_ascii_case("none");
+        let to_none = to.eq_ignore_ascii_case("none");
+        match (from_none, to_none) {
+            (false, true) => {
+                if t >= 1.0 {
+                    to
+                } else {
+                    from
+                }
+            }
+            (true, false) => {
                 if t > 0.0 {
                     to
                 } else {
@@ -2035,6 +2076,37 @@ mod tests {
             ),
             "none",
             "auto->none flips once eased >= 1"
+        );
+    }
+
+    #[test]
+    fn display_segment_value_mirrors_overlay_asymmetry() {
+        // w82: WAAPI `display` uses the same `none` vs shown
+        // asymmetry as `overlay` (direct unit test of the
+        // segment function, no animation registry needed).
+        assert_eq!(
+            discrete_segment_value("block", "none", "display", 0.5),
+            "block"
+        );
+        assert_eq!(
+            discrete_segment_value("block", "none", "display", 1.0),
+            "none"
+        );
+        assert_eq!(
+            discrete_segment_value("none", "block", "display", 0.0),
+            "none"
+        );
+        assert_eq!(
+            discrete_segment_value("none", "block", "display", 0.5),
+            "block"
+        );
+        assert_eq!(
+            discrete_segment_value("block", "flex", "display", 0.4),
+            "block"
+        );
+        assert_eq!(
+            discrete_segment_value("block", "flex", "display", 0.5),
+            "flex"
         );
     }
 

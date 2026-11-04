@@ -109,7 +109,7 @@
 //! pointer/mouse/key/touch/wheel events, and an executor-local focus
 //! model. Its own gaps are listed with its section docs.
 
-use bowser_dom::{EscapeTarget, NodeId};
+use bowser_dom::{DialogFocusEvent, EscapeTarget, NodeId};
 
 use crate::navigation;
 use crate::script::PageEventDispatch;
@@ -662,6 +662,16 @@ struct ExecutorState {
     pointers: HashMap<String, PointerSourceState>,
     modifiers: ModifierState,
     focused: Option<NodeId>,
+    /// Dialog focus stack for this page (w82 fix, B2): the
+    /// testdriver mirror of the window's tab-keyed stack, but
+    /// per page — executor state is already keyed by page
+    /// context, so no tab key is needed here. Entries are
+    /// `(dialog, previously-focused element at show time,
+    /// was-modal)`, replayed from the document's dialog journal
+    /// by [`TestDriver::sync_modal_focus`]. Persisted across
+    /// drains through the thread-local hand-off, like the rest
+    /// of this state.
+    modal_focus_stack: Vec<(NodeId, Option<NodeId>, bool)>,
     next_pointer_id: i32,
     /// Monotonic counter stamped onto a pointer state every time
     /// it is stored back after an action: defines the "most
@@ -676,6 +686,7 @@ impl Default for ExecutorState {
             pointers: HashMap::new(),
             modifiers: ModifierState::default(),
             focused: None,
+            modal_focus_stack: Vec::new(),
             // Pointer ids start at 1, like the mouse stream's
             // `PointerData::mouse_at` convention of a nonzero id.
             next_pointer_id: 1,
@@ -894,6 +905,12 @@ impl TestDriver {
             self.dispatch.dispatch_focus_event(tab, old, "focusout");
         }
         self.actions.focused = new;
+        // Mirror for the show-time snapshot (see the window's
+        // `mirror_focus`): a script showModal after this focus
+        // move must snapshot `new`, not a stale value.
+        if let Some(installed) = tab.installed_mut() {
+            installed.document().borrow_mut().set_host_focus(new);
+        }
         if let Some(n) = new {
             self.dispatch.dispatch_focus_event(tab, n, "focus");
             self.dispatch.dispatch_focus_event(tab, n, "focusin");
@@ -961,6 +978,234 @@ impl TestDriver {
         }
     }
 
+    /// Dialog focus sync for the headless/WPT path (w82 fix,
+    /// B2): the executor mirror of
+    /// `WindowApp::sync_modal_focus`, over executor focus
+    /// (`self.actions.focused`) instead of window focus. It
+    /// drains the document's dialog journal and replays it in
+    /// order (show+close and close+re-show inside one drain
+    /// interval, show-time snapshots from the bindings), then
+    /// diffs the live state as a fallback for journal-less
+    /// paths (`open`-attribute removal, element removal).
+    /// Modal closes restore unconditionally (validity-gated);
+    /// non-modal closes restore only when focus sits inside
+    /// the dialog or nowhere — the same rules as the windowed
+    /// path. Non-modal shows record an entry but never move
+    /// focus (spec: `show()` does not move focus). Focus moves
+    /// go through [`Self::set_focus`], so the page observes
+    /// `blur`/`focusout`/`focus`/`focusin` for them.
+    /// Called at the end of every action sequence and at the
+    /// end of every testdriver drain (which covers script-driven
+    /// shows/closes that ran during a request's completion
+    /// pump). NOT called from `execute_escape`: that arm is
+    /// dismissal-owned and still clears focus inside the
+    /// dismissed dialog; the sequence/drain sync that follows
+    /// restores it from the stack — so executor Escape restores
+    /// *after* its `close` event, like the JS `close()` path,
+    /// not before it like windowed Escape. That residual
+    /// ordering difference is documented here, not hidden.
+    fn sync_modal_focus(&mut self, tab: &mut Tab) {
+        let events: Vec<DialogFocusEvent> = match tab.installed_mut() {
+            Some(installed) => installed.document().borrow_mut().take_dialog_focus_events(),
+            None => Vec::new(),
+        };
+        // Same staleness rule as the windowed sync (see
+        // there): a show after a close replayed in this batch
+        // uses the post-restore focus, not its snapshot.
+        let mut saw_replayed_close = false;
+        for event in events {
+            match event {
+                DialogFocusEvent::Shown { node, modal } => {
+                    if self
+                        .actions
+                        .modal_focus_stack
+                        .iter()
+                        .any(|(stacked, _, _)| *stacked == node)
+                    {
+                        continue;
+                    }
+                    let recorded: Option<Option<NodeId>> = match tab.installed_mut() {
+                        Some(installed) => installed
+                            .document()
+                            .borrow_mut()
+                            .take_dialog_show_previous(node),
+                        None => None,
+                    };
+                    let cur = self.actions.focused;
+                    let inside_stacked = match cur {
+                        Some(focused) => {
+                            let doc_in = |tab: &Tab| -> bool {
+                                match tab.document_ref() {
+                                    Some(doc) => self.actions.modal_focus_stack.iter().any(
+                                        |(stacked, _, _)| {
+                                            focused == *stacked
+                                                || doc.descendants(*stacked).contains(&focused)
+                                        },
+                                    ),
+                                    None => false,
+                                }
+                            };
+                            doc_in(tab)
+                        }
+                        None => false,
+                    };
+                    let (previous, move_in) = if saw_replayed_close {
+                        (cur, modal)
+                    } else {
+                        match recorded {
+                            Some(rec) => {
+                                if cur == rec || inside_stacked {
+                                    (if inside_stacked { cur } else { rec }, modal)
+                                } else {
+                                    (rec, false)
+                                }
+                            }
+                            None => (cur, modal),
+                        }
+                    };
+                    let move_in = move_in
+                        && !match tab.document_ref() {
+                            Some(doc) => {
+                                crate::window::popover_scope_blocks_dialog_move(&doc, node)
+                            }
+                            None => false,
+                        };
+                    self.actions.modal_focus_stack.push((node, previous, modal));
+                    if move_in {
+                        let target = match tab.document_ref() {
+                            Some(doc) => crate::window::dialog_initial_focus(&doc, node),
+                            None => node,
+                        };
+                        self.set_focus(tab, Some(target));
+                    }
+                }
+                DialogFocusEvent::Closed { node } => {
+                    let popped = self
+                        .actions
+                        .modal_focus_stack
+                        .iter()
+                        .position(|(stacked, _, _)| *stacked == node)
+                        .map(|pos| self.actions.modal_focus_stack.remove(pos));
+                    if let Some((_, previous, was_modal)) = popped {
+                        saw_replayed_close = true;
+                        self.restore_focus_after_close(tab, node, previous, was_modal);
+                    }
+                }
+            }
+        }
+        // Diff fallback (journal-less paths): modal entries pop
+        // when no longer modal-open; non-modal entries pop when
+        // no longer open or no longer attached.
+        let current_modal: Vec<NodeId> = match tab.document_ref() {
+            Some(doc) => doc
+                .top_layer()
+                .iter()
+                .copied()
+                .filter(|&node| doc.is_dialog_open(node) && doc.is_dialog_modal(node))
+                .collect(),
+            None => Vec::new(),
+        };
+        let snapshot = self.actions.modal_focus_stack.clone();
+        for (dialog, previous, was_modal) in snapshot.iter().rev() {
+            let still_open = match tab.document_ref() {
+                Some(doc) => {
+                    if *was_modal {
+                        current_modal.contains(dialog)
+                    } else {
+                        doc.is_dialog_open(*dialog)
+                            && doc.propagation_path(*dialog).last() == Some(&doc.root())
+                    }
+                }
+                None => false,
+            };
+            if still_open {
+                continue;
+            }
+            self.actions
+                .modal_focus_stack
+                .retain(|(stacked, _, _)| stacked != dialog);
+            self.restore_focus_after_close(tab, *dialog, *previous, *was_modal);
+        }
+        // Modal adoption (journal-less shows: markup-open,
+        // parse shim): record current focus and move in.
+        for dialog in current_modal {
+            if self
+                .actions
+                .modal_focus_stack
+                .iter()
+                .any(|(stacked, _, _)| *stacked == dialog)
+            {
+                continue;
+            }
+            let previous = self.actions.focused;
+            self.actions
+                .modal_focus_stack
+                .push((dialog, previous, true));
+            let blocked = match tab.document_ref() {
+                Some(doc) => crate::window::popover_scope_blocks_dialog_move(&doc, dialog),
+                None => false,
+            };
+            if blocked {
+                continue;
+            }
+            let target = match tab.document_ref() {
+                Some(doc) => crate::window::dialog_initial_focus(&doc, dialog),
+                None => dialog,
+            };
+            self.set_focus(tab, Some(target));
+        }
+    }
+
+    /// Restore executor focus after `dialog` closed (w82 fix):
+    /// modal restores unconditionally, non-modal only when
+    /// focus sits inside the dialog or nowhere; an invalid
+    /// previous (detached, or inside a closed dialog) clears
+    /// focus only when it sits inside or nowhere, and never
+    /// clobbers focus living elsewhere.
+    fn restore_focus_after_close(
+        &mut self,
+        tab: &mut Tab,
+        dialog: NodeId,
+        previous: Option<NodeId>,
+        was_modal: bool,
+    ) {
+        let (inside, valid_previous) = match tab.document_ref() {
+            Some(doc) => {
+                let inside = match self.actions.focused {
+                    None => true,
+                    Some(focused) => {
+                        focused == dialog || doc.descendants(dialog).contains(&focused)
+                    }
+                };
+                let valid = match previous {
+                    Some(prev) => {
+                        let attached =
+                            prev == doc.root() || doc.ancestors(prev).contains(&doc.root());
+                        let mut chain = vec![prev];
+                        chain.extend(doc.ancestors(prev));
+                        attached
+                            && !chain.iter().any(|&node| {
+                                doc.is_dialog_element(node) && !doc.is_dialog_open(node)
+                            })
+                    }
+                    None => false,
+                };
+                (inside, valid)
+            }
+            None => (false, false),
+        };
+        match previous.filter(|_| valid_previous) {
+            Some(target) if was_modal || inside => {
+                self.set_focus(tab, Some(target));
+            }
+            _ => {
+                if inside {
+                    self.set_focus(tab, None);
+                }
+            }
+        }
+    }
+
     /// Run one action sequence: tick-synchronized execution across
     /// every source. Sources shorter than the longest idle on the
     /// extra ticks (WebDriver pads them with implicit pauses). The
@@ -986,6 +1231,10 @@ impl TestDriver {
             }
         }
         Self::grant_activation(tab);
+        // Dialog focus sync (w82 fix B2): script-driven
+        // shows/closes during the sequence (a click handler
+        // calling showModal, an Escape close) land here.
+        self.sync_modal_focus(tab);
         Ok(())
     }
 
@@ -1107,9 +1356,12 @@ impl TestDriver {
     /// `WindowApp::handle_escape`: dismiss the top-layer member
     /// itself (a modal dialog via cancel-then-close, an `auto`
     /// popover via hide), with the `cancel` / `close` / `toggle`
-    /// hooks routed through the [`JsDispatch`] trait — currently
-    /// no-ops for the production dispatcher, whose `script.rs`
-    /// wiring is deferred, exactly as in the windowed path.
+    /// hooks routed through the [`JsDispatch`] trait — production
+    /// delivery runs through the `script.rs` implementation
+    /// (wired, not deferred), exactly as in the windowed path.
+    /// Dialog closes and popover hides demote through the
+    /// deferred helpers in [`crate::window`] (w82 fixpaths B3),
+    /// so a stored exit duration renders the transition.
     /// Returns true when a dismissible target existed, even when
     /// a canceled `cancel` kept the dialog open. Executor focus
     /// inside a dismissed target is cleared, like the windowed
@@ -1129,11 +1381,10 @@ impl TestDriver {
                     return true;
                 }
                 let closed = match tab.installed_mut() {
-                    Some(installed) => installed
-                        .document()
-                        .borrow_mut()
-                        .close_dialog(dialog, None)
-                        .unwrap_or(false),
+                    Some(installed) => crate::window::deferred_close_dialog(
+                        &mut installed.document().borrow_mut(),
+                        dialog,
+                    ),
                     None => false,
                 };
                 if !closed {
@@ -1148,7 +1399,7 @@ impl TestDriver {
                     Some(installed) => {
                         let mut doc = installed.document().borrow_mut();
                         let was_open = doc.is_popover_open(pop);
-                        was_open && doc.hide_popover(pop).is_ok()
+                        was_open && crate::window::deferred_hide_popover(&mut doc, pop)
                     }
                     None => false,
                 };
@@ -1442,9 +1693,17 @@ impl TestDriver {
                         .and_then(|doc| crate::window::light_dismiss_pending_target(&doc, Some(t)))
                         == Some(pop)
                 {
+                    // w82 fixpaths M4: gate on was-open, like
+                    // the windowed Escape arm — `hide_popover`
+                    // alone reports `Ok` for an already-hidden
+                    // popover, which used to fire a spurious
+                    // `toggle`. Deferred hide (B3) renders the
+                    // exit transition when one was stored.
                     let hidden = match tab.installed_mut() {
                         Some(installed) => {
-                            installed.document().borrow_mut().hide_popover(pop).is_ok()
+                            let mut doc = installed.document().borrow_mut();
+                            let was_open = doc.is_popover_open(pop);
+                            was_open && crate::window::deferred_hide_popover(&mut doc, pop)
                         }
                         None => false,
                     };
@@ -1505,20 +1764,37 @@ impl TestDriver {
                                 // paths run. `auxclick` activates
                                 // nothing.
                                 if button == 0 && !click_prevented {
-                                    let changed = match tab.installed_mut() {
+                                    // Full form, like `execute_click`
+                                    // and the windowed click path: a
+                                    // show branch auto-closes other
+                                    // `auto` popovers, and every
+                                    // victim fires its `toggle`
+                                    // before the primary target's.
+                                    // The primary-only form used to
+                                    // drop those victim toggles
+                                    // (w82 final-review fix).
+                                    let (changed, auto_closed) = match tab.installed_mut() {
                                         Some(installed) => {
                                             let mut doc = installed.document().borrow_mut();
                                             match crate::window::resolve_popover_invoker(&doc, ct) {
                                                 Some(invoker) => {
-                                                    crate::window::activate_popover_target(
+                                                    crate::window::activate_popover_target_full(
                                                         &mut doc, invoker, ct,
                                                     )
                                                 }
-                                                None => None,
+                                                None => (None, Vec::new()),
                                             }
                                         }
-                                        None => None,
+                                        None => (None, Vec::new()),
                                     };
+                                    tab.sync_dirty_flags();
+                                    for victim in auto_closed {
+                                        JsDispatch::dispatch_toggle(
+                                            &mut self.dispatch,
+                                            tab,
+                                            victim,
+                                        );
+                                    }
                                     if let Some(target) = changed {
                                         JsDispatch::dispatch_toggle(
                                             &mut self.dispatch,
@@ -1886,19 +2162,22 @@ impl TestDriver {
         // (see [`crate::window::activate_popover_target`]).
         let prevented = self.dispatch.dispatch_click(tab, node);
         if !prevented {
-            let changed = match tab.installed_mut() {
+            let (changed, auto_closed) = match tab.installed_mut() {
                 Some(installed) => {
                     let mut doc = installed.document().borrow_mut();
                     match crate::window::resolve_popover_invoker(&doc, node) {
                         Some(invoker) => {
-                            crate::window::activate_popover_target(&mut doc, invoker, node)
+                            crate::window::activate_popover_target_full(&mut doc, invoker, node)
                         }
-                        None => None,
+                        None => (None, Vec::new()),
                     }
                 }
-                None => None,
+                None => (None, Vec::new()),
             };
             tab.sync_dirty_flags();
+            for victim in auto_closed {
+                JsDispatch::dispatch_toggle(&mut self.dispatch, tab, victim);
+            }
             if let Some(target) = changed {
                 JsDispatch::dispatch_toggle(&mut self.dispatch, tab, target);
             }
@@ -2015,6 +2294,11 @@ pub fn drain_testdriver_requests(tab: &mut Tab) {
     for req in requests {
         driver.execute(tab, req);
     }
+    // Dialog focus sync (w82 fix B2): covers script-driven
+    // shows/closes from any request in this drain, including
+    // shows that ran during a completion pump. Idempotent
+    // with the per-sequence sync above.
+    driver.sync_modal_focus(tab);
     if let Some(ctx) = ctx {
         store_persisted_action_state(ctx, std::mem::take(&mut driver.actions));
     }
@@ -3496,6 +3780,95 @@ mod tests {
     }
 
     #[test]
+    fn actions_pointerup_invoker_fires_victim_toggles_before_primary() {
+        // w82 final-review fix: the pointer-up invoker path
+        // must use `activate_popover_target_full`, like
+        // `execute_click` and the windowed click path. A naive
+        // victim test would not prove it: pressing the invoker
+        // outside the victim light-dismisses the victim on
+        // release, before the click, so its toggle fires even
+        // with the primary-only form. Shield the victim
+        // instead: a `manual` popover above it makes
+        // `light_dismiss_candidate` return `None` (the victim
+        // is not the top-layer member), while a show still
+        // auto-closes it — so only the victim-toggles path
+        // fires the victim's `toggle`, before the primary's.
+        use std::cell::RefCell;
+        use std::rc::Rc;
+        let doc = Rc::new(RefCell::new(
+            bowser_dom::Document::parse_html(
+                b"<html><body><button id=\"btn\" popovertarget=\"pb\">\
+                 <span id=\"span\">t</span></button>\
+                 <div id=\"pa\" popover>victim</div>\
+                 <div id=\"pm\" popover=\"manual\">shield</div>\
+                 <div id=\"pb\" popover>target</div></body></html>",
+            )
+            .0,
+        ));
+        let (btn, span, pa, pm, pb) = {
+            let d = doc.borrow();
+            (
+                d.get_element_by_id("btn").expect("btn"),
+                d.get_element_by_id("span").expect("span"),
+                d.get_element_by_id("pa").expect("pa"),
+                d.get_element_by_id("pm").expect("pm"),
+                d.get_element_by_id("pb").expect("pb"),
+            )
+        };
+        let base = bowser_url::parse("http://example.com/page.html", None).expect("test url");
+        let page =
+            crate::script::PageVm::new_for_document(doc.clone(), &base, "TestBrowser/9.9", &[])
+                .expect("install web apis");
+        let mut tab = crate::Tab::new(bowser_layout::Size { w: 800.0, h: 600.0 });
+        tab.install_document(doc, page);
+        tab.layout_root = Some(Rc::new(actions_box(
+            (0.0, 0.0, 800.0, 600.0),
+            None,
+            vec![
+                actions_box(
+                    (0.0, 0.0, 100.0, 50.0),
+                    Some(btn),
+                    vec![actions_box((10.0, 10.0, 80.0, 30.0), Some(span), vec![])],
+                ),
+                actions_box((200.0, 200.0, 100.0, 100.0), Some(pa), vec![]),
+                actions_box((300.0, 200.0, 100.0, 100.0), Some(pm), vec![]),
+                actions_box((400.0, 200.0, 100.0, 100.0), Some(pb), vec![]),
+            ],
+        )));
+        open_popover_td(&mut tab, pa);
+        open_popover_td(&mut tab, pm);
+        eval(
+            &mut tab,
+            "window.__toggles = []; \
+             document.getElementById('pa').addEventListener('toggle', function() { window.__toggles.push('a'); }); \
+             document.getElementById('pm').addEventListener('toggle', function() { window.__toggles.push('m'); }); \
+             document.getElementById('pb').addEventListener('toggle', function() { window.__toggles.push('b'); });",
+        );
+        let mut driver = TestDriver::new();
+        driver.execute(
+            &mut tab,
+            sequence_request(vec![pointer_source(
+                "mouse",
+                vec![
+                    move_item(50.0, 25.0, ActionOrigin::Viewport),
+                    button_item(ActionItemKind::PointerDown, 0),
+                    button_item(ActionItemKind::PointerUp, 0),
+                ],
+            )]),
+        );
+        assert!(
+            !popover_open(&tab, pa),
+            "showing pb must auto-close the victim pa"
+        );
+        assert!(popover_open(&tab, pb), "pb must open");
+        assert!(popover_open(&tab, pm), "manual shield pm must stay open");
+        assert!(
+            js_true(&mut tab, "window.__toggles.join(',') === 'a,b'"),
+            "victim toggle must fire before the primary toggle, and the shield must not toggle"
+        );
+    }
+
+    #[test]
     fn actions_pointerup_light_dismiss_and_drag_into_popover() {
         // Same-spot outside release dismisses.
         let (mut tab, _, pop) = popover_seq_tab(popover_seq_html());
@@ -3537,6 +3910,82 @@ mod tests {
         assert!(
             popover_open(&tab, pop),
             "release inside the popover must not light-dismiss"
+        );
+    }
+
+    #[test]
+    fn actions_light_dismiss_with_stored_duration_retains_and_fires_once() {
+        // w82 fixpaths B3: a testdriver light-dismiss with a
+        // show-time stored exit duration retains the popover
+        // for its transition (rendering) while the toggle
+        // fires once, at dismissal time.
+        let (mut tab, _, pop) = popover_seq_tab(popover_seq_html());
+        open_popover_td(&mut tab, pop);
+        tab.installed_mut()
+            .expect("installed")
+            .document()
+            .borrow_mut()
+            .store_exit_duration(pop, 60.0);
+        eval(
+            &mut tab,
+            "window.__toggles = 0; \
+             document.getElementById('pop').addEventListener('toggle', function() { window.__toggles += 1; });",
+        );
+        let mut driver = TestDriver::new();
+        driver.execute(
+            &mut tab,
+            sequence_request(vec![pointer_source(
+                "mouse",
+                vec![
+                    move_item(700.0, 500.0, ActionOrigin::Viewport),
+                    button_item(ActionItemKind::PointerDown, 0),
+                    button_item(ActionItemKind::PointerUp, 0),
+                ],
+            )]),
+        );
+        assert!(
+            tab.document_ref().expect("document").is_exit_retained(pop),
+            "stored duration must retain the light-dismissed popover"
+        );
+        assert!(
+            js_true(&mut tab, "window.__toggles === 1"),
+            "light-dismiss must fire exactly one toggle"
+        );
+    }
+
+    #[test]
+    fn actions_light_dismiss_stale_pending_fires_no_toggle() {
+        // w82 fixpaths M4: a pointerdown record whose popover
+        // a pointerdown listener already closed must not fire
+        // a spurious toggle on release — the release dismisses
+        // nothing when the popover is not open there.
+        let (mut tab, _, pop) = popover_seq_tab(popover_seq_html());
+        open_popover_td(&mut tab, pop);
+        eval(
+            &mut tab,
+            "window.__toggles = 0; \
+             document.getElementById('pop').addEventListener('toggle', function() { window.__toggles += 1; }); \
+             document.body.addEventListener('pointerdown', function() { document.getElementById('pop').hidePopover(); });",
+        );
+        let mut driver = TestDriver::new();
+        driver.execute(
+            &mut tab,
+            sequence_request(vec![pointer_source(
+                "mouse",
+                vec![
+                    move_item(700.0, 500.0, ActionOrigin::Viewport),
+                    button_item(ActionItemKind::PointerDown, 0),
+                    button_item(ActionItemKind::PointerUp, 0),
+                ],
+            )]),
+        );
+        assert!(
+            !popover_open(&tab, pop),
+            "pointerdown listener must have closed the popover"
+        );
+        assert!(
+            js_true(&mut tab, "window.__toggles === 1"),
+            "only the listener's own hide may toggle, never a stale light-dismiss"
         );
     }
 
@@ -3633,5 +4082,167 @@ mod tests {
             Some(p1),
             "Tab must wrap inside the popover, never reaching the dialog"
         );
+    }
+    /// Tab with an outside button, a modal dialog containing
+    /// one button, and layout boxes for both (B2 tests drive
+    /// real JS through the bindings, so the dialog methods run
+    /// their production path, including the show-time
+    /// snapshot).
+    fn dialog_tab() -> (Tab, NodeId, NodeId, NodeId) {
+        use std::cell::RefCell;
+        use std::rc::Rc;
+        let doc = Rc::new(RefCell::new(
+            bowser_dom::Document::parse_html(
+                b"<html><body><button id=\"out\">o</button>\
+                  <dialog id=\"dlg\"><button id=\"a\">a</button></dialog></body></html>",
+            )
+            .0,
+        ));
+        let (out, dlg, a) = {
+            let d = doc.borrow();
+            (
+                d.get_element_by_id("out").expect("out"),
+                d.get_element_by_id("dlg").expect("dlg"),
+                d.get_element_by_id("a").expect("a"),
+            )
+        };
+        let base = bowser_url::parse("http://example.com/page.html", None).expect("test url");
+        let page =
+            crate::script::PageVm::new_for_document(doc.clone(), &base, "TestBrowser/9.9", &[])
+                .expect("install web apis");
+        let mut tab = crate::Tab::new(bowser_layout::Size { w: 800.0, h: 600.0 });
+        tab.install_document(doc, page);
+        tab.layout_root = Some(Rc::new(actions_box(
+            (0.0, 0.0, 800.0, 600.0),
+            None,
+            vec![
+                actions_box((0.0, 0.0, 100.0, 50.0), Some(out), vec![]),
+                actions_box((100.0, 0.0, 100.0, 50.0), Some(a), vec![]),
+            ],
+        )));
+        (tab, out, dlg, a)
+    }
+
+    #[test]
+    fn testdriver_showmodal_moves_focus_and_js_close_restores() {
+        // B2, through real JS: showModal moves executor focus
+        // in, close() restores it at the next sync. The
+        // bindings snapshot the mirrored focus at show time
+        // (set here via `set_focus`, the executor's mirror
+        // site), so this also pins the bindings integration.
+        let (mut tab, out, _dlg, a) = dialog_tab();
+        let mut driver = TestDriver::new();
+        driver.set_focus(&mut tab, Some(out));
+        eval(&mut tab, "document.getElementById('dlg').showModal();");
+        driver.sync_modal_focus(&mut tab);
+        assert_eq!(
+            driver.actions.focused,
+            Some(a),
+            "JS showModal must move testdriver focus in"
+        );
+        assert_eq!(driver.actions.modal_focus_stack.len(), 1);
+        eval(&mut tab, "document.getElementById('dlg').close();");
+        driver.sync_modal_focus(&mut tab);
+        assert_eq!(
+            driver.actions.focused,
+            Some(out),
+            "JS close() must restore testdriver focus at the sync"
+        );
+        assert!(driver.actions.modal_focus_stack.is_empty());
+    }
+
+    #[test]
+    fn testdriver_same_interval_open_close_and_close_reopen() {
+        // B2 + M3 through real JS: same-interval sequences
+        // replay from the journal instead of vanishing.
+        let (mut tab, out, _dlg, a) = dialog_tab();
+        let mut driver = TestDriver::new();
+        driver.set_focus(&mut tab, Some(out));
+        eval(
+            &mut tab,
+            "var d = document.getElementById('dlg'); d.showModal(); d.close();",
+        );
+        driver.sync_modal_focus(&mut tab);
+        assert_eq!(
+            driver.actions.focused,
+            Some(out),
+            "open+close in one interval must end at the previous focus"
+        );
+        assert!(driver.actions.modal_focus_stack.is_empty());
+        eval(&mut tab, "document.getElementById('dlg').showModal();");
+        driver.sync_modal_focus(&mut tab);
+        assert_eq!(driver.actions.focused, Some(a));
+        eval(
+            &mut tab,
+            "var d = document.getElementById('dlg'); d.close(); d.showModal();",
+        );
+        driver.sync_modal_focus(&mut tab);
+        assert_eq!(
+            driver.actions.focused,
+            Some(a),
+            "close+reopen in one interval must move focus in again"
+        );
+        assert_eq!(driver.actions.modal_focus_stack.len(), 1);
+        assert_eq!(
+            driver.actions.modal_focus_stack[0],
+            (_dlg, Some(out), true),
+            "re-show must not keep a stale previous"
+        );
+    }
+    #[test]
+    fn testdriver_popover_scope_blocks_dialog_move_in() {
+        // w82 fix regression (see
+        // `actions_tab_traps_in_popover_above_modal_dialog`):
+        // a dialog shown under an open popover records its
+        // entry but must not move focus into the dialog below
+        // the popover's trap.
+        let (mut tab, out, dlg, _a) = {
+            use std::cell::RefCell;
+            use std::rc::Rc;
+            let doc = Rc::new(RefCell::new(
+                bowser_dom::Document::parse_html(
+                    b"<html><body><button id=\"out\">o</button>\
+                      <dialog id=\"dlg\"><button id=\"a\">a</button></dialog>\
+                      <div id=\"pop\" popover><button id=\"p1\">1</button></div></body></html>",
+                )
+                .0,
+            ));
+            let (out, dlg, pop) = {
+                let d = doc.borrow();
+                (
+                    d.get_element_by_id("out").expect("out"),
+                    d.get_element_by_id("dlg").expect("dlg"),
+                    d.get_element_by_id("pop").expect("pop"),
+                )
+            };
+            let base = bowser_url::parse("http://example.com/page.html", None).expect("test url");
+            let page =
+                crate::script::PageVm::new_for_document(doc.clone(), &base, "TestBrowser/9.9", &[])
+                    .expect("install web apis");
+            let mut tab = crate::Tab::new(bowser_layout::Size { w: 800.0, h: 600.0 });
+            tab.install_document(doc, page);
+            (tab, out, dlg, pop)
+        };
+        let pop = tab
+            .document_ref()
+            .expect("doc")
+            .get_element_by_id("pop")
+            .expect("pop");
+        tab.installed_mut()
+            .expect("installed")
+            .document()
+            .borrow_mut()
+            .show_dialog_modal(dlg)
+            .expect("showModal");
+        open_popover_td(&mut tab, pop);
+        let mut driver = TestDriver::new();
+        driver.set_focus(&mut tab, Some(out));
+        driver.sync_modal_focus(&mut tab);
+        assert_eq!(
+            driver.actions.focused,
+            Some(out),
+            "popover scope above the dialog must block the move-in"
+        );
+        assert_eq!(driver.actions.modal_focus_stack.len(), 1);
     }
 }

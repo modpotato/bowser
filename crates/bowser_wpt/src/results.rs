@@ -679,6 +679,8 @@ impl std::error::Error for MetadataError {}
 ///   runner killed the test before any report arrived", so the message
 ///   carries the disambiguation from the harness-reported `TIMEOUT`;
 /// - reftests and crashtests report `PASS`/`FAIL` with no subtests;
+///   reftest entries carry their per-reference diff detail
+///   (pixel counts and fractions) as the entry `message`;
 /// - skips report `SKIP` with the skip reason as the message;
 /// - driver and filesystem failures report `ERROR` with the error text
 ///   as the message.
@@ -756,7 +758,12 @@ fn push_entry(out: &mut String, r: &crate::runner::TestReport, expected: Option<
         },
         TestOutcome::Reftest { passed, .. } => ExportEntry {
             status: if *passed { "PASS" } else { "FAIL" }.to_owned(),
-            message: None,
+            // Diff detail (per-reference pixel counts/fractions) as
+            // the entry message, so a consumer of the wptreport JSON
+            // sees the failure's magnitude, not just FAIL. A reftest
+            // with no checks says so explicitly instead of carrying
+            // a bare FAIL with no cause.
+            message: r.outcome.reftest_detail(),
             duration: None,
             subtests: Vec::new(),
         },
@@ -1325,7 +1332,16 @@ mod tests {
                 kind: crate::manifest::TestKind::Reftest,
                 outcome: TestOutcome::Reftest {
                     passed: false,
-                    checks: Vec::new(),
+                    checks: vec![crate::runner::RefCheck {
+                        reference: "/css/r-ref.html".into(),
+                        rel: crate::reftest::RefRel::Match,
+                        comparison: crate::reftest::Comparison {
+                            equal: false,
+                            diff_pixels: 42,
+                            diff_fraction: 0.0007,
+                        },
+                        ok: false,
+                    }],
                 },
                 expected_fail: true,
             },
@@ -1415,6 +1431,11 @@ mod tests {
         // Reftest/crashtest map to PASS/FAIL with no subtests.
         assert_eq!(get(1, "status"), Some("FAIL"));
         assert_eq!(get(1, "expected"), None);
+        // Reftest entries carry their diff detail as the message.
+        assert_eq!(
+            get(1, "message"),
+            Some("match /css/r-ref.html: diff=42 pixels (0.000700 fraction) FAIL")
+        );
         assert_eq!(get(2, "status"), Some("PASS"));
         // Skips and driver failures carry their reasons as messages.
         assert_eq!(get(3, "status"), Some("SKIP"));

@@ -4924,6 +4924,27 @@ impl<'a> Styler<'a> {
                     && matches!(&*c.value, CssValue::Keyword(k) if k.eq_ignore_ascii_case("none")))
             });
         }
+        // w82 (overlay-transition-dialog): a dialog retained for
+        // its exit transition has already lost its `open`
+        // attribute, so the UA `dialog:not([open]) { display:
+        // none; }` rule would otherwise hide it at once and the
+        // exit transition could never render. Drop UA
+        // `display: none` candidates for retained dialogs: for a
+        // dialog node the only UA rule that can contribute one
+        // is that `not([open])` rule (the `head, script, …`
+        // rule cannot match a dialog), and author `display:
+        // none` candidates carry a different rank and survive.
+        // Without this, the retained dialog would have no box
+        // and the `display` transition would be unobservable
+        // in layout/paint even though `getComputedStyle`
+        // transitions it.
+        if self.doc.is_exit_retained(node) && self.doc.is_dialog_element(node) {
+            cands.retain(|c| {
+                !(c.rank == rank(Origin::Ua, false)
+                    && c.property.atom() == PropertyAtom::DISPLAY
+                    && matches!(&*c.value, CssValue::Keyword(k) if k.eq_ignore_ascii_case("none")))
+            });
+        }
         let cands = Rc::new(cands);
         let epoch = self.epoch.get();
         self.cands
@@ -7300,9 +7321,27 @@ pub fn is_valid_for_property(property: &str, value: &CssValue) -> bool {
             is_fn(value)
                 || matches!(value, CssValue::List(items) if !items.is_empty() && items.iter().all(is_fn))
         }
-        // CSS Transitions 2: `transition-behavior` is a single
-        // keyword, never a list.
-        "transition-behavior" => is_kw(value, &["normal", "allow-discrete"]),
+        // CSS Transitions 2: `transition-behavior` is
+        // `<transition-behavior-value>#` — one keyword per
+        // transition layer, like the other transition longhands
+        // (w82: the shorthand now emits a list when it has
+        // multiple layers, e.g. the dialog shorthand's
+        // `allow-discrete, allow-discrete`). w82fix (cheap
+        // minor): both arms compare case-insensitively —
+        // CSS keywords are ASCII case-insensitive, and the
+        // list arm's exact-case comparison previously
+        // rejected a hand-built mixed-case list the single
+        // arm's callers never produced only because the
+        // parser lowercases keywords first (parse.rs
+        // lowercases idents into `Keyword`), so parsed input
+        // is unaffected either way.
+        "transition-behavior" => {
+            let is_behavior = |v: &CssValue| {
+                matches!(v, CssValue::Keyword(k) if k.eq_ignore_ascii_case("normal") || k.eq_ignore_ascii_case("allow-discrete"))
+            };
+            is_behavior(value)
+                || matches!(value, CssValue::List(items) if !items.is_empty() && items.iter().all(is_behavior))
+        }
         "float" => is_kw(value, &["left", "right", "none"]),
         "clear" => is_kw(value, &["none", "left", "right", "both"]),
         "overflow" => {
@@ -23017,6 +23056,22 @@ mod tests {
             &kw("allow-discrete")
         ));
         assert!(!is_valid_for_property("transition-behavior", &kw("ease")));
+        // w82fix (cheap minor): the list arm matches the
+        // single arm's case-insensitivity — CSS keywords are
+        // ASCII case-insensitive, so a mixed-case list is
+        // valid even though the parser never produces one.
+        assert!(is_valid_for_property(
+            "transition-behavior",
+            &kw("Allow-Discrete")
+        ));
+        assert!(is_valid_for_property(
+            "transition-behavior",
+            &CssValue::List(vec![kw("Allow-Discrete"), kw("NORMAL")])
+        ));
+        assert!(!is_valid_for_property(
+            "transition-behavior",
+            &CssValue::List(vec![kw("allow-discrete"), kw("ease")])
+        ));
         // Not inherited: the child keeps the initials even when the
         // parent rule sets the property.
         let s = style(
@@ -23088,12 +23143,12 @@ mod tests {
         doc.hide_popover(pop).unwrap();
         assert!(doc.hide_popover(pop).is_ok());
         // Toggle: plain, then forced in both directions.
-        assert!(doc.toggle_popover(pop, None).unwrap());
-        assert!(!doc.toggle_popover(pop, None).unwrap());
-        assert!(doc.toggle_popover(pop, Some(true)).unwrap());
-        assert!(doc.toggle_popover(pop, Some(true)).unwrap());
-        assert!(!doc.toggle_popover(pop, Some(false)).unwrap());
-        assert!(!doc.toggle_popover(pop, Some(false)).unwrap());
+        assert!(doc.toggle_popover(pop, None).unwrap().0);
+        assert!(!doc.toggle_popover(pop, None).unwrap().0);
+        assert!(doc.toggle_popover(pop, Some(true)).unwrap().0);
+        assert!(doc.toggle_popover(pop, Some(true)).unwrap().0);
+        assert!(!doc.toggle_popover(pop, Some(false)).unwrap().0);
+        assert!(!doc.toggle_popover(pop, Some(false)).unwrap().0);
         assert!(doc.toggle_popover(plain, None).is_err());
         // Auto-close: showing a second `auto` popover closes the
         // first; a `manual` popover is never auto-closed.
@@ -23166,6 +23221,47 @@ mod tests {
         styler.invalidate_top_layer();
         assert_eq!(styler.style_for(open).get_str("overlay"), Some("auto"));
         assert_eq!(styler.style_for(closed).get_str("overlay"), Some("none"));
+    }
+
+    // w82: a modal dialog closed with an exit transition
+    // keeps rendering until the transition finishes: the
+    // retained dialog still computes `display: block`,
+    // `position: fixed`, and `overlay: auto` (the UA
+    // `dialog:not([open]) { display: none; }` rule is
+    // suppressed for retentions, and `:modal` still matches),
+    // while a plain closed dialog computes `display: none`.
+    #[test]
+    fn dialog_exit_retention_keeps_rendering_style() {
+        let mut doc = Document::new();
+        let root = doc.root();
+        let html = doc.create_element("html");
+        doc.append_child(root, html);
+        let body = doc.create_element("body");
+        doc.append_child(html, body);
+        let closed = doc.create_element("dialog");
+        doc.append_child(body, closed);
+        let retained = doc.create_element("dialog");
+        doc.append_child(body, retained);
+        doc.show_dialog_modal(retained).unwrap();
+        doc.close_dialog_deferred(retained, None, 60.0).unwrap();
+        assert!(!doc.is_dialog_open(retained));
+        assert!(doc.is_exit_retained(retained));
+        let author = parse_stylesheet("");
+        let ua_sheet = ua();
+        let author_refs = [&author];
+        let styler = Styler::new(&doc, &author_refs, &ua_sheet, vp());
+        assert_eq!(styler.style_for(closed).get_str("display"), Some("none"));
+        assert_eq!(
+            styler.style_for(retained).get_str("display"),
+            Some("block"),
+            "retained dialog must not take the not([open]) display:none"
+        );
+        assert_eq!(
+            styler.style_for(retained).get_str("position"),
+            Some("fixed"),
+            "retained modal dialog keeps :modal fixed centering"
+        );
+        assert_eq!(styler.style_for(retained).get_str("overlay"), Some("auto"));
     }
 
     // w81 phase 2, rescoped w81fix F-H1 to Chromium: dialog UA

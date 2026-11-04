@@ -4499,7 +4499,7 @@ fn popover_show_hide_toggle_and_set_ops_dirty_the_document() {
     assert!(report.style);
     assert!(report.subtrees.contains(&pop));
 
-    assert!(doc.toggle_popover(pop, None).expect("toggle"));
+    assert!(doc.toggle_popover(pop, None).expect("toggle").0);
     assert!(
         !doc.take_dirty().is_empty(),
         "togglePopover must dirty the document"
@@ -4642,6 +4642,300 @@ fn dialog_markup_open_and_open_attribute_removal() {
 }
 
 #[test]
+fn dialog_deferred_close_retains_top_layer_then_drops() {
+    // w82: a modal close with a positive exit duration keeps
+    // the dialog rendering as modal top-layer (but closed)
+    // until the retention expires; the live top layer no
+    // longer lists it, and `:open` stays false throughout.
+    let (mut doc, dlg) = dialog_in_doc();
+    doc.show_dialog_modal(dlg).expect("showModal");
+    assert!(
+        doc.close_dialog_deferred(dlg, Some("bye"), 60.0)
+            .expect("deferred close")
+    );
+    assert!(!doc.is_dialog_open(dlg));
+    assert_eq!(doc.dialog_return_value(dlg), "bye");
+    assert!(doc.is_exit_retained(dlg));
+    assert!(doc.is_in_top_layer(dlg));
+    assert!(doc.is_dialog_modal(dlg));
+    assert!(doc.matches(dlg, ":modal").expect("parse"));
+    assert!(!doc.matches(dlg, ":open").expect("parse"));
+    assert!(!doc.top_layer().contains(&dlg), "live top layer drops it");
+    assert!(doc.top_layer_with_retained().contains(&dlg));
+    assert!(doc.has_top_layer_or_retained());
+    // Re-showing during retention cancels it.
+    doc.show_dialog_modal(dlg)
+        .expect("re-show cancels retention");
+    assert!(!doc.is_exit_retained(dlg));
+    assert!(doc.is_dialog_open(dlg));
+    assert!(doc.is_in_top_layer(dlg));
+    assert!(doc.top_layer().contains(&dlg));
+    // Zero duration (and the plain close) demote synchronously.
+    assert!(
+        doc.close_dialog_deferred(dlg, None, 0.0)
+            .expect("zero-duration close")
+    );
+    assert!(!doc.is_exit_retained(dlg));
+    assert!(!doc.is_in_top_layer(dlg));
+    assert!(!doc.is_dialog_modal(dlg));
+    assert!(!doc.has_top_layer_or_retained());
+}
+
+#[test]
+fn top_layer_with_retained_interleaves_by_promotion_order() {
+    // w82fix Whole-M7: a retained element paints at its
+    // original promotion position, never above a live member
+    // promoted after it, and multi-retention order is the
+    // promotion order, not map order.
+    // Same attachment shape as the popover tests (a host div
+    // under the root): `show_popover` requires attached nodes.
+    let mut doc = Document::new();
+    let host = doc.create_element("div");
+    doc.append_child(doc.root(), host);
+    let outer = doc.create_element("dialog");
+    doc.append_child(host, outer);
+    let inner = doc.create_element("div");
+    doc.append_child(host, inner);
+    doc.set_attribute(inner, "popover", "manual");
+    let third = doc.create_element("div");
+    doc.append_child(host, third);
+    doc.set_attribute(third, "popover", "manual");
+    // Promotion order: outer (dialog), inner, third.
+    // Manual popovers: auto popovers would auto-close each
+    // other on show, so they could never all be live at once.
+    doc.show_dialog_modal(outer).expect("showModal outer");
+    doc.show_popover(inner).expect("show inner");
+    doc.show_popover(third).expect("show third");
+    assert_eq!(doc.top_layer_with_retained(), vec![outer, inner, third]);
+    // Close the outer (earliest) dialog with an exit
+    // transition: it must stay FIRST, below the live inner
+    // and third — the old append shape put it last.
+    assert!(
+        doc.close_dialog_deferred(outer, None, 60.0)
+            .expect("deferred close outer")
+    );
+    assert_eq!(doc.top_layer_with_retained(), vec![outer, inner, third]);
+    // Defer the inner popover too: both retentions keep
+    // promotion order (outer before inner), still below the
+    // live third.
+    doc.hide_popover_deferred(inner, 60.0).expect("defer inner");
+    assert_eq!(doc.top_layer_with_retained(), vec![outer, inner, third]);
+    // Re-showing the retained outer during its exit cancels
+    // the retention and re-promotes it topmost; the still
+    // retained inner (earliest sequence) stays first.
+    doc.show_dialog_modal(outer)
+        .expect("re-show outer cancels retention");
+    assert!(!doc.is_exit_retained(outer));
+    assert_eq!(doc.top_layer_with_retained(), vec![inner, third, outer]);
+}
+
+#[test]
+fn exit_retention_ends_at_its_duration() {
+    // w82fix Whole-M1: retention expiry is the stored
+    // duration from close time (the bindings store
+    // transition + grace; the DOM only sees the total), not
+    // "whenever the next unrelated event happens". A short
+    // duration pins the wall-clock end within sleep
+    // granularity: still retained just before expiry, gone
+    // just after.
+    let (mut doc, dlg) = dialog_in_doc();
+    doc.show_dialog_modal(dlg).expect("showModal");
+    doc.close_dialog_deferred(dlg, None, 0.2)
+        .expect("deferred close");
+    assert!(doc.is_exit_retained(dlg));
+    assert!(doc.earliest_exit_retention_expiry().is_some());
+    std::thread::sleep(std::time::Duration::from_millis(100));
+    assert!(
+        doc.is_exit_retained(dlg),
+        "retention must survive before its duration"
+    );
+    std::thread::sleep(std::time::Duration::from_millis(150));
+    assert!(
+        !doc.is_exit_retained(dlg),
+        "retention must end at its duration, not later"
+    );
+    assert_eq!(doc.earliest_exit_retention_expiry(), None);
+    assert!(!doc.top_layer_with_retained().contains(&dlg));
+}
+
+#[test]
+fn dialog_deferred_close_non_modal_and_closed_are_sync() {
+    // A non-modal dialog was never in the top layer, so a
+    // deferred close has nothing to defer: it is the sync
+    // close, and a second (already closed) deferred close is
+    // a no-op.
+    let (mut doc, dlg) = dialog_in_doc();
+    doc.show_dialog(dlg).expect("show");
+    assert!(doc.close_dialog_deferred(dlg, None, 60.0).expect("close"));
+    assert!(!doc.is_exit_retained(dlg));
+    assert!(!doc.is_in_top_layer(dlg));
+    assert!(
+        !doc.close_dialog_deferred(dlg, None, 60.0)
+            .expect("re-close")
+    );
+}
+
+#[test]
+fn popover_deferred_hide_retains_then_syncs() {
+    let mut doc = Document::new();
+    let host = doc.create_element("div");
+    doc.append_child(doc.root(), host);
+    let pop = doc.create_element("div");
+    doc.append_child(host, pop);
+    doc.set_attribute(pop, "popover", "auto");
+    doc.show_popover(pop).expect("show");
+    assert!(doc.is_popover_open(pop));
+    doc.hide_popover_deferred(pop, 60.0).expect("deferred hide");
+    assert!(doc.is_exit_retained(pop));
+    assert!(doc.is_in_top_layer(pop));
+    assert!(doc.is_popover_open(pop));
+    assert!(!doc.top_layer().contains(&pop));
+    // w82 fixpaths: a retained popover is hidden for API
+    // purposes, so a plain hide, a deferred hide, a
+    // forced-false toggle, and a bare toggle are all no-ops
+    // that leave the retention alone (the old expectation —
+    // plain hide ends the retention — was the bug).
+    doc.hide_popover(pop)
+        .expect("plain hide on retained is a no-op");
+    assert!(doc.is_exit_retained(pop));
+    doc.hide_popover_deferred(pop, 60.0)
+        .expect("deferred hide on retained is a no-op");
+    assert!(doc.is_exit_retained(pop));
+    assert_eq!(
+        doc.toggle_popover(pop, Some(false))
+            .expect("forced-false on retained"),
+        (false, Vec::new())
+    );
+    assert!(doc.is_exit_retained(pop));
+    assert_eq!(
+        doc.toggle_popover(pop, None)
+            .expect("bare toggle on retained"),
+        (false, Vec::new())
+    );
+    assert!(doc.is_exit_retained(pop));
+    assert_eq!(
+        doc.toggle_popover_deferred(pop, None, 60.0)
+            .expect("deferred bare toggle on retained"),
+        (false, Vec::new())
+    );
+    assert!(doc.is_exit_retained(pop));
+    // A forced-true toggle re-opens it, cancelling the retention.
+    assert_eq!(
+        doc.toggle_popover(pop, Some(true))
+            .expect("forced-true re-shows"),
+        (true, Vec::new())
+    );
+    assert!(!doc.is_exit_retained(pop));
+    assert!(doc.top_layer().contains(&pop));
+}
+
+#[test]
+fn popover_show_returns_auto_closed_including_retained_and_defers_live_victims() {
+    // w82 fixpaths B1/m10: show returns every auto-closed
+    // popover — live and retained — so callers can fire a
+    // toggle for each; a live victim with a stored exit
+    // duration is retained (not sync-demoted) for it.
+    let mut doc = Document::new();
+    let host = doc.create_element("div");
+    doc.append_child(doc.root(), host);
+    let mk = |doc: &mut Document, host: NodeId| -> NodeId {
+        let pop = doc.create_element("div");
+        doc.set_attribute(pop, "popover", "auto");
+        doc.append_child(host, pop);
+        pop
+    };
+    let live_victim = mk(&mut doc, host);
+    let retained_victim = mk(&mut doc, host);
+    let newcomer = mk(&mut doc, host);
+    doc.show_popover(live_victim).expect("show live victim");
+    // Showing the retained victim auto-closes the live one
+    // (no stored duration: synchronous demotion).
+    let closed = doc
+        .show_popover(retained_victim)
+        .expect("show retained victim");
+    assert_eq!(closed, vec![live_victim]);
+    assert!(!doc.is_popover_open(live_victim));
+    // Defer the retained victim's own exit, then re-show the
+    // live victim with a stored duration for it: the live
+    // victim's show must auto-close the retained victim and
+    // report it.
+    doc.hide_popover_deferred(retained_victim, 60.0)
+        .expect("defer retained victim");
+    assert!(doc.is_exit_retained(retained_victim));
+    doc.show_popover(live_victim).expect("re-show live victim");
+    doc.store_exit_duration(live_victim, 60.0);
+    let closed = doc.show_popover(newcomer).expect("show newcomer");
+    assert_eq!(closed, vec![live_victim]);
+    assert!(
+        doc.is_exit_retained(live_victim),
+        "live victim with a stored duration must be retained, not sync-demoted"
+    );
+    assert!(!doc.top_layer().contains(&live_victim));
+    assert!(doc.top_layer().contains(&newcomer));
+    // The retained victim auto-closed by the live victim's
+    // re-show above was ended, not extended: re-showing it
+    // is a fresh show, and the newcomer show above closed
+    // only the live victim.
+    let mut doc2 = Document::new();
+    let host2 = doc2.create_element("div");
+    doc2.append_child(doc2.root(), host2);
+    let a = mk(&mut doc2, host2);
+    let b = mk(&mut doc2, host2);
+    doc2.show_popover(a).expect("show a");
+    doc2.hide_popover_deferred(a, 60.0).expect("defer a");
+    assert!(doc2.is_exit_retained(a));
+    let closed = doc2.show_popover(b).expect("show b auto-closes retained a");
+    assert_eq!(closed, vec![a]);
+    assert!(!doc2.is_exit_retained(a), "auto-close ends the retention");
+    assert!(!doc2.is_popover_open(a));
+}
+
+#[test]
+fn remove_from_top_layer_dirties_when_cancelling_a_retention() {
+    // w82 fixpaths m7: cancelling a retention is a paint-visible
+    // state change even when the node was not live.
+    let mut doc = Document::new();
+    let host = doc.create_element("div");
+    doc.append_child(doc.root(), host);
+    let pop = doc.create_element("div");
+    doc.set_attribute(pop, "popover", "auto");
+    doc.append_child(host, pop);
+    doc.show_popover(pop).expect("show");
+    doc.hide_popover_deferred(pop, 60.0).expect("defer");
+    assert!(doc.is_exit_retained(pop));
+    let _ = doc.take_dirty();
+    doc.remove_from_top_layer(pop);
+    assert!(!doc.is_exit_retained(pop));
+    let report = doc.take_dirty();
+    assert!(
+        report.subtrees.contains(&pop),
+        "retention cancellation must dirty, got: {report:?}"
+    );
+    // A non-member, non-retained removal still dirties nothing.
+    let _ = doc.take_dirty();
+    doc.remove_from_top_layer(pop);
+    assert!(doc.take_dirty().is_empty());
+}
+
+#[test]
+fn stored_exit_duration_is_consumed_once() {
+    let mut doc = Document::new();
+    let host = doc.create_element("div");
+    doc.append_child(doc.root(), host);
+    let pop = doc.create_element("div");
+    doc.append_child(host, pop);
+    assert_eq!(doc.stored_exit_duration(pop), None);
+    doc.store_exit_duration(pop, 2.5);
+    assert_eq!(doc.stored_exit_duration(pop), Some(2.5));
+    assert_eq!(doc.take_stored_exit_duration(pop), Some(2.5));
+    assert_eq!(doc.stored_exit_duration(pop), None);
+    // Non-positive storage clears instead of storing.
+    doc.store_exit_duration(pop, 2.5);
+    doc.store_exit_duration(pop, 0.0);
+    assert_eq!(doc.stored_exit_duration(pop), None);
+}
+
+#[test]
 fn dialog_removal_demotes_like_popover_and_open_pseudo_covers_popover() {
     let (mut doc, dlg) = dialog_in_doc();
     doc.show_dialog_modal(dlg).expect("showModal");
@@ -4676,4 +4970,48 @@ fn dialog_removal_demotes_like_popover_and_open_pseudo_covers_popover() {
     doc.append_child(container, details);
     assert!(doc.matches(details, ":open").expect("parse"));
     assert!(!doc.matches(details, ":modal").expect("parse"));
+}
+
+#[test]
+fn dialog_focus_journal_records_order_and_drains() {
+    use super::DialogFocusEvent;
+    let (mut doc, _) = Document::parse_html(
+        b"<html><body><dialog id=\"dlg\"><button>a</button></dialog></body></html>",
+    );
+    let dlg = doc.get_element_by_id("dlg").expect("dlg");
+    assert!(doc.take_dialog_focus_events().is_empty());
+    doc.show_dialog_modal(dlg).expect("showModal");
+    doc.set_host_focus(None);
+    doc.note_dialog_show(dlg);
+    assert_eq!(doc.take_dialog_show_previous(dlg), Some(None));
+    // Re-record: the sync consumes the snapshot, so a second
+    // take is absent, not a stale repeat.
+    assert_eq!(doc.take_dialog_show_previous(dlg), None);
+    doc.close_dialog(dlg, None).expect("close");
+    doc.show_dialog(dlg).expect("show");
+    assert_eq!(
+        doc.take_dialog_focus_events(),
+        vec![
+            DialogFocusEvent::Shown {
+                node: dlg,
+                modal: true
+            },
+            DialogFocusEvent::Closed { node: dlg },
+            DialogFocusEvent::Shown {
+                node: dlg,
+                modal: false
+            },
+        ]
+    );
+    assert!(doc.take_dialog_focus_events().is_empty());
+    // A failed show (already open) appends nothing; a real
+    // close journals once, and a no-op re-close appends
+    // nothing after it.
+    assert!(doc.show_dialog(dlg).is_err());
+    assert!(doc.close_dialog(dlg, None).expect("close"));
+    assert!(!doc.close_dialog(dlg, None).expect("re-close"));
+    assert_eq!(
+        doc.take_dialog_focus_events(),
+        vec![DialogFocusEvent::Closed { node: dlg }]
+    );
 }
