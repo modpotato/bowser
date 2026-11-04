@@ -2603,6 +2603,55 @@ fn apply_logical_mapping(
 /// path (see `finish_overflow_prop`), so a value memoized by — or
 /// inherited through — a cold single-axis resolution is adjusted too,
 /// not just the values a full `compute` produces.
+/// w83, dialog-scoped ONLY (read this first: this is NOT the full
+/// CSS Position 4 §3.1 rule). What this fixup actually does: a
+/// `dialog` element that is in the top layer and whose computed
+/// `position` is `sticky` computes `absolute` instead — so a modal
+/// dialog with author `position: sticky` (which beats the UA
+/// `dialog:modal { position: fixed; }` rule in the cascade)
+/// computes `absolute`, and layout never runs the sticky
+/// constraints on it. The gate is element-kind, not show-method:
+/// a `<dialog popover>` shown via `showPopover` is still a dialog
+/// in the top layer, so it converts too (pinned by
+/// `top_layer_sticky_dialog_computes_absolute`); a non-dialog
+/// popover never converts, whatever method showed it.
+/// Runs in `compute` after `fixup_overflow_axes` and before the
+/// memo batch write, and in [`Styler::finish_prop_raw`] on the
+/// cold single-property path, so every consumer reads the adjusted
+/// value. TODO(w83-followup): widen to the full §3.1 rule, whose
+/// wording ("every element rendered in the top layer whose
+/// specified `position` is not `absolute` or `fixed` computes to
+/// `absolute`") also covers popovers and fullscreen elements and
+/// non-sticky values. Until that lands, the following are KNOWN
+/// DEVIATIONS, pinned as current-behavior assertions (not as
+/// spec-correct results) by
+/// `top_layer_sticky_dialog_computes_absolute`, so widening flips
+/// them deliberately: a modal dialog with `relative` or `static`
+/// still computes `relative`/`static`, and a top-layer popover
+/// with `sticky`, `relative`, or `static` still computes that
+/// value unchanged.
+fn adjust_top_layer_dialog_position(
+    value: Option<Arc<CssValue>>,
+    is_top_layer_dialog: bool,
+) -> Option<Arc<CssValue>> {
+    if !is_top_layer_dialog {
+        return value;
+    }
+    if let Some(CssValue::Keyword(k)) = value.as_deref()
+        && k.eq_ignore_ascii_case("sticky")
+    {
+        return Some(Arc::new(CssValue::Keyword("absolute".into())));
+    }
+    value
+}
+
+fn fixup_top_layer_dialog_position(props: &mut [Option<Arc<CssValue>>], is_top_layer_dialog: bool) {
+    props[props::POSITION as usize] = adjust_top_layer_dialog_position(
+        props[props::POSITION as usize].take(),
+        is_top_layer_dialog,
+    );
+}
+
 fn fixup_overflow_axes(props: &mut [Option<Arc<CssValue>>]) {
     fn kw(props: &[Option<Arc<CssValue>>], idx: u8) -> Option<&str> {
         match props[idx as usize].as_deref() {
@@ -4750,6 +4799,21 @@ impl<'a> Styler<'a> {
         // `fixup_overflow_axes`). Runs before the memo batch write so
         // every consumer reads the adjusted values.
         fixup_overflow_axes(&mut props);
+
+        // w83, dialog-scoped only (see `fixup_top_layer_dialog_position`
+        // for the full scope note and the TODO(w83-followup) widening):
+        // a top-layer dialog's `sticky` computes to `absolute`, and
+        // nothing else converts. Mirrors the overlay exemption's
+        // membership source (`Document::is_in_top_layer`, which counts
+        // an unexpired exit retention, so a retained dialog keeps
+        // computing `absolute` while it still renders as top-layer),
+        // gated additionally on the element actually being a dialog —
+        // so a `<dialog popover>` shown via `showPopover` converts,
+        // while a non-dialog popover does not.
+        fixup_top_layer_dialog_position(
+            &mut props,
+            self.doc.is_in_top_layer(node) && self.doc.is_dialog_element(node),
+        );
 
         // One memo borrow per node instead of two per property. The
         // entry is retagged with the current epoch: a stale entry from
@@ -10616,7 +10680,15 @@ impl<'a> Styler<'a> {
     /// depend on each other (see [`fixup_overflow_axes`]), so a single
     /// axis is never finished — or memoized — on its own; those calls
     /// route to [`Styler::finish_overflow_prop`], which finishes the
-    /// pair together.
+    /// pair together. `position` is the same shape of exception on a
+    /// smaller scale: its computed value depends on the node's own
+    /// top-layer/dialog membership (see
+    /// [`fixup_top_layer_dialog_position`]), so
+    /// [`Styler::finish_prop_raw`] adjusts it per frame on the climb
+    /// below — a raw `sticky` memoized by a cold single-property
+    /// resolution must never reach a consumer unadjusted, and a
+    /// child inheriting from a top-layer dialog must inherit the
+    /// adjusted `absolute`, not the dialog's raw `sticky`.
     fn finish_prop(
         &self,
         node: NodeId,
@@ -10760,7 +10832,17 @@ impl<'a> Styler<'a> {
 
     /// The single-property driver behind [`Styler::finish_prop`] for
     /// every property except the `overflow` axes (which need the pair
-    /// driver above).
+    /// driver above). For `position` it also applies the w83
+    /// top-layer dialog fixup per frame, top-down (see
+    /// [`fixup_top_layer_dialog_position`]): a frame that is itself
+    /// a top-layer dialog converts its `sticky` to `absolute`
+    /// before memoizing, so frames below it inherit the adjusted
+    /// value, while frames above it keep the raw value they computed
+    /// from their own ancestors. Without this, a cold-first child
+    /// with explicit `position: inherit` under a top-layer sticky
+    /// dialog would climb to the dialog's raw `sticky`, memoize it
+    /// for both nodes, and keep `sticky` — contradicting the full
+    /// `compute` path, which adjusts before its memo batch write.
     fn finish_prop_raw(
         &self,
         node: NodeId,
@@ -10800,6 +10882,20 @@ impl<'a> Styler<'a> {
                 }
             }
         };
+        // w83: per-frame top-layer dialog fixup for `position`
+        // (other properties pass through unchanged). Applied
+        // before each memo write, so no frame memoizes a raw
+        // `sticky` that its own top-layer/dialog membership
+        // converts, and descendants inherit the converted value.
+        let adjust = |m: NodeId, v: Option<Arc<CssValue>>| {
+            if idx != props::POSITION {
+                return v;
+            }
+            adjust_top_layer_dialog_position(
+                v,
+                self.doc.is_in_top_layer(m) && self.doc.is_dialog_element(m),
+            )
+        };
         if frames.is_empty() {
             // No climb happened: writing the single frame directly
             // avoids the chain `Vec` the old code allocated per
@@ -10807,6 +10903,7 @@ impl<'a> Styler<'a> {
             if value.is_none() && top_explicit {
                 value = initial_rc(idx);
             }
+            value = adjust(top, value);
             self.memo_set(top, idx, value.clone());
             return (value, invalid);
         }
@@ -10821,6 +10918,7 @@ impl<'a> Styler<'a> {
             if value.is_none() && explicit {
                 value = initial_rc(idx);
             }
+            value = adjust(m, value);
             self.memo_set(m, idx, value.clone());
         }
         (value, invalid)
@@ -23188,6 +23286,425 @@ mod tests {
         // Attribute removal demotes too.
         doc.remove_attribute(outer, "popover");
         assert!(!doc.is_in_top_layer(outer));
+    }
+
+    // w83, dialog-scoped ONLY (not the full CSS Position 4 §3.1
+    // rule — see `fixup_top_layer_dialog_position` for the scope
+    // note and the TODO(w83-followup) widening): a dialog with
+    // author `position: sticky` computes `sticky` before
+    // `showModal()` and `absolute` once in the top layer, and
+    // returns to `sticky` on close — mirroring WPT
+    // `css/css-position/sticky-dialog.html`, which uses an
+    // inline style (so this test sets the `style` attribute,
+    // not an author rule; author rules are pinned separately by
+    // `top_layer_author_rule_dialog_positions`). A non-modal
+    // `show()` dialog is not in the top layer and keeps `sticky`;
+    // a modal dialog with no author position keeps the UA
+    // `dialog:modal` `fixed` (the conversion touches `sticky`
+    // only, never `fixed`). An exit-retained dialog keeps
+    // computing `absolute` while the retention is unexpired
+    // (its `is_in_top_layer` membership is what the fixup reads,
+    // so a live-top-layer-only gate would wrongly return it to
+    // `sticky` mid-transition — this section is the regression
+    // pin for that gate). A top-layer popover keeps `sticky`:
+    // §3.1's wording covers every top-layer element, but this
+    // wave is dialog-scoped by design — widening is a follow-up,
+    // and the deviation pins below (modal dialog
+    // `relative`/`static`, popover `relative`/`static`) pin the
+    // current scope so the widening lands as a deliberate
+    // change, not a silent one. The gate is element-kind, not
+    // show-method: a `<dialog popover>` shown via `showPopover`
+    // DOES convert, and that dual is pinned explicitly below
+    // (it is not a counterexample to the popover pin, which is
+    // about non-dialog popovers).
+    #[test]
+    fn top_layer_sticky_dialog_computes_absolute() {
+        let mut doc = Document::new();
+        let root = doc.root();
+        let html = doc.create_element("html");
+        doc.append_child(root, html);
+        let body = doc.create_element("body");
+        doc.append_child(html, body);
+        let dialog = doc.create_element("dialog");
+        doc.append_child(body, dialog);
+        doc.set_attribute(dialog, "style", "position: sticky");
+        let plain = doc.create_element("div");
+        doc.append_child(body, plain);
+        doc.set_attribute(plain, "style", "position: sticky");
+        // Closed dialog: no top-layer membership, `sticky` wins
+        // over the UA `dialog { position: absolute; }` rule
+        // (inline style beats UA normal).
+        let s = style(&doc, dialog, "", &vp());
+        assert_eq!(s.get_str_by_index(props::POSITION), Some("sticky"));
+        // Non-modal `show()`: open but not top-layer.
+        doc.show_dialog(dialog).unwrap();
+        let s = style(&doc, dialog, "", &vp());
+        assert_eq!(s.get_str_by_index(props::POSITION), Some("sticky"));
+        doc.close_dialog(dialog, None).unwrap();
+        // Modal: top-layer membership converts `sticky`.
+        doc.show_dialog_modal(dialog).unwrap();
+        assert!(doc.is_in_top_layer(dialog));
+        let s = style(&doc, dialog, "", &vp());
+        assert_eq!(s.get_str_by_index(props::POSITION), Some("absolute"));
+        // Close: demoted from the top layer, back to `sticky`.
+        doc.close_dialog(dialog, None).unwrap();
+        assert!(!doc.is_in_top_layer(dialog));
+        let s = style(&doc, dialog, "", &vp());
+        assert_eq!(s.get_str_by_index(props::POSITION), Some("sticky"));
+        // Modal dialog with no author position: UA `fixed` untouched.
+        let bare = doc.create_element("dialog");
+        doc.append_child(body, bare);
+        doc.show_dialog_modal(bare).unwrap();
+        let s = style(&doc, bare, "", &vp());
+        assert_eq!(s.get_str_by_index(props::POSITION), Some("fixed"));
+        // Top-layer popover: dialog-only scope, still `sticky`.
+        let pop = doc.create_element("div");
+        doc.append_child(body, pop);
+        doc.set_attribute(pop, "style", "position: sticky");
+        doc.set_attribute(pop, "popover", "");
+        doc.show_popover(pop).unwrap();
+        assert!(doc.is_in_top_layer(pop));
+        let s = style(&doc, pop, "", &vp());
+        assert_eq!(s.get_str_by_index(props::POSITION), Some("sticky"));
+        // Plain non-top-layer element: untouched.
+        let s = style(&doc, plain, "", &vp());
+        assert_eq!(s.get_str_by_index(props::POSITION), Some("sticky"));
+        // w83fix BLOCKER: exit-retained dialog. Reopen modal,
+        // then close with a 60s exit transition: the dialog is
+        // closed (`open` gone) but still exit-retained, hence
+        // still in the top layer, hence still `absolute` — the
+        // `compute` comment's retained-dialog claim, pinned here
+        // so a live-top-layer-only gate fails this test (before
+        // this section, every wave test plus the pruned WPT file
+        // passed under such a gate).
+        doc.show_dialog_modal(dialog).unwrap();
+        doc.close_dialog_deferred(dialog, None, 60.0).unwrap();
+        assert!(!doc.is_dialog_open(dialog));
+        assert!(doc.is_exit_retained(dialog));
+        assert!(doc.is_in_top_layer(dialog));
+        let s = style(&doc, dialog, "", &vp());
+        assert_eq!(
+            s.get_str_by_index(props::POSITION),
+            Some("absolute"),
+            "exit-retained sticky dialog must keep computing absolute"
+        );
+        // Known deviations (TODO(w83-followup)): under the full
+        // §3.1 rule these would all compute `absolute`. They
+        // currently do not, and these assertions pin that so the
+        // widening flips them deliberately, not silently.
+        // Modal dialog, `relative` / `static`: NOT converted.
+        for value in ["relative", "static"] {
+            let d = doc.create_element("dialog");
+            doc.append_child(body, d);
+            doc.set_attribute(d, "style", &format!("position: {value}"));
+            doc.show_dialog_modal(d).unwrap();
+            assert!(doc.is_in_top_layer(d));
+            let s = style(&doc, d, "", &vp());
+            assert_eq!(
+                s.get_str_by_index(props::POSITION),
+                Some(value),
+                "modal dialog {value} is a known deviation until TODO(w83-followup) widens the fixup"
+            );
+        }
+        // Top-layer popover (non-dialog), `relative` / `static`:
+        // NOT converted. `manual` so showing it does not
+        // auto-close the `auto` popover above.
+        for value in ["relative", "static"] {
+            let p = doc.create_element("div");
+            doc.append_child(body, p);
+            doc.set_attribute(p, "style", &format!("position: {value}"));
+            doc.set_attribute(p, "popover", "manual");
+            doc.show_popover(p).unwrap();
+            assert!(doc.is_in_top_layer(p));
+            let s = style(&doc, p, "", &vp());
+            assert_eq!(
+                s.get_str_by_index(props::POSITION),
+                Some(value),
+                "top-layer popover {value} is a known deviation until TODO(w83-followup) widens the fixup"
+            );
+        }
+        // `<dialog popover>` dual: the gate is element-kind, so
+        // a dialog shown via `showPopover` (not `showModal`)
+        // DOES convert its `sticky` to `absolute` — unlike the
+        // non-dialog popovers pinned above.
+        let dual = doc.create_element("dialog");
+        doc.append_child(body, dual);
+        doc.set_attribute(dual, "style", "position: sticky");
+        doc.set_attribute(dual, "popover", "manual");
+        doc.show_popover(dual).unwrap();
+        assert!(doc.is_in_top_layer(dual));
+        assert!(doc.is_popover_open(dual));
+        let s = style(&doc, dual, "", &vp());
+        assert_eq!(
+            s.get_str_by_index(props::POSITION),
+            Some("absolute"),
+            "dialog shown via showPopover is still a top-layer dialog and must convert"
+        );
+    }
+
+    // w83fix SHOULD-FIX 4: the main test above uses an inline
+    // style (mirroring the WPT file). Author rules take the same
+    // path through the cascade — an author `sticky` on a modal
+    // dialog beats the UA `dialog:modal` `fixed` rule (author
+    // normal beats UA normal) and is then converted to
+    // `absolute`, while an author `fixed` is already `fixed`
+    // and stays `fixed` (the conversion touches `sticky` only).
+    #[test]
+    fn top_layer_author_rule_dialog_positions() {
+        let mut doc = Document::new();
+        let root = doc.root();
+        let html = doc.create_element("html");
+        doc.append_child(root, html);
+        let body = doc.create_element("body");
+        doc.append_child(html, body);
+        let sticky_dlg = doc.create_element("dialog");
+        doc.append_child(body, sticky_dlg);
+        doc.set_attribute(sticky_dlg, "class", "sticky-dlg");
+        let fixed_dlg = doc.create_element("dialog");
+        doc.append_child(body, fixed_dlg);
+        doc.set_attribute(fixed_dlg, "class", "fixed-dlg");
+        let css = ".sticky-dlg { position: sticky; } .fixed-dlg { position: fixed; }";
+        let s = style(&doc, sticky_dlg, css, &vp());
+        assert_eq!(s.get_str_by_index(props::POSITION), Some("sticky"));
+        let s = style(&doc, fixed_dlg, css, &vp());
+        assert_eq!(s.get_str_by_index(props::POSITION), Some("fixed"));
+        doc.show_dialog_modal(sticky_dlg).unwrap();
+        doc.show_dialog_modal(fixed_dlg).unwrap();
+        let s = style(&doc, sticky_dlg, css, &vp());
+        assert_eq!(
+            s.get_str_by_index(props::POSITION),
+            Some("absolute"),
+            "author sticky on a modal dialog must convert, like inline sticky"
+        );
+        let s = style(&doc, fixed_dlg, css, &vp());
+        assert_eq!(
+            s.get_str_by_index(props::POSITION),
+            Some("fixed"),
+            "author fixed on a modal dialog must stay fixed"
+        );
+        doc.close_dialog(sticky_dlg, None).unwrap();
+        doc.close_dialog(fixed_dlg, None).unwrap();
+        let s = style(&doc, sticky_dlg, css, &vp());
+        assert_eq!(s.get_str_by_index(props::POSITION), Some("sticky"));
+    }
+
+    // w83fix SHOULD-FIX 2 (adapted — see the note below): the
+    // main test rebuilds a fresh Styler per query via the
+    // `style()` helper, so memo reuse and `invalidate_top_layer`
+    // are never exercised. This test keeps ONE Styler alive
+    // for repeated queries on the same dialog: a repeat
+    // `style_for_shared` returns the memoized `Rc` itself, and
+    // `invalidate_top_layer` retires that memo so the next
+    // query recomputes (a new `Rc`, same value). It then
+    // covers the before/after showModal/close/retained values
+    // through the production per-pass pattern (a new Styler per
+    // pass, with `invalidate_top_layer` called on it before
+    // restyling, proving the hook is safe and preserves the
+    // conversion).
+    //
+    // NOTE on the literal single-Styler-across-mutation form:
+    // it cannot be written against the current API, and that
+    // is structural, not an oversight in this test. `Styler`
+    // holds `&'a Document`, while every top-layer mutation
+    // (`show_dialog_modal`, `close_dialog`,
+    // `close_dialog_deferred`) takes `&mut Document` — the
+    // borrow checker rejects holding a Styler across such a
+    // mutation, which is exactly why production stylers are
+    // per-pass/per-call and why a stale memo across a
+    // mutation is not a live bug today. Making a Styler live
+    // across mutations would require changing its document
+    // reference to a shared/interior-mutable handle, a
+    // production API redesign out of scope for this fix.
+    // `invalidate_top_layer` currently has no production
+    // caller; it exists for embedders holding a styler across
+    // a mutation made through a shared document handle, should
+    // such a handle ever exist.
+    #[test]
+    fn top_layer_sticky_dialog_styler_memo_and_invalidate() {
+        let mut doc = Document::new();
+        let root = doc.root();
+        let html = doc.create_element("html");
+        doc.append_child(root, html);
+        let body = doc.create_element("body");
+        doc.append_child(html, body);
+        let dialog = doc.create_element("dialog");
+        doc.append_child(body, dialog);
+        doc.set_attribute(dialog, "style", "position: sticky");
+        let author = parse_stylesheet("");
+        let ua_sheet = ua();
+        let author_refs = [&author];
+        // One Styler, repeated queries: memo reuse, then
+        // invalidate retires the memo and recomputes.
+        let styler = Styler::new(&doc, &author_refs, &ua_sheet, vp());
+        let a = styler.style_for_shared(dialog);
+        let b = styler.style_for_shared(dialog);
+        assert!(Rc::ptr_eq(&a, &b), "repeat query must reuse the memo");
+        assert_eq!(a.get_str_by_index(props::POSITION), Some("sticky"));
+        styler.invalidate_top_layer();
+        let c = styler.style_for_shared(dialog);
+        assert!(!Rc::ptr_eq(&a, &c), "invalidate must retire the memo");
+        assert_eq!(c.get_str_by_index(props::POSITION), Some("sticky"));
+        drop(styler);
+        // Production per-pass pattern: new Styler after each
+        // top-layer change, invalidate called before restyling.
+        doc.show_dialog_modal(dialog).unwrap();
+        let styler = Styler::new(&doc, &author_refs, &ua_sheet, vp());
+        assert_eq!(
+            styler.style_for(dialog).get_str_by_index(props::POSITION),
+            Some("absolute")
+        );
+        styler.invalidate_top_layer();
+        assert_eq!(
+            styler.style_for(dialog).get_str_by_index(props::POSITION),
+            Some("absolute"),
+            "invalidate must not lose the top-layer conversion"
+        );
+        drop(styler);
+        doc.close_dialog(dialog, None).unwrap();
+        let styler = Styler::new(&doc, &author_refs, &ua_sheet, vp());
+        assert_eq!(
+            styler.style_for(dialog).get_str_by_index(props::POSITION),
+            Some("sticky")
+        );
+        drop(styler);
+        doc.show_dialog_modal(dialog).unwrap();
+        doc.close_dialog_deferred(dialog, None, 60.0).unwrap();
+        assert!(doc.is_exit_retained(dialog));
+        let styler = Styler::new(&doc, &author_refs, &ua_sheet, vp());
+        styler.invalidate_top_layer();
+        assert_eq!(
+            styler.style_for(dialog).get_str_by_index(props::POSITION),
+            Some("absolute"),
+            "exit-retained dialog must compute absolute on a fresh pass after invalidate"
+        );
+    }
+
+    // w83fix SHOULD-FIX 2, within-pass sharing leg: twin dialogs
+    // sharing one author class, closed styled first (publishing
+    // a share entry), modal styled second. The share key folds
+    // top-layer membership, so the modal twin must NOT adopt
+    // the closed twin's `sticky` style — and `share_misses == 2`
+    // proves the modal twin actually recomputed instead of
+    // adopting (an adopt would leave it at 1 and at `sticky`).
+    #[test]
+    fn top_layer_sticky_dialog_share_key_distinguishes_dialog() {
+        let mut doc = Document::new();
+        let root = doc.root();
+        let html = doc.create_element("html");
+        doc.append_child(root, html);
+        let body = doc.create_element("body");
+        doc.append_child(html, body);
+        let closed = doc.create_element("dialog");
+        doc.append_child(body, closed);
+        doc.set_attribute(closed, "class", "t");
+        let open = doc.create_element("dialog");
+        doc.append_child(body, open);
+        doc.set_attribute(open, "class", "t");
+        doc.show_dialog_modal(open).unwrap();
+        let author = parse_stylesheet(".t { position: sticky; }");
+        let ua_sheet = ua();
+        let author_refs = [&author];
+        let styler = Styler::new(&doc, &author_refs, &ua_sheet, vp());
+        assert_eq!(
+            styler.style_for(closed).get_str_by_index(props::POSITION),
+            Some("sticky")
+        );
+        assert_eq!(
+            styler.style_for(open).get_str_by_index(props::POSITION),
+            Some("absolute"),
+            "modal twin must not adopt the closed twin's shared sticky style"
+        );
+        assert_eq!(styler.share_misses.get(), 2);
+    }
+
+    // w83fix SHOULD-FIX 1: cold single-property path. A child
+    // with explicit `position: inherit` under a top-layer sticky
+    // dialog, queried cold-first (the parent has never been
+    // styled, so `finish_prop_raw` climbs to the dialog's raw
+    // `sticky`), must inherit the dialog's ADJUSTED value,
+    // `absolute` — and the climb must not pollute the dialog's
+    // own memo with the raw `sticky`. `resolved_prop` is the
+    // discriminator here, not `style_for`: `compute`'s batch
+    // fixup converts the child's own returned style even when
+    // the memo is polluted, so a `style_for`-only test passes
+    // with the bug and pins nothing. Each branch below is
+    // queried leaf-first, so its ancestors are cold.
+    #[test]
+    fn top_layer_cold_inherit_child_of_sticky_dialog() {
+        fn pos_str(v: Option<Arc<CssValue>>) -> Option<String> {
+            match v.as_deref() {
+                Some(CssValue::Keyword(k)) => Some(k.to_string()),
+                _ => None,
+            }
+        }
+        let mut doc = Document::new();
+        let root = doc.root();
+        let html = doc.create_element("html");
+        doc.append_child(root, html);
+        let body = doc.create_element("body");
+        doc.append_child(html, body);
+        // Branch 1: modal sticky dialog > inherit child.
+        let dialog = doc.create_element("dialog");
+        doc.append_child(body, dialog);
+        doc.set_attribute(dialog, "style", "position: sticky");
+        let child = doc.create_element("div");
+        doc.append_child(dialog, child);
+        doc.set_attribute(child, "style", "position: inherit");
+        // Branch 2 (control): non-dialog sticky parent > inherit
+        // child — no conversion anywhere.
+        let parent = doc.create_element("div");
+        doc.append_child(body, parent);
+        doc.set_attribute(parent, "style", "position: sticky");
+        let child2 = doc.create_element("div");
+        doc.append_child(parent, child2);
+        doc.set_attribute(child2, "style", "position: inherit");
+        // Branch 3: non-dialog sticky parent > modal dialog
+        // child with `inherit` — the dialog itself converts,
+        // but the conversion must not leak upward to the parent.
+        let parent3 = doc.create_element("div");
+        doc.append_child(body, parent3);
+        doc.set_attribute(parent3, "style", "position: sticky");
+        let dialog3 = doc.create_element("dialog");
+        doc.append_child(parent3, dialog3);
+        doc.set_attribute(dialog3, "style", "position: inherit");
+        doc.show_dialog_modal(dialog).unwrap();
+        doc.show_dialog_modal(dialog3).unwrap();
+        let author = parse_stylesheet("");
+        let ua_sheet = ua();
+        let author_refs = [&author];
+        let styler = Styler::new(&doc, &author_refs, &ua_sheet, vp());
+        // Branch 1, leaf first: child inherits `absolute`.
+        assert_eq!(
+            pos_str(styler.resolved_prop(child, props::POSITION, "position")),
+            Some("absolute".to_string()),
+            "inherit child of a top-layer sticky dialog must inherit absolute"
+        );
+        // The climb must not have polluted the dialog's memo.
+        assert_eq!(
+            pos_str(styler.resolved_prop(dialog, props::POSITION, "position")),
+            Some("absolute".to_string()),
+            "dialog memo must hold the adjusted value, not the raw sticky"
+        );
+        // Branch 2: no dialog anywhere, `sticky` survives.
+        assert_eq!(
+            pos_str(styler.resolved_prop(child2, props::POSITION, "position")),
+            Some("sticky".to_string())
+        );
+        assert_eq!(
+            pos_str(styler.resolved_prop(parent, props::POSITION, "position")),
+            Some("sticky".to_string())
+        );
+        // Branch 3: dialog converts, parent does not.
+        assert_eq!(
+            pos_str(styler.resolved_prop(dialog3, props::POSITION, "position")),
+            Some("absolute".to_string()),
+            "modal dialog inheriting sticky must convert its own value"
+        );
+        assert_eq!(
+            pos_str(styler.resolved_prop(parent3, props::POSITION, "position")),
+            Some("sticky".to_string()),
+            "conversion must not leak upward to the dialog's parent"
+        );
     }
 
     // w80 phase 2: within one style pass, an open popover twin must

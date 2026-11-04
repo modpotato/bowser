@@ -4022,6 +4022,114 @@ mod tests {
     }
 
     #[test]
+    fn send_keys_escape_delivers_trusted_cancel_close_and_toggle() {
+        // w83: the testdriver Escape path routes through the same
+        // trusted host dispatches as the windowed path, so the
+        // dialog's `cancel`/`close` and the popover's `toggle`
+        // events all arrive with `isTrusted === true` — and a
+        // light-dismissed popover's `toggle` is trusted too (the
+        // same hook, exercised below through the pointer path).
+        let (mut tab, out, dlg, _a) = dialog_tab();
+        eval(
+            &mut tab,
+            "document.getElementById('dlg').addEventListener('cancel', function(e) { cancelTrusted = e.isTrusted; }); document.getElementById('dlg').addEventListener('close', function(e) { closeTrusted = e.isTrusted; }); document.getElementById('dlg').showModal();",
+        );
+        let mut driver = TestDriver::new();
+        driver
+            .execute_send_keys(&mut tab, out, "\u{E00C}")
+            .expect("send_keys");
+        assert!(
+            !tab.document_ref().expect("document").is_dialog_open(dlg),
+            "Escape must close the modal dialog"
+        );
+        assert!(
+            js_true(&mut tab, "cancelTrusted === true"),
+            "Escape cancel must be trusted"
+        );
+        assert!(
+            js_true(&mut tab, "closeTrusted === true"),
+            "Escape close must be trusted"
+        );
+
+        // Popover Escape.
+        let (mut tab, btn, pop) = popover_click_tab(popover_seq_html());
+        open_popover_td(&mut tab, pop);
+        eval(
+            &mut tab,
+            "document.getElementById('pop').addEventListener('toggle', function(e) { toggleTrusted = e.isTrusted; toggleOld = e.oldState; toggleNew = e.newState; });",
+        );
+        let mut driver = TestDriver::new();
+        driver
+            .execute_send_keys(&mut tab, btn, "\u{E00C}")
+            .expect("send_keys");
+        assert!(
+            !popover_open(&tab, pop),
+            "Escape must dismiss the auto popover"
+        );
+        assert!(
+            js_true(&mut tab, "toggleTrusted === true"),
+            "Escape toggle must be trusted"
+        );
+        assert!(
+            js_true(&mut tab, "toggleOld === 'open' && toggleNew === 'closed'"),
+            "Escape toggle must read open -> closed"
+        );
+
+        // Popover light-dismiss (pointer press/release outside).
+        let (mut tab, _, pop) = popover_seq_tab(popover_seq_html());
+        open_popover_td(&mut tab, pop);
+        eval(
+            &mut tab,
+            "document.getElementById('pop').addEventListener('toggle', function(e) { ldToggleTrusted = e.isTrusted; });",
+        );
+        let mut driver = TestDriver::new();
+        driver.execute(
+            &mut tab,
+            sequence_request(vec![pointer_source(
+                "mouse",
+                vec![
+                    move_item(700.0, 500.0, ActionOrigin::Viewport),
+                    button_item(ActionItemKind::PointerDown, 0),
+                    button_item(ActionItemKind::PointerUp, 0),
+                ],
+            )]),
+        );
+        assert!(
+            !popover_open(&tab, pop),
+            "light-dismiss must hide the auto popover"
+        );
+        assert!(
+            js_true(&mut tab, "ldToggleTrusted === true"),
+            "light-dismiss toggle must be trusted"
+        );
+    }
+
+    #[test]
+    fn send_keys_escape_passive_cancel_listener_does_not_gate_close() {
+        // S5, testdriver path: a passive `cancel` listener's
+        // `preventDefault()` is a no-op, so Escape must still close
+        // the modal dialog (the non-passive case gates it — see the
+        // windowed Escape tests — but passive must not).
+        let (mut tab, out, dlg, _a) = dialog_tab();
+        eval(
+            &mut tab,
+            "document.getElementById('dlg').addEventListener('cancel', function(e) { passiveRan = true; e.preventDefault(); }, {passive: true}); document.getElementById('dlg').showModal();",
+        );
+        let mut driver = TestDriver::new();
+        driver
+            .execute_send_keys(&mut tab, out, "\u{E00C}")
+            .expect("send_keys");
+        assert!(
+            !tab.document_ref().expect("document").is_dialog_open(dlg),
+            "Escape must close the dialog despite a passive cancel preventDefault"
+        );
+        assert!(
+            js_true(&mut tab, "passiveRan === true"),
+            "passive cancel listener still ran on Escape"
+        );
+    }
+
+    #[test]
     fn actions_tab_traps_in_popover_above_modal_dialog() {
         // Same shape as popover_click_tab (web APIs, dirty layout
         // so no geometry is needed), but with the trap fixture's

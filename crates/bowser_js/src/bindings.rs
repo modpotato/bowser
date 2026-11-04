@@ -134,7 +134,32 @@ use bowser_paint::fonts::{FontCache, FontStyle, SharedFontCache};
 // Hidden property keys
 // ---------------------------------------------------------------------------
 
-/// Context id, stored on every host wrapper object.
+/// Context id, stored on every host wrapper object. The copy on the
+/// page global is special: every host dispatch
+/// ([`Vm::dispatch_window_load`], [`Vm::dispatch_wheel`],
+/// [`Vm::dispatch_touch`], [`Vm::dispatch_pointer_mouse`],
+/// [`Vm::dispatch_snap_event`], [`Vm::dispatch_image_event`], and
+/// [`Vm::dispatch_host_event`]) resolves its context by reading that
+/// copy, so it is installed locked (see [`def_locked_data`] at the
+/// install site) — a page overwrite/delete/forge of a plain data
+/// property there used to make every host dispatch fail silently
+/// (the caller then proceeded with the state change as if the event
+/// had not been prevented). The per-wrapper copies stay plain data
+/// properties: natives resolve their receiver through
+/// [`apis_rc`], which fails with a `TypeError` on a forged/missing
+/// receiver id instead of silently swallowing a state change, and a
+/// wrapper's id never needs to survive a page write — the page can
+/// only harm its own receiver, not a host dispatch.
+///
+/// Why lock instead of resolving from Vm-side state: the `Vm` holds
+/// no installed-context handle (install returns the id to the
+/// caller; `bowser_app::PageVm` keeps it, but the `Vm` dispatches
+/// are a public `bowser_js` API also driven directly), and no
+/// Vm-side key available from `bindings.rs` alone identifies this
+/// realm soundly (the heap address moves with the `Vm`; the
+/// registry is keyed only by the id being resolved). A Vm field
+/// would be a `vm.rs` change, outside this fix's scope, so the
+/// locked global copy is the sound option here.
 pub(crate) const CTX_KEY: &str = "\u{0}bowser:ctx";
 /// Node handle, stored on element/document wrapper objects.
 const NODE_KEY: &str = "\u{0}bowser:node";
@@ -200,6 +225,26 @@ const SNAP_DISPATCH_KEY: &str = "\u{0}bowser:dispatchSnapEvent";
 /// eval'ing the dispatch.
 const SNAP_TARGET_KEY: &str = "\u{0}bowser:snapTarget";
 const SNAP_EVENT_KEY: &str = "\u{0}bowser:snapEvent";
+/// Hidden trampoline natives for host dialog/popover dispatches
+/// ([`Vm::dispatch_cancel_event`], [`Vm::dispatch_close_event`],
+/// [`Vm::dispatch_toggle_event`]): the host evals a stub calling one
+/// of these so listener invocation reaches the interpreter (see
+/// [`Vm::dispatch_host_event`]). They are installed locked
+/// (non-writable, non-configurable, non-enumerable — see
+/// [`def_locked_native`]) and, crucially, carry NO dispatch state
+/// themselves: all state lives in the Rust-side
+/// [`HostEventFrame`] stack on [`WebApis`], and each trampoline only
+/// acts while its host-side armed flag is set, i.e. during the one
+/// synchronous host eval that armed it. A page overwrite therefore
+/// cannot divert the stub (the property cannot be replaced or
+/// deleted), and a page direct call — before, during, or after a
+/// dispatch — finds its armed flag clear (or its frame already
+/// consumed) and is a no-op returning `false`/`undefined`. There is
+/// deliberately no window stash for the target, event, or inline
+/// function anymore: the old `HOST_EVENT_TARGET_KEY` /
+/// `HOST_EVENT_EVENT_KEY` slots are gone.
+const HOST_EVENT_INLINE_KEY: &str = "\u{0}bowser:hostEventInline";
+const HOST_EVENT_CORE_KEY: &str = "\u{0}bowser:hostEventCore";
 /// Touch handle, stored on JS `Touch` wrapper objects.
 const TOUCH_KEY: &str = "\u{0}bowser:touch";
 /// Promise handle, stored on promise wrapper objects.
@@ -2001,8 +2046,72 @@ impl ReadyState {
 /// tree, listeners, promises, timers, fetch machinery, wrapper caches —
 /// is test-only (see the module docs) and gated accordingly.
 ///
+/// One in-flight host dialog/popover dispatch
+/// ([`Vm::dispatch_host_event`]): the Rust-side frame the two
+/// [`HOST_EVENT_INLINE_KEY`] / [`HOST_EVENT_CORE_KEY`] trampolines
+/// consume. Nothing here ever touches the page global: the inline
+/// function value, the prebuilt event wrapper, and the outcome the
+/// inline handler left behind all travel through this stack, which
+/// lives on [`WebApis`] (one stack per context, so two contexts can
+/// never alias each other's frames) and is additionally rooted by
+/// the dispatching host call's temporary heap roots for its whole
+/// duration (the values themselves are not GC-traced from here).
+///
+/// A stack, not a single slot: a nested host dispatch pushed while
+/// an outer frame is live (e.g. a re-entrant embedder call from
+/// inside a listener) gets its own frame on top, and each
+/// trampoline consumes only the top frame, so the outer dispatch
+/// resumes with its frame intact. The trampolines consume
+/// destructively (`inline_func` is taken on first entry, the whole
+/// frame is popped by the core trampoline), so a forged second call
+/// — or a call after the host already cleaned up — finds nothing
+/// to run.
+struct HostEventFrame {
+    /// Dispatch target node (the core takes the node, not a wrapper).
+    target: NodeId,
+    /// The one trusted event wrapper, shared by the inline handler
+    /// and the listeners (object identity, `timeStamp`, and expando
+    /// mutations are therefore shared too).
+    event_val: Value,
+    /// Handle into [`WebApis::events`] / `event_states` for the wrapper.
+    event_handle: u32,
+    /// Compiled inline handler function, taken by the inline
+    /// trampoline on its first (and only) entry.
+    inline_func: Option<Value>,
+    /// Inline outcome, filled in by the inline trampoline after the
+    /// handler runs (read by the host after the inline eval).
+    inline_false: bool,
+    /// Stringified inline throw, if any (the host converts it back
+    /// to [`crate::vm::VmError::Thrown`]).
+    inline_error: Option<String>,
+    /// `stopImmediatePropagation()` set by the inline handler: the
+    /// core resets the stop flags at its start, so without this
+    /// snapshot an inline `stopImmediatePropagation()` would be
+    /// silently dropped; the host skips the core entirely when it
+    /// is set (inline-first order: the inline handler is the first
+    /// listener, so halting means no listener runs).
+    stop_immediate: bool,
+    /// `defaultPrevented` on the wrapper right after the inline
+    /// handler ran: the fallback prevention read when the core
+    /// itself fails mid-flight (so an inline `preventDefault()`
+    /// is not lost with the failure).
+    inline_prevented: bool,
+}
+
 pub struct WebApis {
     id: u32,
+    /// In-flight host dialog/popover dispatch frames, innermost
+    /// last. See [`HostEventFrame`].
+    host_event_frames: Vec<HostEventFrame>,
+    /// Armed only for the duration of the host's synchronous inline
+    /// trampoline eval ([`Vm::dispatch_host_event`]): the inline
+    /// trampoline acts only while this is set, then clears it, so a
+    /// forged call from page code (including from inside the inline
+    /// handler itself, which runs after the flag is cleared) is a
+    /// no-op.
+    host_event_inline_armed: bool,
+    /// Same gate for the core trampoline eval.
+    host_event_core_armed: bool,
     /// `document.readyState` lifecycle state. A `Cell` so the accessor
     /// getter reads it through a shared borrow (see
     /// [`n_ready_state_get`]).
@@ -2294,6 +2403,9 @@ impl WebApis {
             font_load_credentials: HashMap::new(),
             next_callback: 1,
             next_job: 1,
+            host_event_frames: Vec::new(),
+            host_event_inline_armed: false,
+            host_event_core_armed: false,
         }
     }
 
@@ -3208,6 +3320,42 @@ pub enum PointerMouseKind {
     Pointer,
 }
 
+/// Outcome of a host dialog/popover dispatch
+/// ([`Vm::dispatch_cancel_event`], [`Vm::dispatch_close_event`],
+/// [`Vm::dispatch_toggle_event`]): `prevented` is true when the page
+/// canceled the event — the inline handler returning `false` on a
+/// cancelable event, the inline handler calling `preventDefault()`,
+/// or a non-passive listener calling `preventDefault()`. Both
+/// cancellation idioms are cancelability-gated: `preventDefault()`
+/// is gated in [`dom::Event::prevent_default`] (via
+/// [`n_prevent_default`]), and an inline `return false` is gated
+/// here in [`Vm::dispatch_host_event`], so a non-cancelable
+/// `close`/`toggle` is never prevented by either idiom.
+/// `inline_error` carries a throwing inline handler's error for the
+/// embedder to record; the listeners still run after an inline throw
+/// (DOM report-and-continue — the inline handler is one listener
+/// among others, so its throw must not swallow the rest of the
+/// dispatch). `dispatch_error` is `None` for the silent fail-closed
+/// paths (gone realm, unwrappable target — nothing ran, and the
+/// caller proceeds with the state change exactly as without an
+/// installed document) and `Some` when the core dispatch itself
+/// failed mid-flight (e.g. the document died between the inline run
+/// and the listener plan): that case is recorded by the embedder
+/// like `inline_error`, never silently conflated with "not
+/// prevented", and `prevented` then falls back to what the inline
+/// handler already established, so an inline `preventDefault()`
+/// before the failure still gates the state change.
+#[derive(Debug)]
+pub struct HostEventOutcome {
+    /// Whether the page canceled the event (see above).
+    pub prevented: bool,
+    /// A throwing inline handler's error, if any.
+    pub inline_error: Option<crate::vm::VmError>,
+    /// A mid-flight core-dispatch failure, if any (see above).
+    /// Never set for the silent fail-closed paths.
+    pub dispatch_error: Option<crate::vm::VmError>,
+}
+
 impl Vm {
     /// Install the web API surface on this VM's page global — the
     /// production page-realm entry point, called once per page realm
@@ -3687,6 +3835,377 @@ impl Vm {
         heap.delete_property(global, Wtf8::from_str(SNAP_EVENT_KEY));
         heap.release_temp(base);
         prevented
+    }
+
+    /// Dispatch a trusted, non-bubbling, cancelable dialog `cancel`
+    /// event at `target` (HTML §4.11.4 / close-watcher close request):
+    /// the host-fired counterpart of the JS-API path, which was
+    /// already trusted, while the old host path eval'd a plain object
+    /// through the public `dispatchEvent` and delivered it untrusted
+    /// (and page-overridable). `inline` is the target's `oncancel`
+    /// attribute source, if any. See [`Self::dispatch_host_event`]
+    /// for the single-wrapper inline mechanism and the fail-closed
+    /// contract.
+    pub fn dispatch_cancel_event(
+        &mut self,
+        target: NodeId,
+        inline: Option<&str>,
+    ) -> HostEventOutcome {
+        self.dispatch_host_event(
+            target,
+            dom::Event::new("cancel", false, true),
+            false,
+            inline,
+        )
+    }
+
+    /// Dispatch a trusted, non-bubbling, non-cancelable dialog `close`
+    /// event at `target` (HTML §4.11.4), fired after the dialog has
+    /// actually closed. `inline` is the target's `onclose` attribute
+    /// source, if any. `prevented` is always false for this
+    /// non-cancelable type — both cancellation idioms are gated on
+    /// cancelability (an inline `return false` is gated in
+    /// [`Self::dispatch_host_event`], `preventDefault()` in
+    /// [`n_prevent_default`]) — and is reported for symmetry with
+    /// [`Self::dispatch_cancel_event`].
+    pub fn dispatch_close_event(
+        &mut self,
+        target: NodeId,
+        inline: Option<&str>,
+    ) -> HostEventOutcome {
+        self.dispatch_host_event(
+            target,
+            dom::Event::new("close", false, false),
+            false,
+            inline,
+        )
+    }
+
+    /// Dispatch a trusted, non-bubbling, non-cancelable popover
+    /// `toggle` event at `target` carrying the `old_state` ->
+    /// `new_state` pair through `ToggleEvent.prototype` (the same
+    /// wrapper the JS-API `showPopover`/`hidePopover` path builds in
+    /// [`dispatch_popover_toggle`]). `inline` is the target's
+    /// `ontoggle` attribute source, if any.
+    pub fn dispatch_toggle_event(
+        &mut self,
+        target: NodeId,
+        old_state: &str,
+        new_state: &str,
+        inline: Option<&str>,
+    ) -> HostEventOutcome {
+        self.dispatch_host_event(
+            target,
+            dom::Event::new("toggle", false, false).with_toggle_states(old_state, new_state),
+            true,
+            inline,
+        )
+    }
+
+    /// Shared host dialog/popover dispatch behind the three per-type
+    /// methods above: the event wrapper is built once in Rust with
+    /// `trusted = true` (`wrap_event` / `wrap_toggle_event`) and
+    /// delivered to the shared [`run_event_dispatch`] core — never
+    /// through the public `dispatchEvent`, so a page override
+    /// cannot swallow or untrust it.
+    ///
+    /// The single-wrapper inline mechanism (the hard part snap
+    /// never needed): the inline handler runs first, with the very
+    /// wrapper the core then delivers to the `addEventListener`
+    /// listeners passed to it as its `event` argument, so both
+    /// halves observe one trusted event, one `isTrusted`, one
+    /// `timeStamp`, one object identity, and one
+    /// `defaultPrevented` (an inline `preventDefault()` therefore
+    /// counts, as does an inline `return false` on a cancelable
+    /// event). The inline run seeds the wrapper's dispatch state
+    /// (`target`/`currentTarget`/`AT_TARGET`, plus the propagation
+    /// path so `composedPath()` reads the dispatch-time path
+    /// inside it, not `[]`); the core then re-seeds that state
+    /// for the listener plan, which also means an inline
+    /// `stopPropagation()` does not carry into the listener plan
+    /// — the same loss the old eval path had, preserved rather
+    /// than silently changed and pinned by test. An inline
+    /// `stopImmediatePropagation()` is NOT lost: it is snapshotted
+    /// after the inline run and the core is skipped entirely
+    /// (inline-first order — the inline handler is the first
+    /// listener, so halting means no listener runs).
+    ///
+    /// Override-proofing (why there is no window stash): a host
+    /// dispatch from idle Rust cannot invoke JS listeners directly
+    /// — listener invocation needs the interpreter active, which
+    /// only a native called from bytecode provides — so some
+    /// eval'd stub must name a native. The stub here names the
+    /// locked [`HOST_EVENT_INLINE_KEY`] / [`HOST_EVENT_CORE_KEY`]
+    /// trampolines through top-level `this` (not through a
+    /// page-overwritable `window`/`globalThis` binding), the
+    /// properties are non-writable, non-configurable, and
+    /// non-enumerable, and — the actual airtight part — every bit
+    /// of dispatch state lives in the Rust-side
+    /// [`HostEventFrame`] stack, with each trampoline gated on a
+    /// host-side armed flag that is set only for its own
+    /// synchronous eval and cleared on entry. A page overwrite of
+    /// the trampoline keys cannot stick, a page delete cannot
+    /// remove them, and a page direct call (before, during, or
+    /// after a dispatch, including from inside the inline handler
+    /// or a listener) finds its flag clear or its frame already
+    /// consumed and is a no-op. Eliminating the global name
+    /// entirely would need a new `Vm` entry point that runs a
+    /// native with the interpreter active without an eval — that
+    /// lives in `vm.rs`, outside this method's reach — but neither
+    /// reviewer vector (overwrite-to-swallow, forge-prevention)
+    /// survives the locked-plus-armed design above, and the
+    /// negative tests pin both.
+    ///
+    /// Fail-closed: a gone realm or an unwrappable target returns
+    /// `prevented: false` with no inline or dispatch error and
+    /// runs nothing — the caller (Escape / light-dismiss) then
+    /// proceeds with the state change, exactly as without an
+    /// installed document. A failure AFTER the dispatch started
+    /// (the core trampoline eval failing) is different: it sets
+    /// `dispatch_error` and `prevented` falls back to what the
+    /// inline handler already established, so it is never silently
+    /// conflated with "not prevented".
+    fn dispatch_host_event(
+        &mut self,
+        target: NodeId,
+        event: dom::Event,
+        use_toggle_proto: bool,
+        inline: Option<&str>,
+    ) -> HostEventOutcome {
+        let fail = || HostEventOutcome {
+            prevented: false,
+            inline_error: None,
+            dispatch_error: None,
+        };
+        let cancelable = event.cancelable;
+        let ctx_id = match self.get_global(CTX_KEY) {
+            Some(Value::Int(id)) => id as u32,
+            _ => return fail(),
+        };
+        let apis = match web_apis(ContextId(ctx_id)) {
+            Some(rc) => rc,
+            None => return fail(),
+        };
+        let heap = self.heap_mut();
+        let mut g = apis.borrow_mut();
+        let target_val = match wrap_node(heap, &mut g, target) {
+            Ok(v) => v,
+            Err(_) => return fail(),
+        };
+        let (event_val, handle) = {
+            let wrapped = if use_toggle_proto {
+                let proto = g.gc_roots.borrow().toggle_event_proto;
+                wrap_toggle_event(heap, &mut g, event, true, proto)
+            } else {
+                wrap_event(heap, &mut g, event, true)
+            };
+            match wrapped {
+                Ok(v) => v,
+                Err(_) => return fail(),
+            }
+        };
+        // Seed the inline run's dispatch state (see above). The
+        // propagation path is best-effort: a document that died
+        // between install and dispatch still lets the inline
+        // handler run (its `composedPath()` then reads just the
+        // target), and the core below reports the failure as a
+        // dispatch error instead of silently succeeding.
+        let path = match g.live_document() {
+            Ok(doc) => doc.borrow().propagation_path(target),
+            Err(_) => vec![target],
+        };
+        if let Some(s) = g.event_states.get_mut(&handle) {
+            s.target = Some(target);
+            s.current_target = Some(target);
+            s.phase = PHASE_AT_TARGET;
+            s.path = path;
+        }
+        drop(g);
+        // The fresh event wrapper sits in no traced root yet: hold
+        // it (and the target wrapper, and the inline function once
+        // compiled) as temporary roots across the evals below.
+        // `base` is released on every exit path after this point.
+        let base = heap.protect(target_val);
+        heap.protect(event_val);
+        // Compile the inline source to a function value WITHOUT
+        // running it: the function object travels to its invocation
+        // through the Rust-side frame, never through the global,
+        // so page code cannot observe, replace, or delete it in
+        // between. A compile failure is an inline error (the
+        // handler never ran); the listeners still run below.
+        let mut inline_error: Option<crate::vm::VmError> = None;
+        let mut inline_func: Option<Value> = None;
+        if let Some(source) = inline {
+            match self.eval(&format!("(function(event){{{source}}})")) {
+                Ok(v @ Value::Object(_)) => {
+                    inline_func = Some(v);
+                    let heap = self.heap_mut();
+                    heap.protect(v);
+                }
+                Ok(_) => {}
+                Err(e) => inline_error = Some(e),
+            }
+        }
+        // Push the frame, then arm and run the inline trampoline.
+        // The frame stays live across the inline eval so the
+        // trampoline can record its outcome into it; the host
+        // reads that outcome back below (it never reads page
+        // state for it).
+        {
+            let mut g = apis.borrow_mut();
+            g.host_event_frames.push(HostEventFrame {
+                target,
+                event_val,
+                event_handle: handle,
+                inline_func,
+                inline_false: false,
+                inline_error: None,
+                stop_immediate: false,
+                inline_prevented: false,
+            });
+            if inline_func.is_some() {
+                g.host_event_inline_armed = true;
+            }
+        }
+        let (mut inline_false, mut stop_immediate, mut inline_prevented) =
+            (false, false, false);
+        let mut frame_present = true;
+        if inline_func.is_some() {
+            match self.eval("this[\"\\0bowser:hostEventInline\"]();") {
+                Ok(_) => {}
+                Err(e) => {
+                    if inline_error.is_none() {
+                        inline_error = Some(e);
+                    }
+                }
+            }
+            // Belt-and-braces disarm (the trampoline clears the
+            // flag on entry; if the stub never reached it, clear
+            // it here so no later forged call can arm itself).
+            let mut g = apis.borrow_mut();
+            g.host_event_inline_armed = false;
+            match g.host_event_frames.last() {
+                Some(frame) => {
+                    inline_false = frame.inline_false;
+                    if inline_error.is_none()
+                        && let Some(s) = &frame.inline_error
+                    {
+                        inline_error = Some(crate::vm::VmError::Thrown(s.clone()));
+                    }
+                    stop_immediate = frame.stop_immediate;
+                    inline_prevented = frame.inline_prevented;
+                }
+                None => frame_present = false,
+            }
+            drop(g);
+        }
+        // The frame must still be on top: the inline trampoline
+        // never pops it. If it is gone, the dispatch cannot proceed
+        // to the core (there is no event to deliver) — record that
+        // as a dispatch failure, not as a silent non-prevention.
+        if !frame_present {
+            let mut g = apis.borrow_mut();
+            if let Some(s) = g.event_states.get_mut(&handle) {
+                s.current_target = None;
+                s.phase = PHASE_NONE;
+                s.path.clear();
+                s.in_passive_listener = false;
+            }
+            drop(g);
+            let heap = self.heap_mut();
+            heap.release_temp(base);
+            return HostEventOutcome {
+                prevented: (inline_false && cancelable) || inline_prevented,
+                inline_error,
+                dispatch_error: Some(crate::vm::VmError::Thrown(
+                    "host dispatch frame lost before core dispatch".into(),
+                )),
+            };
+        }
+        // Inline `stopImmediatePropagation()` halts the dispatch
+        // outright (see the frame doc): pop the frame, clean the
+        // seeded dispatch state the way the core's epilogue would,
+        // and report only what the inline handler established.
+        if stop_immediate {
+            let mut g = apis.borrow_mut();
+            g.host_event_frames.pop();
+            if let Some(s) = g.event_states.get_mut(&handle) {
+                s.current_target = None;
+                s.phase = PHASE_NONE;
+                s.path.clear();
+                s.in_passive_listener = false;
+            }
+            drop(g);
+            let heap = self.heap_mut();
+            heap.release_temp(base);
+            return HostEventOutcome {
+                prevented: (inline_false && cancelable) || inline_prevented,
+                inline_error,
+                dispatch_error: None,
+            };
+        }
+        // Core dispatch through the armed trampoline: it pops the
+        // frame and runs [`run_event_dispatch`] on the same wrapper.
+        {
+            let mut g = apis.borrow_mut();
+            g.host_event_core_armed = true;
+        }
+        let core_result = self.eval("this[\"\\0bowser:hostEventCore\"]();");
+        let (mut listener_prevented, mut dispatch_error) = (false, None);
+        match core_result {
+            Ok(Value::Bool(b)) => listener_prevented = b,
+            Ok(_) => {}
+            Err(e) => dispatch_error = Some(e),
+        }
+        // Belt-and-braces cleanup: disarm, and pop a frame the core
+        // trampoline never consumed (its eval failed before entry).
+        // A frame still here after a successful core eval would
+        // mean the native never ran, which is itself a dispatch
+        // failure — except the frame is already gone in the normal
+        // case (the native pops it on entry), so this branch only
+        // fires for the stale case. On failure, also clean the
+        // seeded dispatch state the core's epilogue never reached.
+        {
+            let mut g = apis.borrow_mut();
+            g.host_event_core_armed = false;
+            if g.host_event_frames.pop().is_some() && dispatch_error.is_none() {
+                dispatch_error = Some(crate::vm::VmError::Thrown(
+                    "host dispatch core did not run".into(),
+                ));
+            }
+            if dispatch_error.is_some()
+                && let Some(s) = g.event_states.get_mut(&handle)
+            {
+                s.current_target = None;
+                s.phase = PHASE_NONE;
+                s.path.clear();
+                s.in_passive_listener = false;
+            }
+            drop(g);
+        }
+        let prevented = if dispatch_error.is_some() {
+            // Core failed mid-flight: fall back to the wrapper's
+            // current `defaultPrevented` (the inline handler's, plus
+            // any listener that ran before the failure), so an
+            // inline `preventDefault()` is not lost with the
+            // failure. `inline_false` is still cancelability-gated.
+            let current = apis
+                .borrow()
+                .events
+                .get(&handle)
+                .map(|e| e.default_prevented)
+                .unwrap_or(inline_prevented);
+            (inline_false && cancelable) || current
+        } else {
+            (inline_false && cancelable) || listener_prevented
+        };
+        let heap = self.heap_mut();
+        heap.release_temp(base);
+        HostEventOutcome {
+            prevented,
+            inline_error,
+            dispatch_error,
+        }
     }
 
     /// Tear down the web API installation identified by `ctx` (a handle
@@ -4864,8 +5383,14 @@ fn install_web_apis_inner(
                 }
             })?;
 
-            // window: the global object itself.
-            def(heap, global, CTX_KEY, Value::Int(id as i32))?;
+            // window: the global object itself. The global copy of
+            // the context id is locked (see [`CTX_KEY`]): all seven
+            // host dispatches resolve their context from it, so a
+            // page-writable copy let a page overwrite/delete/forge
+            // it and silently swallow every host event (cancel
+            // included). The document wrapper's copy above stays a
+            // plain property — no host dispatch reads it.
+            def_locked_data(heap, global, CTX_KEY, Value::Int(id as i32))?;
             def(heap, global, "window", Value::Object(global))?;
             def(heap, global, "self", Value::Object(global))?;
             def(heap, global, "document", Value::Object(doc_obj))?;
@@ -5109,6 +5634,14 @@ fn install_web_apis_inner(
     // their target and prebuilt event on the global, then eval through
     // this key.
     def_native(heap, global, SNAP_DISPATCH_KEY, n_dispatch_snap_stashed)?;
+    // Host dialog/popover dispatches ([`Vm::dispatch_cancel_event`] /
+    // [`Vm::dispatch_close_event`] / [`Vm::dispatch_toggle_event`])
+    // eval through these trampolines (see
+    // [`Vm::dispatch_host_event`]): locked, so a page assignment
+    // or `delete` cannot divert them, and stateless, so a forged
+    // direct call is a no-op — all dispatch state is Rust-side.
+    def_locked_native(heap, global, HOST_EVENT_INLINE_KEY, n_host_event_inline)?;
+    def_locked_native(heap, global, HOST_EVENT_CORE_KEY, n_host_event_core)?;
     // `window.onscrollsnapchange` / `onscrollsnapchanging` (CSS Scroll
     // Snap 2 Appendix A): the global is an EventTarget whose node is
     // the document root, so these share the document's bucket.
@@ -5197,6 +5730,66 @@ fn native_val(heap: &mut Heap, f: NativeFn) -> Result<Value, AllocError> {
 fn def_native(heap: &mut Heap, obj: Gc<Object>, name: &str, f: NativeFn) -> Result<(), AllocError> {
     let v = native_val(heap, f)?;
     def(heap, obj, name, v)
+}
+
+/// Define a host trampoline native as a locked data property:
+/// non-writable, non-configurable, non-enumerable. A page assignment
+/// to the key silently fails (sloppy) or throws (strict) without
+/// replacing the native, `delete` fails, and
+/// `Object.defineProperty` cannot reconfigure a non-configurable
+/// property — so an eval stub naming this key cannot be diverted
+/// by page script. Used only for the host-event trampolines, whose
+/// whole security story also rests on their armed-flag gating (see
+/// [`Vm::dispatch_host_event`]); a locked-but-ungated native would
+/// still be directly callable.
+/// Define a data property as locked: non-writable, non-configurable,
+/// non-enumerable — the data-property twin of
+/// [`def_locked_native`], for values (not natives) the engine must
+/// keep page-immutable. Used for the global [`CTX_KEY`] copy, which
+/// every host dispatch reads to resolve its context: a page
+/// assignment silently fails (sloppy) or throws (strict) without
+/// replacing the id, `delete` fails, and `Object.defineProperty`
+/// cannot reconfigure a non-configurable property. The engine's own
+/// reinstall still works: the internal
+/// [`Heap::define_property_str`] path overwrites regardless of
+/// attributes (it is not a spec-checked page write), so installing
+/// a second context on the same global replaces the id instead of
+/// failing — the lock binds page script, not the installer.
+fn def_locked_data(
+    heap: &mut Heap,
+    obj: Gc<Object>,
+    name: &str,
+    val: Value,
+) -> Result<(), AllocError> {
+    heap.define_property_str(
+        obj,
+        name,
+        Property {
+            value: val,
+            writable: false,
+            enumerable: false,
+            configurable: false,
+        },
+    )
+}
+
+fn def_locked_native(
+    heap: &mut Heap,
+    obj: Gc<Object>,
+    name: &str,
+    f: NativeFn,
+) -> Result<(), AllocError> {
+    let v = native_val(heap, f)?;
+    heap.define_property_str(
+        obj,
+        name,
+        Property {
+            value: v,
+            writable: false,
+            enumerable: false,
+            configurable: false,
+        },
+    )
 }
 
 /// Define a getter/setter pair (e.g. `innerHTML`) as an accessor property
@@ -14485,6 +15078,151 @@ fn n_dispatch_snap_stashed(
         let handle = event_handle_of(heap, e)?;
         run_event_dispatch(heap, &rc, target, e, handle)
     })();
+    heap.release_temp(base);
+    Ok(Value::Bool(r?))
+}
+
+/// Host dialog/popover inline trampoline (see
+/// [`Vm::dispatch_host_event`]): runs inside the VM — the eval
+/// keeps the interpreter active so the inline function can run —
+/// takes the compiled inline function out of the top
+/// [`HostEventFrame`] and invokes it with the frame's event wrapper
+/// as its `event` argument (`this` is `undefined`, exactly as the
+/// old plain-call inline eval, so a sloppy handler sees the global
+/// object). The outcome (`return false`, throw, stop flags,
+/// `defaultPrevented`) is written back into the frame for the host
+/// to read; the frame itself stays live for the core trampoline.
+///
+/// Forged calls are no-ops: the trampoline acts only while the
+/// host's inline armed flag is set, and clears the flag on entry,
+/// so a second call — including one from inside the inline handler
+/// itself, which runs after the flag is cleared — finds nothing
+/// armed and returns `undefined` without touching any frame. A
+/// throw inside the handler is NOT rethrown here (that would make
+/// the host's inline eval fail and hide the distinction between a
+/// handler throw and a stub failure): it is recorded in the frame
+/// as a string, and the host converts it to `VmError::Thrown`.
+fn n_host_event_inline(
+    heap: &mut Heap,
+    this: Value,
+    _args: &[Value],
+) -> Result<Value, NativeError> {
+    let rc = apis_rc(heap, this)?;
+    // Gate first: only the host's synchronous inline eval may
+    // consume a frame. Clearing before taking the function is what
+    // makes a forged re-entry during the handler a no-op.
+    let armed = {
+        let mut g = rc.borrow_mut();
+        std::mem::replace(&mut g.host_event_inline_armed, false)
+    };
+    if !armed {
+        return Ok(Value::Undefined);
+    }
+    let (func, event_val) = {
+        let mut g = rc.borrow_mut();
+        match g.host_event_frames.last_mut() {
+            Some(frame) => match frame.inline_func.take() {
+                Some(f) => (f, frame.event_val),
+                None => return Ok(Value::Undefined),
+            },
+            None => return Ok(Value::Undefined),
+        }
+    };
+    // No `WebApis` borrow is held across the invocation (see the
+    // reentrancy discipline in `run_event_dispatch`): the handler
+    // may synchronously dispatch other events, which re-borrow.
+    let invoker = rc.borrow().invoker.clone();
+    let result = invoker.borrow().call(heap, func, Value::Undefined, &[event_val]);
+    let inline_false = matches!(result, Ok(Value::Bool(false)));
+    // Record the outcome back into the frame that is still on top
+    // (a nested host dispatch pushed and popped its own frame
+    // during the handler, so the top frame is again this one —
+    // unless the handler somehow consumed it, in which case there
+    // is nothing to record into and the host's frame-missing
+    // branch reports the failure).
+    // Read everything first under shared borrows, then write under
+    // one mutable borrow: `RefMut` deref borrows the whole struct,
+    // so a frame borrow and a state-table borrow cannot coexist.
+    let snapshot = {
+        let g = rc.borrow();
+        g.host_event_frames.last().map(|f| {
+            (
+                f.event_handle,
+                g.event_states
+                    .get(&f.event_handle)
+                    .map(|s| s.stop_immediate)
+                    .unwrap_or(false),
+                g.events
+                    .get(&f.event_handle)
+                    .map(|e| e.default_prevented)
+                    .unwrap_or(false),
+            )
+        })
+    };
+    let throw = match result {
+        Err(InvokeError(s)) => Some(s),
+        _ => None,
+    };
+    if let Some((handle, stop_immediate, inline_prevented)) = snapshot {
+        let mut g = rc.borrow_mut();
+        if let Some(frame) = g.host_event_frames.last_mut()
+            && frame.event_handle == handle
+        {
+            frame.inline_false = inline_false;
+            frame.inline_error = throw;
+            frame.stop_immediate = stop_immediate;
+            frame.inline_prevented = inline_prevented;
+        }
+    }
+    Ok(Value::Bool(inline_false))
+}
+
+/// Host dialog/popover core trampoline (see
+/// [`Vm::dispatch_host_event`]): runs inside the VM — the eval
+/// keeps the interpreter active so listener invocation works —
+/// pops the top [`HostEventFrame`] and runs the shared dispatch
+/// core on its wrapper. Returns true when the core reports the
+/// default prevented at the end of the core: that read includes an
+/// inline `preventDefault()` made on the same wrapper, since the
+/// core reads the wrapper's final `defaultPrevented` flag (a
+/// non-passive listener's `preventDefault()` likewise counts;
+/// a passive listener's no-ops, per [`n_prevent_default`]).
+/// A core error propagates as a native error, so the host's core
+/// eval fails and the host records it as `dispatch_error` instead
+/// of silently reading "not prevented".
+///
+/// Forged calls are no-ops returning `false`: like the inline
+/// trampoline, this acts only while the host's core armed flag is
+/// set, and pops the frame on entry, so a second call — including
+/// one from inside a listener — finds nothing armed and runs
+/// nothing.
+fn n_host_event_core(
+    heap: &mut Heap,
+    this: Value,
+    _args: &[Value],
+) -> Result<Value, NativeError> {
+    let rc = apis_rc(heap, this)?;
+    let armed = {
+        let mut g = rc.borrow_mut();
+        std::mem::replace(&mut g.host_event_core_armed, false)
+    };
+    if !armed {
+        return Ok(Value::Bool(false));
+    }
+    let frame = {
+        let mut g = rc.borrow_mut();
+        g.host_event_frames.pop()
+    };
+    let Some(frame) = frame else {
+        return Ok(Value::Bool(false));
+    };
+    // The frame's event wrapper is reachable only through this
+    // Rust local from here on (the host's temporary root still
+    // covers it too, but hold it explicitly across the dispatch
+    // the way the old stashed natives did, so a collection during
+    // the plan build cannot sweep it).
+    let base = heap.protect(frame.event_val);
+    let r = run_event_dispatch(heap, &rc, frame.target, frame.event_val, frame.event_handle);
     heap.release_temp(base);
     Ok(Value::Bool(r?))
 }
@@ -46886,6 +47624,474 @@ mod tests {
             eval_log(&mut vm, "seen.join(';');"),
             "win:true,true,true,true"
         );
+        remove_context(ctx);
+    }
+
+    #[test]
+    fn host_event_dispatch_trusted_inline_and_listeners_survive_override() {
+        // w83: one trusted wrapper for the inline handler and the
+        // listeners, delivered through the stashed native — never
+        // through the public `dispatchEvent`, so the page override
+        // modeled on `window_load_survives_page_dispatch_event_override`
+        // cannot swallow or untrust it.
+        let (mut vm, doc, ctx) = production_vm();
+        let inner = doc.borrow().get_element_by_id("inner").unwrap();
+        vm.eval(
+            "globalThis.seen = []; globalThis.overrideCalled = false; \
+             var innerEl = document.getElementById('inner'); \
+             innerEl.dispatchEvent = function() { overrideCalled = true; }; \
+             window.dispatchEvent = function() { overrideCalled = true; }; \
+             innerEl.addEventListener('cancel', function(e) { \
+                 seen.push('cancel:' + e.isTrusted + ',' + e.bubbles + ',' + e.cancelable); \
+             }); \
+             innerEl.addEventListener('close', function(e) { \
+                 seen.push('close:' + e.isTrusted + ',' + e.bubbles + ',' + e.cancelable); \
+             }); \
+             innerEl.addEventListener('toggle', function(e) { \
+                 seen.push('toggle:' + e.isTrusted + ',' + e.oldState + ',' + e.newState \
+                     + ',' + (e instanceof ToggleEvent)); \
+             });",
+        )
+        .unwrap();
+        let cancel = vm.dispatch_cancel_event(
+            inner,
+            Some("seen.push('inline-cancel:' + event.isTrusted + ',' + (event.target === document.getElementById('inner')));"),
+        );
+        assert!(!cancel.prevented, "unprevented cancel is not prevented");
+        assert!(
+            cancel.inline_error.is_none(),
+            "inline cancel must not throw"
+        );
+        vm.dispatch_close_event(inner, Some("seen.push('inline-close:' + event.isTrusted);"));
+        vm.dispatch_toggle_event(
+            inner,
+            "closed",
+            "open",
+            Some("seen.push('inline-toggle:' + event.isTrusted + ',' + event.oldState + ',' + event.newState);"),
+        );
+        assert_eq!(
+            eval_log(&mut vm, "seen.join(';');"),
+            "inline-cancel:true,true;cancel:true,false,true;inline-close:true;close:true,false,false;inline-toggle:true,closed,open;toggle:true,closed,open,true"
+        );
+        assert_eq!(
+            vm.eval("overrideCalled;").unwrap(),
+            Value::Bool(false),
+            "host dispatch must not call the overridden dispatchEvent"
+        );
+        // Inline `return false` prevents a cancelable event, and an
+        // inline throw is reported without swallowing the listeners.
+        let prevented = vm.dispatch_cancel_event(inner, Some("return false;"));
+        assert!(prevented.prevented, "inline return false prevents cancel");
+        let thrown = vm.dispatch_cancel_event(inner, Some("throw new Error('boom');"));
+        assert!(!thrown.prevented, "throwing inline does not prevent");
+        assert!(
+            thrown.inline_error.is_some(),
+            "throwing inline must surface its error"
+        );
+        assert_eq!(
+            eval_log(&mut vm, "seen.join(';');")
+                .split(';')
+                .filter(|s| s.starts_with("cancel:"))
+                .count(),
+            3,
+            "listeners still ran after the inline throw"
+        );
+        remove_context(ctx);
+    }
+
+    #[test]
+    fn host_event_inline_and_listeners_share_one_wrapper() {
+        // S5/N1: the inline handler and the listeners receive the
+        // very same wrapper (object identity, one `timeStamp`,
+        // shared expando mutations), and the inline run already
+        // sees the dispatch-time `composedPath()` (target first),
+        // not `[]`.
+        let (mut vm, doc, ctx) = production_vm();
+        let inner = doc.borrow().get_element_by_id("inner").unwrap();
+        vm.eval(
+            "globalThis.seen = []; \
+             var innerEl = document.getElementById('inner'); \
+             innerEl.addEventListener('cancel', function(e) { \
+                 seen.push('l1:' + (e === globalThis.inlineEv) + ',' \
+                     + (e.timeStamp === globalThis.inlineEv.timeStamp) + ',' \
+                     + e.foo + ',' \
+                     + (e.composedPath().length === globalThis.inlinePathLen)); \
+                 e.bar = 7; \
+             }); \
+             innerEl.addEventListener('cancel', function(e) { \
+                 seen.push('l2:' + e.bar); \
+             });",
+        )
+        .unwrap();
+        vm.dispatch_cancel_event(
+            inner,
+            Some(
+                "globalThis.inlineEv = event; event.foo = 42; \
+                 globalThis.inlinePathLen = event.composedPath().length; \
+                 seen.push('inline:' + (event.composedPath()[0] === document.getElementById('inner')));",
+            ),
+        );
+        assert_eq!(
+            eval_log(&mut vm, "seen.join(';');"),
+            "inline:true;l1:true,true,42,true;l2:7"
+        );
+        remove_context(ctx);
+    }
+
+    #[test]
+    fn host_event_hidden_keys_cannot_be_overwritten_or_forged() {
+        // B1/S4 negative test: overwriting, deleting, or directly
+        // calling the hidden trampoline keys — before, during, and
+        // after a dispatch — must neither swallow events nor forge
+        // prevention, and must not corrupt the pending frame. The
+        // old stash keys are plain page properties now and are
+        // likewise ignored.
+        let (mut vm, doc, ctx) = production_vm();
+        let inner = doc.borrow().get_element_by_id("inner").unwrap();
+        vm.eval(
+            "globalThis.seen = []; globalThis.forged = []; \
+             var innerEl = document.getElementById('inner'); \
+             innerEl.addEventListener('cancel', function(e) { \
+                 seen.push('listener'); \
+                 window[\"\\0bowser:hostEventInline\"](); \
+                 window[\"\\0bowser:hostEventCore\"](); \
+                 if (e.cancelable) { e.preventDefault(); } \
+             }); \
+             window[\"\\0bowser:hostEventInline\"] = function() { forged.push('inline'); }; \
+             window[\"\\0bowser:hostEventCore\"] = function() { forged.push('core'); }; \
+             window[\"\\0bowser:hostEvent\"] = function() { forged.push('stash'); }; \
+             window[\"\\0bowser:dispatchHostEvent\"] = function() { forged.push('old'); }; \
+             delete window[\"\\0bowser:hostEventInline\"]; \
+             delete window[\"\\0bowser:hostEventCore\"]; \
+             globalThis.coreResult = window[\"\\0bowser:hostEventCore\"](); \
+             globalThis.inlineResult = window[\"\\0bowser:hostEventInline\"](); \
+             var d = Object.getOwnPropertyDescriptor(window, \"\\0bowser:hostEventInline\"); \
+             globalThis.locked = d.writable === false && d.configurable === false \
+                 && d.enumerable === false && typeof d.value === 'function';",
+        )
+        .unwrap();
+        assert_eq!(vm.eval("locked;").unwrap(), Value::Bool(true));
+        assert_eq!(vm.eval("coreResult;").unwrap(), Value::Bool(false));
+        assert_eq!(vm.eval("inlineResult;").unwrap(), Value::Undefined);
+        assert_eq!(vm.eval("forged.length;").unwrap(), Value::Int(0));
+        // Forged core/inline calls from inside the inline handler
+        // itself must not consume the frame or run listeners early:
+        // the listener still runs exactly once, after the inline.
+        let outcome = vm.dispatch_cancel_event(
+            inner,
+            Some(
+                "seen.push('inline'); \
+                 window[\"\\0bowser:hostEventCore\"](); \
+                 window[\"\\0bowser:hostEventInline\"]();",
+            ),
+        );
+        assert!(
+            outcome.prevented,
+            "listener preventDefault must still count after forged calls"
+        );
+        assert!(outcome.dispatch_error.is_none());
+        assert_eq!(
+            eval_log(&mut vm, "seen.join(';');"),
+            "inline;listener"
+        );
+        assert_eq!(vm.eval("forged.length;").unwrap(), Value::Int(0));
+        // A second, ordinary dispatch still works: no stale frame
+        // or armed flag leaked from the forged calls.
+        let second = vm.dispatch_cancel_event(inner, None);
+        assert!(second.prevented);
+        assert_eq!(
+            eval_log(&mut vm, "seen.join(';');"),
+            "inline;listener;listener"
+        );
+        remove_context(ctx);
+    }
+
+    #[test]
+    fn host_event_global_ctx_key_cannot_be_overwritten_or_deleted() {
+        // w83fix (re-review blocker): the global `CTX_KEY` copy was a
+        // plain data property, so a page overwrite (`= "x"`), delete,
+        // or forge to a nonexistent context id made every host
+        // dispatch resolve no context and fail silently — the caller
+        // then proceeded with the state change as if the event had
+        // not been prevented (Escape closing a dialog whose cancel
+        // listener called `preventDefault()`). The global copy is
+        // now locked like the trampolines, so all three tamper
+        // attempts leave the id intact and both a host dialog
+        // dispatch and a host wheel dispatch (a second consumer of
+        // the same global read) still run with prevention counting.
+        let (mut vm, doc, ctx) = production_vm();
+        let inner = doc.borrow().get_element_by_id("inner").unwrap();
+        vm.eval(
+            "globalThis.seen = []; \
+             globalThis.ctxBefore = window[\"\\0bowser:ctx\"]; \
+             var innerEl = document.getElementById('inner'); \
+             innerEl.addEventListener('cancel', function(e) { \
+                 seen.push('cancel'); e.preventDefault(); \
+             }); \
+             innerEl.addEventListener('wheel', function(e) { \
+                 seen.push('wheel'); e.preventDefault(); \
+             }); \
+             window[\"\\0bowser:ctx\"] = 'x'; \
+             window[\"\\0bowser:ctx\"] = 999999; \
+             delete window[\"\\0bowser:ctx\"]; \
+             globalThis.defineThrew = false; \
+             try { Object.defineProperty(window, \"\\0bowser:ctx\", \
+                 {value: 999999, writable: true, configurable: true}); } \
+             catch (err) { globalThis.defineThrew = true; } \
+             var d = Object.getOwnPropertyDescriptor(window, \"\\0bowser:ctx\"); \
+             globalThis.locked = d.writable === false && d.configurable === false \
+                 && d.enumerable === false && d.value === globalThis.ctxBefore;",
+        )
+        .unwrap();
+        assert_eq!(vm.eval("locked;").unwrap(), Value::Bool(true));
+        assert_eq!(vm.eval("defineThrew;").unwrap(), Value::Bool(true));
+        assert_eq!(
+            vm.eval("window[\"\\0bowser:ctx\"] === ctxBefore;").unwrap(),
+            Value::Bool(true),
+            "tamper attempts must leave the global context id intact"
+        );
+        let cancel = vm.dispatch_cancel_event(inner, None);
+        assert!(
+            cancel.prevented,
+            "cancel prevention must still count after CTX_KEY tampering"
+        );
+        assert!(cancel.dispatch_error.is_none());
+        assert!(
+            vm.dispatch_wheel(inner, 1.0, 2.0, 0),
+            "wheel prevention must still count after CTX_KEY tampering"
+        );
+        assert_eq!(
+            eval_log(&mut vm, "seen.join(';');"),
+            "cancel;wheel"
+        );
+        remove_context(ctx);
+    }
+
+    #[test]
+    fn host_event_core_error_falls_back_to_inline_prevented() {
+        // w83fix S3, end to end (no bogus frame): the core fails
+        // mid-flight when the inline handler corrupts the very
+        // wrapper the core must resolve — it forges the hidden
+        // event handle (so `event_of` falls back to the `type`
+        // property) and sets `type` to a Symbol (so the fallback's
+        // string conversion throws) — and the outcome must then
+        // carry `dispatch_error` with `prevented` falling back to
+        // exactly what the inline handler established: `true` when
+        // it called `preventDefault()` first, `false` when it did
+        // not. In both cases no listener runs (the core plan never
+        // builds), and the failure is never silently read as
+        // "not prevented".
+        let (mut vm, doc, ctx) = production_vm();
+        let inner = doc.borrow().get_element_by_id("inner").unwrap();
+        vm.eval(
+            "globalThis.seen = []; \
+             var innerEl = document.getElementById('inner'); \
+             innerEl.addEventListener('cancel', function() { seen.push('listener'); });",
+        )
+        .unwrap();
+        let prevented = vm.dispatch_cancel_event(
+            inner,
+            Some(
+                "event.preventDefault(); \
+                 event[\"\\0bowser:event\"] = 'x'; event.type = Symbol('x');",
+            ),
+        );
+        assert!(
+            prevented.dispatch_error.is_some(),
+            "corrupted wrapper must fail the core dispatch"
+        );
+        assert!(
+            prevented.prevented,
+            "inline prevention must survive the core failure"
+        );
+        assert_eq!(eval_log(&mut vm, "seen.join(';');"), "");
+        remove_context(ctx);
+        let (mut vm, doc, ctx) = production_vm();
+        let inner = doc.borrow().get_element_by_id("inner").unwrap();
+        vm.eval(
+            "globalThis.seen = []; \
+             var innerEl = document.getElementById('inner'); \
+             innerEl.addEventListener('cancel', function() { seen.push('listener'); });",
+        )
+        .unwrap();
+        let unprevented = vm.dispatch_cancel_event(
+            inner,
+            Some("event[\"\\0bowser:event\"] = 'x'; event.type = Symbol('x');"),
+        );
+        assert!(
+            unprevented.dispatch_error.is_some(),
+            "corrupted wrapper must fail the core dispatch"
+        );
+        assert!(
+            !unprevented.prevented,
+            "the fallback must not invent prevention the inline never established"
+        );
+        assert_eq!(eval_log(&mut vm, "seen.join(';');"), "");
+        remove_context(ctx);
+    }
+
+    #[test]
+    fn host_event_inline_stop_immediate_halts_listeners() {
+        // S1: an inline `stopImmediatePropagation()` halts the
+        // whole dispatch (inline-first order), while an inline
+        // `stopPropagation()` alone does not carry into the
+        // listener plan (documented loss, pinned here).
+        let (mut vm, doc, ctx) = production_vm();
+        let inner = doc.borrow().get_element_by_id("inner").unwrap();
+        vm.eval(
+            "globalThis.seen = []; \
+             var innerEl = document.getElementById('inner'); \
+             var outerEl = document.getElementById('outer'); \
+             outerEl.addEventListener('cancel', function() { seen.push('cap'); }, true); \
+             innerEl.addEventListener('cancel', function() { seen.push('target'); });",
+        )
+        .unwrap();
+        let halted = vm.dispatch_cancel_event(
+            inner,
+            Some("event.stopImmediatePropagation();"),
+        );
+        assert!(!halted.prevented, "stopImmediate alone does not prevent");
+        assert_eq!(eval_log(&mut vm, "seen.join(';');"), "");
+        let halted_prevented = vm.dispatch_cancel_event(
+            inner,
+            Some("event.stopImmediatePropagation(); event.preventDefault();"),
+        );
+        assert!(
+            halted_prevented.prevented,
+            "inline prevention still counts when listeners are halted"
+        );
+        assert_eq!(eval_log(&mut vm, "seen.join(';');"), "");
+        let propagated = vm.dispatch_cancel_event(
+            inner,
+            Some("event.stopPropagation();"),
+        );
+        assert!(!propagated.prevented);
+        assert_eq!(
+            eval_log(&mut vm, "seen.join(';');"),
+            "cap;target",
+            "inline stopPropagation is documented as not carrying into the listener plan"
+        );
+        remove_context(ctx);
+    }
+
+    #[test]
+    fn host_event_inline_return_false_gated_on_cancelable() {
+        // S2: an inline `return false` prevents a cancelable event
+        // only; on non-cancelable `close`/`toggle` it prevents
+        // nothing (and sets no `defaultPrevented` anywhere, unlike
+        // `preventDefault()`).
+        let (mut vm, doc, ctx) = production_vm();
+        let inner = doc.borrow().get_element_by_id("inner").unwrap();
+        vm.eval(
+            "globalThis.seen = []; \
+             var innerEl = document.getElementById('inner'); \
+             innerEl.addEventListener('cancel', function(e) { seen.push('cancel:' + e.defaultPrevented); }); \
+             innerEl.addEventListener('close', function(e) { seen.push('close:' + e.defaultPrevented); }); \
+             innerEl.addEventListener('toggle', function(e) { seen.push('toggle:' + e.defaultPrevented); });",
+        )
+        .unwrap();
+        let close = vm.dispatch_close_event(inner, Some("return false;"));
+        assert!(!close.prevented, "return false must not prevent non-cancelable close");
+        let toggle = vm.dispatch_toggle_event(inner, "closed", "open", Some("return false;"));
+        assert!(!toggle.prevented, "return false must not prevent non-cancelable toggle");
+        let cancel = vm.dispatch_cancel_event(inner, Some("return false;"));
+        assert!(cancel.prevented, "return false prevents cancelable cancel");
+        assert_eq!(
+            eval_log(&mut vm, "seen.join(';');"),
+            "close:false;toggle:false;cancel:false",
+            "return false sets no defaultPrevented; only the cancel outcome is prevented"
+        );
+        remove_context(ctx);
+    }
+
+    #[test]
+    fn host_event_capture_once_passive_and_non_bubbling() {
+        // S5: capture, `once`, and passive listeners all behave on
+        // the host path, and a non-bubbling `cancel` never reaches
+        // a bubble listener on an ancestor. A passive listener's
+        // `preventDefault()` must not gate the event.
+        let (mut vm, doc, ctx) = production_vm();
+        let inner = doc.borrow().get_element_by_id("inner").unwrap();
+        vm.eval(
+            "globalThis.seen = []; \
+             var innerEl = document.getElementById('inner'); \
+             var outerEl = document.getElementById('outer'); \
+             outerEl.addEventListener('cancel', function() { seen.push('cap'); }, true); \
+             outerEl.addEventListener('cancel', function() { seen.push('bub'); }); \
+             innerEl.addEventListener('cancel', function() { seen.push('once'); }, {once: true}); \
+             innerEl.addEventListener('cancel', function(e) { seen.push('pas'); e.preventDefault(); }, {passive: true});",
+        )
+        .unwrap();
+        let first = vm.dispatch_cancel_event(inner, None);
+        assert!(!first.prevented, "passive preventDefault must not prevent cancel");
+        let second = vm.dispatch_cancel_event(inner, None);
+        assert!(!second.prevented);
+        assert_eq!(
+            eval_log(&mut vm, "seen.join(';');"),
+            "cap;once;pas;cap;pas",
+            "capture runs every dispatch, once runs once, bubble never runs (non-bubbling)"
+        );
+        remove_context(ctx);
+    }
+
+    #[test]
+    fn host_event_no_document_is_silent_and_core_error_propagates() {
+        // S3: a gone realm/document fails closed silently (no
+        // inline error, no dispatch error, nothing runs), while a
+        // core failure surfaces as an error rather than collapsing
+        // to "not prevented". The mid-flight branch is defensive:
+        // no JS-reachable path fails the core plan once the
+        // wrapper is built, so the propagation half is pinned at
+        // the trampoline level with a bogus frame.
+        let (mut vm, doc, ctx) = production_vm();
+        let inner = doc.borrow().get_element_by_id("inner").unwrap();
+        vm.eval(
+            "globalThis.seen = []; \
+             var innerEl = document.getElementById('inner'); \
+             innerEl.addEventListener('cancel', function() { seen.push('listener'); });",
+        )
+        .unwrap();
+        drop(doc);
+        let silent = vm.dispatch_cancel_event(
+            inner,
+            Some("seen.push('inline'); event.preventDefault();"),
+        );
+        assert!(!silent.prevented);
+        assert!(silent.inline_error.is_none());
+        assert!(
+            silent.dispatch_error.is_none(),
+            "gone document is the silent fail-closed path, not a dispatch error"
+        );
+        assert_eq!(eval_log(&mut vm, "seen.join(';');"), "");
+        remove_context(ctx);
+        // Bogus frame through the core trampoline: the core fails
+        // (no event object to dispatch) and the error propagates
+        // out of the native instead of becoming `false`.
+        let (mut vm, _doc, ctx) = production_vm();
+        let inner = _doc.borrow().get_element_by_id("inner").unwrap();
+        let global = vm.get_global("window").expect("window");
+        let rc = web_apis(ctx).expect("context");
+        {
+            let mut g = rc.borrow_mut();
+            g.host_event_frames.push(HostEventFrame {
+                target: inner,
+                event_val: Value::Undefined,
+                event_handle: u32::MAX,
+                inline_func: None,
+                inline_false: false,
+                inline_error: None,
+                stop_immediate: false,
+                inline_prevented: false,
+            });
+            g.host_event_core_armed = true;
+        }
+        let r = n_host_event_core(vm.heap_mut(), global, &[]);
+        assert!(r.is_err(), "core failure must propagate, not read as not-prevented");
+        assert!(
+            rc.borrow().host_event_frames.is_empty(),
+            "the failed core consumed its frame"
+        );
+        assert!(!rc.borrow().host_event_core_armed);
         remove_context(ctx);
     }
 

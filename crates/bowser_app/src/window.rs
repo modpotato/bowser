@@ -257,18 +257,24 @@ pub trait JsDispatch {
     /// this doc used to describe — real pages now observe all
     /// three from Escape and light-dismiss), and the test double
     /// below proves the app invokes the hooks in the right order.
+    /// Since w83 the production dispatcher delivers all three as
+    /// trusted events through the `bowser_js` host natives (one
+    /// wrapper shared by the inline handler and the listeners),
+    /// never through the page-overridable public `dispatchEvent`.
     fn dispatch_cancel(&mut self, _tab: &mut Tab, _target: NodeId) -> bool {
         false
     }
     /// Dispatch a non-bubbling `close` event at `target` (dialog
     /// closed by Escape). The default does nothing; the production
     /// dispatcher ([`crate::script::PageEventDispatch`]) overrides
-    /// this (see [`JsDispatch::dispatch_cancel`]).
+    /// this (see [`JsDispatch::dispatch_cancel`], including the
+    /// trusted-delivery note there).
     fn dispatch_close(&mut self, _tab: &mut Tab, _target: NodeId) {}
     /// Dispatch a `toggle` event at `target` (popover hidden by
     /// Escape or light-dismiss). The default does nothing; the
     /// production dispatcher ([`crate::script::PageEventDispatch`])
-    /// overrides this (see [`JsDispatch::dispatch_cancel`]).
+    /// overrides this (see [`JsDispatch::dispatch_cancel`],
+    /// including the trusted-delivery note there).
     fn dispatch_toggle(&mut self, _tab: &mut Tab, _target: NodeId) {}
 }
 

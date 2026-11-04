@@ -2373,6 +2373,13 @@ impl crate::window::JsDispatch for PageEventDispatch {
         // testdriver `execute_escape`) already honors the return value:
         // `true` keeps the dialog open. Fail closed with no installed
         // document, exactly like `dispatch_click` above.
+        //
+        // Trusted host dispatch (w83): the `Vm` native builds one
+        // trusted wrapper, runs the inline `oncancel` source on it,
+        // then delivers that same wrapper to the listeners through
+        // the shared dispatch core — never through the public
+        // `dispatchEvent`, so a page override cannot swallow or
+        // untrust it.
         let inline = tab
             .document_ref()
             .and_then(|doc| doc.get_attribute(target, "oncancel").map(|s| s.to_owned()));
@@ -2383,21 +2390,24 @@ impl crate::window::JsDispatch for PageEventDispatch {
         // `Rc` clone — the tab keeps the sole strong owner.
         let (doc, page_vm) = installed.document_and_vm_mut();
         // Reentrancy gate (see `InstalledDocument::assert_no_live_borrow`):
-        // the inline source and the `dispatchEvent` eval re-enter the
+        // the inline source and the listener dispatch re-enter the
         // page VM, whose natives re-borrow the document through the
         // registry `Weak` — so no `Ref`/`RefMut` may be alive across
         // either eval.
         crate::tab::InstalledDocument::assert_no_live_borrow(doc);
-        // One eval: the inline handler runs with the dispatched event
-        // object bound as `event`, then the same object goes to the
-        // listeners via `dispatchEvent`.
-        let prevented = self.dispatch_typed_with_inline(
-            doc,
-            page_vm,
-            target,
-            "{type:'cancel',bubbles:false,cancelable:true}",
-            inline.as_deref(),
-        );
+        let outcome = page_vm
+            .vm_mut()
+            .dispatch_cancel_event(target, inline.as_deref());
+        if let Some(e) = outcome.inline_error {
+            page_vm.record_error(ScriptError::from_vm_error(target, None, &e));
+        }
+        // A mid-flight core failure is recorded exactly like an
+        // inline throw: it must never silently read as "not
+        // prevented" (see `HostEventOutcome::dispatch_error`).
+        if let Some(e) = outcome.dispatch_error {
+            page_vm.record_error(ScriptError::from_vm_error(target, None, &e));
+        }
+        let prevented = outcome.prevented;
         page_vm.pump();
         tab.sync_dirty_flags();
         prevented
@@ -2406,11 +2416,14 @@ impl crate::window::JsDispatch for PageEventDispatch {
     fn dispatch_close(&mut self, tab: &mut crate::tab::Tab, target: NodeId) {
         // Dialog `close` (HTML §4.11.4): non-bubbling, non-cancelable,
         // fired after the dialog has actually closed — so the return
-        // value of the typed dispatch (always false for a
-        // non-cancelable event) is discarded, and no caller gates a
-        // state change on it. Same fail-closed / reentrancy / pump
-        // discipline as `dispatch_cancel`; the inline attribute is
-        // `onclose`.
+        // value of the trusted dispatch is discarded, and no caller
+        // gates a state change on it. That return value is false not
+        // by convention but by gating: both cancellation idioms are
+        // cancelability-gated (an inline `return false` is gated in
+        // the host dispatch, `preventDefault()` in the event core),
+        // so a non-cancelable `close` can never report prevented.
+        // Same fail-closed / reentrancy / pump discipline as
+        // `dispatch_cancel`; the inline attribute is `onclose`.
         let inline = tab
             .document_ref()
             .and_then(|doc| doc.get_attribute(target, "onclose").map(|s| s.to_owned()));
@@ -2419,13 +2432,17 @@ impl crate::window::JsDispatch for PageEventDispatch {
         };
         let (doc, page_vm) = installed.document_and_vm_mut();
         crate::tab::InstalledDocument::assert_no_live_borrow(doc);
-        let _ = self.dispatch_typed_with_inline(
-            doc,
-            page_vm,
-            target,
-            "{type:'close',bubbles:false,cancelable:false}",
-            inline.as_deref(),
-        );
+        let outcome = page_vm
+            .vm_mut()
+            .dispatch_close_event(target, inline.as_deref());
+        if let Some(e) = outcome.inline_error {
+            page_vm.record_error(ScriptError::from_vm_error(target, None, &e));
+        }
+        // See `dispatch_cancel`: a mid-flight core failure is
+        // recorded exactly like an inline throw.
+        if let Some(e) = outcome.dispatch_error {
+            page_vm.record_error(ScriptError::from_vm_error(target, None, &e));
+        }
         page_vm.pump();
         tab.sync_dirty_flags();
     }
@@ -2459,27 +2476,24 @@ impl crate::window::JsDispatch for PageEventDispatch {
         // `closed` -> `open`: a live member is the only
         // just-shown shape.
         //
-        // (b) `ToggleEvent.oldState` / `newState`: these members are
-        // carried in the init literal below, so the inline `ontoggle`
-        // handler — which runs on that very object — sees them. The
-        // `addEventListener` listeners see them too: the eval path
-        // hands the object to `dispatchEvent`, and
-        // `dispatch_event_inner` (`bowser_js::bindings`) rebuilds it
-        // via `event_of`, which reads `oldState`/`newState` into the
-        // `dom::Event` `toggle_states` payload (modeled on
-        // `snap_targets`) and wraps it with
-        // `ToggleEvent.prototype`, whose accessors read the stored
-        // pair back. A constructed `ToggleEvent` re-dispatched
-        // through its stored clone keeps the pair the same way.
+        // (b) `ToggleEvent.oldState` / `newState`: the pair is carried
+        // in the Rust `dom::Event`'s `toggle_states` payload, and the
+        // `Vm` native wraps it once with `ToggleEvent.prototype`,
+        // whose accessors read the stored pair back — so the inline
+        // `ontoggle` handler and the `addEventListener` listeners
+        // observe the same states on the same wrapper.
         //
-        // (c) Trusted vs untrusted: deliberately kept on the eval /
-        // public-`dispatchEvent` path, like clicks, keys, and scrolls,
-        // so the delivered event is untrusted (`isTrusted` false).
-        // A trusted `toggle` would need a new per-type `Vm` native
-        // (modeled on `dispatch_snap_event`, with its own stash-key
-        // native) plus a separate inline-handler mechanism — not a
-        // small generic addition — and is not required for the
-        // state members to be visible to listeners.
+        // (c) Trusted (w83, w83fix): like `dispatch_cancel` /
+        // `dispatch_close` above, this goes through the per-type
+        // `Vm` native (`dispatch_toggle_event`), never through the
+        // public `dispatchEvent` — so the delivered event is
+        // trusted (`isTrusted` true) and survives a page override
+        // of `dispatchEvent`. The host path keeps its dispatch
+        // state in a Rust-side frame and reaches the listener core
+        // through locked trampoline natives (see
+        // `bowser_js::Vm::dispatch_host_event`), so a page
+        // overwrite of the hidden keys cannot swallow or forge it
+        // either.
         let (inline, is_open, is_retained) = match tab.document_ref() {
             Some(doc) => (
                 doc.get_attribute(target, "ontoggle").map(|s| s.to_owned()),
@@ -2500,11 +2514,18 @@ impl crate::window::JsDispatch for PageEventDispatch {
         } else {
             ("open", "closed")
         };
-        let event_init = format!(
-            "{{type:'toggle',bubbles:false,cancelable:false,oldState:'{old_state}',newState:'{new_state}'}}"
-        );
-        let _ =
-            self.dispatch_typed_with_inline(doc, page_vm, target, &event_init, inline.as_deref());
+        let outcome =
+            page_vm
+                .vm_mut()
+                .dispatch_toggle_event(target, old_state, new_state, inline.as_deref());
+        if let Some(e) = outcome.inline_error {
+            page_vm.record_error(ScriptError::from_vm_error(target, None, &e));
+        }
+        // See `dispatch_cancel`: a mid-flight core failure is
+        // recorded exactly like an inline throw.
+        if let Some(e) = outcome.dispatch_error {
+            page_vm.record_error(ScriptError::from_vm_error(target, None, &e));
+        }
         page_vm.pump();
         tab.sync_dirty_flags();
     }
@@ -4076,12 +4097,16 @@ mod tests {
         );
         tab.page_vm_mut()
             .expect("page vm")
-            .eval("ran = false; document.getElementById('t').addEventListener('toggle', function(e) { ran = true; gotOld = e.oldState; gotNew = e.newState; });")
+            .eval("ran = false; document.getElementById('t').addEventListener('toggle', function(e) { ran = true; gotOld = e.oldState; gotNew = e.newState; gotTrusted = e.isTrusted; });")
             .expect("register listener");
         let mut dispatch = PageEventDispatch::new();
         dispatch.dispatch_toggle(&mut tab, pop);
         let vm = tab.page_vm_mut().expect("page vm");
         assert!(js_is_true(vm, "ran"), "toggle listener ran on retained");
+        assert!(
+            js_is_true(vm, "gotTrusted"),
+            "toggle on an exit-retained popover must still be trusted"
+        );
         let old = vm.eval("gotOld").expect("read gotOld");
         let new = vm.eval("gotNew").expect("read gotNew");
         assert!(
@@ -4193,6 +4218,236 @@ mod tests {
         // panic without an installed document.
         dispatch.dispatch_close(&mut tab, target);
         dispatch.dispatch_toggle(&mut tab, target);
+    }
+
+    #[test]
+    fn page_event_dispatch_cancel_close_toggle_are_trusted_for_inline_and_listeners() {
+        // w83: the host path builds ONE trusted wrapper and runs the
+        // inline handler on it before delivering it to the listeners,
+        // so both halves observe `isTrusted === true` (and the inline
+        // half observes the dispatch target).
+        use crate::window::JsDispatch;
+
+        let (mut tab, dialog) = dispatch_tab(
+            "<html><body><dialog id=\"t\" oncancel=\"inlineCancelTrusted = event.isTrusted; inlineCancelTarget = event.target === document.getElementById('t');\" onclose=\"inlineCloseTrusted = event.isTrusted;\">x</dialog><div id=\"p\" popover=\"auto\" ontoggle=\"inlineToggleTrusted = event.isTrusted; inlineToggleOld = event.oldState; inlineToggleNew = event.newState;\">hi</div></body></html>",
+        );
+        let pop = tab
+            .document_ref()
+            .expect("document")
+            .get_element_by_id("p")
+            .expect("popover");
+        tab.page_vm_mut()
+            .expect("page vm")
+            .eval("document.getElementById('t').addEventListener('cancel', function(e) { listenerCancelTrusted = e.isTrusted; }); document.getElementById('t').addEventListener('close', function(e) { listenerCloseTrusted = e.isTrusted; }); document.getElementById('p').addEventListener('toggle', function(e) { listenerToggleTrusted = e.isTrusted; listenerToggle = e instanceof ToggleEvent; });")
+            .expect("register listeners");
+        tab.installed_mut()
+            .expect("installed document")
+            .document()
+            .borrow_mut()
+            .show_popover(pop)
+            .expect("show popover");
+
+        let mut dispatch = PageEventDispatch::new();
+        assert!(
+            !dispatch.dispatch_cancel(&mut tab, dialog),
+            "unprevented trusted cancel still closes"
+        );
+        dispatch.dispatch_close(&mut tab, dialog);
+        dispatch.dispatch_toggle(&mut tab, pop);
+
+        let vm = tab.page_vm_mut().expect("page vm");
+        for name in [
+            "inlineCancelTrusted",
+            "listenerCancelTrusted",
+            "inlineCloseTrusted",
+            "listenerCloseTrusted",
+            "inlineToggleTrusted",
+            "listenerToggleTrusted",
+        ] {
+            assert!(js_is_true(vm, name), "{name} must be trusted");
+        }
+        assert!(
+            js_is_true(vm, "inlineCancelTarget"),
+            "inline cancel handler must see the dispatch target"
+        );
+        assert!(
+            js_is_true(vm, "listenerToggle"),
+            "toggle listener event is a ToggleEvent"
+        );
+        let old = vm.eval("inlineToggleOld").expect("read inlineToggleOld");
+        let new = vm.eval("inlineToggleNew").expect("read inlineToggleNew");
+        assert!(
+            matches!(old, Value::Str(ref s) if s.as_wtf8().to_utf8_lossy() == "closed"),
+            "inline toggle show: oldState closed, got: {old:?}"
+        );
+        assert!(
+            matches!(new, Value::Str(ref s) if s.as_wtf8().to_utf8_lossy() == "open"),
+            "inline toggle show: newState open, got: {new:?}"
+        );
+    }
+
+    #[test]
+    fn page_event_dispatch_cancel_inline_prevent_default_prevents_and_is_visible_to_listeners() {
+        // w83 single-wrapper proof: an inline `preventDefault()` sets
+        // the flag on the wrapper the listeners then receive, so the
+        // listener observes `defaultPrevented === true` and the
+        // Escape gate reports prevented.
+        use crate::window::JsDispatch;
+
+        let (mut tab, dialog) = dispatch_tab(
+            "<html><body><dialog id=\"t\" oncancel=\"event.preventDefault();\">x</dialog></body></html>",
+        );
+        tab.page_vm_mut()
+            .expect("page vm")
+            .eval("document.getElementById('t').addEventListener('cancel', function(e) { listenerSawPrevented = e.defaultPrevented; listenerTrusted = e.isTrusted; });")
+            .expect("register listener");
+
+        let mut dispatch = PageEventDispatch::new();
+        assert!(
+            dispatch.dispatch_cancel(&mut tab, dialog),
+            "inline preventDefault must keep the dialog open"
+        );
+        let vm = tab.page_vm_mut().expect("page vm");
+        assert!(
+            js_is_true(vm, "listenerSawPrevented"),
+            "listener must see the inline handler's preventDefault on the same wrapper"
+        );
+        assert!(
+            js_is_true(vm, "listenerTrusted"),
+            "cancel listener event must be trusted"
+        );
+    }
+
+    #[test]
+    fn page_event_dispatch_cancel_inline_throw_still_runs_listeners_and_records_error() {
+        // w83: an inline throw is recorded, not swallowed, and must
+        // not swallow the listener dispatch (DOM report-and-continue).
+        use crate::window::JsDispatch;
+
+        let (mut tab, dialog) = dispatch_tab(
+            "<html><body><dialog id=\"t\" oncancel=\"throw new Error('boom');\">x</dialog></body></html>",
+        );
+        tab.page_vm_mut()
+            .expect("page vm")
+            .eval("document.getElementById('t').addEventListener('cancel', function(e) { ran = true; listenerTrusted = e.isTrusted; });")
+            .expect("register listener");
+
+        let mut dispatch = PageEventDispatch::new();
+        assert!(
+            !dispatch.dispatch_cancel(&mut tab, dialog),
+            "a throwing inline handler does not prevent the default"
+        );
+        let vm = tab.page_vm_mut().expect("page vm");
+        assert!(
+            js_is_true(vm, "ran"),
+            "listener still ran after inline throw"
+        );
+        assert!(
+            js_is_true(vm, "listenerTrusted"),
+            "cancel listener event must be trusted"
+        );
+        assert!(
+            !vm.report().errors.is_empty(),
+            "inline throw must land in the page's error report"
+        );
+    }
+
+    #[test]
+    fn page_event_dispatch_cancel_passive_listener_does_not_gate_escape() {
+        // S5: a passive `cancel` listener's `preventDefault()` is a
+        // no-op, so `dispatch_cancel` must report not-prevented and
+        // the Escape caller may close the dialog.
+        use crate::window::JsDispatch;
+
+        let (mut tab, dialog) =
+            dispatch_tab("<html><body><dialog id=\"t\">x</dialog></body></html>");
+        tab.page_vm_mut()
+            .expect("page vm")
+            .eval("document.getElementById('t').addEventListener('cancel', function(e) { ran = true; e.preventDefault(); }, {passive: true});")
+            .expect("register passive listener");
+
+        let mut dispatch = PageEventDispatch::new();
+        assert!(
+            !dispatch.dispatch_cancel(&mut tab, dialog),
+            "passive preventDefault must not keep the dialog open"
+        );
+        let vm = tab.page_vm_mut().expect("page vm");
+        assert!(js_is_true(vm, "ran"), "passive listener still ran");
+    }
+
+    #[test]
+    fn page_event_dispatch_close_inline_return_false_does_not_prevent() {
+        // S2 at the `PageEventDispatch` level: `dispatch_close`
+        // discards its outcome, so the observable half is the
+        // listener's `defaultPrevented`, which an inline
+        // `return false` on a non-cancelable `close` must not set.
+        use crate::window::JsDispatch;
+
+        let (mut tab, dialog) = dispatch_tab(
+            "<html><body><dialog id=\"t\" onclose=\"return false;\">x</dialog></body></html>",
+        );
+        tab.page_vm_mut()
+            .expect("page vm")
+            .eval("document.getElementById('t').addEventListener('close', function(e) { sawPrevented = e.defaultPrevented; });")
+            .expect("register listener");
+
+        let mut dispatch = PageEventDispatch::new();
+        dispatch.dispatch_close(&mut tab, dialog);
+        let vm = tab.page_vm_mut().expect("page vm");
+        assert!(
+            !js_is_true(vm, "sawPrevented"),
+            "inline return false must not set defaultPrevented on non-cancelable close"
+        );
+    }
+
+    #[test]
+    fn page_event_dispatch_cancel_close_toggle_survive_dispatch_event_override() {
+        // w83: the host path never calls the public `dispatchEvent`,
+        // so a page override of it (on the element and on `window`)
+        // must neither swallow nor untrust the host events — and
+        // w83fix extends that coverage to `toggle` through
+        // `PageEventDispatch`, which the original test omitted.
+        use crate::window::JsDispatch;
+
+        let (mut tab, dialog) = dispatch_tab(
+            "<html><body><dialog id=\"t\" oncancel=\"inlineCancelTrusted = event.isTrusted;\" onclose=\"inlineCloseTrusted = event.isTrusted;\">x</dialog><div id=\"p\" popover=\"auto\" ontoggle=\"inlineToggleTrusted = event.isTrusted;\">hi</div></body></html>",
+        );
+        let pop = tab
+            .document_ref()
+            .expect("document")
+            .get_element_by_id("p")
+            .expect("popover");
+        tab.installed_mut()
+            .expect("installed document")
+            .document()
+            .borrow_mut()
+            .show_popover(pop)
+            .expect("show popover");
+        tab.page_vm_mut()
+            .expect("page vm")
+            .eval("overrideCalled = false; document.getElementById('t').dispatchEvent = function() { overrideCalled = true; }; document.getElementById('p').dispatchEvent = function() { overrideCalled = true; }; window.dispatchEvent = function() { overrideCalled = true; }; document.getElementById('t').addEventListener('cancel', function(e) { listenerCancelTrusted = e.isTrusted; }); document.getElementById('t').addEventListener('close', function(e) { listenerCloseTrusted = e.isTrusted; }); document.getElementById('p').addEventListener('toggle', function(e) { listenerToggleTrusted = e.isTrusted; });")
+            .expect("register override and listeners");
+
+        let mut dispatch = PageEventDispatch::new();
+        dispatch.dispatch_cancel(&mut tab, dialog);
+        dispatch.dispatch_close(&mut tab, dialog);
+        dispatch.dispatch_toggle(&mut tab, pop);
+
+        let vm = tab.page_vm_mut().expect("page vm");
+        assert!(
+            !js_is_true(vm, "overrideCalled"),
+            "host dispatch must not call the page-overridden dispatchEvent"
+        );
+        for name in [
+            "inlineCancelTrusted",
+            "listenerCancelTrusted",
+            "inlineCloseTrusted",
+            "listenerCloseTrusted",
+            "inlineToggleTrusted",
+            "listenerToggleTrusted",
+        ] {
+            assert!(js_is_true(vm, name), "{name} must be trusted");
+        }
     }
 
     #[test]

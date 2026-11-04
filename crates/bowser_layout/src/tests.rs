@@ -12982,6 +12982,118 @@ fn w82_multicol_top_layer_dialog_parent_laid_out() {
 }
 
 #[test]
+fn w83_sticky_dialog_top_layer_lays_out_as_absolute() {
+    // w83 (CSS Position 4 §3.1, dialog-scoped): a modal dialog
+    // with author `position: sticky` must lay out exactly like
+    // the same dialog with `position: absolute` — an absolute
+    // top-layer box against the viewport, not a sticky in-flow
+    // box. The 100px spacer before the dialog is the
+    // discriminator: a sticky box would stay at its flow spot
+    // (y=100, below the `top: 30px` stick threshold), while an
+    // absolute box goes to y=30. (Without the spacer the two
+    // coincide at zero scroll: a flow y=0 sticky box with
+    // `top: 30px` clamps to 30, so a spacer-less fixture passes
+    // with or without the fix and pins nothing.) The twin
+    // comparison pins the geometry without baking in unrelated
+    // UA-dialog centering behavior.
+    fn laid_out(position: &str) -> (f32, f32, f32, f32) {
+        let (mut doc, _) = bowser_dom::Document::parse_html(
+            b"<!DOCTYPE html><html><body><div class=\"sp\"></div><dialog id=\"d\"></dialog></body></html>".as_slice(),
+        );
+        let dlg = doc.get_element_by_id("d").expect("dialog");
+        doc.show_dialog_modal(dlg).expect("show modal dialog");
+        let ss = bowser_css::parse_stylesheet(
+            &[
+                TABLE_TEST_RESET_CSS,
+                "body { margin: 0; } .sp { height: 100px; } ",
+                "dialog { top: 30px; left: 40px; width: 100px; height: 50px; margin: 0; position: ",
+                position,
+                "; }",
+            ]
+            .concat(),
+        );
+        let l = layout(&doc, &[&ss], VP, &FixedFontMetrics);
+        let b = find_box(&l, dlg).expect("dialog box");
+        (b.rect.x, b.rect.y, b.rect.w, b.rect.h)
+    }
+    let sticky = laid_out("sticky");
+    let absolute = laid_out("absolute");
+    assert!(
+        approx(sticky.0, absolute.0)
+            && approx(sticky.1, absolute.1)
+            && approx(sticky.2, absolute.2)
+            && approx(sticky.3, absolute.3),
+        "modal sticky dialog rect {sticky:?} must equal absolute twin {absolute:?}"
+    );
+    assert!(
+        approx(sticky.0, 40.0) && approx(sticky.1, 30.0),
+        "modal sticky dialog at ({}, {}) != (40, 30): still laying out as sticky/in-flow",
+        sticky.0,
+        sticky.1
+    );
+    assert!(
+        approx(sticky.2, 100.0) && approx(sticky.3, 50.0),
+        "modal sticky dialog size ({}, {}) != (100, 50)",
+        sticky.2,
+        sticky.3
+    );
+}
+
+#[test]
+fn w83fix_sticky_dialog_top_layer_scrolled_lays_out_as_absolute() {
+    // w83fix NIT: scrolled twin of
+    // `w83_sticky_dialog_top_layer_lays_out_as_absolute` (which
+    // is zero-scroll only). At a 200px viewport scroll, an
+    // unconverted sticky dialog would stick at the viewport
+    // top (page y = 200 + 30 = 230 in the sticky-constraint
+    // convention used by `layout_with_scroll`, vs its 100px
+    // flow spot), while the absolute twin stays at its
+    // `top: 30px` placement — so twin equality at scroll is a
+    // strictly stronger pin than at zero scroll, where the two
+    // could still coincide. Only twin equality and size are
+    // pinned here, not the absolute page coordinate: whether
+    // the top-layer absolute box is reported in page or
+    // viewport coordinates is a separate layout-convention
+    // question, and baking one coordinate would pin that
+    // convention into a sticky-conversion test.
+    fn laid_out_scrolled(position: &str) -> (f32, f32, f32, f32) {
+        let (mut doc, _) = bowser_dom::Document::parse_html(
+            b"<!DOCTYPE html><html><body><div class=\"sp\"></div><dialog id=\"d\"></dialog></body></html>".as_slice(),
+        );
+        let dlg = doc.get_element_by_id("d").expect("dialog");
+        doc.show_dialog_modal(dlg).expect("show modal dialog");
+        let ss = bowser_css::parse_stylesheet(
+            &[
+                TABLE_TEST_RESET_CSS,
+                "body { margin: 0; } .sp { height: 100px; } ",
+                "dialog { top: 30px; left: 40px; width: 100px; height: 50px; margin: 0; position: ",
+                position,
+                "; }",
+            ]
+            .concat(),
+        );
+        let l = layout_with_scroll(&doc, &[&ss], VP, &FixedFontMetrics, (0.0, 200.0));
+        let b = find_box(&l, dlg).expect("dialog box");
+        (b.rect.x, b.rect.y, b.rect.w, b.rect.h)
+    }
+    let sticky = laid_out_scrolled("sticky");
+    let absolute = laid_out_scrolled("absolute");
+    assert!(
+        approx(sticky.0, absolute.0)
+            && approx(sticky.1, absolute.1)
+            && approx(sticky.2, absolute.2)
+            && approx(sticky.3, absolute.3),
+        "scrolled modal sticky dialog rect {sticky:?} must equal absolute twin {absolute:?}"
+    );
+    assert!(
+        approx(sticky.2, 100.0) && approx(sticky.3, 50.0),
+        "scrolled modal sticky dialog size ({}, {}) != (100, 50)",
+        sticky.2,
+        sticky.3
+    );
+}
+
+#[test]
 fn w82_multicol_top_layer_popover_parent_laid_out() {
     // w82: same pin with a popover parent (`show_popover`
     // promotes to the top layer). The popover UA style is
