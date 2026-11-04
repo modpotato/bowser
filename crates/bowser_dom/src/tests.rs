@@ -4537,3 +4537,143 @@ fn popover_show_hide_toggle_and_set_ops_dirty_the_document() {
         "newly shown popover must be dirtied"
     );
 }
+
+// -- dialog API (w81 phase 2) ------------------------------------------------
+
+fn dialog_in_doc() -> (Document, NodeId) {
+    let mut doc = Document::new();
+    let host = doc.create_element("div");
+    doc.append_child(doc.root(), host);
+    let dlg = doc.create_element("dialog");
+    doc.append_child(host, dlg);
+    (doc, dlg)
+}
+
+#[test]
+fn dialog_show_show_modal_close_and_return_value() {
+    let (mut doc, dlg) = dialog_in_doc();
+    assert!(!doc.is_dialog_open(dlg));
+    assert!(!doc.is_dialog_modal(dlg));
+    assert_eq!(doc.dialog_return_value(dlg), "");
+    assert!(!doc.matches(dlg, ":open").expect("parse"));
+    assert!(!doc.matches(dlg, ":modal").expect("parse"));
+
+    // Non-dialog receiver is NotSupported, not InvalidState.
+    let div = doc.create_element("div");
+    doc.append_child(doc.root(), div);
+    assert!(doc.show_dialog(div).is_err());
+    assert!(doc.show_dialog_modal(div).is_err());
+    assert!(doc.close_dialog(div, None).is_err());
+
+    // Detached dialog cannot show.
+    let detached = doc.create_element("dialog");
+    assert!(doc.show_dialog(detached).is_err());
+    assert!(doc.show_dialog_modal(detached).is_err());
+
+    // show(): open, non-modal, not in the top layer.
+    doc.show_dialog(dlg).expect("show");
+    assert!(doc.is_dialog_open(dlg));
+    assert!(!doc.is_dialog_modal(dlg));
+    assert!(!doc.is_in_top_layer(dlg));
+    assert!(doc.matches(dlg, ":open").expect("parse"));
+    assert!(!doc.matches(dlg, ":modal").expect("parse"));
+    assert!(doc.show_dialog(dlg).is_err(), "re-show must throw");
+    assert!(
+        doc.show_dialog_modal(dlg).is_err(),
+        "showModal on open dialog must throw"
+    );
+
+    // close() with a return value: closed, value stored, open gone.
+    assert!(doc.close_dialog(dlg, Some("ok")).expect("close"));
+    assert!(!doc.is_dialog_open(dlg));
+    assert_eq!(doc.dialog_return_value(dlg), "ok");
+    assert!(!doc.matches(dlg, ":open").expect("parse"));
+    // Closing a closed dialog is a no-op, not an error, and keeps the value.
+    assert!(!doc.close_dialog(dlg, None).expect("re-close"));
+    assert_eq!(doc.dialog_return_value(dlg), "ok");
+
+    // showModal(): open, modal, top-layer member.
+    doc.show_dialog_modal(dlg).expect("showModal");
+    assert!(doc.is_dialog_open(dlg));
+    assert!(doc.is_dialog_modal(dlg));
+    assert!(doc.is_in_top_layer(dlg));
+    assert!(doc.matches(dlg, ":open").expect("parse"));
+    assert!(doc.matches(dlg, ":modal").expect("parse"));
+
+    // close() without an argument keeps the stored return value.
+    assert!(doc.close_dialog(dlg, None).expect("close modal"));
+    assert!(!doc.is_dialog_open(dlg));
+    assert!(!doc.is_dialog_modal(dlg));
+    assert!(!doc.is_in_top_layer(dlg));
+    assert_eq!(doc.dialog_return_value(dlg), "ok");
+
+    // IDL accessor path: set without opening, read back.
+    doc.set_dialog_return_value(dlg, "preset");
+    assert_eq!(doc.dialog_return_value(dlg), "preset");
+    assert_eq!(
+        doc.dialog_return_value(div),
+        "",
+        "non-dialog returnValue is empty"
+    );
+}
+
+#[test]
+fn dialog_markup_open_and_open_attribute_removal() {
+    let (mut doc, dlg) = dialog_in_doc();
+    // A bare `open` attribute in markup is open (non-modal) and
+    // `show()` on it throws — the attribute is the open state.
+    doc.set_attribute(dlg, "open", "");
+    assert!(doc.is_dialog_open(dlg));
+    assert!(!doc.is_dialog_modal(dlg));
+    assert!(doc.matches(dlg, ":open").expect("parse"));
+    assert!(doc.show_dialog(dlg).is_err());
+    // close() works on a markup-open dialog too.
+    assert!(doc.close_dialog(dlg, Some("x")).expect("close markup-open"));
+    assert_eq!(doc.dialog_return_value(dlg), "x");
+
+    // Removing `open` from a modal dialog demotes it and clears
+    // the modal flag (no event at this layer — that is the
+    // bindings' job, and only for close()).
+    doc.show_dialog_modal(dlg).expect("showModal");
+    doc.remove_attribute(dlg, "open");
+    assert!(!doc.is_dialog_open(dlg));
+    assert!(!doc.is_dialog_modal(dlg));
+    assert!(!doc.is_in_top_layer(dlg));
+}
+
+#[test]
+fn dialog_removal_demotes_like_popover_and_open_pseudo_covers_popover() {
+    let (mut doc, dlg) = dialog_in_doc();
+    doc.show_dialog_modal(dlg).expect("showModal");
+    let container = doc.children(doc.root())[0];
+    doc.set_inner_html(container, "");
+    assert!(
+        !doc.is_in_top_layer(dlg),
+        "removed modal dialog must demote"
+    );
+    assert!(
+        !doc.is_dialog_modal(dlg),
+        "removed modal dialog loses modal flag"
+    );
+    // The `open` attribute survives removal (demotion is not a
+    // close), so a reinserted dialog renders open but non-modal.
+    assert!(doc.is_dialog_open(dlg));
+
+    // `:open` also matches a shown popover (the popover tests'
+    // `matches(':open')` assertion) and an open details element.
+    // Both go under the (now empty) container: the document root
+    // already holds that one element child, so appending a second
+    // element child to the root itself would not link.
+    let pop = doc.create_element("div");
+    doc.set_attribute(pop, "popover", "auto");
+    doc.append_child(container, pop);
+    doc.show_popover(pop).expect("show popover");
+    assert!(doc.matches(pop, ":open").expect("parse"));
+    assert!(doc.matches(pop, ":popover-open").expect("parse"));
+    assert!(!doc.matches(pop, ":modal").expect("parse"));
+    let details = doc.create_element("details");
+    doc.set_attribute(details, "open", "");
+    doc.append_child(container, details);
+    assert!(doc.matches(details, ":open").expect("parse"));
+    assert!(!doc.matches(details, ":modal").expect("parse"));
+}

@@ -380,7 +380,34 @@ pub fn compute_style(
     out.expect("node is always in its own ancestor chain")
 }
 
-/// The UA stylesheet gives `table` its spec display value (`table`);
+/// One-shot wrapper around [`Styler::pseudo_style_for`]: builds a
+/// fresh styler, styles the node's ancestor chain root-first (as
+/// [`compute_style`] does), and returns the pseudo-element's
+/// computed style, or `None` when no rule targets the pseudo.
+/// `getComputedStyle`'s pseudo argument and any other one-shot
+/// pseudo query use this; the layout box pass builds one `Styler`
+/// and calls `pseudo_style_for` directly instead.
+pub fn compute_pseudo_style(
+    doc: &Document,
+    node: NodeId,
+    author: &[&Stylesheet],
+    ua: &Stylesheet,
+    viewport: &Viewport,
+    pseudo: &str,
+    allowed_atoms: &[PropertyAtom],
+) -> Option<ComputedStyle> {
+    let styler = Styler::new(doc, author, ua, *viewport);
+    let mut chain = Vec::new();
+    let mut cursor = Some(node);
+    while let Some(n) = cursor {
+        chain.push(n);
+        cursor = styler.style_parent(n);
+    }
+    for n in chain.into_iter().rev() {
+        let _ = styler.style_for(n);
+    }
+    styler.pseudo_style_for(node, pseudo, allowed_atoms)
+}
 /// layout implements table layout for it (see `bowser_layout`).
 const UA_CSS: &str = r#"
 html, body, div, p, h1, h2, h3, h4, h5, h6, ul, ol,
@@ -441,6 +468,47 @@ pre { white-space: pre; }
    on this rule. */
 [popover] { position: fixed; top: 0; right: 0; bottom: 0; left: 0; width: fit-content; height: fit-content; margin: auto; }
 [popover]:not(:popover-open) { display: none; }
+/* HTML rendering (dialog, w81 phase 2, rescoped w81fix F-H1 to
+   match Chromium): the base dialog is absolute with both inline
+   insets 0, fit-content sizes, and auto margins, so an open
+   non-modal dialog centers horizontally but sits at its static
+   vertical position and scrolls with its containing block — it
+   is NOT fixed and NOT viewport-centered vertically. `dialog[open]`
+   only switches display to block. Only a `:modal` dialog is
+   fixed with both block insets 0 (inheriting the inline insets
+   from the base rule, so all four insets are 0 and it centers
+   in the viewport), and only a `:modal` dialog gets the
+   Chromium max-size cap. Insets are spelled `0px`, not bare
+   `0`, so computed style serializes as `0px` (same reason as
+   the backdrop rule below). The `:modal` overlay rule below is
+   needed in its own right: popovers DO have an explicit UA
+   `overlay: auto !important` rule for `:popover-open`, and a
+   modal dialog needs the same — the top-layer exemption in
+   [`Styler::candidates`] only drops the UA `overlay: none`
+   rule for top-layer nodes, it supplies no `auto` winner, so
+   without this rule a modal dialog with no author overlay
+   rule would compute the `none` initial. */
+/* CSS Position 4 §3.2 + HTML rendering (w81 backdrop, W4): every
+   element rendered in the top layer has a `::backdrop`
+   pseudo-element, and the UA stylesheet gives it a fixed,
+   viewport-filling box. The dim itself is modal-dialog-only:
+   HTML gives `dialog:modal::backdrop` a translucent black
+   background, while a popover's UA backdrop is transparent — a
+   popover backdrop exists (it is generated for every top-layer
+   element and author `::backdrop` rules apply to it) but renders
+   nothing until an author rule styles it. A non-modal dialog is
+   never in the top layer, so it never generates a backdrop at
+   all; `::backdrop` generation is gated on top-layer membership
+   by the box/paint callers, not by this stylesheet (the UA rule
+   alone must not conjure a backdrop for a closed or non-modal
+   element), and a non-modal dialog's `::backdrop` query must
+   read transparent, not dimmed. */
+::backdrop { display: block; position: fixed; top: 0px; right: 0px; bottom: 0px; left: 0px; }
+dialog:modal::backdrop { background-color: rgba(0, 0, 0, 0.1); }
+dialog { display: block; position: absolute; inset-inline-start: 0px; inset-inline-end: 0px; width: fit-content; height: fit-content; margin: auto; }
+dialog:not([open]) { display: none; }
+dialog[open] { display: block; }
+dialog:modal { position: fixed; inset-block-start: 0px; inset-block-end: 0px; max-width: calc(100% - 2em - 6px); max-height: calc(100% - 2em - 6px); overlay: auto !important; }
 /* CSS Position 4 (w80 phase 2): a shown popover computes
    `overlay: auto`. This UA `!important` rule beats the `*` rule
    below on specificity (attribute + pseudo-class vs universal),
@@ -1175,7 +1243,85 @@ pub const BEFORE_AFTER_ATOMS: &[PropertyAtom] = &[
     PropertyAtom::TEXT_TRANSFORM,
 ];
 
-/// Declares the computed-property set once and derives both the
+/// Properties `::backdrop` rules may set in this engine (w81
+/// backdrop, W4): CSS Position 4 puts no restriction on which
+/// properties apply to `::backdrop`, so this is the broad box /
+/// background / border / opacity set plus the inherited text
+/// properties the pseudo base carries from its originating element
+/// (the base style is the origin's computed style, so inherited
+/// properties read as inherited here unless a pseudo rule overrides
+/// them). `display` is included so the UA `::backdrop` rule's
+/// `display: block` — and an author's `display: none`, which
+/// suppresses the backdrop box — survive the pseudo cascade; the
+/// pseudo base still resets `display` to `inline` first, so only an
+/// explicit pseudo declaration (UA or author) overrides it.
+/// `background-color` etc. are what paint reads for the backdrop
+/// fill; `backdrop-filter` is carried for completeness (paint v1
+/// only fills `background-color` — see `bowser_paint`'s backdrop
+/// note). Exported alongside [`BEFORE_AFTER_ATOMS`] for the
+/// layout `::backdrop` query and for `getComputedStyle`'s pseudo
+/// argument. There is no `color-scheme` / `pointer-events` atom in
+/// this engine yet, so those properties cannot (yet) ride the
+/// pseudo cascade — see the backdrop-inherit-computed note in the
+/// wave report.
+pub const BACKDROP_ATOMS: &[PropertyAtom] = &[
+    PropertyAtom::DISPLAY,
+    PropertyAtom::POSITION,
+    PropertyAtom::TOP,
+    PropertyAtom::RIGHT,
+    PropertyAtom::BOTTOM,
+    PropertyAtom::LEFT,
+    PropertyAtom::WIDTH,
+    PropertyAtom::HEIGHT,
+    PropertyAtom::MIN_WIDTH,
+    PropertyAtom::MIN_HEIGHT,
+    PropertyAtom::MAX_WIDTH,
+    PropertyAtom::MAX_HEIGHT,
+    PropertyAtom::MARGIN_TOP,
+    PropertyAtom::MARGIN_RIGHT,
+    PropertyAtom::MARGIN_BOTTOM,
+    PropertyAtom::MARGIN_LEFT,
+    PropertyAtom::BACKGROUND_COLOR,
+    PropertyAtom::BACKGROUND_IMAGE,
+    PropertyAtom::BACKGROUND_REPEAT,
+    PropertyAtom::BACKGROUND_ATTACHMENT,
+    PropertyAtom::BACKGROUND_POSITION,
+    PropertyAtom::BACKGROUND_SIZE,
+    PropertyAtom::BACKGROUND_ORIGIN,
+    PropertyAtom::BACKGROUND_CLIP,
+    PropertyAtom::BORDER_TOP_WIDTH,
+    PropertyAtom::BORDER_RIGHT_WIDTH,
+    PropertyAtom::BORDER_BOTTOM_WIDTH,
+    PropertyAtom::BORDER_LEFT_WIDTH,
+    PropertyAtom::BORDER_TOP_STYLE,
+    PropertyAtom::BORDER_RIGHT_STYLE,
+    PropertyAtom::BORDER_BOTTOM_STYLE,
+    PropertyAtom::BORDER_LEFT_STYLE,
+    PropertyAtom::BORDER_TOP_COLOR,
+    PropertyAtom::BORDER_RIGHT_COLOR,
+    PropertyAtom::BORDER_BOTTOM_COLOR,
+    PropertyAtom::BORDER_LEFT_COLOR,
+    PropertyAtom::OPACITY,
+    PropertyAtom::VISIBILITY,
+    PropertyAtom::OVERFLOW_X,
+    PropertyAtom::OVERFLOW_Y,
+    PropertyAtom::Z_INDEX,
+    PropertyAtom::BACKDROP_FILTER,
+    PropertyAtom::FILTER,
+    PropertyAtom::BOX_SHADOW,
+    PropertyAtom::COLOR,
+    PropertyAtom::FONT_FAMILY,
+    PropertyAtom::FONT_SIZE,
+    PropertyAtom::FONT_STYLE,
+    PropertyAtom::FONT_WEIGHT,
+    PropertyAtom::FONT_VARIANT,
+    PropertyAtom::LINE_HEIGHT,
+    PropertyAtom::TEXT_TRANSFORM,
+    PropertyAtom::LETTER_SPACING,
+    PropertyAtom::WORD_SPACING,
+    PropertyAtom::WHITE_SPACE,
+    PropertyAtom::CURSOR,
+];
 /// [`COMPUTED_PROPS`] name table and the [`props`] const-index module from
 /// it, so the two can never drift apart. Each entry is
 /// `CONST_NAME = "css-name"`; indices are assigned in declaration order.
@@ -1904,22 +2050,123 @@ enum ResolveWork<'a> {
     FallbackTail,
 }
 
-/// Top-level provenance of a [`Styler::resolve_inner`] result: whether
-/// the whole substituted value came from a `var()` substitution whose
-/// token stream held a top-level `/` or a top-level comma. Both
-/// readings encode as the same nested `List` shape in the returned
-/// value (see [`ResolveResult::into_option`]), so this is the only
-/// channel by which a consumer can tell them apart. It is top-level
-/// only: a slash/comma spliced inside an enclosing list, or nested
-/// inside another substituted stream, is not reported here (that needs
-/// provenance at every `List` nesting level, a separate follow-up).
-/// `Neither` covers every other shape, including a value that never
-/// went through a slash/comma substitution at all.
+/// How one [`ProvTree`] list node's items relate: space-separated
+/// items of one layer, comma-separated groups, or a `/`-separated
+/// before/after pair. A list node's kind is the tag that survives
+/// substitution; the plain value shape alone cannot carry it (a
+/// comma list and a slash marker both nest as `List([List, List])`).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum TopLevelProvenance {
-    Neither,
-    Slash,
+enum ProvKind {
+    Space,
     Comma,
+    Slash,
+}
+
+/// Tree-shaped provenance for one [`Styler::resolve_inner`] result,
+/// mirroring the resolved value's `List` nesting. Every `List` in
+/// the value has one node here; scalars and opaque composites
+/// (gradients, `repeat()` descriptors) are [`Leaf`](ProvTree::Leaf).
+/// The tree is `Rc`-shared exactly like [`SharedSlash`]/[`SharedComma`]:
+/// a memoized substitution hands out a pointer bump, and memoizing a
+/// fresh one moves the `Rc`, so the tag costs no deep clone per
+/// `var()` reference.
+///
+/// Fragment rule: a node's children are the tree fragments of its
+/// list's items, with one exception — a [`Comma`](ProvKind::Comma)
+/// child of a [`Space`](ProvKind::Space) list stands for its groups,
+/// not for one item: it spans as many value items as it has group
+/// children (see [`prov_frag_span`]). That is what keeps a comma
+/// group distinct from a nested list when a `var()` substitution
+/// splices it into an enclosing list: the enclosing `Space` node's
+/// children are `[leaf, Comma-node]`, not `[leaf, group, group]`.
+/// [`None`](ProvTree::None) is not a tag: it marks an invalid,
+/// cyclic, or otherwise untagged result (a direct parse-side value,
+/// a token-level substitution that bypassed the machine), and any
+/// consumer reading it must fall back to shape heuristics.
+#[derive(Clone, Debug)]
+enum ProvTree {
+    None,
+    Leaf,
+    List(ProvKind, Vec<Rc<ProvTree>>),
+}
+
+type SharedTree = Rc<ProvTree>;
+
+/// The shared [`ProvTree::Leaf`] singleton: leaves are the common
+/// case, so they share one allocation per thread instead of one per
+/// scalar (`Rc` is not `Sync`, so a `static` cannot hold it).
+fn leaf_tree() -> SharedTree {
+    thread_local! {
+        static LEAF: SharedTree = Rc::new(ProvTree::Leaf);
+    }
+    LEAF.with(Rc::clone)
+}
+
+/// The shared [`ProvTree::None`] singleton (see [`ProvTree`]).
+fn none_tree() -> SharedTree {
+    thread_local! {
+        static NONE: SharedTree = Rc::new(ProvTree::None);
+    }
+    NONE.with(Rc::clone)
+}
+
+/// One entry of the tree stack that runs parallel to the
+/// [`ResolveResult`] stack in [`Styler::resolve_inner`]: either the
+/// tree of a single value, or the flat item trees of a
+/// [`Splice`](ResolveResult::Splice) result (which has no single
+/// value of its own). The two stacks stay the same length at all
+/// times; every combinator pops and pushes both together.
+enum TreeFrag {
+    Val(SharedTree),
+    Seq(Vec<SharedTree>),
+}
+
+/// The tree of a result's [`ResolveResult::into_option`] value:
+/// a single value's own tree, or a `Space` list over a splice's
+/// item trees.
+fn frag_to_value_tree(frag: TreeFrag) -> SharedTree {
+    match frag {
+        TreeFrag::Val(t) => t,
+        TreeFrag::Seq(items) => Rc::new(ProvTree::List(ProvKind::Space, items)),
+    }
+}
+
+/// How many value items one tree fragment stands for when it
+/// appears as a child of a `Space` list (see [`ProvTree`]): one,
+/// except a `Comma` node, which stands for its groups.
+fn prov_frag_span(tree: &ProvTree) -> usize {
+    match tree {
+        ProvTree::List(ProvKind::Comma, groups) => groups.len(),
+        _ => 1,
+    }
+}
+
+/// The fragments of one list value's items: a list node's children,
+/// except that a `Space` node's children are fragments in their own
+/// right (a `Comma` child spans its groups — see
+/// [`prov_frag_span`] — rather than standing for one item). A
+/// `Slash`/`Comma` node's children are its sides/groups, which are
+/// that value's items. Callers that pair fragments with values
+/// must respect spans; they must never zip the two lists.
+fn value_item_frags(tree: &SharedTree) -> Vec<SharedTree> {
+    match tree.as_ref() {
+        ProvTree::List(_, children) => children.clone(),
+        _ => vec![Rc::clone(tree)],
+    }
+}
+
+/// The tree of a `List` value built from one result fragment: a
+/// list node's own tree, a `Space` list over a splice's items, or
+/// a one-item `Space` list for a scalar.
+fn list_tree_from_frag(frag: TreeFrag) -> SharedTree {
+    match frag {
+        TreeFrag::Val(t) => match t.as_ref() {
+            ProvTree::List(..) => t,
+            ProvTree::Leaf => Rc::new(ProvTree::List(ProvKind::Space, vec![leaf_tree()])),
+            ProvTree::None => none_tree(),
+        },
+        TreeFrag::Seq(items) => Rc::new(ProvTree::List(ProvKind::Space, items)),
+    }
 }
 
 /// One resolved stack item in [`Styler::resolve`].
@@ -2031,15 +2278,24 @@ impl VarNameInterner {
 /// payload stays an owned `CssValue`: every use site needs an owned value
 /// to embed (splicing/extending parent lists), so sharing it would only
 /// relocate the one unavoidable clone from the probe to the use.
+///
+/// Every variant also carries the substitution's [`ProvTree`]: the
+/// plain value's tree, or the slash/comma marker node itself. Without
+/// it a memo hit (the common repeated-`var()` case) would return an
+/// untagged value and every nested comma/slash boundary would silently
+/// revert to shape heuristics on second use.
 #[derive(Clone)]
 enum MemoVar {
-    /// Plain substituted value (`None` = invalid at computed-value time).
-    Value(Option<CssValue>),
+    /// Plain substituted value (`None` = invalid at computed-value time),
+    /// plus the tree of that value.
+    Value(Option<CssValue>, SharedTree),
     /// The token stream held a top-level `/`: resolved before/after
-    /// groups (`None` = invalid at computed-value time).
-    Slash(SharedSlash),
-    /// The token stream held a top-level comma: resolved comma groups.
-    Comma(SharedComma),
+    /// groups (`None` = invalid at computed-value time), plus the
+    /// slash marker node.
+    Slash(SharedSlash, SharedTree),
+    /// The token stream held a top-level comma: resolved comma groups,
+    /// plus the comma marker node.
+    Comma(SharedComma, SharedTree),
 }
 
 /// One node's cascade winners, `var()` unresolved and deferred
@@ -2724,6 +2980,23 @@ impl<'a> Styler<'a> {
             })
     }
 
+    /// Stylesheet-level scan for `::backdrop` rules: the flag
+    /// behind [`Styler::has_backdrop_rules`]. Same rightmost-compound
+    /// shape as [`Self::scan_generated_content`].
+    fn scan_backdrop(ua: &Stylesheet, author: &[&Stylesheet]) -> bool {
+        std::iter::once(ua)
+            .chain(author.iter().copied())
+            .any(|sheet| {
+                sheet.rules().iter().any(|rule| {
+                    rule.selectors.iter().any(|sel| {
+                        sel.compounds.last().is_some_and(|c| {
+                            matches!(c.pseudo_element.as_deref(), Some("backdrop"))
+                        })
+                    })
+                })
+            })
+    }
+
     /// Stylesheet-level scan for `counter-reset` / `counter-increment`
     /// declarations: the gate behind
     /// [`Styler::has_counter_adjustments`]. One pass over every
@@ -3142,6 +3415,12 @@ pub struct Styler<'a> {
     /// per-element pseudo query, so documents without generated-content
     /// rules pay ~zero in that hot loop.
     generated_content_rules: bool,
+    /// Stylesheet-level `::backdrop` flag (w81 backdrop, W4): true
+    /// when any UA or author selector targets `::backdrop`. The UA
+    /// stylesheet always carries one, so this is true in practice;
+    /// see [`Styler::has_backdrop_rules`] for why the real
+    /// generation gate is top-layer membership, not this flag.
+    backdrop_rules: bool,
     /// Stylesheet-level gate for CSS counter scoping: true when any UA
     /// or author declaration sets `counter-reset` / `counter-increment`
     /// (scanned once at construction, like `generated_content_rules`).
@@ -3222,6 +3501,10 @@ impl<'a> Styler<'a> {
         // document, ~zero per-element cost when no `::before` /
         // `::after` rules exist.
         let generated_content_rules = Self::scan_generated_content(ua, author);
+        // Stylesheet-level backdrop flag (see the `backdrop_rules`
+        // field docs): same one-scan shape as the generated-content
+        // gate above.
+        let backdrop_rules = Self::scan_backdrop(ua, author);
         // Stylesheet-level counter gate (see the
         // `counter_adjustment_rules` field docs): one declaration scan
         // per document, ~zero per-element scope maintenance when no
@@ -3253,6 +3536,7 @@ impl<'a> Styler<'a> {
             match_scratch: RefCell::new(MatchScratch::new()),
             share_flags: ShareFlags::scan(ua, author),
             generated_content_rules,
+            backdrop_rules,
             counter_adjustment_rules,
             share_cache: RefCell::new(FxHashMap::default()),
             share_keys: RefCell::new(NodeSlab::default()),
@@ -3493,7 +3777,13 @@ impl<'a> Styler<'a> {
     /// plus `div::before { color: red }` would synthesize a phantom box
     /// from the origin's `content` (spec: the pseudo starts at
     /// `content: normal`, i.e. no box). `::marker` queries route through
-    /// the shared marker memo instead.
+    /// the shared marker memo instead. `::backdrop` goes further
+    /// (see [`pseudo_style_uncached`](Self::pseudo_style_uncached)
+    /// via [`pseudo_style_for_shared`](Self::pseudo_style_for_shared)):
+    /// CSS Position 4 lets only inherited properties come from the
+    /// originator, so every non-inherited [`BACKDROP_ATOMS`] slot
+    /// resets to its initial before pseudo winners apply; that reset
+    /// is backdrop-scoped and does not change `::before` / `::after`.
     ///
     /// The style is memoized and reference-counted (see
     /// [`pseudo_style_for_shared`](Self::pseudo_style_for_shared)):
@@ -3547,15 +3837,17 @@ impl<'a> Styler<'a> {
     /// `var()`), so equal share keys imply equal winners; the base
     /// style comes from [`Styler::style_for_shared`], value-identical
     /// for equal keys; and the `display` / `content` / `unicode-bidi`
-    /// resets below are constant per pseudo. Equal keys therefore imply
-    /// byte-identical pseudo styles. (The `None` outcome — no rule
-    /// targets the pseudo — is likewise identical for equal keys; it is
-    /// simply not memoized, as before.)
+    /// resets below — plus, for `::backdrop` only, the non-inherited
+    /// [`BACKDROP_ATOMS`] reset — are constant per pseudo. Equal keys
+    /// therefore imply byte-identical pseudo styles. (The `None`
+    /// outcome — no rule targets the pseudo — is likewise identical
+    /// for equal keys; it is simply not memoized, as before.)
     ///
     /// The stored style is the post-reset style: the `display` /
-    /// `content` / `unicode-bidi` resets below are constant per pseudo,
-    /// so memoizing after applying them keeps one computation path for
-    /// the memoized and unmemoized callers.
+    /// `content` / `unicode-bidi` resets below (and the
+    /// backdrop-scoped reset) are constant per pseudo, so memoizing
+    /// after applying them keeps one computation path for the
+    /// memoized and unmemoized callers.
     pub fn pseudo_style_for_shared(
         &self,
         node: NodeId,
@@ -3632,6 +3924,26 @@ impl<'a> Styler<'a> {
         // doc comment on [`pseudo_style_for`](Self::pseudo_style_for)).
         style.set_slot(props::CONTENT, initial_rc(props::CONTENT));
         style.set_slot(props::UNICODE_BIDI, initial_rc(props::UNICODE_BIDI));
+        // `::backdrop` only (scoped here, not shared with
+        // `::before` / `::after`, whose base keeps the originator's
+        // non-inherited values apart from the three resets above):
+        // CSS Position 4 gives `::backdrop` the originator's values
+        // only for inherited properties; every non-inherited
+        // property in [`BACKDROP_ATOMS`] starts at its initial
+        // value unless a pseudo rule declares it, so the base
+        // clone's specified values for those slots are reset here
+        // before the winners below are applied. Inherited slots
+        // are left alone, so e.g. an originator's `color` still
+        // shows through. The reset is constant per pseudo, so the
+        // memo keys in [`pseudo_style_for_shared`] stay sound.
+        if pseudo == "backdrop" {
+            for atom in BACKDROP_ATOMS {
+                if atom.is_computed() && !is_inherited(atom.as_str()) {
+                    let idx = atom.index();
+                    style.set_slot(idx, initial_rc(idx));
+                }
+            }
+        }
         let rc = Rc::new(apply_pseudo_winners(style, &winners));
         self.pseudo_memo.borrow_mut().insert(
             key,
@@ -3796,6 +4108,18 @@ impl<'a> Styler<'a> {
     /// on `display: list-item`).
     pub fn has_generated_content_rules(&self) -> bool {
         self.generated_content_rules
+    }
+
+    /// Whether any stylesheet (UA or author) carries a `::backdrop`
+    /// rule (w81 backdrop, W4). The UA stylesheet always carries
+    /// one, so this is true in practice; the real generation gate
+    /// is top-layer membership, enforced by the box/paint callers
+    /// — this flag only mirrors the `::before` / `::after` gate
+    /// shape so a caller that wants the stylesheet-level answer
+    /// has it. Backdrop queries themselves are cheap (memoized
+    /// pseudo cascade) and rare (top-layer elements only).
+    pub fn has_backdrop_rules(&self) -> bool {
+        self.backdrop_rules
     }
 
     /// Whether any UA or author declaration sets `counter-reset` /
@@ -4678,17 +5002,20 @@ impl<'a> Styler<'a> {
                 // keeps the lowercasing parse its expansion was written
                 // for.
                 let preserve_case = cand.property.atom() == PropertyAtom::FONT;
-                if let (Some(substituted), provenance) =
+                if let (Some(substituted), tree) =
                     self.resolve_inner(node, &cand.value, &env, preserve_case)
                 {
                     // The `font` expansion parses comma groups itself
-                    // (family boundaries), and so does `background`
-                    // (layer boundaries: a single-item layer must stay
-                    // a nested list, or >= 3 single-item layers flatten
-                    // to a flat list whose second image reads as a
-                    // duplicate and drops the whole declaration);
-                    // every other shorthand sees the `parse_value`
-                    // shape its expansion was written for.
+                    // from the value shape (family boundaries, via
+                    // shape heuristics — it does not read the
+                    // provenance tree), and so does `background`
+                    // (layer boundaries, via the provenance tree: a
+                    // single-item layer must stay a nested list, or
+                    // >= 3 single-item layers flatten to a flat list
+                    // whose second image reads as a duplicate and
+                    // drops the whole declaration); every other
+                    // shorthand sees the `parse_value` shape its
+                    // expansion was written for.
                     let substituted = if matches!(
                         cand.property.atom(),
                         PropertyAtom::FONT | PropertyAtom::BACKGROUND
@@ -4698,7 +5025,7 @@ impl<'a> Styler<'a> {
                         normalize_comma_groups(substituted)
                     };
                     for (property, value) in
-                        expand_deferred_shorthand(&cand.property, substituted, provenance)
+                        expand_deferred_shorthand(&cand.property, substituted, &tree)
                     {
                         let atom = property.atom();
                         if atom.is_computed() {
@@ -4991,30 +5318,34 @@ impl<'a> Styler<'a> {
     /// memo key includes the flag so the two parses never share cache
     /// entries).
     /// [`resolve`](Self::resolve) with identifier-case control, plus
-    /// the result's [`TopLevelProvenance`]. The lossy [`resolve`]
-    /// wrapper above keeps the old return type for every other
-    /// consumer; only the deferred-shorthand path in
-    /// [`cascade_expanded`](Styler::cascade_expanded) reads the
-    /// provenance, and only for `background`.
+    /// the result's tree-shaped provenance (see [`ProvTree`]). The
+    /// lossy [`resolve`] wrapper above keeps the old return type for
+    /// every other consumer; only the deferred-shorthand path in
+    /// [`cascade_expanded`](Styler::cascade_expanded) reads the tree,
+    /// and only the `background` expansion consumes it.
     fn resolve_inner<'r>(
         &self,
         node: NodeId,
         value: &'r CssValue,
         env: &'r FxHashMap<String, CssValue>,
         preserve_case: bool,
-    ) -> (Option<CssValue>, TopLevelProvenance) {
+    ) -> (Option<CssValue>, SharedTree) {
         // The guaranteed-invalid marker is invalid at computed-value
         // time wherever it is substituted (including `var()` inside
         // math via `substitute_math_vars`): fail closed before the
         // work stack can return it literally.
         if is_guaranteed_invalid(value) {
-            return (None, TopLevelProvenance::Neither);
+            return (None, none_tree());
         }
         let mut work = vec![ResolveWork::ValueRef(value)];
         // Result stack: every `Value` work item pushes exactly one
         // `ResolveResult`; the combinators pop their inputs and push
         // one combined result.
         let mut results: Vec<ResolveResult> = Vec::new();
+        // Tree stack, parallel to the result stack (see [`TreeFrag`]):
+        // every result push has a tree push, every pop pops both, so
+        // the two stacks stay the same length at all times.
+        let mut trees: Vec<TreeFrag> = Vec::new();
         // Custom properties currently being resolved (cycle detection):
         // the styler-wide scratch set, reused across calls instead of
         // allocating a fresh `HashSet<String>` per resolution. Keyed by
@@ -5088,14 +5419,20 @@ impl<'a> Styler<'a> {
                                     };
                                     match parse(toks) {
                                         Ok(parsed) => work.push(ResolveWork::Value(parsed)),
-                                        Err(_) => results.push(ResolveResult::Single(None)),
+                                        Err(_) => {
+                                            results.push(ResolveResult::Single(None));
+                                            trees.push(TreeFrag::Val(none_tree()));
+                                        }
                                     }
                                 }
                             },
                         }
                     }
                     // A borrowed leaf: the single materialization point.
-                    other => results.push(ResolveResult::Single(Some(other.clone()))),
+                    other => {
+                        results.push(ResolveResult::Single(Some(other.clone())));
+                        trees.push(TreeFrag::Val(leaf_tree()));
+                    }
                 },
                 ResolveWork::Value(v) => match v {
                     CssValue::Var(name, fallback) => {
@@ -5171,6 +5508,7 @@ impl<'a> Styler<'a> {
                                 Some(substituted) => substituted,
                                 None => {
                                     results.push(ResolveResult::Single(None));
+                                    trees.push(TreeFrag::Val(none_tree()));
                                     continue;
                                 }
                             }
@@ -5212,13 +5550,19 @@ impl<'a> Styler<'a> {
                                     };
                                     match parse(&toks) {
                                         Ok(parsed) => work.push(ResolveWork::Value(parsed)),
-                                        Err(_) => results.push(ResolveResult::Single(None)),
+                                        Err(_) => {
+                                            results.push(ResolveResult::Single(None));
+                                            trees.push(TreeFrag::Val(none_tree()));
+                                        }
                                     }
                                 }
                             },
                         }
                     }
-                    other => results.push(ResolveResult::Single(Some(other))),
+                    other => {
+                        results.push(ResolveResult::Single(Some(other)));
+                        trees.push(TreeFrag::Val(leaf_tree()));
+                    }
                 },
                 ResolveWork::VarRef { id, fallback } => {
                     // Shared tail of `var()` resolution for one reference:
@@ -5245,8 +5589,28 @@ impl<'a> Styler<'a> {
                         // here avoids a second deep clone; the `Rc`
                         // payloads stay single pointer bumps.
                         match cached {
-                            MemoVar::Value(Some(v)) => results.push(ResolveResult::Single(Some(v))),
-                            MemoVar::Value(None) => match fallback {
+                            // A memoized list value splices, exactly
+                            // like the cold path below (`PropTail`
+                            // turns a list-valued substitution into a
+                            // `Splice`): returning it as a single
+                            // nested list on memo hits made the second
+                            // `var()` of the same name in one list
+                            // substitute differently from the first,
+                            // and dropped the stored tree's comma
+                            // boundaries with it. The tree travels as
+                            // the splice's item trees, so the memo
+                            // hit and the cold path now agree on both
+                            // value and tags.
+                            MemoVar::Value(Some(CssValue::List(items)), tree) => {
+                                let frags = value_item_frags(&tree);
+                                results.push(ResolveResult::Splice(Some(items)));
+                                trees.push(TreeFrag::Seq(frags));
+                            }
+                            MemoVar::Value(Some(v), tree) => {
+                                results.push(ResolveResult::Single(Some(v)));
+                                trees.push(TreeFrag::Val(tree));
+                            }
+                            MemoVar::Value(None, _) => match fallback {
                                 Some(f) => {
                                     work.push(ResolveWork::FallbackTail);
                                     work.push(ResolveWork::Value(f))
@@ -5255,10 +5619,16 @@ impl<'a> Styler<'a> {
                             },
                             // A memoized slash marker re-enters as a
                             // marker, never as a flat value.
-                            MemoVar::Slash(slashed) => results.push(ResolveResult::Slash(slashed)),
+                            MemoVar::Slash(slashed, tree) => {
+                                results.push(ResolveResult::Slash(slashed));
+                                trees.push(TreeFrag::Val(tree));
+                            }
                             // A memoized comma substitution re-enters
                             // with its groups intact.
-                            MemoVar::Comma(groups) => results.push(ResolveResult::Comma(groups)),
+                            MemoVar::Comma(groups, tree) => {
+                                results.push(ResolveResult::Comma(groups));
+                                trees.push(TreeFrag::Val(tree));
+                            }
                         }
                     } else if let Some(v) = {
                         // The environment is keyed by name: translate
@@ -5286,6 +5656,7 @@ impl<'a> Styler<'a> {
                 }
                 ResolveWork::PropTail { name, fallback } => {
                     let child = results.pop().unwrap_or(ResolveResult::Single(None));
+                    let child_tree = trees.pop().unwrap_or(TreeFrag::Val(none_tree()));
                     active.remove(&name);
                     // Memoize the custom property's own substituted value
                     // (before fallback): a cyclic/invalid property stays
@@ -5295,16 +5666,18 @@ impl<'a> Styler<'a> {
                     // same node still splices it correctly.
                     match child {
                         ResolveResult::Slash(slashed) => {
-                            // The `Rc` moves into the memo entry: no clone
-                            // of the group `Vec`s, and the result keeps
-                            // the original.
+                            // The `Rc`s move into the memo entry: no clone
+                            // of the group `Vec`s or the tree, and the
+                            // result keeps the originals.
+                            let tree = frag_to_value_tree(child_tree);
                             self.var_memo_insert(
                                 node,
                                 name,
                                 preserve_case,
-                                MemoVar::Slash(Rc::clone(&slashed)),
+                                MemoVar::Slash(Rc::clone(&slashed), Rc::clone(&tree)),
                             );
                             results.push(ResolveResult::Slash(slashed));
+                            trees.push(TreeFrag::Val(tree));
                         }
                         // A comma-separated substitution keeps its groups
                         // (see [`ResolveResult::Comma`]) so a later
@@ -5312,13 +5685,15 @@ impl<'a> Styler<'a> {
                         // correctly whether standalone or in a list.
                         ResolveResult::Comma(groups) => {
                             if groups.is_some() {
+                                let tree = frag_to_value_tree(child_tree);
                                 self.var_memo_insert(
                                     node,
                                     name,
                                     preserve_case,
-                                    MemoVar::Comma(Rc::clone(&groups)),
+                                    MemoVar::Comma(Rc::clone(&groups), Rc::clone(&tree)),
                                 );
                                 results.push(ResolveResult::Comma(groups));
+                                trees.push(TreeFrag::Val(tree));
                             } else {
                                 match fallback {
                                     Some(f) => {
@@ -5336,11 +5711,24 @@ impl<'a> Styler<'a> {
                             // consumers of one owned value. (The
                             // slash/comma payloads above are `Rc`-shared,
                             // so cloning a memo entry is a pointer bump.)
+                            // The tree follows the value, not the
+                            // result shape: a list-valued substitution
+                            // memoizes the list's own tree, and the
+                            // splice below reuses its item fragments.
+                            let tree_val = match &child_tree {
+                                TreeFrag::Val(t) if matches!(t.as_ref(), ProvTree::List(..)) => {
+                                    Rc::clone(t)
+                                }
+                                TreeFrag::Seq(items) => {
+                                    Rc::new(ProvTree::List(ProvKind::Space, items.clone()))
+                                }
+                                _ => frag_to_value_tree(child_tree),
+                            };
                             self.var_memo_insert(
                                 node,
                                 name,
                                 preserve_case,
-                                MemoVar::Value(child.clone()),
+                                MemoVar::Value(child.clone(), Rc::clone(&tree_val)),
                             );
                             match child {
                                 // A list-valued substitution splices token-wise
@@ -5350,9 +5738,14 @@ impl<'a> Styler<'a> {
                                 // `/`-separated `border-radius` groups) never pass
                                 // through here, so their nesting is preserved.
                                 Some(CssValue::List(items)) => {
-                                    results.push(ResolveResult::Splice(Some(items)))
+                                    let frags = value_item_frags(&tree_val);
+                                    results.push(ResolveResult::Splice(Some(items)));
+                                    trees.push(TreeFrag::Seq(frags));
                                 }
-                                Some(v) => results.push(ResolveResult::Single(Some(v))),
+                                Some(v) => {
+                                    results.push(ResolveResult::Single(Some(v)));
+                                    trees.push(TreeFrag::Val(tree_val));
+                                }
                                 None => match fallback {
                                     Some(f) => {
                                         work.push(ResolveWork::FallbackTail);
@@ -5364,19 +5757,25 @@ impl<'a> Styler<'a> {
                         }
                     }
                 }
-                ResolveWork::ListTail(n) => {
-                    combine_list_tail(&mut results, n, |items, slash| match slash {
+                ResolveWork::ListTail(n) => combine_list_tail(
+                    &mut results,
+                    &mut trees,
+                    n,
+                    true,
+                    |items, slash| match slash {
                         Some((before, after)) => {
                             CssValue::List(vec![CssValue::List(before), CssValue::List(after)])
                         }
                         None => CssValue::List(items),
-                    })
-                }
+                    },
+                ),
                 ResolveWork::RepeatTail { mode, n } => {
                     // Same combination rules as a list (see
                     // `combine_list_tail`), but the result keeps the
-                    // dedicated `repeat()` descriptor shape.
-                    combine_list_tail(&mut results, n, |items, slash| {
+                    // dedicated `repeat()` descriptor shape, and its
+                    // tree is opaque: no background layer walk reads
+                    // a `repeat()` descriptor's tracks.
+                    combine_list_tail(&mut results, &mut trees, n, false, |items, slash| {
                         let tracks = match slash {
                             Some((before, after)) => {
                                 vec![CssValue::List(before), CssValue::List(after)]
@@ -5389,36 +5788,65 @@ impl<'a> Styler<'a> {
                 ResolveWork::SlashTail => {
                     // The `/`-separated sides were pushed as two lists
                     // (before first, so it resolves first); pop them in
-                    // reverse and re-attach the slash marker.
+                    // reverse and re-attach the slash marker. The
+                    // marker node holds the sides' own trees, so a
+                    // comma list on one side keeps its groups under
+                    // the slash instead of flattening into it.
                     let after = results
                         .pop()
                         .map(ResolveResult::into_option)
                         .unwrap_or(None);
+                    let after_tree = trees
+                        .pop()
+                        .map(list_tree_from_frag)
+                        .unwrap_or_else(none_tree);
                     let before = results
                         .pop()
                         .map(ResolveResult::into_option)
                         .unwrap_or(None);
+                    let before_tree = trees
+                        .pop()
+                        .map(list_tree_from_frag)
+                        .unwrap_or_else(none_tree);
                     match (before, after) {
-                        (Some(b), Some(a)) => results.push(ResolveResult::Slash(Rc::new(Some((
-                            as_list(&b),
-                            as_list(&a),
-                        ))))),
-                        _ => results.push(ResolveResult::Slash(Rc::new(None))),
+                        (Some(b), Some(a)) => {
+                            results.push(ResolveResult::Slash(Rc::new(Some((
+                                as_list(&b),
+                                as_list(&a),
+                            )))));
+                            trees.push(TreeFrag::Val(Rc::new(ProvTree::List(
+                                ProvKind::Slash,
+                                vec![before_tree, after_tree],
+                            ))));
+                        }
+                        _ => {
+                            results.push(ResolveResult::Slash(Rc::new(None)));
+                            trees.push(TreeFrag::Val(none_tree()));
+                        }
                     }
                 }
                 ResolveWork::CommaTail(n) => {
                     // The comma groups were pushed as lists in reverse
                     // (so the first resolves first); pop them and keep
-                    // source order.
+                    // source order. Each group's tree is the tree of
+                    // its list value: a slash marker inside a group
+                    // keeps its `Slash` node (it is the group's whole
+                    // value), so a group that is a slash layer does
+                    // not flatten into two comma groups here.
                     let mut groups: Vec<Vec<CssValue>> = Vec::with_capacity(n);
+                    let mut group_trees: Vec<SharedTree> = Vec::with_capacity(n);
                     let mut ok = true;
                     for _ in 0..n {
+                        let frag = trees.pop().unwrap_or(TreeFrag::Val(none_tree()));
                         match results
                             .pop()
                             .map(ResolveResult::into_option)
                             .unwrap_or(None)
                         {
-                            Some(v) => groups.push(as_list(&v).to_vec()),
+                            Some(v) => {
+                                groups.push(as_list(&v).to_vec());
+                                group_trees.push(list_tree_from_frag(frag));
+                            }
                             None => {
                                 ok = false;
                                 break;
@@ -5426,38 +5854,56 @@ impl<'a> Styler<'a> {
                         }
                     }
                     groups.reverse();
-                    results.push(ResolveResult::Comma(Rc::new(if ok {
-                        Some(groups)
+                    group_trees.reverse();
+                    if ok {
+                        results.push(ResolveResult::Comma(Rc::new(Some(groups))));
+                        trees.push(TreeFrag::Val(Rc::new(ProvTree::List(
+                            ProvKind::Comma,
+                            group_trees,
+                        ))));
                     } else {
-                        None
-                    })));
+                        results.push(ResolveResult::Comma(Rc::new(None)));
+                        trees.push(TreeFrag::Val(none_tree()));
+                    }
                 }
-                ResolveWork::PushNone => results.push(ResolveResult::Single(None)),
+                ResolveWork::PushNone => {
+                    results.push(ResolveResult::Single(None));
+                    trees.push(TreeFrag::Val(none_tree()));
+                }
                 ResolveWork::FallbackTail => {
+                    let frag = trees.pop().unwrap_or(TreeFrag::Val(none_tree()));
                     match results.pop().unwrap_or(ResolveResult::Single(None)) {
                         ResolveResult::Single(Some(CssValue::List(items))) => {
-                            results.push(ResolveResult::Splice(Some(items)))
+                            let frags = match frag {
+                                TreeFrag::Val(t) => value_item_frags(&t),
+                                TreeFrag::Seq(items) => items,
+                            };
+                            results.push(ResolveResult::Splice(Some(items)));
+                            trees.push(TreeFrag::Seq(frags));
                         }
-                        other => results.push(other),
+                        other => {
+                            results.push(other);
+                            trees.push(frag);
+                        }
                     }
                 }
             }
         }
         debug_assert_eq!(results.len(), 1, "resolve left stray results");
-        // Read the provenance off the final stack item before
-        // `into_option` erases the slash/comma distinction into the
-        // shared nested-`List` shape.
-        let provenance = match results.last() {
-            Some(ResolveResult::Slash(_)) => TopLevelProvenance::Slash,
-            Some(ResolveResult::Comma(_)) => TopLevelProvenance::Comma,
-            _ => TopLevelProvenance::Neither,
-        };
+        debug_assert_eq!(trees.len(), 1, "resolve left stray trees");
+        // The final stack item's tree is the result's provenance: a
+        // splice re-wraps into a `Space` list, a slash/comma marker
+        // keeps its node, a single value keeps its own tree.
+        let tree = trees
+            .pop()
+            .map(frag_to_value_tree)
+            .unwrap_or_else(none_tree);
         (
             results
                 .pop()
                 .map(ResolveResult::into_option)
                 .unwrap_or(None),
-            provenance,
+            tree,
         )
     }
 }
@@ -7790,15 +8236,19 @@ fn value_contains_var(value: &CssValue) -> bool {
 
 /// Run the parser's expansion for a substituted deferred shorthand,
 /// returning `(longhand, value)` pairs. `important` is already encoded in
-/// the candidate's cascade rank. `provenance` is the top-level
-/// slash/comma provenance of the substituted value (see
-/// [`TopLevelProvenance`]); only the `background` expansion reads it,
-/// to skip its slash-first arm for a proven top-level comma list — every
-/// other expansion keeps its existing shape-based reading unchanged.
+/// the candidate's cascade rank. `tree` is the substituted value's
+/// tree-shaped provenance (see [`ProvTree`]); only the `background`
+/// expansion reads it. That scoping is background-only, not
+/// shorthand-general: `font` and every other deferred shorthand
+/// ignore `tree` and keep their existing shape-based readings
+/// (for `font`, the comma-group heuristics in
+/// [`expand_font_value`]), so a claim that the provenance tree
+/// fixes deferred shorthands as a class would be wrong — it fixes
+/// `background` layer/slash boundaries only.
 fn expand_deferred_shorthand(
     property: &PropertyName,
     value: CssValue,
-    provenance: TopLevelProvenance,
+    tree: &ProvTree,
 ) -> Vec<(PropertyName, CssValue)> {
     // w79: compound logical border shorthands have no `PropertyAtom`
     // (see `is_shorthand_property`); dispatch them by name before the
@@ -7861,12 +8311,16 @@ fn expand_deferred_shorthand(
         | PropertyAtom::BORDER_BOTTOM
         | PropertyAtom::BORDER_LEFT => expand_border_sides(&[property.as_str()], value),
         PropertyAtom::BORDER_RADIUS => expand_border_radius(value),
-        PropertyAtom::BACKGROUND => expand_background(value, provenance),
+        PropertyAtom::BACKGROUND => expand_background(value, tree),
         // w80: the `transition` shorthand expands through the shared
         // value-level expander in `parse.rs` (same shapes as the
         // eager path, after `var()` substitution).
         PropertyAtom::TRANSITION => crate::parse::expand_transition_value(value),
         PropertyAtom::LIST_STYLE => expand_list_style(value),
+        // `font` deliberately ignores `tree`: its comma/slash
+        // readings are shape heuristics in `expand_font_value`,
+        // not provenance-tree readings (background-only scoping —
+        // see the doc comment on this function).
         PropertyAtom::FONT => expand_font_value(&value),
         PropertyAtom::FLEX => expand_flex_value(&value),
         PropertyAtom::GAP | PropertyAtom::GRID_GAP => expand_gap_value(&value),
@@ -7887,7 +8341,14 @@ fn decl(property: &str, value: CssValue) -> (String, CssValue) {
     (property.to_string(), value)
 }
 
-/// Split a value into its whitespace/comma-separated items.
+/// One open `/` split inside [`combine_list_tail`]: the before
+/// items and their tree fragments, then the after items and theirs.
+type SlashSplit = (
+    Vec<CssValue>,
+    Vec<SharedTree>,
+    Vec<CssValue>,
+    Vec<SharedTree>,
+);
 /// Combine the `n` resolved items of one list-like value back into a
 /// single value: the shared combination rules behind
 /// [`ResolveWork::ListTail`] and [`ResolveWork::RepeatTail`]. Results pop
@@ -7904,38 +8365,78 @@ fn decl(property: &str, value: CssValue) -> (String, CssValue) {
 /// shapes.
 fn combine_list_tail(
     results: &mut Vec<ResolveResult>,
+    trees: &mut Vec<TreeFrag>,
     n: usize,
+    build_tree: bool,
     wrap: impl FnOnce(Vec<CssValue>, Option<(Vec<CssValue>, Vec<CssValue>)>) -> CssValue,
 ) {
-    let mut rev: Vec<ResolveResult> = Vec::with_capacity(n);
+    let mut rev: Vec<(ResolveResult, TreeFrag)> = Vec::with_capacity(n);
     let mut ok = true;
     for _ in 0..n {
+        let frag = trees.pop().unwrap_or(TreeFrag::Val(none_tree()));
         match results.pop().unwrap_or(ResolveResult::Single(None)) {
             ResolveResult::Single(None) | ResolveResult::Splice(None) => ok = false,
             // The `Rc` payloads report their own `None`: invalid results
             // were filtered above, so the arms below can unwrap.
             ResolveResult::Slash(s) if s.is_none() => ok = false,
             ResolveResult::Comma(g) if g.is_none() => ok = false,
-            r => rev.push(r),
+            r => rev.push((r, frag)),
         }
     }
     rev.reverse();
     let mut items: Vec<CssValue> = Vec::new();
+    // The tree fragments of `items`, in the same order: a `Comma`
+    // fragment stands for its groups (see [`ProvTree`]), a `Slash`
+    // fragment never lands here (it becomes the `slash` split).
+    let mut item_frags: Vec<SharedTree> = Vec::new();
     // At most one top-level `/` may split the list: siblings before the
     // `var()` join the `before` group, siblings after join the `after`
     // group. A second `/` is invalid at computed-value time.
-    let mut slash: Option<(Vec<CssValue>, Vec<CssValue>)> = None;
-    for r in rev {
+    let mut slash: Option<SlashSplit> = None;
+    // Push one item (value + fragment) onto the current side: the
+    // plain side, or the slash's `after` side once a slash is open.
+    let push_item = |items: &mut Vec<CssValue>,
+                     item_frags: &mut Vec<SharedTree>,
+                     slash: &mut Option<SlashSplit>,
+                     v: CssValue,
+                     frag: SharedTree| {
+        match slash {
+            Some((_, _, after, after_frags)) => {
+                after.push(v);
+                after_frags.push(frag);
+            }
+            None => {
+                items.push(v);
+                item_frags.push(frag);
+            }
+        }
+    };
+    for (r, frag) in rev {
         match r {
-            ResolveResult::Single(Some(v)) => match &mut slash {
-                Some((_, after)) => after.push(v),
-                None => items.push(v),
-            },
-            // Token-wise splice of a substituted list-valued `var()`.
-            ResolveResult::Splice(Some(vs)) => match &mut slash {
-                Some((_, after)) => after.extend(vs),
-                None => items.extend(vs),
-            },
+            ResolveResult::Single(Some(v)) => {
+                let frag = match frag {
+                    TreeFrag::Val(t) => t,
+                    TreeFrag::Seq(items) => frag_to_value_tree(TreeFrag::Seq(items)),
+                };
+                push_item(&mut items, &mut item_frags, &mut slash, v, frag);
+            }
+            // Token-wise splice of a substituted list-valued `var()`:
+            // values and fragments extend together, unzipped — a
+            // fragment may span several values (a `Comma` node spans
+            // its groups), so zipping would truncate the value at
+            // the fragment count and silently drop trailing groups.
+            ResolveResult::Splice(Some(vs)) => {
+                let frags = match frag {
+                    TreeFrag::Seq(items) => items,
+                    TreeFrag::Val(t) => value_item_frags(&t),
+                };
+                let (vals, frag_list) = match &mut slash {
+                    Some((_, _, after, after_frags)) => (after, after_frags),
+                    None => (&mut items, &mut item_frags),
+                };
+                vals.extend(vs);
+                frag_list.extend(frags);
+            }
             ResolveResult::Slash(s) => {
                 // Invalid (`None`) results were filtered above. The
                 // payload may be shared with the `var()` memo: unwrap
@@ -7949,22 +8450,50 @@ fn combine_list_tail(
                     ok = false; // two top-level slashes
                     break;
                 }
+                // The slash marker node's sides are the trees of the
+                // before/after lists; their item fragments join the
+                // enclosing list's sides (a comma list on the before
+                // side contributes its groups as fragments, kept
+                // together by the `Comma` node itself).
+                let (before_frags, after_frags) = match frag {
+                    TreeFrag::Val(t) => match t.as_ref() {
+                        ProvTree::List(ProvKind::Slash, sides) if sides.len() == 2 => {
+                            (value_item_frags(&sides[0]), value_item_frags(&sides[1]))
+                        }
+                        _ => (
+                            vec![leaf_tree(); before.len()],
+                            vec![leaf_tree(); after.len()],
+                        ),
+                    },
+                    TreeFrag::Seq(_) => (
+                        vec![leaf_tree(); before.len()],
+                        vec![leaf_tree(); after.len()],
+                    ),
+                };
                 let mut b = std::mem::take(&mut items);
                 b.extend(before);
-                slash = Some((b, after));
+                let mut b_frags = std::mem::take(&mut item_frags);
+                b_frags.extend(before_frags);
+                slash = Some((b, b_frags, after, after_frags));
             }
             // A comma-separated substitution splices one nested list per
             // group, preserving the group structure for the deferred
             // `font` expansion (every other consumer normalizes back via
-            // [`normalize_comma_groups`]).
+            // [`normalize_comma_groups`]). The tree keeps the `Comma`
+            // node itself as one fragment spanning its groups, so the
+            // enclosing list's items stay tagged: a nested comma group
+            // never becomes indistinguishable from a nested list.
             ResolveResult::Comma(g) => {
                 let Some(groups) = Rc::unwrap_or_clone(g) else {
                     unreachable!("invalid results filtered")
                 };
-                match &mut slash {
-                    Some((_, after)) => after.extend(groups.into_iter().map(CssValue::List)),
-                    None => items.extend(groups.into_iter().map(CssValue::List)),
-                }
+                let comma_tree = frag_to_value_tree(frag);
+                let (vals, frags) = match &mut slash {
+                    Some((_, _, after, after_frags)) => (after, after_frags),
+                    None => (&mut items, &mut item_frags),
+                };
+                vals.extend(groups.into_iter().map(CssValue::List));
+                frags.push(comma_tree);
             }
             // Invalid results were filtered above.
             ResolveResult::Single(None) | ResolveResult::Splice(None) => {
@@ -7972,8 +8501,28 @@ fn combine_list_tail(
             }
         }
     }
-    let value = if ok { Some(wrap(items, slash)) } else { None };
+    let (value, tree) = if !ok {
+        (None, TreeFrag::Val(none_tree()))
+    } else {
+        let slash_values = slash.as_ref().map(|(b, _, a, _)| (b.clone(), a.clone()));
+        let value = Some(wrap(items, slash_values));
+        let tree = if !build_tree {
+            TreeFrag::Val(leaf_tree())
+        } else if let Some((_, b_frags, _, a_frags)) = slash {
+            TreeFrag::Val(Rc::new(ProvTree::List(
+                ProvKind::Slash,
+                vec![
+                    Rc::new(ProvTree::List(ProvKind::Space, b_frags)),
+                    Rc::new(ProvTree::List(ProvKind::Space, a_frags)),
+                ],
+            )))
+        } else {
+            TreeFrag::Val(Rc::new(ProvTree::List(ProvKind::Space, item_frags)))
+        };
+        (value, tree)
+    };
     results.push(ResolveResult::Single(value));
+    trees.push(tree);
 }
 
 fn as_list(value: &CssValue) -> Vec<CssValue> {
@@ -9373,6 +9922,250 @@ fn emit_bg_layers(layers: &[BgLayer]) -> Option<Vec<(String, CssValue)>> {
     ])
 }
 
+/// One background layer in tagged form: plain items, or a
+/// `/`-separated layer whose `after` items are the size group plus
+/// any trailing items ([`classify_bg_slash_layer`] splits them).
+#[derive(Clone)]
+enum BgSpec {
+    Plain(Vec<CssValue>),
+    Slash(Vec<CssValue>, Vec<CssValue>),
+}
+
+fn bg_spec_to_layer(spec: &BgSpec) -> Option<BgLayer> {
+    match spec {
+        BgSpec::Plain(items) => classify_bg_layer(items, None),
+        BgSpec::Slash(before, after) => classify_bg_slash_layer(before, after),
+    }
+}
+
+/// Merge one tagged layer spec into a layer stream under
+/// construction. A plain spec appends to the current layer; a slash
+/// spec appends its before items and attaches its size to it; a
+/// plain spec after a slash layer (a comma boundary) flushes the
+/// slash layer first. A second slash for one layer is not a shape
+/// this walk covers: it returns `None` and the caller falls back
+/// to the heuristic arms.
+fn bg_merge_spec(cur: &mut Option<BgSpec>, out: &mut Vec<BgSpec>, spec: BgSpec) -> Option<()> {
+    match (cur.take(), spec) {
+        (None, spec) => *cur = Some(spec),
+        (Some(BgSpec::Plain(mut items)), BgSpec::Plain(mut more)) => {
+            items.append(&mut more);
+            *cur = Some(BgSpec::Plain(items));
+        }
+        (Some(BgSpec::Plain(mut items)), BgSpec::Slash(mut before, after)) => {
+            items.append(&mut before);
+            *cur = Some(BgSpec::Slash(items, after));
+        }
+        (Some(BgSpec::Slash(before, after)), spec) => {
+            // The current layer already has its slash, so a
+            // following spec starts a new layer (it arrived via a
+            // comma boundary: trailing items after a slash are
+            // scalars, merged by the stream loop, never specs).
+            out.push(BgSpec::Slash(before, after));
+            *cur = Some(spec);
+        }
+    }
+    Some(())
+}
+
+/// Merge a sequence of tagged layer specs into a layer stream:
+/// the first merges into the current layer (it continues it), each
+/// middle spec completes a layer (merge, then flush), and the last
+/// becomes the new current layer (following stream items continue
+/// it). This is the comma semantics: `a, b, c` after a current
+/// layer `x` is `[x+a], [b], [c+...]`, never `[x+a+b+c]`.
+fn bg_merge_specs(
+    cur: &mut Option<BgSpec>,
+    out: &mut Vec<BgSpec>,
+    specs: Vec<BgSpec>,
+) -> Option<()> {
+    let mut specs = specs.into_iter().peekable();
+    while let Some(spec) = specs.next() {
+        bg_merge_spec(cur, out, spec)?;
+        if specs.peek().is_some() {
+            let done = cur.take()?;
+            out.push(done);
+        }
+    }
+    Some(())
+}
+/// `None` means "not a tagged shape this walk covers": the caller
+/// falls back to the heuristic arms, so an uncovered shape behaves
+/// exactly as it did before tags existed. Classification failures
+/// also return `None` here (via [`bg_layers_tagged`]), for the same
+/// reason: the heuristic arms are the behavior of record for them.
+fn bg_collect(value: &CssValue, tree: &ProvTree) -> Option<Vec<BgSpec>> {
+    match (value, tree) {
+        (CssValue::List(items), ProvTree::List(ProvKind::Comma, children)) => {
+            if children.len() != items.len() {
+                return None;
+            }
+            let mut out = Vec::new();
+            for (item, child) in items.iter().zip(children.iter()) {
+                out.extend(bg_collect(item, child.as_ref())?);
+            }
+            Some(out)
+        }
+        (CssValue::List(items), ProvTree::List(ProvKind::Slash, sides)) => {
+            if items.len() != 2 || sides.len() != 2 {
+                return None;
+            }
+            // The slash belongs to the last layer of the before
+            // side (a comma list there yields several layers) and
+            // takes the first layer of the after side as its size
+            // group; any further after layers follow as layers.
+            let mut before = bg_collect(&items[0], sides[0].as_ref())?;
+            let after = bg_collect(&items[1], sides[1].as_ref())?;
+            if before.is_empty() || after.is_empty() {
+                return None;
+            }
+            let (first_after, rest_after) = after.split_first()?;
+            let BgSpec::Plain(after_items) = first_after else {
+                return None;
+            };
+            let last = before.pop()?;
+            let BgSpec::Plain(last_items) = last else {
+                return None;
+            };
+            before.push(BgSpec::Slash(last_items, after_items.clone()));
+            before.extend(rest_after.iter().cloned());
+            Some(before)
+        }
+        (CssValue::List(items), ProvTree::List(ProvKind::Space, children)) => {
+            bg_stream(items, children)
+        }
+        (_, ProvTree::Leaf) => match value {
+            CssValue::List(_) => None,
+            _ => Some(vec![BgSpec::Plain(vec![value.clone()])]),
+        },
+        _ => None,
+    }
+}
+
+/// Collect the layer specs of one space-separated item stream:
+/// scalars append to the current layer, `Comma` fragments split
+/// it (font's [`split_spliced_groups`] semantics, but kind-checked:
+/// only a tagged `Comma` node splits, never a nested list that
+/// merely looks like one), and `Slash` fragments attach a size to
+/// the current layer. Untagged nested lists keep the old mixed-arm
+/// reading: they flush the current layer and read as their own
+/// layer(s), with a two-list slash marker tried first.
+fn bg_stream(items: &[CssValue], children: &[SharedTree]) -> Option<Vec<BgSpec>> {
+    // Author-level wrap (see `parse_background`): every item a
+    // one-item list holding a list. Unwrap one level per item and
+    // read the contents as layers; this shape defeats the
+    // slash-first arm on purpose, and the tags say so (a `Space`
+    // node with one list child), so it is not confused with a
+    // comma group (a `Comma` node) or a slash marker.
+    if !items.is_empty()
+        && items.len() == children.len()
+        && items.iter().zip(children.iter()).all(|(item, child)| {
+            matches!((item, child.as_ref()),
+                (CssValue::List(inner), ProvTree::List(ProvKind::Space, grandchildren))
+                if inner.len() == 1
+                    && matches!(&inner[0], CssValue::List(_))
+                    && grandchildren.len() == 1
+                    && matches!(grandchildren[0].as_ref(), ProvTree::List(..)))
+        })
+    {
+        let mut out = Vec::new();
+        for (item, child) in items.iter().zip(children.iter()) {
+            let CssValue::List(inner) = item else {
+                unreachable!("wrap shape checked")
+            };
+            let ProvTree::List(_, grandchildren) = child.as_ref() else {
+                unreachable!("wrap shape checked")
+            };
+            out.extend(bg_collect(&inner[0], grandchildren[0].as_ref())?);
+        }
+        return Some(out);
+    }
+    let mut out: Vec<BgSpec> = Vec::new();
+    let mut cur: Option<BgSpec> = None;
+    let mut i = 0;
+    for child in children {
+        let span = prov_frag_span(child);
+        let segment = items.get(i..i + span)?;
+        i += span;
+        match child.as_ref() {
+            ProvTree::Leaf => {
+                // A scalar appends to the current layer even after
+                // a slash: those are the trailing items
+                // `classify_bg_slash_layer` allows after the size,
+                // so they belong to the slash's `after` side — not
+                // its `before` side, where a position item would
+                // read as a second position and bypass the "rest
+                // must not contain a position item" validation
+                // (a post-size position is invalid: the position
+                // lives before the slash).
+                let v = segment[0].clone();
+                match &mut cur {
+                    Some(BgSpec::Plain(items)) => items.push(v),
+                    Some(BgSpec::Slash(_, after)) => after.push(v),
+                    None => cur = Some(BgSpec::Plain(vec![v])),
+                }
+            }
+            ProvTree::List(ProvKind::Comma, groups) => {
+                if groups.len() != segment.len() {
+                    return None;
+                }
+                let mut group_specs = Vec::new();
+                for (group_value, group_tree) in segment.iter().zip(groups.iter()) {
+                    group_specs.extend(bg_collect(group_value, group_tree.as_ref())?);
+                }
+                bg_merge_specs(&mut cur, &mut out, group_specs)?;
+            }
+            ProvTree::List(ProvKind::Slash, _) => {
+                let specs = bg_collect(&segment[0], child.as_ref())?;
+                bg_merge_specs(&mut cur, &mut out, specs)?;
+            }
+            ProvTree::List(ProvKind::Space, _) => {
+                if let Some(cur_spec) = cur.take() {
+                    out.push(cur_spec);
+                }
+                // A two-list slash marker reads as a slash layer
+                // when it classifies; otherwise this list reads as
+                // its own layer(s), as the mixed arm did.
+                let mut handled = false;
+                if let CssValue::List(pair) = &segment[0]
+                    && pair.len() == 2
+                    && let (CssValue::List(before), CssValue::List(after)) = (&pair[0], &pair[1])
+                    && classify_bg_slash_layer(before, after).is_some()
+                {
+                    out.push(BgSpec::Slash(before.clone(), after.clone()));
+                    handled = true;
+                }
+                if !handled {
+                    out.extend(bg_collect(&segment[0], child.as_ref())?);
+                }
+            }
+            ProvTree::None => return None,
+        }
+    }
+    if i != items.len() {
+        return None;
+    }
+    if let Some(cur_spec) = cur.take() {
+        out.push(cur_spec);
+    }
+    Some(out)
+}
+
+/// Read `background` layers off the provenance tree. `None` means
+/// the value is untagged or the walk does not cover its shape, and
+/// the caller falls back to the heuristic arms; a `Some` result is
+/// fully classified, so it is authoritative.
+fn bg_layers_tagged(value: &CssValue, tree: &ProvTree) -> Option<Vec<BgLayer>> {
+    if matches!(tree, ProvTree::None) {
+        return None;
+    }
+    let specs = bg_collect(value, tree)?;
+    if specs.is_empty() {
+        return None;
+    }
+    specs.iter().map(bg_spec_to_layer).collect()
+}
+
 /// Expand `background` after `var()` substitution (the cascade-side
 /// twin of parse.rs's `expand_background`): `<bg-layer>#` with a
 /// final-layer `<color>`, each layer
@@ -9386,13 +10179,18 @@ fn emit_bg_layers(layers: &[BgLayer]) -> Option<Vec<(String, CssValue)>> {
 /// one layer; `List([List(before), List(after)])` is the `/` marker
 /// (position/size split); a list of lists is the layer list from a
 /// substituted comma-separated value. The `/` marker and a
-/// two-layer list share the two-nested-list shape, so the slash
-/// reading is tried first (like `expand_font_value`) — except when
-/// `provenance` proves the whole substituted value was a top-level
-/// comma list, in which case the slash arm is skipped and the value
-/// reads as layers straight away. A top-level slash keeps the
-/// slash-first behavior, and `Neither` (no top-level slash/comma
-/// substitution, e.g. a direct call) keeps the historical order.
+/// two-layer list share the two-nested-list shape, so the
+/// shape-based arms below try the slash reading first (like
+/// `expand_font_value`) — except when the tree's root is a comma
+/// node, in which case the slash arm is skipped and the value
+/// reads as layers straight away. Those arms are the fallback:
+/// when the value carries a full provenance tree, the tagged walk
+/// ([`bg_layers_tagged`]) runs first and reads layer boundaries
+/// and slash splits off the tags, including a slash/comma spliced
+/// inside an enclosing list (w81fix), which no shape can tell apart
+/// from a nested list on its own. An untagged value (a direct call,
+/// a parse-side value, a token-level substitution site) keeps the
+/// historical arm order.
 ///
 /// Formerly KNOWN-WRONG (w79fix 2, pinned by
 /// `w79fix_background_slash_vs_two_layers_known_wrong`, now fixed
@@ -9405,12 +10203,11 @@ fn emit_bg_layers(layers: &[BgLayer]) -> Option<Vec<(String, CssValue)>> {
 /// distinguished differently: the parser wraps each layer once
 /// more (see `parse_background`), so the wrapped shape always
 /// defeats the slash-first arm and the layer-list arm below
-/// unwraps it. Mixed cases (a slash/comma spliced inside an
-/// enclosing list, rather than at the author level) still share
-/// shapes at this level and remain out of scope: they need
-/// tree-shaped provenance (see [`TopLevelProvenance`]).
+/// unwraps it. A slash/comma spliced inside an enclosing list is
+/// now read off the provenance tree (see [`ProvTree`]) instead of
+/// the shape.
 /// A lone CSS-wide keyword expands per longhand, like `expand_box`.
-fn expand_background(value: CssValue, provenance: TopLevelProvenance) -> Vec<(String, CssValue)> {
+fn expand_background(value: CssValue, tree: &ProvTree) -> Vec<(String, CssValue)> {
     let items = as_list(&value);
     if items.len() == 1 && is_css_wide_keyword(&items[0]) {
         let kw = items[0].clone();
@@ -9428,10 +10225,21 @@ fn expand_background(value: CssValue, provenance: TopLevelProvenance) -> Vec<(St
         .map(|p| decl(p, kw.clone()))
         .collect();
     }
+    // Tagged walk first: when substitution tagged every list node,
+    // layer boundaries and slash splits read off the tags, not the
+    // shape — including a comma group spliced inside an enclosing
+    // list, which the heuristic arms below cannot see. A `None`
+    // result (untagged value, or a tagged shape this walk does not
+    // cover) falls through to those arms, which stay as the
+    // fallback for direct calls, parse-side values, and
+    // token-level substitution sites.
+    if let Some(layers) = bg_layers_tagged(&value, tree) {
+        return emit_bg_layers(&layers).unwrap_or_default();
+    }
     // `/` marker: exactly two nested lists, second group a size.
     // Skipped for a proven top-level comma list: there the two
     // nested lists are layers, not a position/size split.
-    if provenance != TopLevelProvenance::Comma
+    if !matches!(tree, ProvTree::List(ProvKind::Comma, _))
         && let CssValue::List(groups) = &value
         && groups.len() == 2
         && let (CssValue::List(before), CssValue::List(after)) = (&groups[0], &groups[1])
@@ -13983,6 +14791,110 @@ mod tests {
     }
 
     #[test]
+    fn flex_shorthand_computed_serialization_cases() {
+        // w81fn probe pin: the longhands below are exactly what the
+        // computed `flex` shorthand serializes from (CSSOM: a
+        // shorthand serializes from its longhands, never from a
+        // stored value), so these pins are the serialization pins
+        // at the cascade level. Per CSS Flexbox 1 §7.1, `flex: none`
+        // computes to `0 0 auto`, `flex: auto` to `1 1 auto`,
+        // `flex: initial` to `0 1 auto`, and `flex: 1` to `1 1 0%`.
+        // The computed shorthand therefore reads `0 0 auto` for
+        // `flex: none`, never `none`: collapsing `0 0 auto` back
+        // to `none` would misreport a longhand-authored
+        // `flex: 0 0 auto` set, which has identical longhands (see
+        // the `explicit` case). Verified end-to-end by a temporary
+        // parse-shim probe (since removed): getComputedStyle read
+        // `0 0 auto` / `1 1 0%` / `1 1 auto` / `0 1 auto` for
+        // none / 1 / auto / initial, matching the Chromium
+        // flex-longhand-parsing expectation that `style.flex =
+        // 'none'` and getComputedStyle both read `0 0 auto`.
+        //
+        // SCOPE LIMIT (w81fix): this crate cannot reach the actual
+        // synthesized string. `flex` occupies no computed slot (it
+        // is shorthand-only) and `bowser_css` has no value
+        // serializer; the string is built by
+        // `synthesize_flex_shorthand` in `bowser_js`'s bindings,
+        // which joins the three longhand serializations with
+        // spaces. The assertions below therefore pin, in addition
+        // to the longhand values, the exact joined string that
+        // synthesis consumes for each case — serialized here with
+        // the same rules (`Number` as `{n}`, `Percentage` as
+        // `{n}%`, keyword as-is). A collapse inside
+        // `synthesize_flex_shorthand` itself would still pass this
+        // test, so a `getComputedStyle(el).flex` assertion for
+        // stylesheet-authored `none` / `1` / `auto` / `initial`
+        // was a round-3 item — now landed as
+        // `get_computed_style_flex_shorthand_keyword_cases` in
+        // `bowser_js`'s bindings, which reads the actual
+        // synthesized string through the production
+        // `getComputedStyle` surface for exactly these four cases.
+        let (doc, div, _) = sample();
+        let synthesized = |s: &ComputedStyle| -> String {
+            let part = |v: &CssValue| match v {
+                CssValue::Number(n) => format!("{n}"),
+                CssValue::Percentage(n) => format!("{n}%"),
+                CssValue::Keyword(k) => k.to_string(),
+                other => panic!("unexpected flex longhand {other:?}"),
+            };
+            format!(
+                "{} {} {}",
+                part(s.get("flex-grow").expect("flex-grow")),
+                part(s.get("flex-shrink").expect("flex-shrink")),
+                part(s.get("flex-basis").expect("flex-basis")),
+            )
+        };
+        let check = |css: &str, grow: f32, shrink: f32, basis: &CssValue, joined: &str| {
+            let s = style(&doc, div, css, &vp());
+            assert_eq!(s.get("flex-grow"), Some(&CssValue::Number(grow)), "{css}");
+            assert_eq!(
+                s.get("flex-shrink"),
+                Some(&CssValue::Number(shrink)),
+                "{css}"
+            );
+            assert_eq!(s.get("flex-basis"), Some(basis), "{css}");
+            assert_eq!(synthesized(&s), joined, "{css}");
+        };
+        check(
+            "div { flex: none; }",
+            0.0,
+            0.0,
+            &CssValue::Keyword("auto".into()),
+            "0 0 auto",
+        );
+        check(
+            "div { flex: 1; }",
+            1.0,
+            1.0,
+            &CssValue::Percentage(0.0),
+            "1 1 0%",
+        );
+        check(
+            "div { flex: auto; }",
+            1.0,
+            1.0,
+            &CssValue::Keyword("auto".into()),
+            "1 1 auto",
+        );
+        // Longhand-authored, identical to `flex: none`: the
+        // synthesized string is the same `0 0 auto`, never `none`.
+        check(
+            "div { flex: 0 0 auto; }",
+            0.0,
+            0.0,
+            &CssValue::Keyword("auto".into()),
+            "0 0 auto",
+        );
+        check(
+            "div { flex: initial; }",
+            0.0,
+            1.0,
+            &CssValue::Keyword("auto".into()),
+            "0 1 auto",
+        );
+    }
+
+    #[test]
     fn flex_shorthand_intrinsic_basis_keywords() {
         let (doc, div, _) = sample();
         // Deferred path: `var()` in the shorthand is substituted by the
@@ -15049,6 +15961,327 @@ mod tests {
     }
 
     #[test]
+    fn w81fix_background_nested_var_comma_in_list() {
+        // w81fix: a comma-valued `var()` used as one component of a
+        // larger list must keep its comma boundaries. Token-wise,
+        // `--layer: url(a.png) var(--pos)` with `--pos: center, 50%`
+        // is `url(a.png) center, 50%`: two layers (image+center,
+        // then a position-only layer), not three layers with the
+        // image detached from its position (the base behavior: the
+        // comma groups flattened into one mixed list and the mixed
+        // arm read each item as its own layer).
+        let (doc, div, _) = sample();
+        let s = style(
+            &doc,
+            div,
+            "div { --pos: center, 50%; --layer: url(a.png) var(--pos); background: var(--layer); }",
+            &vp(),
+        );
+        assert_eq!(
+            s.get("background-image"),
+            Some(&CssValue::List(vec![
+                CssValue::List(vec![CssValue::Url("a.png".into())]),
+                CssValue::List(vec![kw("none")]),
+            ]))
+        );
+        assert_eq!(
+            s.get("background-position"),
+            Some(&CssValue::List(vec![
+                CssValue::List(vec![kw("center")]),
+                CssValue::List(vec![CssValue::Percentage(50.0)]),
+            ]))
+        );
+        assert_eq!(
+            s.get("background-size"),
+            Some(&CssValue::List(vec![
+                CssValue::List(vec![CssValue::List(vec![kw("auto"), kw("auto")])]),
+                CssValue::List(vec![CssValue::List(vec![kw("auto"), kw("auto")])]),
+            ]))
+        );
+    }
+
+    #[test]
+    fn w81fix_background_nested_var_slash_in_comma_layer() {
+        // w81fix: a genuine slash layer inside a comma list stays
+        // one layer. `--layer: url(a.png) var(--s), red` with
+        // `--s: center/50%` is two layers (the slash layer, then
+        // the color layer), not three. Its resolved value is
+        // byte-identical to the comma-groups case below, so only
+        // provenance tags can tell them apart.
+        let (doc, div, _) = sample();
+        let s = style(
+            &doc,
+            div,
+            "div { --s: center/50%; --layer: url(a.png) var(--s), red; background: var(--layer); }",
+            &vp(),
+        );
+        assert_eq!(
+            s.get("background-image"),
+            Some(&CssValue::List(vec![
+                CssValue::List(vec![CssValue::Url("a.png".into())]),
+                CssValue::List(vec![kw("none")]),
+            ]))
+        );
+        assert_eq!(
+            s.get("background-position"),
+            Some(&CssValue::List(vec![
+                CssValue::List(vec![kw("center")]),
+                CssValue::List(vec![CssValue::List(vec![
+                    CssValue::Percentage(0.0),
+                    CssValue::Percentage(0.0),
+                ])]),
+            ]))
+        );
+        assert_eq!(
+            s.get("background-size"),
+            Some(&CssValue::List(vec![
+                CssValue::List(vec![CssValue::Percentage(50.0)]),
+                CssValue::List(vec![CssValue::List(vec![kw("auto"), kw("auto")])]),
+            ]))
+        );
+        assert_eq!(
+            s.get("background-color"),
+            Some(&CssValue::NamedColor {
+                color: Color {
+                    r: 255,
+                    g: 0,
+                    b: 0,
+                    a: 255
+                },
+                keyword: "red".into()
+            })
+        );
+    }
+
+    #[test]
+    fn w81fix_background_nested_var_comma_slash_coincidence() {
+        // w81fix: the coincidence twin of the slash test above.
+        // `--layer: var(--p), red` with `--p: url(a.png) center, 50%`
+        // resolves to the exact same value shape as the slash case
+        // (`List[List[List[Url, center], List[50%]], List[red]]`),
+        // but is THREE layers (url+center, 50%, red), not two: the
+        // inner `[List, List]` node is two comma groups, not a
+        // position/size split. A shape heuristic or a splitter that
+        // treats every nested list as one kind of boundary gets
+        // exactly one of the two cases wrong; only the tag on the
+        // inner node distinguishes them.
+        let (doc, div, _) = sample();
+        let s = style(
+            &doc,
+            div,
+            "div { --p: url(a.png) center, 50%; --layer: var(--p), red; background: var(--layer); }",
+            &vp(),
+        );
+        assert_eq!(
+            s.get("background-image"),
+            Some(&CssValue::List(vec![
+                CssValue::List(vec![CssValue::Url("a.png".into())]),
+                CssValue::List(vec![kw("none")]),
+                CssValue::List(vec![kw("none")]),
+            ]))
+        );
+        assert_eq!(
+            s.get("background-position"),
+            Some(&CssValue::List(vec![
+                CssValue::List(vec![kw("center")]),
+                CssValue::List(vec![CssValue::Percentage(50.0)]),
+                CssValue::List(vec![CssValue::List(vec![
+                    CssValue::Percentage(0.0),
+                    CssValue::Percentage(0.0),
+                ])]),
+            ]))
+        );
+        assert_eq!(
+            s.get("background-size"),
+            Some(&CssValue::List(vec![
+                CssValue::List(vec![CssValue::List(vec![kw("auto"), kw("auto")])]),
+                CssValue::List(vec![CssValue::List(vec![kw("auto"), kw("auto")])]),
+                CssValue::List(vec![CssValue::List(vec![kw("auto"), kw("auto")])]),
+            ]))
+        );
+        assert_eq!(
+            s.get("background-color"),
+            Some(&CssValue::NamedColor {
+                color: Color {
+                    r: 255,
+                    g: 0,
+                    b: 0,
+                    a: 255
+                },
+                keyword: "red".into()
+            })
+        );
+    }
+
+    #[test]
+    fn w81fix_background_nested_var_comma_in_slash_side() {
+        // w81fix: a comma list on the before side of a slash: the
+        // slash belongs to the LAST comma group only. Token-wise,
+        // `var(--pos) / cover` with `--pos: url(a.png) center, 50%`
+        // is `url(a.png) center, 50% / cover`: layer 1 at its
+        // initial size, layer 2 positioned `50%` with size `cover`.
+        let (doc, div, _) = sample();
+        let s = style(
+            &doc,
+            div,
+            "div { --pos: url(a.png) center, 50%; --layer: var(--pos) / cover; background: var(--layer); }",
+            &vp(),
+        );
+        assert_eq!(
+            s.get("background-image"),
+            Some(&CssValue::List(vec![
+                CssValue::List(vec![CssValue::Url("a.png".into())]),
+                CssValue::List(vec![kw("none")]),
+            ]))
+        );
+        assert_eq!(
+            s.get("background-position"),
+            Some(&CssValue::List(vec![
+                CssValue::List(vec![kw("center")]),
+                CssValue::List(vec![CssValue::Percentage(50.0)]),
+            ]))
+        );
+        assert_eq!(
+            s.get("background-size"),
+            Some(&CssValue::List(vec![
+                CssValue::List(vec![CssValue::List(vec![kw("auto"), kw("auto")])]),
+                CssValue::List(vec![kw("cover")]),
+            ]))
+        );
+    }
+
+    #[test]
+    fn w81fix_background_nested_var_memo_plain_splice() {
+        // w81fix: the memo-splice companion of the memo test above.
+        // A plain (comma-free) list-valued `var()` used twice on one
+        // node splices on the memo hit exactly like the cold path;
+        // before the fix the second use nested as one list item,
+        // so `var(--layer), var(--layer)` merged into one layer
+        // instead of two.
+        let (doc, div, _) = sample();
+        let s = style(
+            &doc,
+            div,
+            "div { --layer: url(a.png) center; background: var(--layer), var(--layer); }",
+            &vp(),
+        );
+        assert_eq!(
+            s.get("background-image"),
+            Some(&CssValue::List(vec![
+                CssValue::List(vec![CssValue::Url("a.png".into())]),
+                CssValue::List(vec![CssValue::Url("a.png".into())]),
+            ]))
+        );
+    }
+
+    #[test]
+    fn w81fix_background_nested_var_comma_in_wrapped_layer() {
+        // w81fix: the section-2 value as one author-level wrapped
+        // layer (cold path, no memo involved): the wrapped layer's
+        // inner comma list still splits into two layers, plus the
+        // following literal layer. This is the shape that caught
+        // the splice zip-truncation during development: the second
+        // comma group was dropped from the value while the tree
+        // still claimed it.
+        let (doc, div, _) = sample();
+        let s = style(
+            &doc,
+            div,
+            "div { --pos: center, 50%; --layer: url(a.png) var(--pos); background: var(--layer), url(b.png); }",
+            &vp(),
+        );
+        assert_eq!(
+            s.get("background-image"),
+            Some(&CssValue::List(vec![
+                CssValue::List(vec![CssValue::Url("a.png".into())]),
+                CssValue::List(vec![kw("none")]),
+                CssValue::List(vec![CssValue::Url("b.png".into())]),
+            ]))
+        );
+    }
+
+    #[test]
+    fn w81fix_background_nested_var_memo_tagged() {
+        // w81fix: the section-2 value used twice on one node, the
+        // second time through the `var()` memo, expands identically
+        // to the first. Token-wise `var(--layer), var(--layer)` is
+        // four layers: each `--layer` contributes its two comma
+        // layers. The memo path used to return the stored list as
+        // one nested item instead of splicing it (the cold path
+        // splices), which both changed the value shape and dropped
+        // the comma tag on second use.
+        let (doc, div, _) = sample();
+        let s = style(
+            &doc,
+            div,
+            "div { --pos: center, 50%; --layer: url(a.png) var(--pos); background: var(--layer), var(--layer); }",
+            &vp(),
+        );
+        assert_eq!(
+            s.get("background-image"),
+            Some(&CssValue::List(vec![
+                CssValue::List(vec![CssValue::Url("a.png".into())]),
+                CssValue::List(vec![kw("none")]),
+                CssValue::List(vec![CssValue::Url("a.png".into())]),
+                CssValue::List(vec![kw("none")]),
+            ]))
+        );
+        assert_eq!(
+            s.get("background-position"),
+            Some(&CssValue::List(vec![
+                CssValue::List(vec![kw("center")]),
+                CssValue::List(vec![CssValue::Percentage(50.0)]),
+                CssValue::List(vec![kw("center")]),
+                CssValue::List(vec![CssValue::Percentage(50.0)]),
+            ]))
+        );
+    }
+
+    #[test]
+    fn w81fix_background_stream_post_slash_position_item_rejected() {
+        // w81fix: `bg_stream`'s Leaf arm used to push post-slash
+        // scalars into the slash spec's `before` vector, so a
+        // position item after the size read as a second position
+        // and the layer classified instead of being rejected by
+        // `classify_bg_slash_layer`'s "rest must not contain a
+        // position item" check. Post-slash scalars belong to the
+        // `after` side. Built directly on `bg_layers_tagged` with
+        // a hand-made provenance tree: a Space stream holding a
+        // `url(a.png) center / cover` slash marker followed by one
+        // trailing scalar (the shape a `var()`-spliced slash marker
+        // plus a trailing item produces in an enclosing list).
+        let slash_marker = CssValue::List(vec![
+            CssValue::List(vec![CssValue::Url("a.png".into()), kw("center")]),
+            CssValue::List(vec![kw("cover")]),
+        ]);
+        let slash_tree = Rc::new(ProvTree::List(
+            ProvKind::Slash,
+            vec![
+                Rc::new(ProvTree::List(
+                    ProvKind::Space,
+                    vec![leaf_tree(), leaf_tree()],
+                )),
+                Rc::new(ProvTree::List(ProvKind::Space, vec![leaf_tree()])),
+            ],
+        ));
+        let tagged = |trailing: CssValue| {
+            let value = CssValue::List(vec![slash_marker.clone(), trailing]);
+            let tree = ProvTree::List(ProvKind::Space, vec![Rc::clone(&slash_tree), leaf_tree()]);
+            bg_layers_tagged(&value, &tree)
+        };
+        // A position item after the size invalidates the layer
+        // (`BgLayer` has no `Debug`, so assert via `is_none`).
+        assert!(tagged(kw("left")).is_none());
+        // A non-position trailing item still classifies: size
+        // `cover`, position `center`, repeat `no-repeat`.
+        let layers = tagged(kw("no-repeat")).expect("trailing repeat classifies");
+        assert_eq!(layers.len(), 1);
+        assert_eq!(layers[0].position, vec![kw("center")]);
+        assert_eq!(layers[0].size, Some(kw("cover")));
+        assert_eq!(layers[0].repeat, vec![kw("no-repeat")]);
+    }
+
+    #[test]
     fn w79fix_background_calc_position_and_size() {
         // w79fix 3: `calc()` is a valid `<length-percentage>` for
         // both position and size, on the direct and `var()` paths.
@@ -15380,7 +16613,7 @@ mod tests {
         let pairs = expand_deferred_shorthand(
             &PropertyName::from("border-block"),
             CssValue::Keyword("inherit".into()),
-            TopLevelProvenance::Neither,
+            &ProvTree::None,
         );
         assert_eq!(pairs.len(), 6);
         assert!(
@@ -21935,6 +23168,414 @@ mod tests {
         assert_eq!(styler.style_for(closed).get_str("overlay"), Some("none"));
     }
 
+    // w81 phase 2, rescoped w81fix F-H1 to Chromium: dialog UA
+    // rules and the `:open` / `:modal` pseudo-classes through
+    // the real cascade. A closed dialog is `display: none`; an
+    // open non-modal dialog is block and ABSOLUTE with inline
+    // insets 0 (horizontally centered, vertically at its static
+    // position, scrolling with its containing block) — NOT
+    // fixed and NOT viewport-centered, which the pre-fix test
+    // wrongly pinned. Only a `:modal` dialog is fixed with
+    // block insets 0 and viewport-centered, and only it gets
+    // the UA `overlay: auto !important` rule: popovers DO have
+    // an explicit UA `overlay: auto !important` rule for
+    // `:popover-open`, so the old comment claiming a modal
+    // dialog with no author rule would compute `none` like a
+    // popover without its rule was backwards — the modal rule
+    // exists precisely so no author rule is needed. The
+    // pseudo-classes themselves are exercised through the
+    // production selector engine (`matches`), not just the
+    // DOM mini-selector.
+    #[test]
+    fn dialog_ua_rules_and_open_modal_pseudos() {
+        let mut doc = Document::new();
+        let root = doc.root();
+        let html = doc.create_element("html");
+        doc.append_child(root, html);
+        let body = doc.create_element("body");
+        doc.append_child(html, body);
+        let closed = doc.create_element("dialog");
+        doc.append_child(body, closed);
+        let non_modal = doc.create_element("dialog");
+        doc.append_child(body, non_modal);
+        doc.show_dialog(non_modal).unwrap();
+        let modal = doc.create_element("dialog");
+        doc.append_child(body, modal);
+        doc.show_dialog_modal(modal).unwrap();
+        // An author `overlay: auto` rule, like the popover
+        // overlay test's: it must lose to the UA `!important`
+        // `none` rule for closed and non-modal dialogs, and win
+        // for the modal dialog via the top-layer exemption plus
+        // the UA `:modal` rule below.
+        let author = parse_stylesheet("dialog { overlay: auto; }");
+        let ua_sheet = ua();
+        let author_refs = [&author];
+        let styler = Styler::new(&doc, &author_refs, &ua_sheet, vp());
+        assert_eq!(styler.style_for(closed).get_str("display"), Some("none"));
+        assert_eq!(styler.style_for(closed).get_str("overlay"), Some("none"));
+        assert_eq!(
+            styler.style_for(non_modal).get_str("display"),
+            Some("block")
+        );
+        // Non-modal: absolute, inline insets 0, block insets
+        // auto (static vertical position), fit-content sizes.
+        let non_modal_style = styler.style_for(non_modal);
+        assert_eq!(non_modal_style.get_str("position"), Some("absolute"));
+        assert_eq!(
+            non_modal_style.get("left"),
+            Some(&CssValue::Length(0.0, LengthUnit::Px))
+        );
+        assert_eq!(
+            non_modal_style.get("right"),
+            Some(&CssValue::Length(0.0, LengthUnit::Px))
+        );
+        assert_eq!(non_modal_style.get("top"), Some(&kw("auto")));
+        assert_eq!(non_modal_style.get("bottom"), Some(&kw("auto")));
+        assert_eq!(non_modal_style.get_str("width"), Some("fit-content"));
+        assert_eq!(non_modal_style.get_str("height"), Some("fit-content"));
+        assert_eq!(non_modal_style.get_str("margin-left"), Some("auto"));
+        assert_eq!(non_modal_style.get_str("margin-right"), Some("auto"));
+        assert_eq!(non_modal_style.get_str("overlay"), Some("none"));
+        // Modal: fixed, all four insets 0 (base inline insets
+        // plus the `:modal` block insets), Chromium max-size cap.
+        let modal_style = styler.style_for(modal);
+        assert_eq!(modal_style.get_str("display"), Some("block"));
+        assert_eq!(modal_style.get_str("position"), Some("fixed"));
+        assert_eq!(
+            modal_style.get("top"),
+            Some(&CssValue::Length(0.0, LengthUnit::Px))
+        );
+        assert_eq!(
+            modal_style.get("bottom"),
+            Some(&CssValue::Length(0.0, LengthUnit::Px))
+        );
+        assert_eq!(
+            modal_style.get("left"),
+            Some(&CssValue::Length(0.0, LengthUnit::Px))
+        );
+        assert_eq!(
+            modal_style.get("right"),
+            Some(&CssValue::Length(0.0, LengthUnit::Px))
+        );
+        assert_eq!(modal_style.get_str("overlay"), Some("auto"));
+        // Exact folded cap, not just "some negative offset":
+        // the modal dialog carries no author or UA font-size rule
+        // in this test, so its font is the 16px default and
+        // `calc(100% - 2em - 6px)` folds to pct 100.0, px -38.0
+        // (2 * 16 + 6). A `calc(100% - 1px)` string would fold to
+        // px -1.0 and must not pass.
+        assert!(
+            matches!(
+                modal_style.get("max-width"),
+                Some(CssValue::MathDeferred { pct, px, .. })
+                    if *pct == 100.0 && *px == -38.0
+            ),
+            "modal max-width must be the calc(100% - 2em - 6px) cap, got {:?}",
+            modal_style.get("max-width")
+        );
+        assert!(
+            matches!(
+                modal_style.get("max-height"),
+                Some(CssValue::MathDeferred { pct, px, .. })
+                    if *pct == 100.0 && *px == -38.0
+            ),
+            "modal max-height must be the calc(100% - 2em - 6px) cap, got {:?}",
+            modal_style.get("max-height")
+        );
+        // Non-modal keeps the `none` max-size initials.
+        assert_eq!(non_modal_style.get_str("max-width"), Some("none"));
+        assert_eq!(non_modal_style.get_str("max-height"), Some("none"));
+        // Modal computes `overlay: auto` with NO author overlay
+        // rule at all — the UA `dialog:modal` rule supplies it.
+        let no_author = parse_stylesheet("");
+        let no_author_refs = [&no_author];
+        let no_author_styler = Styler::new(&doc, &no_author_refs, &ua_sheet, vp());
+        assert_eq!(
+            no_author_styler.style_for(modal).get_str("overlay"),
+            Some("auto")
+        );
+        assert_eq!(
+            no_author_styler.style_for(non_modal).get_str("overlay"),
+            Some("none")
+        );
+        // Backdrop dim is modal-only: the modal backdrop dims,
+        // the non-modal backdrop query reads transparent.
+        let modal_backdrop = no_author_styler
+            .pseudo_style_for(modal, "backdrop", BACKDROP_ATOMS)
+            .expect("modal ::backdrop style");
+        assert_eq!(
+            modal_backdrop.get("background-color"),
+            Some(&CssValue::Color(crate::value::Color {
+                r: 0,
+                g: 0,
+                b: 0,
+                a: 26
+            }))
+        );
+        let non_modal_backdrop = no_author_styler
+            .pseudo_style_for(non_modal, "backdrop", BACKDROP_ATOMS)
+            .expect("non-modal ::backdrop style");
+        assert_eq!(
+            non_modal_backdrop.get("background-color"),
+            Some(&CssValue::Color(crate::value::Color {
+                r: 0,
+                g: 0,
+                b: 0,
+                a: 0
+            }))
+        );
+        // Production selector engine: `:open` / `:modal`.
+        let sel_open = crate::selector::parse_selector_list(":open")
+            .expect("parse :open")
+            .into_iter()
+            .next()
+            .expect("one :open selector");
+        let sel_modal = crate::selector::parse_selector_list(":modal")
+            .expect("parse :modal")
+            .into_iter()
+            .next()
+            .expect("one :modal selector");
+        assert!(!crate::matching::matches(&sel_open, &doc, closed));
+        assert!(crate::matching::matches(&sel_open, &doc, non_modal));
+        assert!(crate::matching::matches(&sel_open, &doc, modal));
+        assert!(!crate::matching::matches(&sel_modal, &doc, closed));
+        assert!(!crate::matching::matches(&sel_modal, &doc, non_modal));
+        assert!(crate::matching::matches(&sel_modal, &doc, modal));
+        // The UA rules' own selectors parse: `dialog:modal` and
+        // `dialog:modal::backdrop` are both accepted, the latter
+        // targeting the backdrop pseudo-element of a modal
+        // dialog (its matching is proven end-to-end by the
+        // backdrop assertions above, not just by parsing).
+        let sel_dialog_modal = crate::selector::parse_selector_list("dialog:modal")
+            .expect("parse dialog:modal")
+            .into_iter()
+            .next()
+            .expect("one dialog:modal selector");
+        assert!(crate::matching::matches(&sel_dialog_modal, &doc, modal));
+        assert!(!crate::matching::matches(
+            &sel_dialog_modal,
+            &doc,
+            non_modal
+        ));
+        let sel_modal_backdrop = crate::selector::parse_selector_list("dialog:modal::backdrop")
+            .expect("parse dialog:modal::backdrop")
+            .into_iter()
+            .next()
+            .expect("one dialog:modal::backdrop selector");
+        assert_eq!(
+            sel_modal_backdrop
+                .compounds
+                .last()
+                .and_then(|c| c.pseudo_element.as_deref()),
+            Some("backdrop")
+        );
+    }
+
+    // w81 backdrop (W4): the UA `::backdrop` rule, author
+    // `::backdrop` overrides, and the modal-dialog-only dim. The query
+    // itself is ungated by top-layer membership — mirroring the
+    // WPT `backdrop-ua-style` test, which queries a plain `div`
+    // — generation gating lives in the box/paint callers.
+    #[test]
+    fn backdrop_ua_style_and_author_override() {
+        let mut doc = Document::new();
+        let root = doc.root();
+        let body = doc.create_element("body");
+        doc.append_child(root, body);
+        let div = doc.create_element("div");
+        doc.append_child(body, div);
+        let dialog = doc.create_element("dialog");
+        doc.append_child(body, dialog);
+        doc.show_dialog_modal(dialog).unwrap();
+        let pop = doc.create_element("div");
+        doc.append_child(body, pop);
+        doc.set_attribute(pop, "popover", "");
+        doc.show_popover(pop).unwrap();
+        let author = parse_stylesheet(
+            "div::backdrop { background-color: red; } dialog::backdrop { background-color: blue; }",
+        );
+        let ua_sheet = ua();
+        let author_refs = [&author];
+        let styler = Styler::new(&doc, &author_refs, &ua_sheet, vp());
+        assert!(styler.has_backdrop_rules());
+        // Plain div (not top-layer): UA fixed + inset 0 still query.
+        let plain = styler
+            .pseudo_style_for(div, "backdrop", BACKDROP_ATOMS)
+            .expect("::backdrop style");
+        assert_eq!(plain.get_str_by_index(props::POSITION), Some("fixed"));
+        // The UA rule spells the insets as `0px` (not bare `0`)
+        // so `getComputedStyle` serializes them as `"0px"`, which
+        // is what WPT `backdrop-ua-style` asserts; a bare `0`
+        // would serialize as `"0"`.
+        for slot in [props::TOP, props::RIGHT, props::BOTTOM, props::LEFT] {
+            assert_eq!(
+                plain.get_by_index(slot),
+                Some(&CssValue::Length(0.0, LengthUnit::Px))
+            );
+        }
+        // Author rule beats the UA dim for the dialog; the div
+        // author rule wins over the transparent UA default.
+        let dlg = styler
+            .pseudo_style_for(dialog, "backdrop", BACKDROP_ATOMS)
+            .expect("dialog ::backdrop style");
+        assert_eq!(dlg.get("background-color"), Some(&blue()));
+        let pop_style = styler
+            .pseudo_style_for(pop, "backdrop", BACKDROP_ATOMS)
+            .expect("popover ::backdrop style");
+        assert_eq!(pop_style.get("background-color"), Some(&red()));
+        // One-shot helper agrees with the styler query.
+        let one_shot = compute_pseudo_style(
+            &doc,
+            dialog,
+            &author_refs,
+            &ua_sheet,
+            &vp(),
+            "backdrop",
+            BACKDROP_ATOMS,
+        )
+        .expect("one-shot ::backdrop style");
+        assert_eq!(one_shot.get_str_by_index(props::POSITION), Some("fixed"));
+        assert_eq!(one_shot.get("background-color"), Some(&blue()));
+    }
+
+    #[test]
+    fn backdrop_ua_dim_is_dialog_only() {
+        // No author rules: a modal dialog's backdrop dims, a
+        // popover's is transparent (so it renders nothing until
+        // styled) — the popover-backdrop rule implemented here.
+        let mut doc = Document::new();
+        let root = doc.root();
+        let body = doc.create_element("body");
+        doc.append_child(root, body);
+        let dialog = doc.create_element("dialog");
+        doc.append_child(body, dialog);
+        doc.show_dialog_modal(dialog).unwrap();
+        let pop = doc.create_element("div");
+        doc.append_child(body, pop);
+        doc.set_attribute(pop, "popover", "");
+        doc.show_popover(pop).unwrap();
+        let author = parse_stylesheet("");
+        let ua_sheet = ua();
+        let author_refs = [&author];
+        let styler = Styler::new(&doc, &author_refs, &ua_sheet, vp());
+        let dlg = styler
+            .pseudo_style_for(dialog, "backdrop", BACKDROP_ATOMS)
+            .expect("dialog ::backdrop style");
+        assert_eq!(
+            dlg.get("background-color"),
+            Some(&CssValue::Color(crate::value::Color {
+                r: 0,
+                g: 0,
+                b: 0,
+                a: 26
+            }))
+        );
+        let pop_style = styler
+            .pseudo_style_for(pop, "backdrop", BACKDROP_ATOMS)
+            .expect("popover ::backdrop style");
+        // Transparent initial: no UA dim for popovers.
+        assert_eq!(
+            pop_style.get("background-color"),
+            Some(&CssValue::Color(crate::value::Color {
+                r: 0,
+                g: 0,
+                b: 0,
+                a: 0
+            }))
+        );
+    }
+
+    #[test]
+    fn backdrop_non_inherited_properties_do_not_leak_from_originator() {
+        // CSS Position 4: `::backdrop` takes only inherited
+        // properties from its originator; non-inherited properties
+        // start at their initials unless a pseudo rule declares
+        // them. Before the backdrop-scoped reset in
+        // `pseudo_style_uncached`, the base clone carried the
+        // originator's specified values through, so a popover with
+        // a blue background and no `::backdrop` rule reported a
+        // blue / 100px / 0.5 backdrop. The UA `::backdrop` rule
+        // still supplies winners here (display / position / insets),
+        // so this exercises the reset path, not the no-rule path.
+        let mut doc = Document::new();
+        let root = doc.root();
+        let body = doc.create_element("body");
+        doc.append_child(root, body);
+        let dialog = doc.create_element("dialog");
+        doc.append_child(body, dialog);
+        doc.show_dialog_modal(dialog).unwrap();
+        let pop = doc.create_element("div");
+        doc.append_child(body, pop);
+        doc.set_attribute(pop, "popover", "");
+        doc.show_popover(pop).unwrap();
+        let author = parse_stylesheet(
+            "div { background-color: blue; width: 100px; opacity: 0.5; color: red; }",
+        );
+        let ua_sheet = ua();
+        let author_refs = [&author];
+        let styler = Styler::new(&doc, &author_refs, &ua_sheet, vp());
+        // Originator itself keeps its specified values.
+        assert_eq!(styler.style_for(pop).get("background-color"), Some(&blue()));
+        assert_eq!(
+            styler.style_for(pop).get("width"),
+            Some(&CssValue::Length(100.0, LengthUnit::Px))
+        );
+        assert_eq!(
+            styler.style_for(pop).get("opacity"),
+            Some(&CssValue::Number(0.5))
+        );
+        // No `::backdrop` rule: non-inherited slots read initials,
+        // the inherited `color` still comes from the originator,
+        // and the UA winners (display / position) still apply.
+        let pop_style = styler
+            .pseudo_style_for(pop, "backdrop", BACKDROP_ATOMS)
+            .expect("popover ::backdrop style");
+        assert_eq!(
+            pop_style.get("background-color"),
+            Some(&CssValue::Color(crate::value::Color {
+                r: 0,
+                g: 0,
+                b: 0,
+                a: 0
+            }))
+        );
+        assert_eq!(pop_style.get("width"), Some(&kw("auto")));
+        assert_eq!(pop_style.get("opacity"), Some(&CssValue::Number(1.0)));
+        assert_eq!(pop_style.get("color"), Some(&red()));
+        assert_eq!(pop_style.get_str_by_index(props::POSITION), Some("fixed"));
+        assert_eq!(pop_style.get_str_by_index(props::DISPLAY), Some("block"));
+        // Dialog case still reads the UA dim: the reset runs before
+        // winners, so the UA `dialog:modal::backdrop` declaration wins.
+        let dlg = styler
+            .pseudo_style_for(dialog, "backdrop", BACKDROP_ATOMS)
+            .expect("dialog ::backdrop style");
+        assert_eq!(
+            dlg.get("background-color"),
+            Some(&CssValue::Color(crate::value::Color {
+                r: 0,
+                g: 0,
+                b: 0,
+                a: 26
+            }))
+        );
+        // With an author `::backdrop` rule, the rule's values win
+        // over the reset initials.
+        let author2 = parse_stylesheet(
+            "div { background-color: blue; width: 100px; opacity: 0.5; } div::backdrop { background-color: red; width: 50px; opacity: 0.25; }",
+        );
+        let author_refs2 = [&author2];
+        let styler2 = Styler::new(&doc, &author_refs2, &ua_sheet, vp());
+        let ruled = styler2
+            .pseudo_style_for(pop, "backdrop", BACKDROP_ATOMS)
+            .expect("ruled popover ::backdrop style");
+        assert_eq!(ruled.get("background-color"), Some(&red()));
+        assert_eq!(
+            ruled.get("width"),
+            Some(&CssValue::Length(50.0, LengthUnit::Px))
+        );
+        assert_eq!(ruled.get("opacity"), Some(&CssValue::Number(0.25)));
+    }
+
     #[test]
     fn transform_origin_cascades() {
         use crate::value::TransformOrigin;
@@ -23536,7 +25177,7 @@ mod w65_p_cascade_tests {
         // memo clone is a pointer bump, not a per-reference deep clone
         // of the group `Vec`s.
         match (&m1, &m2) {
-            (MemoVar::Slash(s1), MemoVar::Slash(s2)) => {
+            (MemoVar::Slash(s1, _), MemoVar::Slash(s2, _)) => {
                 assert!(Rc::ptr_eq(s1, s2), "slash payload shared, not cloned")
             }
             _ => panic!("expected slash-marked memo for --x"),
@@ -23566,7 +25207,7 @@ mod w65_p_cascade_tests {
         // memo clone is a pointer bump, not a per-reference deep clone
         // of the group `Vec`s.
         match (&m1, &m2) {
-            (MemoVar::Comma(g1), MemoVar::Comma(g2)) => {
+            (MemoVar::Comma(g1, _), MemoVar::Comma(g2, _)) => {
                 assert!(Rc::ptr_eq(g1, g2), "comma payload shared, not cloned")
             }
             _ => panic!("expected comma-marked memo for --y"),

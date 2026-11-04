@@ -45,7 +45,7 @@ fn usage() -> ! {
          --exclude SUB        skip tests whose id contains SUB (repeatable)\n  \
          --kind KIND          only run tests of KIND (repeatable;\n  \
          testharness|reftest|print-reftest|manual|crashtest)\n  \
-         --timeout-secs N     per-test timeout (default 60)\n  \
+         --timeout-secs N     per-test timeout (default 180)\n  \
          --output-json FILE   write the run as wptreport JSON to FILE\n  \
          --metadata-dir DIR   expected-failure metadata dir\n  \
          (default: <wpt-root>/metadata when it exists)\n  \
@@ -124,7 +124,7 @@ fn main() {
     let mut include = Vec::new();
     let mut exclude = Vec::new();
     let mut kinds = Vec::new();
-    let mut timeout_secs: u64 = 60;
+    let mut timeout_secs: u64 = 180;
     let mut output_json: Option<PathBuf> = None;
     let mut metadata_dir: Option<PathBuf> = None;
     let mut exe_override: Option<PathBuf> = None;

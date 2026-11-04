@@ -61,7 +61,7 @@ use bowser_css::{
     ComputedStyle, CssValue, ElementState as CssElementState, LengthUnit, Stylesheet,
     selectors_are_subtree_local,
 };
-use bowser_dom::{Document, NodeId, NodeKind};
+use bowser_dom::{Document, EscapeTarget, Namespace, NodeId, NodeKind};
 use bowser_layout::{
     LayoutBox, Position, Size, layout_subtree_with_intrinsics_and_scroll_and_offsets,
     layout_with_intrinsics_and_scroll_and_offsets, position_of, ua_stylesheet,
@@ -246,6 +246,28 @@ pub trait JsDispatch {
     ) {
         let _ = (tab, target, event_type, targets);
     }
+    /// Dispatch a cancelable `cancel` event at `target` (dialog
+    /// Escape: HTML §4.11.4). Returns true when the page canceled
+    /// it, in which case the dialog stays open. The default does
+    /// nothing and reports nothing canceled, so hosts without a JS
+    /// bridge keep the state change; the production dispatcher
+    /// ([`crate::script::PageEventDispatch`]) does not override
+    /// this yet (w81 W-LD gap: real pages do not observe `cancel`
+    /// / `close` / popover `toggle` from Escape or light-dismiss
+    /// until a script.rs worker wires these hooks up — the state
+    /// transitions themselves already happen, and the test double
+    /// below proves the app invokes the hooks in the right order).
+    fn dispatch_cancel(&mut self, _tab: &mut Tab, _target: NodeId) -> bool {
+        false
+    }
+    /// Dispatch a non-bubbling `close` event at `target` (dialog
+    /// closed by Escape). The default does nothing; see
+    /// [`JsDispatch::dispatch_cancel`] for the wiring gap.
+    fn dispatch_close(&mut self, _tab: &mut Tab, _target: NodeId) {}
+    /// Dispatch a `toggle` event at `target` (popover hidden by
+    /// Escape or light-dismiss). The default does nothing; see
+    /// [`JsDispatch::dispatch_cancel`] for the wiring gap.
+    fn dispatch_toggle(&mut self, _tab: &mut Tab, _target: NodeId) {}
 }
 
 // ---------------------------------------------------------------------------
@@ -268,6 +290,15 @@ struct InputState {
     /// Last cursor position in CSS px (winit reports button events without
     /// a position, so the motion position is remembered).
     cursor: (f32, f32),
+    /// Light-dismiss pointerdown record (HTML §6.12.2): the popover
+    /// a primary-button press outside it named as its dismiss
+    /// candidate, or `None` when the press named none (inside the
+    /// popover, on its invoker, or with nothing dismissible open).
+    /// The release dismisses it only when the release resolves to
+    /// this same popover; a drag into the popover (or onto its
+    /// invoker) before release therefore dismisses nothing.
+    /// Cleared on every primary-button release.
+    light_dismiss_pending: Option<NodeId>,
 }
 
 fn state_for(input: &mut InputState, node: NodeId) -> &mut CssElementState {
@@ -947,9 +978,20 @@ fn is_sequentially_focusable(doc: &Document, node: NodeId) -> bool {
 /// the zero/`tabindex`-less focusables in document order. Negative
 /// `tabindex` elements never appear.
 fn focus_order(doc: &Document) -> Vec<NodeId> {
+    sort_focus_order(doc, doc.descendants(doc.root()))
+}
+
+/// Sequential focus navigation order over an explicit candidate
+/// list, already in document order: elements with a positive
+/// `tabindex` first in ascending order (stable on ties), then the
+/// zero/`tabindex`-less focusables. [`focus_order`] is this over
+/// the whole document; the modal-dialog trap passes the dialog
+/// itself followed by its descendants, so Tab cycles inside the
+/// dialog instead of escaping to the page behind it.
+fn sort_focus_order(doc: &Document, candidates: Vec<NodeId>) -> Vec<NodeId> {
     let mut positive: Vec<(i32, usize, NodeId)> = Vec::new();
     let mut zero: Vec<NodeId> = Vec::new();
-    for (i, node) in doc.descendants(doc.root()).iter().enumerate() {
+    for (i, node) in candidates.iter().enumerate() {
         if !is_sequentially_focusable(doc, *node) {
             continue;
         }
@@ -982,6 +1024,60 @@ fn apply_focus_nav(input: &mut InputState, tab: &mut Tab, backward: bool) -> Vec
         Some(document) => focus_order(&document),
         None => return Vec::new(),
     };
+    move_focus_in_order(input, tab, order, backward)
+}
+
+/// Top-layer focus trap (w81 W-LD): Tab/Shift+Tab inside a
+/// top-layer scope (a modal dialog, or a popover above it — see
+/// [`top_layer_focus_scope`]) cycles through the scope's
+/// focusables in sequential focus navigation order — positive
+/// `tabindex` first in ascending order, then the zero /
+/// `tabindex`-less focusables in document order — and never
+/// reaches the page behind it. The scope element itself is a
+/// candidate like any descendant: it comes first only when the
+/// sequential order puts it there, not by a dialog-first rule.
+/// Focus outside the scope (or no focus) starts at the first/last
+/// scope focusable, like the global path. When the scope has no
+/// focusable descendant, focus falls back to the scope itself
+/// (the spec's showModal fallback, applied lazily here: the engine
+/// has no showModal hook in the window — see the focus gap note
+/// on [`WindowApp::handle_escape`]).
+fn apply_focus_nav_in_scope(
+    input: &mut InputState,
+    tab: &mut Tab,
+    scope: NodeId,
+    backward: bool,
+) -> Vec<Option<NodeId>> {
+    let order = match tab.document_ref() {
+        Some(document) => {
+            let mut candidates = vec![scope];
+            candidates.extend(document.descendants(scope));
+            let order = sort_focus_order(&document, candidates);
+            if order.is_empty() { vec![scope] } else { order }
+        }
+        None => return Vec::new(),
+    };
+    move_focus_in_order(input, tab, order, backward)
+}
+
+/// Modal-dialog focus trap: [`apply_focus_nav_in_scope`] with a
+/// dialog scope, kept for the dialog-only tests.
+#[cfg(test)]
+fn apply_focus_nav_in_dialog(
+    input: &mut InputState,
+    tab: &mut Tab,
+    dialog: NodeId,
+    backward: bool,
+) -> Vec<Option<NodeId>> {
+    apply_focus_nav_in_scope(input, tab, dialog, backward)
+}
+
+fn move_focus_in_order(
+    input: &mut InputState,
+    tab: &mut Tab,
+    order: Vec<NodeId>,
+    backward: bool,
+) -> Vec<Option<NodeId>> {
     if order.is_empty() {
         return Vec::new();
     }
@@ -2401,6 +2497,319 @@ fn link_href(doc: &Document, node: NodeId) -> Option<String> {
     doc.get_attribute(node, "href").map(str::to_owned)
 }
 
+/// Popover-target activation for a clicked element (HTML "popover
+/// target attribute activation behavior", 6.12.1), shared by the
+/// windowed click path and the testdriver click path. Callers run it
+/// only as the click's *default action*: a `preventDefault()`ed click
+/// must not activate, because the spec's activation behavior is the
+/// element's activation behavior, which fires only when the event is
+/// not canceled (the same reason [`WindowApp::on_click`] returns
+/// early on `prevented` before link navigation). This is the
+/// spec-faithful reading; the spec text itself defines the behavior
+/// as an activation behavior rather than a listener, and activation
+/// behaviors are default actions.
+///
+/// Rules, verified against the current WHATWG text (the local WPT
+/// checkout is css-only, so no `html/semantics/popovers/` tests were
+/// available to check against):
+/// * Invoker: an HTML-namespace `<button>` element, or an
+///   HTML-namespace `<input>` whose `type` is `button` (ASCII
+///   case-insensitive). Other elements, other input types, and
+///   foreign-namespace elements named `button`/`input` never
+///   activate from a click, even with the attributes present.
+///   Callers resolve the invoker from the click target with
+///   [`resolve_popover_invoker`]: hit-testing prefers the deepest
+///   child box, so a click on a `<span>` inside a button must
+///   still find the button.
+/// * A `disabled` invoker never activates.
+/// * A submit button — a `<button>` whose missing/invalid `type`
+///   defaults to submit, or an `<input type="submit">` — with a
+///   form owner never activates: the popover-target-element
+///   algorithm returns null there. The form owner is the element
+///   named by the invoker's `form` attribute when that attribute
+///   is present (HTML §4.10.17.3: the attribute overrides, so a
+///   `form` naming nothing — or a non-form — means no owner even
+///   inside a `<form>`); only with no `form` attribute is it the
+///   nearest ancestor `<form>`. A submit `<button>` with no form
+///   owner does activate, per the same algorithm's literal
+///   wording. For `<input type="submit">` only the gate is
+///   implemented (see [`is_valid_popover_invoker`]): whether such
+///   a button activates at all — whether "button" in the
+///   algorithm includes input submit — is still unconfirmed, and
+///   clicks never reach activation today because
+///   [`resolve_popover_invoker`] routes only `<button>` and
+///   `<input type="button">`, so the activation question stays
+///   deferred and the gate is behaviorally latent.
+/// * Target: the first element in document order whose `id` equals
+///   the invoker's `popovertarget` value
+///   ([`Document::get_element_by_id`], which indexes only the
+///   document tree, so detached targets are invisible). Missing id,
+///   or a target with no `popover` attribute, is a silent no-op: in
+///   particular an attribute-stripped popover is never resurrected,
+///   because [`Document::popover_state`] returns `None` for it and
+///   this helper returns before any show/hide/toggle.
+/// * Action: `popovertargetaction` `show`/`hide`, anything else
+///   (missing, invalid, or `toggle`) toggles. The missing/invalid
+///   default is toggle per the enumerated-attribute definition, not
+///   a guess. `show` on an already-showing popover and `hide` on a
+///   hidden one are no-ops, per the activation-behavior steps.
+/// * Descendant guard: when the event target is inside the popover
+///   (inclusive) and the popover is inside the invoker (inclusive),
+///   activation is a no-op. Self-target is the direct-click case
+///   of this guard, kept as its own early return below.
+/// * Errors from the `Document` show/hide/toggle calls are swallowed:
+///   the spec's activation behavior catches a failed validity check
+///   and does nothing, and a click default action must not throw.
+/// * Returns the target when activation actually changed its
+///   visibility (show opened a hidden popover, hide closed an open
+///   one, toggle flipped it), so the caller can fire the `toggle`
+///   event for exactly those changes; `None` for every no-op.
+///   The caller fires the hook — this helper owns no dispatcher —
+///   and production delivery of that hook through `script.rs` is
+///   deferred, like the Escape / light-dismiss hooks.
+/// * Out of scope here, deliberately: `command`/`commandfor`
+///   invokers (a separate follow-on) and keyboard activation.
+pub(crate) fn activate_popover_target(
+    doc: &mut Document,
+    invoker: NodeId,
+    event_target: NodeId,
+) -> Option<NodeId> {
+    if !is_valid_popover_invoker(doc, invoker) {
+        return None;
+    }
+    let target_id = doc.get_attribute(invoker, "popovertarget")?;
+    let target = doc.get_element_by_id(target_id)?;
+    if target == invoker {
+        return None;
+    }
+    // Descendant guard (inclusive both sides): the event target
+    // inside the popover while the popover sits inside the invoker.
+    let target_inside_invoker = target == invoker || doc.descendants(invoker).contains(&target);
+    let event_inside_target =
+        event_target == target || doc.descendants(target).contains(&event_target);
+    if target_inside_invoker && event_inside_target {
+        return None;
+    }
+    // Not a popover (including attribute-stripped): never resurrect.
+    doc.popover_state(target)?;
+    let action = doc
+        .get_attribute(invoker, "popovertargetaction")
+        .unwrap_or("")
+        .to_ascii_lowercase();
+    match action.as_str() {
+        "show" => {
+            if !doc.is_popover_open(target) {
+                doc.show_popover(target).ok()?;
+                Some(target)
+            } else {
+                None
+            }
+        }
+        "hide" => {
+            if doc.is_popover_open(target) {
+                doc.hide_popover(target).ok()?;
+                Some(target)
+            } else {
+                None
+            }
+        }
+        // Missing, invalid, or "toggle": toggle.
+        _ => {
+            doc.toggle_popover(target, None).ok()?;
+            Some(target)
+        }
+    }
+}
+
+/// Whether `node` can be a popover invoker at all, before any
+/// target lookup: an HTML-namespace `<button>`, or an
+/// HTML-namespace `<input type="button">` or `<input
+/// type="submit">`, not `disabled`, and — for a submit
+/// `<button>` or `<input type="submit">` — with no form owner
+/// (see [`has_form_owner`]). This is the validity half of
+/// [`activate_popover_target`], shared by the light-dismiss
+/// invoker exemption, which must not exempt clicks on elements
+/// that could never activate (a `<div>` with `popovertarget`,
+/// a disabled button, a submit button owned by a form).
+///
+/// Gate versus activation, kept distinct: the submit gate is
+/// implemented here for both `<button>` and `<input
+/// type="submit">`, but activation for input submit buttons is
+/// deferred — [`resolve_popover_invoker`] still routes only
+/// `<button>` and `<input type="button">` clicks, so an input
+/// submit never reaches activation today and this gate is
+/// behaviorally latent in production until the routing question
+/// (whether "button" in the popover-target algorithm includes
+/// input submit) is settled.
+fn is_valid_popover_invoker(doc: &Document, node: NodeId) -> bool {
+    let NodeKind::Element(data) = doc.kind(node) else {
+        return false;
+    };
+    if data.namespace != Namespace::Html {
+        return false;
+    }
+    let tag = data.tag_name.as_str();
+    let is_button = tag == "button";
+    let input_type = if tag == "input" {
+        doc.get_attribute(node, "type")
+    } else {
+        None
+    };
+    let is_button_input = input_type.is_some_and(|t| t.eq_ignore_ascii_case("button"));
+    // Explicit type=submit only: a missing/invalid input type
+    // defaults to text, never to submit.
+    let is_submit_input = input_type.is_some_and(|t| t.eq_ignore_ascii_case("submit"));
+    if !is_button && !is_button_input && !is_submit_input {
+        return false;
+    }
+    if doc.has_attribute(node, "disabled") {
+        return false;
+    }
+    if is_button {
+        // Submit-button gate: missing/invalid type defaults to submit.
+        let is_submit = doc
+            .get_attribute(node, "type")
+            .is_none_or(|t| !matches!(t.to_ascii_lowercase().as_str(), "button" | "reset"));
+        if is_submit && has_form_owner(doc, node) {
+            return false;
+        }
+    } else if is_submit_input && has_form_owner(doc, node) {
+        return false;
+    }
+    true
+}
+
+/// The popover invoker for a click whose event target is `node`:
+/// the nearest element on the inclusive ancestor chain (the node
+/// itself, then parents upward) that is an HTML-namespace
+/// `<button>` or `<input type="button">` carrying a
+/// `popovertarget` attribute, or `None`. Hit-testing prefers the
+/// deepest child box, so the event target is usually a `<span>` or
+/// `<img>` inside the button, not the button itself; walking
+/// ancestors is what makes `<button popovertarget><span>`
+/// toggle. Validity beyond tag/namespace/attribute (disabled,
+/// submit form owner) is NOT checked here — callers that need it
+/// run [`is_valid_popover_invoker`] on the result.
+pub(crate) fn resolve_popover_invoker(doc: &Document, node: NodeId) -> Option<NodeId> {
+    for candidate in doc.propagation_path(node) {
+        let NodeKind::Element(data) = doc.kind(candidate) else {
+            continue;
+        };
+        if data.namespace != Namespace::Html {
+            continue;
+        }
+        let tag = data.tag_name.as_str();
+        let is_button = tag == "button";
+        let is_button_input = tag == "input"
+            && doc
+                .get_attribute(candidate, "type")
+                .is_some_and(|t| t.eq_ignore_ascii_case("button"));
+        if (is_button || is_button_input) && doc.has_attribute(candidate, "popovertarget") {
+            return Some(candidate);
+        }
+    }
+    None
+}
+
+/// True when `node` has a form owner (HTML §4.10.17.3): when the
+/// `form` attribute is present it overrides — the owner is the
+/// HTML `<form>` element with that id, or nothing when the id
+/// names nothing or a non-form (no ancestor fallback). Only with
+/// no `form` attribute is the owner the nearest ancestor HTML
+/// `<form>`.
+fn has_form_owner(doc: &Document, node: NodeId) -> bool {
+    if let Some(form_id) = doc.get_attribute(node, "form") {
+        return doc.get_element_by_id(form_id).is_some_and(|form| {
+            matches!(doc.kind(form), NodeKind::Element(data)
+                if data.tag_name.as_str() == "form" && data.namespace == Namespace::Html)
+        });
+    }
+    doc.ancestors(node).iter().any(|ancestor| {
+        matches!(doc.kind(*ancestor), NodeKind::Element(data)
+            if data.tag_name.as_str() == "form" && data.namespace == Namespace::Html)
+    })
+}
+
+/// Whether a primary-button press at `hit` is swallowed by modal
+/// inertness: any modal dialog in the top layer blocks presses
+/// outside it, except a press inside a top-layer member above the
+/// topmost modal dialog that is itself interactive (an open
+/// popover, or a nested modal). A press with no hit (backdrop,
+/// empty area) is outside everything and is blocked whenever any
+/// modal dialog is open. Checking only the last top-layer member
+/// was wrong: a popover above a modal dialog does not lift the
+/// modal's inertness for background content.
+pub(crate) fn modal_press_blocked(doc: &Document, hit: Option<NodeId>) -> bool {
+    let top_layer = doc.top_layer();
+    let Some(modal_pos) = top_layer
+        .iter()
+        .rev()
+        .position(|n| doc.is_dialog_modal(*n))
+        .map(|rev| top_layer.len() - 1 - rev)
+    else {
+        return false;
+    };
+    let modal = top_layer[modal_pos];
+    let Some(hit) = hit else {
+        return true;
+    };
+    if hit == modal || doc.descendants(modal).contains(&hit) {
+        return false;
+    }
+    // Blocked unless the press is inside a top-layer member above
+    // the modal that is itself interactive: such a press belongs
+    // to that member, not to the inert background.
+    !top_layer[modal_pos + 1..].iter().any(|member| {
+        (doc.is_popover_open(*member) || doc.is_dialog_modal(*member))
+            && (hit == *member || doc.descendants(*member).contains(&hit))
+    })
+}
+
+/// The top-layer focus scope for Tab: the topmost modal dialog,
+/// or an open popover above it, or `None`. Only modal dialogs
+/// trap focus: with no modal dialog in the top layer there is
+/// no scope at all, even when a popover is open — Tab moves
+/// through the page focusables as usual. A popover above a
+/// modal dialog owns Tab while it is on top, because the modal
+/// below already traps and the popover is the topmost member of
+/// that trap; the modal regains it when the popover closes.
+pub(crate) fn top_layer_focus_scope(doc: &Document) -> Option<NodeId> {
+    let top_layer = doc.top_layer();
+    if !top_layer.iter().any(|n| doc.is_dialog_modal(*n)) {
+        return None;
+    }
+    top_layer
+        .iter()
+        .rev()
+        .find(|n| doc.is_dialog_modal(**n) || doc.is_popover_open(**n))
+        .copied()
+}
+
+/// The light-dismiss candidate for a press/release at `clicked`,
+/// with the invoker exemption applied: `None` when the target
+/// resolves (through [`resolve_popover_invoker`]) to a valid
+/// invoker naming the candidate popover — that press/release
+/// pair is the invoker's click, which toggles instead of
+/// dismissing — and otherwise the document's candidate from
+/// [`Document::light_dismiss_candidate`].
+pub(crate) fn light_dismiss_pending_target(
+    doc: &Document,
+    clicked: Option<NodeId>,
+) -> Option<NodeId> {
+    let top = doc.light_dismiss_candidate(clicked)?;
+    if let Some(clicked) = clicked
+        && let Some(invoker) = resolve_popover_invoker(doc, clicked)
+        && is_valid_popover_invoker(doc, invoker)
+        && doc
+            .get_attribute(invoker, "popovertarget")
+            .and_then(|id| doc.get_element_by_id(id))
+            == Some(top)
+    {
+        return None;
+    }
+    Some(top)
+}
+
 /// The base URL for resolving a clicked link's href.
 ///
 /// Delegates to the loader's [`effective_base_url`](crate::loader::effective_base_url)
@@ -2607,8 +3016,9 @@ pub const HEADLESS_PUMP_BUDGET: Duration = Duration::from_secs(2);
 /// The chain invariant "harness deadline < pump deadline <
 /// child/runner kill, with margin, for any install duration" as
 /// literally stated is false: the pump deadline is pump_start +
-/// 90 s, i.e. child_start + install + 90 s, which exceeds the 180 s
-/// runner budget once install >= 90 s. The outcome is still correct
+/// 90 s, i.e. child_start + install + 90 s, which reaches the 180 s
+/// runner budget at install = 90 s and exceeds it only once
+/// install > 90 s. The outcome is still correct
 /// there because a harness timer past due at pump start fires on the
 /// first pump iteration, before the child kill — but that is
 /// past-due firing, not the stated deadline ordering. What the
@@ -2616,12 +3026,11 @@ pub const HEADLESS_PUMP_BUDGET: Duration = Duration::from_secs(2);
 /// full `timeout_multiplier` x 10 s harness deadline measured from
 /// setup, not just the deadline minus a typical install. With
 /// multiplier 8 the harness deadline is setup + 80 s, hence this
-/// 90 s budget; runs are validated with `bowser-wpt --timeout-secs
-/// 180` (the 60 s default in `bowser-wpt.rs`/`RunConfig` is NOT
-/// enough for a genuine harness TIMEOUT at multiplier 8 — the driver
-/// would kill the child at 60 s before the 80 s harness timer fires
-/// — and raising that default is a separate change outside this
-/// budget). Long-test exception: a test with `<meta name="timeout"
+/// 90 s budget; the default in `bowser-wpt.rs`/`RunConfig` is now
+/// 180 s (w81), so runs no longer need `bowser-wpt --timeout-secs
+/// 180`: the old 60 s default was NOT enough for a genuine harness
+/// TIMEOUT at multiplier 8 — the driver would kill the child at
+/// 60 s before the 80 s harness timer fires. Long-test exception: a test with `<meta name="timeout"
 /// content="long">` has a 60 s x 8 = 480 s harness deadline that is
 /// unreachable under this 90 s budget and the 180 s runner budget;
 /// it ends as a runner `DriverTimeout`, never a harness TIMEOUT
@@ -2629,7 +3038,8 @@ pub const HEADLESS_PUMP_BUDGET: Duration = Duration::from_secs(2);
 /// TIMEOUT), and needs a separate solution (e.g. capping the
 /// multiplier when `timeout_length` is long, or a pump budget keyed
 /// to it). Cost, stated plainly: a genuine harness TIMEOUT now
-/// takes ~80 s to report instead of ~30 s.
+/// takes ~80 s to report instead of ~30 s at multiplier 3 (and ~10 s
+/// at the pre-wave multiplier-1 default).
 const HEADLESS_HARNESS_WAIT_BUDGET: Duration = Duration::from_secs(90);
 
 /// Cap on the tasks one [`pump_headless`] iteration runs through the
@@ -4068,12 +4478,31 @@ impl<'a> WindowApp<'a> {
     /// the press target is a click.
     fn on_primary_button(&mut self, pressed: bool, x: f32, y: f32) {
         if pressed {
+            // Modal-dialog press block first, before scrollbar
+            // interception: a press on the page scrollbar behind a
+            // modal dialog is a press on inert background content,
+            // so it must be swallowed whole instead of scrolling
+            // that content. A positioned overlay covering the bar
+            // still keeps the press (`press_scrollbar_at` runs the
+            // DOM hit test first) once the modal check passes.
+            let (hit_target, modal_blocked) = match self.tabs.get(self.tab) {
+                Some(tab) => {
+                    let hit = target_at(tab, x, y);
+                    let blocked = match tab.document_ref() {
+                        Some(doc) => modal_press_blocked(&doc, hit),
+                        None => false,
+                    };
+                    (hit, blocked)
+                }
+                None => (None, false),
+            };
+            if modal_blocked {
+                return;
+            }
             // Scrollbars intercept the press ahead of the DOM: a thumb
             // press starts a drag, a track press pages the container.
             // Either way the DOM press/active/focus path is skipped —
             // clicking a scrollbar must not focus content beneath it.
-            // A positioned overlay covering the bar keeps the press
-            // (`press_scrollbar_at` runs the DOM hit test first).
             let hit = match self.tabs.get(self.tab) {
                 Some(tab) => press_scrollbar_at(tab, x, y),
                 None => None,
@@ -4096,6 +4525,13 @@ impl<'a> WindowApp<'a> {
                 self.needs_redraw = true;
                 return;
             }
+            // Popover light-dismiss is pointerdown-recorded, not
+            // press-dismissed (HTML §6.12.2): the press only records
+            // the dismiss candidate; the release dismisses it when
+            // it resolves to the same popover (see
+            // [`WindowApp::light_dismiss_for_release`]). The press
+            // itself still lands on its target either way.
+            self.record_light_dismiss_press(hit_target);
             let hit = match self.tabs.get(self.tab) {
                 Some(tab) => press_at(&mut self.input, tab, x, y),
                 None => None,
@@ -4117,6 +4553,18 @@ impl<'a> WindowApp<'a> {
             {
                 tab.scroll_tree.snap_after_direct_manipulation(drag.node);
             }
+            // Light-dismiss settles on release, before the click:
+            // the release hit — not `release_at`'s same-target
+            // click result — decides it, so a press outside dragged
+            // into the popover before release dismisses nothing,
+            // while a same-spot outside release dismisses. A
+            // scrollbar-drag release recorded no candidate, so
+            // this is a no-op for it.
+            let release_hit = match self.tabs.get(self.tab) {
+                Some(tab) => target_at(tab, x, y),
+                None => None,
+            };
+            self.light_dismiss_for_release(release_hit);
             let had_active = self.input.active.is_some();
             let clicked = match self.tabs.get(self.tab) {
                 Some(tab) => release_at(&mut self.input, tab, x, y),
@@ -4174,8 +4622,8 @@ impl<'a> WindowApp<'a> {
 
     /// Click dispatch: page scripts run first through the [`JsDispatch`]
     /// implementation; when the page did not prevent the default action,
-    /// `<a href>` navigates on a worker thread (the pre-dispatcher
-    /// fallback).
+    /// popover-target activation runs, then `<a href>` navigates on a
+    /// worker thread (the pre-dispatcher fallback).
     fn on_click(&mut self, node: NodeId) {
         // Disjoint field borrows (`js` vs `tabs`): `tab_mut()` would
         // take `&mut self` and conflict.
@@ -4189,6 +4637,34 @@ impl<'a> WindowApp<'a> {
         self.needs_redraw = true;
         if prevented {
             return;
+        }
+        // Default action, part 1: popover-target activation (a
+        // prevented click never reaches here, see
+        // [`activate_popover_target`]). The invoker is resolved
+        // from the event target's ancestors — the target is the
+        // deepest hit box, usually a child of the button — and the
+        // original target is kept for the descendant guard. A
+        // visibility change fires the `toggle` hook (production
+        // delivery via `script.rs` is deferred, as for Escape /
+        // light-dismiss).
+        let changed = match self.tabs.get_mut(self.tab) {
+            Some(tab) => match tab.installed_mut() {
+                Some(installed) => {
+                    let mut doc = installed.document().borrow_mut();
+                    match resolve_popover_invoker(&doc, node) {
+                        Some(invoker) => activate_popover_target(&mut doc, invoker, node),
+                        None => None,
+                    }
+                }
+                None => None,
+            },
+            None => None,
+        };
+        if let Some(target) = changed
+            && let Some(js) = self.js.as_mut()
+            && let Some(tab) = self.tabs.get_mut(self.tab)
+        {
+            js.dispatch_toggle(tab, target);
         }
         let href = self
             .tabs
@@ -4520,6 +4996,200 @@ impl<'a> WindowApp<'a> {
         self.needs_redraw = true;
     }
 
+    /// Escape / light-dismiss (w81 W-LD), in spec order:
+    /// `cancel` (cancelable) then `close` for a modal dialog, `toggle`
+    /// for an `auto` popover. Returns true when a dismissible target
+    /// existed — even when the page canceled the dialog's `cancel`
+    /// event and the dialog stayed open — and false when nothing was
+    /// dismissible. State changes happen here; event delivery goes
+    /// through the [`JsDispatch`] hooks, whose production wiring is
+    /// still pending (see [`JsDispatch::dispatch_cancel`]).
+    ///
+    /// Focus gap (deferred, not invented): the spec moves focus into
+    /// the dialog on `showModal` and restores the previously focused
+    /// element on close. This engine cannot do either yet, because
+    /// `showModal` runs in the JS bindings (`bowser_js`, which has no
+    /// access to this window's [`InputState`]) while focus lives here
+    /// — no record of the previously focused element exists anywhere
+    /// to restore from. What this worker does implement: Tab inside
+    /// a modal dialog is trapped to the dialog's focusables (see
+    /// [`apply_focus_nav_in_dialog`]), and closing a dialog/popover
+    /// clears focus that sat inside it instead of leaving `:focus`
+    /// on hidden content. A follow-up worker must thread a
+    /// previously-focused record through `Tab` (or notify the window
+    /// from the bindings) before true showModal focus move/restore
+    /// is possible.
+    fn handle_escape(&mut self) -> bool {
+        let target = match self.tabs.get(self.tab) {
+            Some(tab) => match tab.document_ref() {
+                Some(doc) => doc.topmost_escape_target(),
+                None => None,
+            },
+            None => None,
+        };
+        let Some(target) = target else { return false };
+        match target {
+            EscapeTarget::ModalDialog(dialog) => {
+                // Cancelable `cancel` first: a canceled event keeps
+                // the dialog open (and the key is still consumed).
+                let canceled = match self.js.as_mut() {
+                    Some(js) => match self.tabs.get_mut(self.tab) {
+                        Some(tab) => js.dispatch_cancel(tab, dialog),
+                        None => false,
+                    },
+                    None => false,
+                };
+                if canceled {
+                    return true;
+                }
+                let closed = match self.tabs.get_mut(self.tab) {
+                    Some(tab) => match tab.installed_mut() {
+                        Some(installed) => installed
+                            .document()
+                            .borrow_mut()
+                            .close_dialog(dialog, None)
+                            .unwrap_or(false),
+                        None => false,
+                    },
+                    None => false,
+                };
+                if !closed {
+                    return true;
+                }
+                if let Some(js) = self.js.as_mut()
+                    && let Some(tab) = self.tabs.get_mut(self.tab)
+                {
+                    js.dispatch_close(tab, dialog);
+                }
+                self.clear_focus_inside(dialog);
+                if let Some(tab) = self.tab_mut() {
+                    tab.dirty.style = true;
+                }
+                self.needs_redraw = true;
+                true
+            }
+            EscapeTarget::AutoPopover(pop) => {
+                // The boolean is whether the popover was actually
+                // open and is now hidden — like the dialog arm's
+                // `closed` — not `hide_popover().is_ok()`, which is
+                // `Ok` for an already-hidden popover too. An
+                // already-hidden popover consumes the key with no
+                // `toggle` event, mirroring a canceled `cancel`.
+                let hidden = match self.tabs.get_mut(self.tab) {
+                    Some(tab) => match tab.installed_mut() {
+                        Some(installed) => {
+                            let mut doc = installed.document().borrow_mut();
+                            let was_open = doc.is_popover_open(pop);
+                            was_open && doc.hide_popover(pop).is_ok()
+                        }
+                        None => false,
+                    },
+                    None => false,
+                };
+                if !hidden {
+                    return true;
+                }
+                if let Some(js) = self.js.as_mut()
+                    && let Some(tab) = self.tabs.get_mut(self.tab)
+                {
+                    js.dispatch_toggle(tab, pop);
+                }
+                self.clear_focus_inside(pop);
+                if let Some(tab) = self.tab_mut() {
+                    tab.dirty.style = true;
+                }
+                self.needs_redraw = true;
+                true
+            }
+        }
+    }
+
+    /// Light-dismiss pointerdown record (w81 W-LD, HTML §6.12.2):
+    /// store the dismiss candidate for a press at `clicked`
+    /// (see [`light_dismiss_pending_target`]) — the press itself
+    /// dismisses nothing. A press on the popover's own invoker
+    /// records nothing, so the release's click toggles it instead
+    /// of dismissing and re-opening it; a press inside the
+    /// popover, and a press when a modal dialog or a `manual`
+    /// popover sits above the auto popover, likewise record
+    /// nothing.
+    fn record_light_dismiss_press(&mut self, clicked: Option<NodeId>) {
+        self.input.light_dismiss_pending = match self.tabs.get(self.tab) {
+            Some(tab) => match tab.document_ref() {
+                Some(doc) => light_dismiss_pending_target(&doc, clicked),
+                None => None,
+            },
+            None => None,
+        };
+    }
+
+    /// Light-dismiss pointerup (w81 W-LD, HTML §6.12.2): dismiss
+    /// the recorded popover only when the release at `released`
+    /// resolves to that same popover — a press outside dragged
+    /// inside the popover, or onto its invoker, before release
+    /// dismisses nothing, and the release's click then runs
+    /// normally. The record is cleared on every release either
+    /// way. Returns true when a popover was dismissed.
+    fn light_dismiss_for_release(&mut self, released: Option<NodeId>) -> bool {
+        let pending = self.input.light_dismiss_pending.take();
+        let Some(pop) = pending else {
+            return false;
+        };
+        let release_target = match self.tabs.get(self.tab) {
+            Some(tab) => match tab.document_ref() {
+                Some(doc) => light_dismiss_pending_target(&doc, released),
+                None => None,
+            },
+            None => None,
+        };
+        if release_target != Some(pop) {
+            return false;
+        }
+        let dismissed = match self.tabs.get_mut(self.tab) {
+            Some(tab) => match tab.installed_mut() {
+                Some(installed) => installed
+                    .document()
+                    .borrow_mut()
+                    .light_dismiss_popover(released),
+                None => None,
+            },
+            None => None,
+        };
+        let Some(pop) = dismissed else { return false };
+        if let Some(js) = self.js.as_mut()
+            && let Some(tab) = self.tabs.get_mut(self.tab)
+        {
+            js.dispatch_toggle(tab, pop);
+        }
+        self.clear_focus_inside(pop);
+        if let Some(tab) = self.tab_mut() {
+            tab.dirty.style = true;
+        }
+        self.needs_redraw = true;
+        true
+    }
+
+    /// Clear keyboard focus when it sits on `closed` or inside it
+    /// (dialog/popover just dismissed): focus must not linger on
+    /// hidden content. Focus elsewhere is untouched.
+    fn clear_focus_inside(&mut self, closed: NodeId) {
+        let inside = match self.tabs.get(self.tab) {
+            Some(tab) => match tab.document_ref() {
+                Some(doc) => match self.input.focused {
+                    Some(focused) => {
+                        focused == closed || doc.descendants(closed).contains(&focused)
+                    }
+                    None => false,
+                },
+                None => false,
+            },
+            None => false,
+        };
+        if inside && let Some(old) = self.input.focused.take() {
+            state_for(&mut self.input, old).focus = false;
+        }
+    }
+
     /// Key press: F5 reloads; browser back/forward keys traverse session
     /// history through the async loader (never the blocking traversals —
     /// see [`traverse`](Self::traverse)); everything else goes to the JS
@@ -4570,12 +5240,24 @@ impl<'a> WindowApp<'a> {
             }
             self.needs_redraw = true;
         }
+        // Escape default action (w81 W-LD): dismiss the topmost
+        // modal dialog / auto popover, after the page's keydown
+        // dispatch — a prevented keydown suppresses it, like every
+        // other default action here. (The dialog `cancel` hook runs
+        // inside [`WindowApp::handle_escape`].)
+        if label == "Escape" && !prevented && self.handle_escape() {
+            return;
+        }
         // Sequential focus navigation, then the keyboard scrolling
         // fallback: Tab/Shift+Tab move `input.focused` through the focus
         // order and reveal the newly focused element
         // ([`apply_focus_nav`]); arrows/PageUp/PageDown/Space/Home/End
         // pan the focused element's scroll container (else the viewport)
         // — all only when the page didn't prevent the key's default.
+        // Inside a top-layer scope, Tab is trapped to that scope
+        // ([`apply_focus_nav_in_scope`], via
+        // [`top_layer_focus_scope`]): a popover above a modal dialog
+        // owns Tab while it is on top, not the dialog below it.
         let focused = self.input.focused;
         let shift = self.modifiers.shift_key();
         let scrolled = if prevented {
@@ -4583,8 +5265,18 @@ impl<'a> WindowApp<'a> {
         } else if label == "Tab" {
             // Disjoint field borrows (`input` vs `tabs`): `tab_mut()`
             // would take `&mut self` and conflict with `&mut self.input`.
+            let scope = match self.tabs.get(self.tab) {
+                Some(tab) => match tab.document_ref() {
+                    Some(doc) => top_layer_focus_scope(&doc),
+                    None => None,
+                },
+                None => None,
+            };
             match self.tabs.get_mut(self.tab) {
-                Some(tab) => apply_focus_nav(&mut self.input, tab, shift),
+                Some(tab) => match scope {
+                    Some(scope) => apply_focus_nav_in_scope(&mut self.input, tab, scope, shift),
+                    None => apply_focus_nav(&mut self.input, tab, shift),
+                },
                 None => Vec::new(),
             }
         } else {
@@ -10721,6 +11413,12 @@ mod tests {
         /// Unified dispatch order across scroll/snap/scrollend, for
         /// the snap-event ordering assertions.
         order: Vec<String>,
+        /// Escape / light-dismiss hook deliveries (w81 W-LD).
+        closes: Vec<NodeId>,
+        cancels: Vec<NodeId>,
+        toggles: Vec<NodeId>,
+        /// What [`StubDispatch::dispatch_cancel`] reports.
+        cancel_prevent: bool,
     }
 
     /// [`JsDispatch`] test double recording dispatched events.
@@ -10780,6 +11478,20 @@ mod tests {
             let mut log = self.log.borrow_mut();
             log.snaps.push((target, event_type.to_string(), targets));
             log.order.push(event_type.to_string());
+        }
+
+        fn dispatch_cancel(&mut self, _tab: &mut Tab, target: NodeId) -> bool {
+            let mut log = self.log.borrow_mut();
+            log.cancels.push(target);
+            log.cancel_prevent
+        }
+
+        fn dispatch_close(&mut self, _tab: &mut Tab, target: NodeId) {
+            self.log.borrow_mut().closes.push(target);
+        }
+
+        fn dispatch_toggle(&mut self, _tab: &mut Tab, target: NodeId) {
+            self.log.borrow_mut().toggles.push(target);
         }
     }
 
@@ -14270,6 +14982,1029 @@ mod tests {
             w79_run_full_page(html),
             "0|0|80|70|50|60",
             "shim dynamic fixed (flex) must land at viewport (80,70)"
+        );
+    }
+
+    // -----------------------------------------------------------------
+    // popovertarget activation (w81-G)
+    // -----------------------------------------------------------------
+
+    fn popover_doc(html: &str) -> (Document, NodeId, NodeId) {
+        let (doc, _) = Document::parse_html(html.as_bytes());
+        let btn = doc.get_element_by_id("btn").expect("invoker");
+        let pop = doc.get_element_by_id("pop").expect("popover target");
+        (doc, btn, pop)
+    }
+
+    #[test]
+    fn popover_target_toggle_show_hide_and_invalid_default() {
+        let (mut doc, btn, pop) = popover_doc(
+            "<html><body><button id=\"btn\" popovertarget=\"pop\">t</button>\
+             <div id=\"pop\" popover>hi</div></body></html>",
+        );
+        // Missing action defaults to toggle.
+        activate_popover_target(&mut doc, btn, btn);
+        assert!(doc.is_popover_open(pop), "toggle must open");
+        activate_popover_target(&mut doc, btn, btn);
+        assert!(!doc.is_popover_open(pop), "toggle must close");
+
+        let (mut doc, btn, pop) = popover_doc(
+            "<html><body><button id=\"btn\" popovertarget=\"pop\" \
+             popovertargetaction=\"show\">s</button>\
+             <div id=\"pop\" popover>hi</div></body></html>",
+        );
+        activate_popover_target(&mut doc, btn, btn);
+        assert!(doc.is_popover_open(pop), "show must open");
+        activate_popover_target(&mut doc, btn, btn);
+        assert!(doc.is_popover_open(pop), "show on open is a no-op");
+
+        doc.set_attribute(btn, "popovertargetaction", "hide");
+        activate_popover_target(&mut doc, btn, btn);
+        assert!(!doc.is_popover_open(pop), "hide must close");
+        activate_popover_target(&mut doc, btn, btn);
+        assert!(!doc.is_popover_open(pop), "hide on hidden is a no-op");
+
+        // Invalid action falls back to toggle, not to show or hide.
+        doc.set_attribute(btn, "popovertargetaction", "bogus");
+        activate_popover_target(&mut doc, btn, btn);
+        assert!(doc.is_popover_open(pop), "invalid action must toggle open");
+    }
+
+    #[test]
+    fn popover_target_noops_and_invoker_rules() {
+        // Missing id and non-popover target: no-op, no panic.
+        let (mut doc, btn, _) = popover_doc(
+            "<html><body><button id=\"btn\" popovertarget=\"nope\">t</button>\
+             <div id=\"pop\">not a popover</div></body></html>",
+        );
+        activate_popover_target(&mut doc, btn, btn);
+        assert!(!doc.is_popover_open(btn), "missing id must no-op");
+        doc.set_attribute(btn, "popovertarget", "pop");
+        activate_popover_target(&mut doc, btn, btn);
+        assert!(!doc.is_popover_open(btn), "non-popover target must no-op");
+
+        // Non-button invokers never activate, even a div with the attrs.
+        let (mut doc, btn, pop) = popover_doc(
+            "<html><body><div id=\"btn\" popovertarget=\"pop\">t</div>\
+             <div id=\"pop\" popover>hi</div></body></html>",
+        );
+        activate_popover_target(&mut doc, btn, btn);
+        assert!(!doc.is_popover_open(pop), "div invoker must not activate");
+
+        // Input type=button activates; other input types do not.
+        let (mut doc, btn, pop) = popover_doc(
+            "<html><body><input id=\"btn\" type=\"button\" popovertarget=\"pop\">\
+             <div id=\"pop\" popover>hi</div></body></html>",
+        );
+        activate_popover_target(&mut doc, btn, btn);
+        assert!(doc.is_popover_open(pop), "input type=button must activate");
+        doc.set_attribute(btn, "type", "text");
+        activate_popover_target(&mut doc, btn, btn);
+        assert!(
+            doc.is_popover_open(pop),
+            "input type=text must not toggle it closed"
+        );
+
+        // Disabled invoker never activates.
+        let (mut doc, btn, pop) = popover_doc(
+            "<html><body><button id=\"btn\" disabled popovertarget=\"pop\">t</button>\
+             <div id=\"pop\" popover>hi</div></body></html>",
+        );
+        activate_popover_target(&mut doc, btn, btn);
+        assert!(
+            !doc.is_popover_open(pop),
+            "disabled invoker must not activate"
+        );
+
+        // Submit button inside a form does not activate; the same
+        // button with no form owner does (spec target-element rule).
+        let (mut doc, btn, pop) = popover_doc(
+            "<html><body><form><button id=\"btn\" popovertarget=\"pop\">t</button></form>\
+             <div id=\"pop\" popover>hi</div></body></html>",
+        );
+        activate_popover_target(&mut doc, btn, btn);
+        assert!(
+            !doc.is_popover_open(pop),
+            "submit in form must not activate"
+        );
+        let (mut doc, btn, pop) = popover_doc(
+            "<html><body><button id=\"btn\" popovertarget=\"pop\">t</button>\
+             <div id=\"pop\" popover>hi</div></body></html>",
+        );
+        activate_popover_target(&mut doc, btn, btn);
+        assert!(
+            doc.is_popover_open(pop),
+            "submit with no form must activate"
+        );
+    }
+
+    #[test]
+    fn popover_target_nested_content_invoker_and_descendant_guard() {
+        // A span and an img inside the button both resolve to the
+        // button: hit-testing prefers the deepest child box.
+        let (mut doc, btn, pop) = popover_doc(
+            "<html><body><button id=\"btn\" popovertarget=\"pop\">\
+             <span id=\"inner\">t</span><img id=\"pic\"></button>\
+             <div id=\"pop\" popover>hi</div></body></html>",
+        );
+        let inner = doc.get_element_by_id("inner").expect("span");
+        let pic = doc.get_element_by_id("pic").expect("img");
+        assert_eq!(resolve_popover_invoker(&doc, inner), Some(btn));
+        assert_eq!(resolve_popover_invoker(&doc, pic), Some(btn));
+        assert_eq!(
+            activate_popover_target(&mut doc, btn, inner),
+            Some(pop),
+            "span click must toggle via the button"
+        );
+        assert!(doc.is_popover_open(pop));
+        assert_eq!(
+            activate_popover_target(&mut doc, btn, pic),
+            Some(pop),
+            "img click must toggle via the button"
+        );
+        assert!(!doc.is_popover_open(pop));
+
+        // Descendant guard: the popover sits inside the invoker and
+        // the event target sits inside the popover, so activation
+        // is a no-op and the open popover stays open (a toggle
+        // would have closed it).
+        let (mut doc, btn, pop) = popover_doc(
+            "<html><body><button id=\"btn\" popovertarget=\"pop\">t</button>\
+             <div id=\"pop\" popover>hi</div></body></html>",
+        );
+        let inner = doc.create_element("span");
+        doc.append_child(pop, inner);
+        // Move the popover inside the invoker: append reparents.
+        doc.append_child(btn, pop);
+        doc.show_popover(pop).expect("show");
+        assert_eq!(
+            activate_popover_target(&mut doc, btn, inner),
+            None,
+            "guard must block: event inside popover, popover inside invoker"
+        );
+        assert!(
+            doc.is_popover_open(pop),
+            "guard must leave the popover open"
+        );
+    }
+
+    #[test]
+    fn popover_target_form_attribute_overrides_ancestor_form() {
+        // Inside a form, but form="nonexistent": no owner, so the
+        // submit button activates.
+        let (mut doc, btn, pop) = popover_doc(
+            "<html><body><form><button id=\"btn\" popovertarget=\"pop\" \
+             form=\"nonexistent\">t</button></form>\
+             <div id=\"pop\" popover>hi</div></body></html>",
+        );
+        assert_eq!(activate_popover_target(&mut doc, btn, btn), Some(pop));
+        assert!(doc.is_popover_open(pop));
+
+        // form="other" naming a real form elsewhere: that form owns
+        // the button even though it is not an ancestor, so no
+        // activation.
+        let (mut doc, btn, pop) = popover_doc(
+            "<html><body><form id=\"other\"></form><form>\
+             <button id=\"btn\" popovertarget=\"pop\" form=\"other\">t</button></form>\
+             <div id=\"pop\" popover>hi</div></body></html>",
+        );
+        assert_eq!(activate_popover_target(&mut doc, btn, btn), None);
+        assert!(!doc.is_popover_open(pop));
+
+        // form naming a non-form element: no owner, so activation.
+        let (mut doc, btn, pop) = popover_doc(
+            "<html><body><div id=\"notform\"></div><form>\
+             <button id=\"btn\" popovertarget=\"pop\" form=\"notform\">t</button></form>\
+             <div id=\"pop\" popover>hi</div></body></html>",
+        );
+        assert_eq!(activate_popover_target(&mut doc, btn, btn), Some(pop));
+        assert!(doc.is_popover_open(pop));
+    }
+
+    #[test]
+    fn popover_invoker_submit_input_form_owner_gate() {
+        // Helper-level only: the submit gate for `<input
+        // type="submit">` mirrors the `<button>` submit gate.
+        // Clicks never reach this helper for input submit today
+        // (routing resolves only button/button-input), so these
+        // assertions pin the gate for when activation expands,
+        // not activation itself.
+        let (doc, btn, _) = popover_doc(
+            "<html><body><form><input id=\"btn\" type=\"submit\" popovertarget=\"pop\"></form>\
+             <div id=\"pop\" popover>hi</div></body></html>",
+        );
+        assert!(
+            !is_valid_popover_invoker(&doc, btn),
+            "form-owned input submit must be an invalid invoker"
+        );
+        let (doc, btn, _) = popover_doc(
+            "<html><body><input id=\"btn\" type=\"submit\" popovertarget=\"pop\">\
+             <div id=\"pop\" popover>hi</div></body></html>",
+        );
+        assert!(
+            is_valid_popover_invoker(&doc, btn),
+            "input submit with no form owner must pass the gate"
+        );
+        // form-attribute override both ways, like the button gate.
+        let (doc, btn, _) = popover_doc(
+            "<html><body><form><input id=\"btn\" type=\"submit\" popovertarget=\"pop\" \
+             form=\"nonexistent\"></form>\
+             <div id=\"pop\" popover>hi</div></body></html>",
+        );
+        assert!(
+            is_valid_popover_invoker(&doc, btn),
+            "form naming nothing means no owner, so the gate passes"
+        );
+        let (doc, btn, _) = popover_doc(
+            "<html><body><form id=\"other\"></form><form>\
+             <input id=\"btn\" type=\"submit\" popovertarget=\"pop\" form=\"other\"></form>\
+             <div id=\"pop\" popover>hi</div></body></html>",
+        );
+        assert!(
+            !is_valid_popover_invoker(&doc, btn),
+            "form naming a real form elsewhere owns the input, so the gate blocks"
+        );
+    }
+
+    #[test]
+    fn popover_target_foreign_namespace_invoker_never_activates() {
+        let (mut doc, _) =
+            Document::parse_html(b"<html><body><div id=\"pop\" popover>hi</div></body></html>");
+        let pop = doc.get_element_by_id("pop").expect("pop");
+        let body = doc
+            .get_elements_by_tag_name("body")
+            .into_iter()
+            .next()
+            .expect("body");
+        let foreign = doc.create_element_ns(Namespace::Svg, "button");
+        doc.append_child(body, foreign);
+        doc.set_attribute(foreign, "popovertarget", "pop");
+        assert_eq!(resolve_popover_invoker(&doc, foreign), None);
+        assert_eq!(
+            activate_popover_target(&mut doc, foreign, foreign),
+            None,
+            "foreign-namespace button must not activate"
+        );
+        assert!(!doc.is_popover_open(pop));
+    }
+
+    #[test]
+    fn light_dismiss_pending_target_exempts_only_valid_invokers() {
+        let (mut doc, _) = Document::parse_html(
+            b"<html><body><button id=\"btn\" popovertarget=\"pop\">t</button>\
+              <div id=\"fake\" popovertarget=\"pop\">f</div>\
+              <form><button id=\"owned\" popovertarget=\"pop\">o</button></form>\
+              <div id=\"pop\" popover>hi</div></body></html>",
+        );
+        let pop = doc.get_element_by_id("pop").expect("pop");
+        doc.show_popover(pop).expect("show");
+        let btn = doc.get_element_by_id("btn").expect("btn");
+        let fake = doc.get_element_by_id("fake").expect("fake");
+        let owned = doc.get_element_by_id("owned").expect("owned");
+        assert_eq!(
+            light_dismiss_pending_target(&doc, Some(btn)),
+            None,
+            "valid invoker exempts"
+        );
+        assert_eq!(
+            light_dismiss_pending_target(&doc, Some(fake)),
+            Some(pop),
+            "a div with popovertarget is not an invoker"
+        );
+        assert_eq!(
+            light_dismiss_pending_target(&doc, Some(owned)),
+            Some(pop),
+            "a submit button owned by a form is not a valid invoker"
+        );
+        assert_eq!(
+            light_dismiss_pending_target(&doc, None),
+            Some(pop),
+            "backdrop names the popover"
+        );
+        assert_eq!(
+            light_dismiss_pending_target(&doc, Some(pop)),
+            None,
+            "inside the popover names nothing"
+        );
+    }
+
+    // -----------------------------------------------------------------
+    // Escape / light-dismiss / modal focus (w81 W-LD)
+    // -----------------------------------------------------------------
+
+    /// Tab with a document plus synthetic boxes for hit-testing:
+    /// `#btn` (invoker) at (0,0,100,30), `#pop` at (200,200,100,100),
+    /// `#dlg` at (400,0,200,200) containing `#inner` at (410,10,50,20),
+    /// `#outside` at (0,300,800,100). The caller opens the dialog /
+    /// popover on the shared document before installing it.
+    /// Read installed-document state through the app's tab:
+    /// `install_test_document` requires sole `Rc` ownership, so
+    /// tests cannot keep a document alias around (see `tab.rs`).
+    fn check(app: &WindowApp, tab: TabId, f: impl FnOnce(&Document) -> bool) -> bool {
+        let t = app.tabs.get(tab).expect("tab");
+        let d = t.document_ref().expect("doc");
+        f(&d)
+    }
+
+    fn return_value(app: &WindowApp, tab: TabId, dlg: NodeId) -> String {
+        let t = app.tabs.get(tab).expect("tab");
+        let d = t.document_ref().expect("doc");
+        d.dialog_return_value(dlg).to_string()
+    }
+
+    fn dismiss_tab(doc: Document) -> (Tab, NodeId, NodeId, NodeId, NodeId, NodeId) {
+        let id = |name: &str| doc.get_element_by_id(name).expect(name);
+        let (btn, pop, dlg, inner, outside) =
+            (id("btn"), id("pop"), id("dlg"), id("inner"), id("outside"));
+        let mut tab = test_tab();
+        tab.install_test_document(Rc::new(RefCell::new(doc)));
+        tab.layout_root = Some(Rc::new(layout_box(
+            rect(0.0, 0.0, 800.0, 600.0),
+            None,
+            vec![
+                layout_box(rect(0.0, 300.0, 800.0, 100.0), Some(outside), vec![]),
+                layout_box(rect(0.0, 0.0, 100.0, 30.0), Some(btn), vec![]),
+                layout_box(rect(200.0, 200.0, 100.0, 100.0), Some(pop), vec![]),
+                layout_box(
+                    rect(400.0, 0.0, 200.0, 200.0),
+                    Some(dlg),
+                    vec![layout_box(
+                        rect(410.0, 10.0, 50.0, 20.0),
+                        Some(inner),
+                        vec![],
+                    )],
+                ),
+            ],
+        )));
+        (tab, btn, pop, dlg, inner, outside)
+    }
+
+    fn dismiss_doc() -> Document {
+        let (doc, _) = Document::parse_html(
+            b"<html><body><button id=\"btn\" popovertarget=\"pop\">t</button>\
+              <div id=\"pop\" popover>hi</div>\
+              <dialog id=\"dlg\"><button id=\"inner\">x</button></dialog>\
+              <div id=\"outside\">o</div></body></html>",
+        );
+        doc
+    }
+
+    fn dismiss_app<'a>(
+        tabs: &'a mut TabArena,
+        jar: &Arc<Mutex<CookieJar>>,
+        tab: TabId,
+        stub: StubDispatch,
+    ) -> (WindowApp<'a>, std::rc::Rc<RefCell<CallLog>>) {
+        let log = stub.log.clone();
+        let app = test_app_with_js(tabs, jar, tab, Some(Box::new(stub)));
+        (app, log)
+    }
+
+    #[test]
+    fn escape_closes_modal_dialog_with_cancel_then_close_and_keeps_return_value() {
+        let mut doc = dismiss_doc();
+        let dlg = doc.get_element_by_id("dlg").expect("dlg");
+        doc.set_dialog_return_value(dlg, "ok");
+        doc.show_dialog_modal(dlg).expect("showModal");
+        let (tab, _, _, _, _, _) = dismiss_tab(doc);
+        let mut tabs = TabArena::default();
+        let tab_id = tabs.insert(tab);
+        let jar = Arc::new(Mutex::new(CookieJar::new()));
+        let stub = StubDispatch {
+            prevent: false,
+            ..Default::default()
+        };
+        let (mut app, log) = dismiss_app(&mut tabs, &jar, tab_id, stub);
+
+        app.on_key(&Key::Named(NamedKey::Escape), true);
+        assert!(
+            !check(&app, tab_id, |d| d.is_dialog_open(dlg)),
+            "Escape must close the dialog"
+        );
+        assert!(!check(&app, tab_id, |d| d.is_dialog_modal(dlg)));
+        assert_eq!(
+            return_value(&app, tab_id, dlg),
+            "ok",
+            "Escape close passes no return value, so the stored one survives"
+        );
+        let log = log.borrow();
+        assert_eq!(log.cancels, vec![dlg], "cancel fires before close");
+        assert_eq!(log.closes, vec![dlg], "close fires after cancel");
+        assert!(log.toggles.is_empty());
+    }
+
+    #[test]
+    fn escape_cancel_prevented_or_keydown_prevented_keeps_dialog_open() {
+        // Canceled `cancel`: dialog stays, `close` never fires.
+        let mut doc = dismiss_doc();
+        let dlg = doc.get_element_by_id("dlg").expect("dlg");
+        doc.show_dialog_modal(dlg).expect("showModal");
+        let (tab, _, _, _, _, _) = dismiss_tab(doc);
+        let mut tabs = TabArena::default();
+        let tab_id = tabs.insert(tab);
+        let jar = Arc::new(Mutex::new(CookieJar::new()));
+        let stub = StubDispatch {
+            log: Rc::new(RefCell::new(CallLog {
+                cancel_prevent: true,
+                ..Default::default()
+            })),
+            prevent: false,
+        };
+        let (mut app, log) = dismiss_app(&mut tabs, &jar, tab_id, stub);
+        app.on_key(&Key::Named(NamedKey::Escape), true);
+        assert!(
+            check(&app, tab_id, |d| d.is_dialog_open(dlg)),
+            "canceled cancel must keep the dialog open"
+        );
+        assert_eq!(log.borrow().cancels, vec![dlg]);
+        assert!(log.borrow().closes.is_empty());
+
+        // Prevented keydown: the Escape default action never runs,
+        // so `cancel` does not even fire.
+        let mut doc = dismiss_doc();
+        let dlg = doc.get_element_by_id("dlg").expect("dlg");
+        doc.show_dialog_modal(dlg).expect("showModal");
+        let (tab, _, _, _, _, _) = dismiss_tab(doc);
+        let mut tabs = TabArena::default();
+        let tab_id = tabs.insert(tab);
+        let jar = Arc::new(Mutex::new(CookieJar::new()));
+        let stub = StubDispatch {
+            prevent: true,
+            ..Default::default()
+        };
+        let (mut app, log) = dismiss_app(&mut tabs, &jar, tab_id, stub);
+        app.on_key(&Key::Named(NamedKey::Escape), true);
+        assert!(
+            check(&app, tab_id, |d| d.is_dialog_open(dlg)),
+            "prevented keydown must not close the dialog"
+        );
+        assert!(log.borrow().cancels.is_empty());
+        assert!(log.borrow().closes.is_empty());
+    }
+
+    #[test]
+    fn escape_closes_auto_popover_but_not_manual_and_follows_top_layer() {
+        // Auto popover alone: Escape hides it with a `toggle`.
+        let mut doc = dismiss_doc();
+        let pop = doc.get_element_by_id("pop").expect("pop");
+        doc.show_popover(pop).expect("show");
+        let (tab, _, _, _, _, _) = dismiss_tab(doc);
+        let mut tabs = TabArena::default();
+        let tab_id = tabs.insert(tab);
+        let jar = Arc::new(Mutex::new(CookieJar::new()));
+        let (mut app, log) = dismiss_app(
+            &mut tabs,
+            &jar,
+            tab_id,
+            StubDispatch {
+                prevent: false,
+                ..Default::default()
+            },
+        );
+        app.on_key(&Key::Named(NamedKey::Escape), true);
+        assert!(!check(&app, tab_id, |d| d.is_popover_open(pop)));
+        assert_eq!(log.borrow().toggles, vec![pop]);
+
+        // Manual popover: Escape does nothing.
+        let mut doc = dismiss_doc();
+        let pop = doc.get_element_by_id("pop").expect("pop");
+        doc.set_attribute(pop, "popover", "manual");
+        doc.show_popover(pop).expect("show manual");
+        let (tab, _, _, _, _, _) = dismiss_tab(doc);
+        let mut tabs = TabArena::default();
+        let tab_id = tabs.insert(tab);
+        let jar = Arc::new(Mutex::new(CookieJar::new()));
+        let (mut app, log) = dismiss_app(
+            &mut tabs,
+            &jar,
+            tab_id,
+            StubDispatch {
+                prevent: false,
+                ..Default::default()
+            },
+        );
+        app.on_key(&Key::Named(NamedKey::Escape), true);
+        assert!(
+            check(&app, tab_id, |d| d.is_popover_open(pop)),
+            "manual popovers require explicit hide"
+        );
+        assert!(log.borrow().toggles.is_empty());
+
+        // Stacking: auto popover above a modal dialog closes first;
+        // a second Escape then closes the dialog.
+        let mut doc = dismiss_doc();
+        let pop = doc.get_element_by_id("pop").expect("pop");
+        let dlg = doc.get_element_by_id("dlg").expect("dlg");
+        doc.show_dialog_modal(dlg).expect("showModal");
+        doc.show_popover(pop).expect("show");
+        let (tab, _, _, _, _, _) = dismiss_tab(doc);
+        let mut tabs = TabArena::default();
+        let tab_id = tabs.insert(tab);
+        let jar = Arc::new(Mutex::new(CookieJar::new()));
+        let (mut app, log) = dismiss_app(
+            &mut tabs,
+            &jar,
+            tab_id,
+            StubDispatch {
+                prevent: false,
+                ..Default::default()
+            },
+        );
+        app.on_key(&Key::Named(NamedKey::Escape), true);
+        assert!(!check(&app, tab_id, |d| d.is_popover_open(pop)));
+        assert!(check(&app, tab_id, |d| d.is_dialog_open(dlg)));
+        app.on_key(&Key::Named(NamedKey::Escape), true);
+        assert!(!check(&app, tab_id, |d| d.is_dialog_open(dlg)));
+        assert_eq!(log.borrow().toggles, vec![pop]);
+        assert_eq!(log.borrow().closes, vec![dlg]);
+    }
+
+    #[test]
+    fn light_dismiss_press_outside_closes_auto_only_and_inside_keeps_open() {
+        // Outside press (empty area, no hit) dismisses the auto popover.
+        let mut doc = dismiss_doc();
+        let pop = doc.get_element_by_id("pop").expect("pop");
+        doc.show_popover(pop).expect("show");
+        let (tab, _, _, _, _, _) = dismiss_tab(doc);
+        let mut tabs = TabArena::default();
+        let tab_id = tabs.insert(tab);
+        let jar = Arc::new(Mutex::new(CookieJar::new()));
+        let (mut app, log) = dismiss_app(
+            &mut tabs,
+            &jar,
+            tab_id,
+            StubDispatch {
+                prevent: false,
+                ..Default::default()
+            },
+        );
+        app.on_cursor_moved(10.0, 500.0);
+        app.on_mouse_button(true, MouseButton::Left);
+        app.on_mouse_button(false, MouseButton::Left);
+        assert!(!check(&app, tab_id, |d| d.is_popover_open(pop)));
+        assert_eq!(log.borrow().toggles, vec![pop]);
+
+        // Inside press keeps it open.
+        let mut doc = dismiss_doc();
+        let pop = doc.get_element_by_id("pop").expect("pop");
+        doc.show_popover(pop).expect("show");
+        let (tab, _, _, _, _, _) = dismiss_tab(doc);
+        let mut tabs = TabArena::default();
+        let tab_id = tabs.insert(tab);
+        let jar = Arc::new(Mutex::new(CookieJar::new()));
+        let (mut app, log) = dismiss_app(
+            &mut tabs,
+            &jar,
+            tab_id,
+            StubDispatch {
+                prevent: false,
+                ..Default::default()
+            },
+        );
+        app.on_cursor_moved(250.0, 250.0);
+        app.on_mouse_button(true, MouseButton::Left);
+        app.on_mouse_button(false, MouseButton::Left);
+        assert!(check(&app, tab_id, |d| d.is_popover_open(pop)));
+        assert!(log.borrow().toggles.is_empty());
+
+        // Manual popover: outside press does nothing.
+        let mut doc = dismiss_doc();
+        let pop = doc.get_element_by_id("pop").expect("pop");
+        doc.set_attribute(pop, "popover", "manual");
+        doc.show_popover(pop).expect("show manual");
+        let (tab, _, _, _, _, _) = dismiss_tab(doc);
+        let mut tabs = TabArena::default();
+        let tab_id = tabs.insert(tab);
+        let jar = Arc::new(Mutex::new(CookieJar::new()));
+        let (mut app, log) = dismiss_app(
+            &mut tabs,
+            &jar,
+            tab_id,
+            StubDispatch {
+                prevent: false,
+                ..Default::default()
+            },
+        );
+        app.on_cursor_moved(10.0, 500.0);
+        app.on_mouse_button(true, MouseButton::Left);
+        app.on_mouse_button(false, MouseButton::Left);
+        assert!(check(&app, tab_id, |d| d.is_popover_open(pop)));
+        assert!(log.borrow().toggles.is_empty());
+    }
+
+    #[test]
+    fn light_dismiss_invoker_click_closes_exactly_once_with_toggle_hook() {
+        // Press on the invoker records no light-dismiss candidate;
+        // the release's click toggles the popover closed instead.
+        // Net effect is one close, and the activation change fires
+        // exactly one `toggle` hook — the invoker-toggle delivery,
+        // distinct from the light-dismiss delivery below, which
+        // fires at release with no click toggle after it.
+        let mut doc = dismiss_doc();
+        let pop = doc.get_element_by_id("pop").expect("pop");
+        doc.show_popover(pop).expect("show");
+        let (tab, btn, _, _, _, _) = dismiss_tab(doc);
+        let mut tabs = TabArena::default();
+        let tab_id = tabs.insert(tab);
+        let jar = Arc::new(Mutex::new(CookieJar::new()));
+        let (mut app, log) = dismiss_app(
+            &mut tabs,
+            &jar,
+            tab_id,
+            StubDispatch {
+                prevent: false,
+                ..Default::default()
+            },
+        );
+        app.on_cursor_moved(50.0, 15.0);
+        app.on_mouse_button(true, MouseButton::Left);
+        assert!(
+            check(&app, tab_id, |d| d.is_popover_open(pop)),
+            "press on the invoker must not light-dismiss"
+        );
+        app.on_mouse_button(false, MouseButton::Left);
+        assert!(!check(&app, tab_id, |d| d.is_popover_open(pop)));
+        assert_eq!(
+            log.borrow().toggles,
+            vec![pop],
+            "the activation toggle fires its toggle hook exactly once"
+        );
+        assert_eq!(log.borrow().clicks, vec![btn]);
+    }
+
+    #[test]
+    fn light_dismiss_press_outside_drag_inside_release_inside_keeps_open() {
+        // Pointerup model (HTML §6.12.2): the outside press only
+        // records the candidate, so a drag into the popover before
+        // release dismisses nothing — the release resolves inside
+        // the popover, not to the recorded popover.
+        let mut doc = dismiss_doc();
+        let pop = doc.get_element_by_id("pop").expect("pop");
+        doc.show_popover(pop).expect("show");
+        let (tab, _, _, _, _, _) = dismiss_tab(doc);
+        let mut tabs = TabArena::default();
+        let tab_id = tabs.insert(tab);
+        let jar = Arc::new(Mutex::new(CookieJar::new()));
+        let (mut app, log) = dismiss_app(
+            &mut tabs,
+            &jar,
+            tab_id,
+            StubDispatch {
+                prevent: false,
+                ..Default::default()
+            },
+        );
+        app.on_cursor_moved(10.0, 500.0);
+        app.on_mouse_button(true, MouseButton::Left);
+        assert!(
+            check(&app, tab_id, |d| d.is_popover_open(pop)),
+            "press outside must not dismiss yet"
+        );
+        app.on_cursor_moved(250.0, 250.0);
+        app.on_mouse_button(false, MouseButton::Left);
+        assert!(
+            check(&app, tab_id, |d| d.is_popover_open(pop)),
+            "release inside the popover must not dismiss"
+        );
+        assert!(log.borrow().toggles.is_empty());
+    }
+
+    #[test]
+    fn popover_above_modal_background_press_blocked_but_popover_press_lands() {
+        // A popover above a modal dialog does not lift the modal's
+        // inertness for background content, but a press inside the
+        // popover itself lands normally.
+        let mut doc = dismiss_doc();
+        let pop = doc.get_element_by_id("pop").expect("pop");
+        let dlg = doc.get_element_by_id("dlg").expect("dlg");
+        doc.show_dialog_modal(dlg).expect("showModal");
+        doc.show_popover(pop).expect("show");
+        let (tab, _, _, _, inner, _) = dismiss_tab(doc);
+        let mut tabs = TabArena::default();
+        let tab_id = tabs.insert(tab);
+        let jar = Arc::new(Mutex::new(CookieJar::new()));
+        let (mut app, _) = dismiss_app(
+            &mut tabs,
+            &jar,
+            tab_id,
+            StubDispatch {
+                prevent: false,
+                ..Default::default()
+            },
+        );
+        app.input.focused = Some(inner);
+        app.on_cursor_moved(50.0, 350.0);
+        app.on_mouse_button(true, MouseButton::Left);
+        app.on_mouse_button(false, MouseButton::Left);
+        assert_eq!(
+            app.input.focused,
+            Some(inner),
+            "background press with a popover above a modal must stay blocked"
+        );
+        assert!(
+            check(&app, tab_id, |d| d.is_popover_open(pop)),
+            "blocked press must not light-dismiss the popover"
+        );
+        assert!(
+            check(&app, tab_id, |d| d.is_dialog_open(dlg)),
+            "blocked press must not close the dialog"
+        );
+        // Press inside the popover lands: focus moves to it and
+        // nothing closes.
+        app.on_cursor_moved(250.0, 250.0);
+        app.on_mouse_button(true, MouseButton::Left);
+        assert_eq!(app.input.focused, Some(pop));
+        app.on_mouse_button(false, MouseButton::Left);
+        assert!(check(&app, tab_id, |d| d.is_popover_open(pop)));
+        assert!(check(&app, tab_id, |d| d.is_dialog_open(dlg)));
+    }
+
+    #[test]
+    fn popover_activation_click_fires_toggle_hook_on_show_and_hide() {
+        let doc = dismiss_doc();
+        let (tab, _, pop, _, _, _) = dismiss_tab(doc);
+        let mut tabs = TabArena::default();
+        let tab_id = tabs.insert(tab);
+        let jar = Arc::new(Mutex::new(CookieJar::new()));
+        let (mut app, log) = dismiss_app(
+            &mut tabs,
+            &jar,
+            tab_id,
+            StubDispatch {
+                prevent: false,
+                ..Default::default()
+            },
+        );
+        assert!(!check(&app, tab_id, |d| d.is_popover_open(pop)));
+        app.on_cursor_moved(50.0, 15.0);
+        app.on_mouse_button(true, MouseButton::Left);
+        app.on_mouse_button(false, MouseButton::Left);
+        assert!(check(&app, tab_id, |d| d.is_popover_open(pop)));
+        assert_eq!(log.borrow().toggles, vec![pop]);
+        app.on_mouse_button(true, MouseButton::Left);
+        app.on_mouse_button(false, MouseButton::Left);
+        assert!(!check(&app, tab_id, |d| d.is_popover_open(pop)));
+        assert_eq!(log.borrow().toggles, vec![pop, pop]);
+    }
+
+    #[test]
+    fn tab_with_popover_above_modal_navigates_within_popover() {
+        // Top-layer order, not the topmost modal, owns Tab: with a
+        // popover above a modal dialog, Tab cycles inside the
+        // popover and never reaches the dialog or the page.
+        let (mut doc, _) = Document::parse_html(
+            b"<html><body><button id=\"out\">o</button>\
+              <dialog id=\"dlg\"><button id=\"dinner\">d</button></dialog>\
+              <div id=\"pop\" popover><button id=\"p1\">1</button>\
+              <button id=\"p2\">2</button></div></body></html>",
+        );
+        let id = |name: &str| doc.get_element_by_id(name).expect(name);
+        let (out, dlg, dinner, pop, p1, p2) = (
+            id("out"),
+            id("dlg"),
+            id("dinner"),
+            id("pop"),
+            id("p1"),
+            id("p2"),
+        );
+        doc.show_dialog_modal(dlg).expect("showModal");
+        doc.show_popover(pop).expect("show");
+        let mut tab = test_tab();
+        tab.install_test_document(Rc::new(RefCell::new(doc)));
+        tab.layout_root = Some(Rc::new(layout_box(
+            rect(0.0, 0.0, 800.0, 600.0),
+            None,
+            vec![
+                layout_box(rect(0.0, 0.0, 100.0, 30.0), Some(out), vec![]),
+                layout_box(
+                    rect(400.0, 0.0, 200.0, 200.0),
+                    Some(dlg),
+                    vec![layout_box(
+                        rect(410.0, 10.0, 50.0, 20.0),
+                        Some(dinner),
+                        vec![],
+                    )],
+                ),
+                layout_box(
+                    rect(200.0, 200.0, 100.0, 100.0),
+                    Some(pop),
+                    vec![
+                        layout_box(rect(210.0, 210.0, 50.0, 20.0), Some(p1), vec![]),
+                        layout_box(rect(210.0, 240.0, 50.0, 20.0), Some(p2), vec![]),
+                    ],
+                ),
+            ],
+        )));
+        let mut tabs = TabArena::default();
+        let tab_id = tabs.insert(tab);
+        let jar = Arc::new(Mutex::new(CookieJar::new()));
+        let (mut app, _) = dismiss_app(
+            &mut tabs,
+            &jar,
+            tab_id,
+            StubDispatch {
+                prevent: false,
+                ..Default::default()
+            },
+        );
+        app.input.focused = Some(out);
+        app.on_key(&Key::Named(NamedKey::Tab), true);
+        assert_eq!(app.input.focused, Some(p1));
+        app.on_key(&Key::Named(NamedKey::Tab), true);
+        assert_eq!(app.input.focused, Some(p2));
+        app.on_key(&Key::Named(NamedKey::Tab), true);
+        assert_eq!(
+            app.input.focused,
+            Some(p1),
+            "Tab must wrap inside the popover, never reaching the dialog"
+        );
+    }
+
+    #[test]
+    fn lone_open_popover_does_not_trap_tab() {
+        // No modal dialog in the top layer, so there is no focus
+        // scope even with a popover open: only modal dialogs trap
+        // focus, popovers do not. Tab from the last popover button
+        // leaves the popover for the next page focusable, and the
+        // next Tab wraps to the first page focusable — never back
+        // inside the popover.
+        let (mut doc, _) = Document::parse_html(
+            b"<html><body><button id=\"out\">o</button>\
+              <div id=\"pop\" popover><button id=\"p1\">1</button>\
+              <button id=\"p2\">2</button></div>\
+              <button id=\"after\">a</button></body></html>",
+        );
+        let id = |name: &str| doc.get_element_by_id(name).expect(name);
+        let (out, pop, p1, p2, after) = (id("out"), id("pop"), id("p1"), id("p2"), id("after"));
+        doc.show_popover(pop).expect("show");
+        assert_eq!(
+            top_layer_focus_scope(&doc),
+            None,
+            "a lone open popover is not a focus scope"
+        );
+        let mut tab = test_tab();
+        tab.install_test_document(Rc::new(RefCell::new(doc)));
+        tab.layout_root = Some(Rc::new(layout_box(
+            rect(0.0, 0.0, 800.0, 600.0),
+            None,
+            vec![
+                layout_box(rect(0.0, 0.0, 100.0, 30.0), Some(out), vec![]),
+                layout_box(
+                    rect(200.0, 200.0, 100.0, 100.0),
+                    Some(pop),
+                    vec![
+                        layout_box(rect(210.0, 210.0, 50.0, 20.0), Some(p1), vec![]),
+                        layout_box(rect(210.0, 240.0, 50.0, 20.0), Some(p2), vec![]),
+                    ],
+                ),
+                layout_box(rect(0.0, 300.0, 100.0, 30.0), Some(after), vec![]),
+            ],
+        )));
+        let mut tabs = TabArena::default();
+        let tab_id = tabs.insert(tab);
+        let jar = Arc::new(Mutex::new(CookieJar::new()));
+        let (mut app, _) = dismiss_app(
+            &mut tabs,
+            &jar,
+            tab_id,
+            StubDispatch {
+                prevent: false,
+                ..Default::default()
+            },
+        );
+        app.input.focused = Some(p2);
+        app.on_key(&Key::Named(NamedKey::Tab), true);
+        assert_eq!(
+            app.input.focused,
+            Some(after),
+            "Tab from the last popover button must leave a lone popover"
+        );
+        app.on_key(&Key::Named(NamedKey::Tab), true);
+        assert_eq!(
+            app.input.focused,
+            Some(out),
+            "Tab must wrap to the page, not back inside the popover"
+        );
+    }
+
+    #[test]
+    fn modal_dialog_blocks_outside_presses_and_escape_clears_inner_focus() {
+        let mut doc = dismiss_doc();
+        let dlg = doc.get_element_by_id("dlg").expect("dlg");
+        doc.show_dialog_modal(dlg).expect("showModal");
+        let (tab, _, _, _, inner, _) = dismiss_tab(doc);
+        let mut tabs = TabArena::default();
+        let tab_id = tabs.insert(tab);
+        let jar = Arc::new(Mutex::new(CookieJar::new()));
+        let (mut app, _) = dismiss_app(
+            &mut tabs,
+            &jar,
+            tab_id,
+            StubDispatch {
+                prevent: false,
+                ..Default::default()
+            },
+        );
+        // Focus inside the dialog, then press outside it: the press
+        // is swallowed, focus never leaves the dialog.
+        app.on_cursor_moved(435.0, 20.0);
+        app.on_mouse_button(true, MouseButton::Left);
+        app.on_mouse_button(false, MouseButton::Left);
+        assert_eq!(app.input.focused, Some(inner));
+        app.on_cursor_moved(50.0, 350.0);
+        app.on_mouse_button(true, MouseButton::Left);
+        app.on_mouse_button(false, MouseButton::Left);
+        assert_eq!(
+            app.input.focused,
+            Some(inner),
+            "outside press must not move focus out of a modal dialog"
+        );
+        // Escape closes the dialog and clears the inner focus
+        // instead of leaving `:focus` on hidden content.
+        app.on_key(&Key::Named(NamedKey::Escape), true);
+        assert!(!check(&app, tab_id, |d| d.is_dialog_open(dlg)));
+        assert_eq!(app.input.focused, None);
+    }
+
+    #[test]
+    fn modal_dialog_traps_tab_to_its_focusables() {
+        // Pure trap function: focus outside the dialog jumps to the
+        // first dialog focusable, cycles inside, and wraps.
+        let (doc, _) = Document::parse_html(
+            b"<html><body><button id=\"out\">o</button>\
+              <dialog id=\"dlg\"><button id=\"a\">a</button>\
+              <button id=\"b\">b</button></dialog></body></html>",
+        );
+        let id = |name: &str| doc.get_element_by_id(name).expect(name);
+        let (out, dlg, a, b) = (id("out"), id("dlg"), id("a"), id("b"));
+        let mut doc = doc;
+        doc.show_dialog_modal(dlg).expect("showModal");
+        let mut tab = test_tab();
+        tab.install_test_document(Rc::new(RefCell::new(doc)));
+        let mut input = InputState {
+            focused: Some(out),
+            ..Default::default()
+        };
+        apply_focus_nav_in_dialog(&mut input, &mut tab, dlg, false);
+        assert_eq!(input.focused, Some(a), "Tab from outside lands inside");
+        apply_focus_nav_in_dialog(&mut input, &mut tab, dlg, false);
+        assert_eq!(input.focused, Some(b));
+        apply_focus_nav_in_dialog(&mut input, &mut tab, dlg, false);
+        assert_eq!(input.focused, Some(a), "Tab wraps inside the dialog");
+        apply_focus_nav_in_dialog(&mut input, &mut tab, dlg, true);
+        assert_eq!(input.focused, Some(b), "Shift+Tab wraps backward");
+
+        // App-level Tab while a modal dialog is open uses the trap:
+        // focus outside the dialog moves to the first inner button,
+        // never to the outside button.
+        let mut doc = dismiss_doc();
+        let dlg = doc.get_element_by_id("dlg").expect("dlg");
+        doc.show_dialog_modal(dlg).expect("showModal");
+        let (tab, _, _, _, inner, outside) = dismiss_tab(doc);
+        let mut tabs = TabArena::default();
+        let tab_id = tabs.insert(tab);
+        let jar = Arc::new(Mutex::new(CookieJar::new()));
+        let (mut app, _) = dismiss_app(
+            &mut tabs,
+            &jar,
+            tab_id,
+            StubDispatch {
+                prevent: false,
+                ..Default::default()
+            },
+        );
+        app.input.focused = Some(outside);
+        app.on_key(&Key::Named(NamedKey::Tab), true);
+        assert_eq!(
+            app.input.focused,
+            Some(inner),
+            "Tab with a modal dialog open must stay inside it"
+        );
+    }
+
+    #[test]
+    fn popover_target_self_target_and_stripped_popover_noop() {
+        // A button targeting itself: the descendant guard no-ops.
+        let (mut doc, btn, _) = popover_doc(
+            "<html><body><button id=\"btn\" popover popovertarget=\"btn\">t</button>\
+             <div id=\"pop\" popover>hi</div></body></html>",
+        );
+        activate_popover_target(&mut doc, btn, btn);
+        assert!(!doc.is_popover_open(btn), "self-target must no-op");
+
+        // Attribute-stripped popover is never resurrected by show.
+        let (mut doc, btn, pop) = popover_doc(
+            "<html><body><button id=\"btn\" popovertarget=\"pop\" \
+             popovertargetaction=\"show\">s</button>\
+             <div id=\"pop\" popover>hi</div></body></html>",
+        );
+        activate_popover_target(&mut doc, btn, btn);
+        assert!(doc.is_popover_open(pop), "precondition: open");
+        doc.remove_attribute(pop, "popover");
+        activate_popover_target(&mut doc, btn, btn);
+        assert!(
+            !doc.is_popover_open(pop),
+            "stripped popover must stay closed"
         );
     }
 }

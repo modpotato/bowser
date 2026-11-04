@@ -109,7 +109,7 @@
 //! pointer/mouse/key/touch/wheel events, and an executor-local focus
 //! model. Its own gaps are listed with its section docs.
 
-use bowser_dom::NodeId;
+use bowser_dom::{EscapeTarget, NodeId};
 
 use crate::navigation;
 use crate::script::PageEventDispatch;
@@ -625,6 +625,12 @@ struct PointerSourceState {
     pointer_id: i32,
     touch_target: Option<NodeId>,
     touch_pan: Option<usize>,
+    /// Light-dismiss pointerdown record (HTML §6.12.2), mirroring
+    /// the windowed input path: the popover a primary-button
+    /// press outside it named as its dismiss candidate. The
+    /// release dismisses it only when it resolves to the same
+    /// popover; cleared on every pointerup / pointercancel.
+    light_dismiss_pending: Option<NodeId>,
     /// Executor tick of this pointer's last stored action (see
     /// [`ExecutorState::pointer_use_seq`]): the deterministic
     /// "most recently active pointer" key for wheel actions with
@@ -644,6 +650,7 @@ impl Default for PointerSourceState {
             pointer_id: 1,
             touch_target: None,
             touch_pan: None,
+            light_dismiss_pending: None,
             last_used: 0,
         }
     }
@@ -898,10 +905,22 @@ impl TestDriver {
     /// newly focused element (`Nearest`/`Nearest`, instant — the same
     /// path the windowed `apply_focus_nav` uses). Shift is read from
     /// the held modifier set, like the windowed path reads the
-    /// modifier state.
+    /// modifier state. With a top-layer scope open (a modal dialog,
+    /// or a popover above it — see
+    /// [`crate::window::top_layer_focus_scope`]), Tab traps inside
+    /// that scope, mirroring the windowed path; a scope with no
+    /// focusables falls back to the scope itself.
     fn move_focus_tab(&mut self, tab: &mut Tab, backward: bool) {
         let order = match tab.document_ref() {
-            Some(doc) => sequential_focus_order(&doc),
+            Some(doc) => match crate::window::top_layer_focus_scope(&doc) {
+                Some(scope) => {
+                    let mut candidates = vec![scope];
+                    candidates.extend(doc.descendants(scope));
+                    let order = sequential_focus_order_over(&doc, candidates);
+                    if order.is_empty() { vec![scope] } else { order }
+                }
+                None => sequential_focus_order(&doc),
+            },
             None => return,
         };
         if order.is_empty() {
@@ -1069,10 +1088,93 @@ impl TestDriver {
         } else {
             self.dispatch.dispatch_key_up_at(tab, target, &key, mods)
         };
-        if down && key == "Tab" && !prevented {
-            self.move_focus_tab(tab, self.actions.modifiers.shift);
+        // Default actions, mirroring the windowed key path: an
+        // un-prevented Escape dismisses the topmost modal dialog /
+        // auto popover, and an un-prevented Tab moves focus through
+        // the top-layer focus scope when one is open (see
+        // [`Self::move_focus_tab`]).
+        if down && !prevented {
+            if key == "Escape" {
+                self.execute_escape(tab);
+            } else if key == "Tab" {
+                self.move_focus_tab(tab, self.actions.modifiers.shift);
+            }
         }
         Ok(())
+    }
+
+    /// Escape default action for the executor, mirroring
+    /// `WindowApp::handle_escape`: dismiss the top-layer member
+    /// itself (a modal dialog via cancel-then-close, an `auto`
+    /// popover via hide), with the `cancel` / `close` / `toggle`
+    /// hooks routed through the [`JsDispatch`] trait — currently
+    /// no-ops for the production dispatcher, whose `script.rs`
+    /// wiring is deferred, exactly as in the windowed path.
+    /// Returns true when a dismissible target existed, even when
+    /// a canceled `cancel` kept the dialog open. Executor focus
+    /// inside a dismissed target is cleared, like the windowed
+    /// path's `clear_focus_inside`.
+    fn execute_escape(&mut self, tab: &mut Tab) -> bool {
+        let target = match tab.document_ref() {
+            Some(doc) => doc.topmost_escape_target(),
+            None => None,
+        };
+        let Some(target) = target else {
+            return false;
+        };
+        match target {
+            EscapeTarget::ModalDialog(dialog) => {
+                let canceled = JsDispatch::dispatch_cancel(&mut self.dispatch, tab, dialog);
+                if canceled {
+                    return true;
+                }
+                let closed = match tab.installed_mut() {
+                    Some(installed) => installed
+                        .document()
+                        .borrow_mut()
+                        .close_dialog(dialog, None)
+                        .unwrap_or(false),
+                    None => false,
+                };
+                if !closed {
+                    return true;
+                }
+                JsDispatch::dispatch_close(&mut self.dispatch, tab, dialog);
+                self.clear_focus_inside(tab, dialog);
+                true
+            }
+            EscapeTarget::AutoPopover(pop) => {
+                let hidden = match tab.installed_mut() {
+                    Some(installed) => {
+                        let mut doc = installed.document().borrow_mut();
+                        let was_open = doc.is_popover_open(pop);
+                        was_open && doc.hide_popover(pop).is_ok()
+                    }
+                    None => false,
+                };
+                if !hidden {
+                    return true;
+                }
+                JsDispatch::dispatch_toggle(&mut self.dispatch, tab, pop);
+                self.clear_focus_inside(tab, pop);
+                true
+            }
+        }
+    }
+
+    /// Clear executor focus when it sits on `closed` or inside it
+    /// (dialog/popover just dismissed): focus must not linger on
+    /// hidden content. Focus elsewhere is untouched.
+    fn clear_focus_inside(&mut self, tab: &mut Tab, closed: NodeId) {
+        let inside = match (self.actions.focused, tab.document_ref()) {
+            (Some(focused), Some(doc)) => {
+                focused == closed || doc.descendants(closed).contains(&focused)
+            }
+            _ => false,
+        };
+        if inside {
+            self.set_focus(tab, None);
+        }
     }
 
     /// Resolve the target point of a `pointerMove` action in client
@@ -1165,7 +1267,14 @@ impl TestDriver {
     /// One `pointerDown` action: `pointerdown` + `touchstart` (touch
     /// sources) + `mousedown`, in that order, then focus moves to the
     /// press target. The pressed button's bit is set before the
-    /// events, so they report it held.
+    /// events, so they report it held. A primary-button press
+    /// swallowed by modal inertness ([`crate::window::modal_press_blocked`])
+    /// dispatches nothing and records no press target, so its
+    /// release synthesizes no click — mirroring the windowed path.
+    /// A primary-button press otherwise records its light-dismiss
+    /// candidate (HTML §6.12.2) before any event fires; the release
+    /// dismisses only on a matching candidate (see
+    /// [`Self::execute_pointer_up`]).
     fn execute_pointer_down(&mut self, tab: &mut Tab, source: &ActionSource, item: &ActionItem) {
         let mut st = self.pointer_snapshot(source);
         let button = item.button.unwrap_or(0);
@@ -1176,6 +1285,21 @@ impl TestDriver {
             target = Self::fallback_target(tab);
         }
         st.buttons |= button_bit(button);
+        if button == 0 {
+            let blocked = match tab.document_ref() {
+                Some(doc) => crate::window::modal_press_blocked(&doc, target),
+                None => false,
+            };
+            if blocked {
+                st.light_dismiss_pending = None;
+                self.store_pointer(source, st);
+                return;
+            }
+            st.light_dismiss_pending = match tab.document_ref() {
+                Some(doc) => crate::window::light_dismiss_pending_target(&doc, target),
+                None => None,
+            };
+        }
         if let Some(t) = target {
             st.down_targets.insert(button, t);
         }
@@ -1253,6 +1377,9 @@ impl TestDriver {
     fn execute_pointer_up(&mut self, tab: &mut Tab, source: &ActionSource, item: &ActionItem) {
         let mut st = self.pointer_snapshot(source);
         let button = item.button.unwrap_or(0);
+        // The light-dismiss record is taken here so every release
+        // clears it, whether or not the release dismisses.
+        let light_dismiss_pending = st.light_dismiss_pending.take();
         let hit = self
             .dispatch
             .hit_test_at_point(tab, st.x as f32, st.y as f32);
@@ -1290,6 +1417,8 @@ impl TestDriver {
             // whole compatibility chain below — `mouseup` and the
             // synthesized `click`/`auxclick`/`contextmenu` — exactly
             // as a cancelled `pointerdown` suppresses `mousedown`.
+            // Light-dismiss is part of that chain: a cancelled
+            // `pointerup` dismisses nothing either.
             if !up_prevented && !touch_prevented {
                 self.fire_pointer(
                     tab,
@@ -1300,6 +1429,30 @@ impl TestDriver {
                     button as i32,
                     (0.0, 0.0),
                 );
+                // Light-dismiss on release (HTML §6.12.2), before
+                // the synthesized click: only when the release
+                // resolves to the same popover the press recorded.
+                // A press outside dragged inside the popover, or
+                // onto its invoker, before release dismisses
+                // nothing, and the click below then runs normally.
+                if button == 0
+                    && let Some(pop) = light_dismiss_pending
+                    && tab
+                        .document_ref()
+                        .and_then(|doc| crate::window::light_dismiss_pending_target(&doc, Some(t)))
+                        == Some(pop)
+                {
+                    let hidden = match tab.installed_mut() {
+                        Some(installed) => {
+                            installed.document().borrow_mut().hide_popover(pop).is_ok()
+                        }
+                        None => false,
+                    };
+                    if hidden {
+                        JsDispatch::dispatch_toggle(&mut self.dispatch, tab, pop);
+                        self.clear_focus_inside(tab, pop);
+                    }
+                }
                 match button {
                     // Secondary button: `contextmenu`, and only when
                     // a matching `pointerDown` landed on this same
@@ -1331,7 +1484,7 @@ impl TestDriver {
                                 .and_then(|doc| nearest_common_inclusive_ancestor(&doc, down, t))
                                 .or(if down == t { Some(t) } else { None });
                             if let Some(ct) = click_target {
-                                self.fire_pointer(
+                                let click_prevented = self.fire_pointer(
                                     tab,
                                     &st,
                                     ct,
@@ -1340,6 +1493,40 @@ impl TestDriver {
                                     button as i32,
                                     (0.0, 0.0),
                                 );
+                                // Primary-click default action, gated
+                                // on the click not being prevented:
+                                // popover-target activation, with the
+                                // invoker resolved from the click
+                                // target's ancestors (the target is
+                                // the deepest hit box) and the
+                                // `toggle` hook on a visibility
+                                // change — the same default action
+                                // the windowed and phase-1 click
+                                // paths run. `auxclick` activates
+                                // nothing.
+                                if button == 0 && !click_prevented {
+                                    let changed = match tab.installed_mut() {
+                                        Some(installed) => {
+                                            let mut doc = installed.document().borrow_mut();
+                                            match crate::window::resolve_popover_invoker(&doc, ct) {
+                                                Some(invoker) => {
+                                                    crate::window::activate_popover_target(
+                                                        &mut doc, invoker, ct,
+                                                    )
+                                                }
+                                                None => None,
+                                            }
+                                        }
+                                        None => None,
+                                    };
+                                    if let Some(target) = changed {
+                                        JsDispatch::dispatch_toggle(
+                                            &mut self.dispatch,
+                                            tab,
+                                            target,
+                                        );
+                                    }
+                                }
                             }
                         }
                     }
@@ -1391,6 +1578,7 @@ impl TestDriver {
         st.down_targets.clear();
         st.touch_target = None;
         st.touch_pan = None;
+        st.light_dismiss_pending = None;
         self.store_pointer(source, st);
     }
 
@@ -1597,9 +1785,17 @@ fn td_is_sequentially_focusable(doc: &Document, node: NodeId) -> bool {
 /// the zero/`tabindex`-less focusables in document order. Mirrors
 /// `window::focus_order`.
 fn sequential_focus_order(doc: &Document) -> Vec<NodeId> {
+    sequential_focus_order_over(doc, doc.descendants(doc.root()))
+}
+
+/// [`sequential_focus_order`] over an explicit candidate list,
+/// already in document order: the top-layer Tab trap passes the
+/// scope element followed by its descendants, so Tab cycles inside
+/// the scope instead of escaping to the page behind it.
+fn sequential_focus_order_over(doc: &Document, candidates: Vec<NodeId>) -> Vec<NodeId> {
     let mut positive: Vec<(i32, usize, NodeId)> = Vec::new();
     let mut zero: Vec<NodeId> = Vec::new();
-    for (i, node) in doc.descendants(doc.root()).iter().enumerate() {
+    for (i, node) in candidates.iter().enumerate() {
         if !td_is_sequentially_focusable(doc, *node) {
             continue;
         }
@@ -1684,8 +1880,29 @@ impl TestDriver {
     fn execute_click(&mut self, tab: &mut Tab, node: NodeId) -> Result<(), String> {
         self.scroll_into_view(tab, node);
         // The same primitive real mouse input uses: inline `onclick`
-        // plus a trusted bubbling, cancelable `click` dispatch.
-        self.dispatch.dispatch_click(tab, node);
+        // plus a trusted bubbling, cancelable `click` dispatch. Its
+        // return value is the default-action gate: a prevented click
+        // runs no default action, popover-target activation included
+        // (see [`crate::window::activate_popover_target`]).
+        let prevented = self.dispatch.dispatch_click(tab, node);
+        if !prevented {
+            let changed = match tab.installed_mut() {
+                Some(installed) => {
+                    let mut doc = installed.document().borrow_mut();
+                    match crate::window::resolve_popover_invoker(&doc, node) {
+                        Some(invoker) => {
+                            crate::window::activate_popover_target(&mut doc, invoker, node)
+                        }
+                        None => None,
+                    }
+                }
+                None => None,
+            };
+            tab.sync_dirty_flags();
+            if let Some(target) = changed {
+                JsDispatch::dispatch_toggle(&mut self.dispatch, tab, target);
+            }
+        }
         Self::grant_activation(tab);
         Ok(())
     }
@@ -1693,7 +1910,19 @@ impl TestDriver {
     fn execute_send_keys(&mut self, tab: &mut Tab, node: NodeId, keys: &str) -> Result<(), String> {
         self.scroll_into_view(tab, node);
         for key in split_testdriver_keys(keys) {
-            self.dispatch.dispatch_key_at(tab, node, &key);
+            // Split the pair so the Escape default action can be
+            // gated on the `keydown` alone, like the windowed key
+            // path (a prevented `keyup` must not suppress it, and a
+            // prevented `keydown` must). Other keys behave exactly
+            // as `dispatch_key_at` did: one down plus one up.
+            let prevented_down =
+                self.dispatch
+                    .dispatch_key_down_at(tab, node, &key, Default::default());
+            self.dispatch
+                .dispatch_key_up_at(tab, node, &key, Default::default());
+            if key == "Escape" && !prevented_down {
+                self.execute_escape(tab);
+            }
         }
         Self::grant_activation(tab);
         Ok(())
@@ -3074,6 +3303,335 @@ mod tests {
         assert!(
             js_true(&mut tab, "window.__events.join(',') === 'scroll'"),
             "keyup fires no further scroll"
+        );
+    }
+
+    // -----------------------------------------------------------------
+    // popovertarget activation (w81-G): through execute_click, the
+    // same path test_driver.click() takes.
+    // -----------------------------------------------------------------
+
+    /// A tab with web APIs and no layout tree: `execute_click`
+    /// skips scrolling when `dirty.layout` is set, so no layout
+    /// boxes are needed for these click tests.
+    fn popover_click_tab(html: &str) -> (Tab, NodeId, NodeId) {
+        use std::cell::RefCell;
+        use std::rc::Rc;
+        let doc = Rc::new(RefCell::new(
+            bowser_dom::Document::parse_html(html.as_bytes()).0,
+        ));
+        let (btn, pop) = {
+            let d = doc.borrow();
+            (
+                d.get_element_by_id("btn").expect("invoker"),
+                d.get_element_by_id("pop").expect("popover target"),
+            )
+        };
+        let base = bowser_url::parse("http://example.com/page.html", None).expect("test url");
+        let page =
+            crate::script::PageVm::new_for_document(doc.clone(), &base, "TestBrowser/9.9", &[])
+                .expect("install web apis");
+        let mut tab = crate::Tab::new(bowser_layout::Size { w: 800.0, h: 600.0 });
+        tab.install_document(doc, page);
+        tab.dirty.layout = true;
+        (tab, btn, pop)
+    }
+
+    fn popover_open(tab: &Tab, pop: NodeId) -> bool {
+        tab.document_ref()
+            .map(|doc| doc.is_popover_open(pop))
+            .unwrap_or(false)
+    }
+
+    #[test]
+    fn testdriver_click_activates_popover_target_toggle_show_hide() {
+        let (mut tab, btn, pop) = popover_click_tab(
+            "<html><body><button id=\"btn\" popovertarget=\"pop\">t</button>\
+             <div id=\"pop\" popover>hi</div></body></html>",
+        );
+        let mut driver = TestDriver::new();
+        driver.execute_click(&mut tab, btn).expect("click");
+        assert!(popover_open(&tab, pop), "toggle click must open");
+        driver.execute_click(&mut tab, btn).expect("click");
+        assert!(!popover_open(&tab, pop), "toggle click must close");
+
+        // Show / hide actions, including their no-op directions.
+        let (mut tab, btn, pop) = popover_click_tab(
+            "<html><body><button id=\"btn\" popovertarget=\"pop\" \
+             popovertargetaction=\"show\">s</button>\
+             <button id=\"hide\" popovertarget=\"pop\" popovertargetaction=\"hide\">h</button>\
+             <div id=\"pop\" popover>hi</div></body></html>",
+        );
+        let hide = tab
+            .document_ref()
+            .and_then(|doc| doc.get_element_by_id("hide"))
+            .expect("hide button");
+        let mut driver = TestDriver::new();
+        driver.execute_click(&mut tab, btn).expect("click");
+        assert!(popover_open(&tab, pop), "show click must open");
+        driver.execute_click(&mut tab, btn).expect("click");
+        assert!(popover_open(&tab, pop), "show on open is a no-op");
+        driver.execute_click(&mut tab, hide).expect("click");
+        assert!(!popover_open(&tab, pop), "hide click must close");
+    }
+
+    #[test]
+    fn testdriver_click_popover_target_noops_and_prevented_click() {
+        // Missing id and non-popover target: no-op.
+        let (mut tab, btn, pop) = popover_click_tab(
+            "<html><body><button id=\"btn\" popovertarget=\"nope\">t</button>\
+             <div id=\"pop\">not a popover</div></body></html>",
+        );
+        let mut driver = TestDriver::new();
+        driver.execute_click(&mut tab, btn).expect("click");
+        assert!(!popover_open(&tab, pop), "missing id must no-op");
+
+        // A preventDefault()ed click runs no default action, so the
+        // popover stays closed even though the listener fired.
+        let (mut tab, btn, pop) = popover_click_tab(
+            "<html><body><button id=\"btn\" popovertarget=\"pop\">t</button>\
+             <div id=\"pop\" popover>hi</div></body></html>",
+        );
+        eval(
+            &mut tab,
+            "window.__fired = 0; \
+             document.getElementById('btn').addEventListener('click', function(e) { \
+               window.__fired = 1; e.preventDefault(); });",
+        );
+        let mut driver = TestDriver::new();
+        driver.execute_click(&mut tab, btn).expect("click");
+        assert!(
+            js_true(&mut tab, "window.__fired === 1"),
+            "listener must still fire on a prevented click"
+        );
+        assert!(
+            !popover_open(&tab, pop),
+            "preventDefault()ed click must not activate the popover"
+        );
+    }
+
+    // -----------------------------------------------------------------
+    // Action-sequence / send_keys window-path parity (w81fix-B1)
+    // -----------------------------------------------------------------
+
+    /// A tab with web APIs and layout boxes for popover action
+    /// sequences: `#btn` (0,0,100,50) containing `#span`
+    /// (10,10,80,30), `#pop` (200,200,100,100). Mirrors
+    /// `actions_tab`'s hand-built tree, with popover ids instead
+    /// of `#a`/`#b`.
+    fn popover_seq_tab(html: &str) -> (Tab, NodeId, NodeId) {
+        use std::cell::RefCell;
+        use std::rc::Rc;
+        let doc = Rc::new(RefCell::new(
+            bowser_dom::Document::parse_html(html.as_bytes()).0,
+        ));
+        let (btn, span, pop) = {
+            let d = doc.borrow();
+            (
+                d.get_element_by_id("btn").expect("btn"),
+                d.get_element_by_id("span").expect("span"),
+                d.get_element_by_id("pop").expect("pop"),
+            )
+        };
+        let base = bowser_url::parse("http://example.com/page.html", None).expect("test url");
+        let page =
+            crate::script::PageVm::new_for_document(doc.clone(), &base, "TestBrowser/9.9", &[])
+                .expect("install web apis");
+        let mut tab = crate::Tab::new(bowser_layout::Size { w: 800.0, h: 600.0 });
+        tab.install_document(doc, page);
+        tab.layout_root = Some(Rc::new(actions_box(
+            (0.0, 0.0, 800.0, 600.0),
+            None,
+            vec![
+                actions_box(
+                    (0.0, 0.0, 100.0, 50.0),
+                    Some(btn),
+                    vec![actions_box((10.0, 10.0, 80.0, 30.0), Some(span), vec![])],
+                ),
+                actions_box((200.0, 200.0, 100.0, 100.0), Some(pop), vec![]),
+            ],
+        )));
+        (tab, btn, pop)
+    }
+
+    fn open_popover_td(tab: &mut Tab, pop: NodeId) {
+        tab.installed_mut()
+            .expect("installed")
+            .document()
+            .borrow_mut()
+            .show_popover(pop)
+            .expect("show");
+    }
+
+    fn popover_seq_html() -> &'static str {
+        "<html><body><button id=\"btn\" popovertarget=\"pop\">\
+         <span id=\"span\">t</span></button>\
+         <div id=\"pop\" popover>hi</div></body></html>"
+    }
+
+    #[test]
+    fn actions_click_activates_popover_target_via_nested_span() {
+        let (mut tab, _, pop) = popover_seq_tab(popover_seq_html());
+        let click = || {
+            sequence_request(vec![pointer_source(
+                "mouse",
+                vec![
+                    move_item(50.0, 25.0, ActionOrigin::Viewport),
+                    button_item(ActionItemKind::PointerDown, 0),
+                    button_item(ActionItemKind::PointerUp, 0),
+                ],
+            )])
+        };
+        let mut driver = TestDriver::new();
+        driver.execute(&mut tab, click());
+        assert!(
+            popover_open(&tab, pop),
+            "action-sequence click on the nested span must activate via the button"
+        );
+        driver.execute(&mut tab, click());
+        assert!(
+            !popover_open(&tab, pop),
+            "second action-sequence click must toggle closed"
+        );
+    }
+
+    #[test]
+    fn actions_pointerup_light_dismiss_and_drag_into_popover() {
+        // Same-spot outside release dismisses.
+        let (mut tab, _, pop) = popover_seq_tab(popover_seq_html());
+        open_popover_td(&mut tab, pop);
+        let mut driver = TestDriver::new();
+        driver.execute(
+            &mut tab,
+            sequence_request(vec![pointer_source(
+                "mouse",
+                vec![
+                    move_item(700.0, 500.0, ActionOrigin::Viewport),
+                    button_item(ActionItemKind::PointerDown, 0),
+                    button_item(ActionItemKind::PointerUp, 0),
+                ],
+            )]),
+        );
+        assert!(
+            !popover_open(&tab, pop),
+            "outside press + same-spot release must light-dismiss"
+        );
+
+        // Press outside, drag into the popover, release inside:
+        // no dismiss.
+        let (mut tab, _, pop) = popover_seq_tab(popover_seq_html());
+        open_popover_td(&mut tab, pop);
+        let mut driver = TestDriver::new();
+        driver.execute(
+            &mut tab,
+            sequence_request(vec![pointer_source(
+                "mouse",
+                vec![
+                    move_item(700.0, 500.0, ActionOrigin::Viewport),
+                    button_item(ActionItemKind::PointerDown, 0),
+                    move_item(250.0, 250.0, ActionOrigin::Viewport),
+                    button_item(ActionItemKind::PointerUp, 0),
+                ],
+            )]),
+        );
+        assert!(
+            popover_open(&tab, pop),
+            "release inside the popover must not light-dismiss"
+        );
+    }
+
+    #[test]
+    fn actions_escape_dismisses_auto_popover() {
+        let (mut tab, _, pop) = popover_click_tab(popover_seq_html());
+        open_popover_td(&mut tab, pop);
+        let mut driver = TestDriver::new();
+        driver.execute(
+            &mut tab,
+            sequence_request(vec![key_source(vec![
+                key_item(ActionItemKind::KeyDown, "\u{E00C}"),
+                key_item(ActionItemKind::KeyUp, "\u{E00C}"),
+            ])]),
+        );
+        assert!(
+            !popover_open(&tab, pop),
+            "action-sequence Escape must dismiss the auto popover"
+        );
+    }
+
+    #[test]
+    fn send_keys_escape_dismisses_auto_popover() {
+        let (mut tab, btn, pop) = popover_click_tab(popover_seq_html());
+        open_popover_td(&mut tab, pop);
+        let mut driver = TestDriver::new();
+        driver
+            .execute_send_keys(&mut tab, btn, "\u{E00C}")
+            .expect("send_keys");
+        assert!(
+            !popover_open(&tab, pop),
+            "send_keys Escape must dismiss the auto popover"
+        );
+    }
+
+    #[test]
+    fn actions_tab_traps_in_popover_above_modal_dialog() {
+        // Same shape as popover_click_tab (web APIs, dirty layout
+        // so no geometry is needed), but with the trap fixture's
+        // ids instead of btn/pop.
+        let mut tab = {
+            use std::cell::RefCell;
+            use std::rc::Rc;
+            let doc = Rc::new(RefCell::new(
+                bowser_dom::Document::parse_html(
+                    b"<html><body><button id=\"out\">o</button>\
+                     <dialog id=\"dlg\"><button id=\"dinner\">d</button></dialog>\
+                     <div id=\"pop\" popover><button id=\"p1\">1</button>\
+                     <button id=\"p2\">2</button></div></body></html>",
+                )
+                .0,
+            ));
+            let base = bowser_url::parse("http://example.com/page.html", None).expect("test url");
+            let page =
+                crate::script::PageVm::new_for_document(doc.clone(), &base, "TestBrowser/9.9", &[])
+                    .expect("install web apis");
+            let mut tab = crate::Tab::new(bowser_layout::Size { w: 800.0, h: 600.0 });
+            tab.install_document(doc, page);
+            tab.dirty.layout = true;
+            tab
+        };
+        let (out, dlg, pop, p1, p2) = {
+            let doc = tab.document_ref().expect("doc");
+            (
+                doc.get_element_by_id("out").expect("out"),
+                doc.get_element_by_id("dlg").expect("dlg"),
+                doc.get_element_by_id("pop").expect("pop"),
+                doc.get_element_by_id("p1").expect("p1"),
+                doc.get_element_by_id("p2").expect("p2"),
+            )
+        };
+        tab.installed_mut()
+            .expect("installed")
+            .document()
+            .borrow_mut()
+            .show_dialog_modal(dlg)
+            .expect("showModal");
+        open_popover_td(&mut tab, pop);
+        let mut driver = TestDriver::new();
+        driver.actions.focused = Some(out);
+        let tab_key = || {
+            sequence_request(vec![key_source(vec![
+                key_item(ActionItemKind::KeyDown, "\u{E004}"),
+                key_item(ActionItemKind::KeyUp, "\u{E004}"),
+            ])])
+        };
+        driver.execute(&mut tab, tab_key());
+        assert_eq!(driver.actions.focused, Some(p1));
+        driver.execute(&mut tab, tab_key());
+        assert_eq!(driver.actions.focused, Some(p2));
+        driver.execute(&mut tab, tab_key());
+        assert_eq!(
+            driver.actions.focused,
+            Some(p1),
+            "Tab must wrap inside the popover, never reaching the dialog"
         );
     }
 }

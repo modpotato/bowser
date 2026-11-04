@@ -1335,9 +1335,12 @@ fn matches_compound(
                 // lowercased at intern time), so the selector name goes
                 // through the case-insensitive lookup for HTML elements.
                 // Either side outside the atom table (custom elements,
-                // `createElementNS` without lowercasing, ...) falls back
-                // to the string compare, which stays correct against
-                // spilled names.
+                // spilled foreign-namespace names, whose case
+                // `createElementNS` preserves, ...) falls back to the
+                // string compare, which stays correct against spilled
+                // names. HTML-namespace `createElementNS` is not such
+                // a source anymore: it lowercases HTML names since
+                // w80fix F1.
                 let elem = &data.tag_name;
                 let ok = if elem.atom() == NameAtom::UNKNOWN {
                     if html {
@@ -1661,6 +1664,8 @@ fn matches_pseudo(
         PseudoClass::Visited => is_html_link(doc, node) && state.visited,
         PseudoClass::Checked => is_checked(doc, node),
         PseudoClass::PopoverOpen => doc.is_popover_open(node),
+        PseudoClass::Open => doc.is_open_element(node),
+        PseudoClass::Modal => doc.is_dialog_modal(node),
         PseudoClass::Disabled => is_disabled(doc, node),
         PseudoClass::Enabled => is_enabled(doc, node),
         PseudoClass::Not(args) => !args
@@ -1752,12 +1757,16 @@ fn ns_key(ns: &Namespace) -> u8 {
 /// ASCII-case-insensitive in HTML, exact elsewhere.
 ///
 /// Well-known tags borrow their canonical atom-table string (no
-/// allocation, no heap hashing). Anything needing normalization —
-/// unknown/spilled names, or a mixed-case well-known name under HTML's
-/// case-insensitive rule (reachable only via `createElementNS`) —
-/// carries a pre-normalized owned string. That path still allocates
-/// once per element, exactly like the old `(u8, String)` key, and only
-/// there.
+/// allocation, no heap hashing). Anything needing normalization in
+/// the HTML case — unknown/spilled names, or (defensively) a
+/// mixed-case well-known name under HTML's case-insensitive rule,
+/// which HTML-namespace `createElementNS` no longer produces since
+/// w80fix F1 lowercases it — carries a pre-normalized owned string.
+/// Mixed-case names still produced in practice are foreign-namespace
+/// names, whose case `createElementNS` preserves and which compare
+/// exactly, so they need no such normalization. That path still
+/// allocates once per element, exactly like the old `(u8, String)`
+/// key, and only there.
 #[derive(Clone, Debug)]
 struct TypeKey {
     ns: u8,
@@ -1836,8 +1845,14 @@ fn type_key(data: &ElementData) -> TypeKey {
                     name: TypeName::Borrowed(canonical),
                 };
             }
-            // Mixed-case well-known name, reachable only via
-            // `createElementNS`: normalize like the old code did.
+            // Mixed-case well-known name in the HTML namespace:
+            // HTML-namespace `createElementNS` no longer produces
+            // one (it lowercases since w80fix F1), so this is a
+            // defensive path, reached only by direct construction
+            // (tests); the mixed-case names still produced in
+            // practice are foreign-namespace names, whose case
+            // `createElementNS` preserves. Normalize like the old
+            // code did.
             return TypeKey {
                 ns,
                 name: TypeName::Owned(canonical.to_ascii_lowercase().into_boxed_str()),
@@ -1965,8 +1980,11 @@ fn element_index_from_end(sib: Option<&SiblingCache>, doc: &Document, node: Node
 /// namespace and same tag name (ASCII case-insensitive in HTML, exact
 /// elsewhere — the same rule as type-selector matching). Canonical tag
 /// atoms compare as one `u32`; spilled (unknown) names fall back to the
-/// string rule so non-canonical names (e.g. `createElementNS` without
-/// lowercasing) still group correctly.
+/// string rule so non-canonical names (e.g. custom elements, and
+/// foreign-namespace names outside the atom table, whose case
+/// `createElementNS` preserves) still group correctly.
+/// HTML-namespace `createElementNS` no longer produces such a name:
+/// it lowercases HTML names since w80fix F1.
 fn same_type(a: &ElementData, b: &ElementData) -> bool {
     if a.namespace != b.namespace {
         return false;

@@ -191,16 +191,19 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use crate::{ImageIdMap, font_key_for_style, load_tab_headless};
 use bowser_css::ComputedStyle;
-use bowser_dom::Document;
+use bowser_dom::{Document, NodeId};
 use bowser_layout::{LayoutBox, Size};
 use bowser_paint::WgpuBackend;
-use bowser_paint::display_list::{DecodedImage, ImageId, build_display_list};
+use bowser_paint::display_list::{
+    DecodedImage, ImageId, build_display_list_with_backdrop_styles, collect_backdrop_styles,
+};
 use bowser_paint::fonts::{FontCache, FontKey};
-use bowser_paint::render::render_layout_to_rgba_with_scroll;
+use bowser_paint::render::render_layout_to_rgba_with_scroll_and_backdrop_styles;
 use bowser_wpt::driver::{BrowserDriver, DriverError, Screenshot, Viewport};
 use bowser_wpt::manifest::{TestExtras, TestItem};
 use bowser_wpt::reftest::{self, RefRel, ReftestTolerance};
 use bowser_wpt::results::{HarnessResult, HarnessStatus, SubtestResult};
+use std::rc::Rc;
 
 /// Default wall-clock budget for `--viewport` renders (shader compile and
 /// first paint can be slow on a cold GPU).
@@ -697,8 +700,9 @@ const HARNESS_PREFIX: &str = "/__bowser_harness__/";
 /// runner budget expires. The wall-clock chain "harness deadline <
 /// pump deadline < child/runner kill" as literally stated is false
 /// for long installs: the pump deadline is pump_start + 90 s, i.e.
-/// child_start + install + 90 s, which exceeds the 180 s runner
-/// budget once install >= 90 s. The outcome is still correct there
+/// child_start + install + 90 s, which reaches the 180 s runner
+/// budget at install = 90 s and exceeds it only once install > 90 s.
+/// The outcome is still correct there
 /// because a harness timer already past due at pump start fires on
 /// the first pump iteration, before the child kill — but that is
 /// past-due firing, not the stated deadline ordering, so the
@@ -720,14 +724,13 @@ const HARNESS_PREFIX: &str = "/__bowser_harness__/";
 /// runner budget expires; the child `--timeout` is forwarded from the
 /// runner budget (see `run_testharness_with_markers`) and the runner
 /// watchdog enforces the same budget. That last link is the one this
-/// file cannot raise: runs are validated with
-/// `bowser-wpt --timeout-secs 180`, because the 60 s default in
-/// `bowser-wpt.rs`/`RunConfig` would kill a genuine-TIMEOUT control
-/// at 60 s before its 80 s harness timer fires (a runner
-/// `DriverTimeout`, which still matches `TIMEOUT` metadata but is
-/// not a harness TIMEOUT) and would kill a contended colors-007
-/// install past 60 s outright. Raising that default is a separate
-/// change in files outside this reporter.
+/// file cannot raise: the default in `bowser-wpt.rs`/`RunConfig`
+/// is now 180 s (w81), so runs no longer need
+/// `bowser-wpt --timeout-secs 180` to validate: the old 60 s default
+/// would kill a genuine-TIMEOUT control at 60 s before its 80 s
+/// harness timer fires (a runner `DriverTimeout`, which still
+/// matches `TIMEOUT` metadata but is not a harness TIMEOUT) and
+/// would kill a contended colors-007 install past 60 s outright.
 /// Long-test exception: a test with `<meta name="timeout"
 /// content="long">` has a 60 s base deadline, so at multiplier 8 its
 /// harness deadline is setup + 480 s — unreachable under the 90 s
@@ -740,9 +743,12 @@ const HARNESS_PREFIX: &str = "/__bowser_harness__/";
 /// multiplier when `timeout_length` is long, or a pump budget keyed
 /// to it); no timer redesign is attempted here. Cost of this fix,
 /// stated plainly: genuine harness TIMEOUTs now take ~80 s to report
-/// instead of ~10 s (and ~30 s at multiplier 3). Aggregate suite-time
-/// cost: every genuine TIMEOUT test now costs 60 s at the default
-/// (watchdog) instead of ~10 s pre-wave, and 80 s at 180 s validation.
+/// instead of ~10 s at the pre-wave multiplier-1 default (and ~30 s
+/// at multiplier 3). Aggregate suite-time cost: every
+/// watchdog-bound TIMEOUT test now costs 180 s at the current
+/// (w81 validation) default watchdog budget instead of ~10 s at the
+/// pre-wave multiplier-1 harness deadline; a harness TIMEOUT
+/// itself still reports at its ~80 s harness deadline.
 ///
 /// Kept to conservative ES5 (`var`, function expressions, no `Date` —
 /// the engine has no `Date` yet): it only needs `add_completion_callback`
@@ -5607,8 +5613,12 @@ fn composite_over_white(pixels: &mut [u8]) {
 /// `render_layout_to_rgba_with_fonts`; kept in sync with it: the GPU
 /// path builds the display list resolving font keys against `fonts` and
 /// renders offscreen (the backend persists thread-locally across
-/// commands), and the adapter-less fallback is the plain
-/// [`render_layout_to_rgba_with_scroll`] entry point (identical pixels).
+/// commands), and the adapter-less fallback is the
+/// with-backdrop-styles render entry point (identical pixels to the
+/// plain entry point when the map is empty). `backdrop_styles`
+/// carries the author `::backdrop` styles (see
+/// `collect_backdrop_styles`); without them paint falls back to the
+/// UA modal dim.
 ///
 /// `scroll` is the viewport scroll offset (CSS px), subtracted from
 /// content at draw time like the windowed path's per-frame uniform.
@@ -5619,6 +5629,7 @@ fn render_with_fonts(
     image_resolver: &mut dyn FnMut(&str) -> Option<(ImageId, DecodedImage)>,
     fonts: &mut FontCache,
     scroll: (f32, f32),
+    backdrop_styles: HashMap<NodeId, Rc<ComputedStyle>>,
 ) -> Vec<u8> {
     let Some((w, h)) = viewport_whole_px(viewport) else {
         return Vec::new();
@@ -5627,12 +5638,15 @@ fn render_with_fonts(
         let display_list = {
             let mut resolve_fonts =
                 |style: &ComputedStyle| -> FontKey { font_key_for_style(fonts, style) };
-            build_display_list(
+            // Cloned, not moved: the adapter-vanished fallback below
+            // still needs the map.
+            build_display_list_with_backdrop_styles(
                 root,
                 doc,
                 &mut resolve_fonts,
                 &mut *image_resolver,
                 viewport,
+                backdrop_styles.clone(),
             )
         };
         if let Some(mut pixels) =
@@ -5644,7 +5658,14 @@ fn render_with_fonts(
         // Adapter vanished between probe and render; fall through to the
         // CPU path below.
     }
-    render_layout_to_rgba_with_scroll(root, doc, viewport, image_resolver, scroll)
+    render_layout_to_rgba_with_scroll_and_backdrop_styles(
+        root,
+        doc,
+        viewport,
+        image_resolver,
+        scroll,
+        backdrop_styles,
+    )
 }
 
 impl SessionOps for PipelineOps {
@@ -5684,6 +5705,13 @@ impl SessionOps for PipelineOps {
         // page (e.g. via `scrollIntoView` in the test) screenshots at
         // the scrolled position, not the top of the document.
         let scroll = tab.scroll().offset();
+        // Author `::backdrop` styles for the production paint path,
+        // collected from the tab's author sheets over the top layer
+        // (see `bowser_paint::display_list::collect_backdrop_styles`):
+        // without them paint falls back to the UA modal dim and
+        // author backdrop rules never render.
+        let author_refs: Vec<&bowser_css::Stylesheet> = tab.render.author.iter().collect();
+        let backdrop_styles = collect_backdrop_styles(&document, &author_refs, viewport);
         Ok(render_with_fonts(
             root,
             &document,
@@ -5691,6 +5719,7 @@ impl SessionOps for PipelineOps {
             &mut resolve_images,
             &mut fonts,
             scroll,
+            backdrop_styles,
         ))
     }
 

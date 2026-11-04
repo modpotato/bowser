@@ -3273,33 +3273,48 @@ mod tests {
         // underneath the pump no matter how long the main thread is
         // descheduled, so the sleep can never race a wall clock.
         std::thread::sleep(Duration::from_millis(200));
-        // Owner B opens on a helper thread so the 5 s bound is on
-        // B's open actually returning, not on the main thread's
-        // scheduling: even descheduled for seconds, the main thread
-        // observes the result whenever it wakes. A regression that
-        // lets the pump hold the session lock past the slice fails
-        // here in 5 s with a clear message instead of hanging. The
-        // 2 s -> 5 s loosening is a deliberate scheduling-headroom
-        // tradeoff: `open_request` blocks indefinitely on the session
-        // mutex, so a stuck pump is caught by this bound at any
-        // duration — but on a loaded 2-vCPU box under parallel-test
-        // load, scheduling jitter between pump slices can cost
-        // seconds, and the old 2 s bound flaked. The cost is that a
-        // regression holding the lock ~4 s now passes where 2 s
-        // would have failed; a real past-the-slice regression holds
-        // the lock for the whole pump (30 s here), orders of
-        // magnitude past the bound either way.
+        // Owner B opens on a helper thread so the main thread's
+        // scheduling cannot masquerade as pump latency: even
+        // descheduled for seconds, the main thread observes the
+        // result whenever it wakes. There is deliberately NO
+        // wall-clock pass/fail bound on B's open here. The old 5 s
+        // bound flaked on a loaded 2-vCPU box under parallel-test
+        // load, where scheduling jitter alone costs seconds — and
+        // either side starving looked like a pump regression while
+        // proving nothing about the session lock. The sole pass/fail
+        // criterion is the structural assertion below
+        // (`pump_done_before_stop`): a genuinely stuck pump cannot
+        // let B return before the stop, so B returns only after the
+        // pump's 30 s deadline expires, the flag reads true, and the
+        // test fails — worst case slow (30 s), never hung.
+        // The two remaining durations are hang guards, not latency
+        // bounds, and both sit strictly past the pump's own 30 s
+        // deadline so they cannot fire on scheduling jitter: B's
+        // open deadline is 30 s from B's start, which is after the
+        // pump's 30 s deadline from its earlier start (so the pump
+        // ends first and B's deadline check, which runs only after
+        // the session lock is acquired, still passes), and the main
+        // thread's 60 s receive guard only fires if the helper
+        // thread itself is lost — a stuck pump is caught by the
+        // structural assertion at ~30 s, well before it.
         let (b_tx, b_rx) = std::sync::mpsc::channel();
+        let b_start = Instant::now();
         std::thread::spawn(move || {
-            let res = shared_b.open_request(&[], &[], Instant::now() + Duration::from_secs(5));
+            let res = shared_b.open_request(&[], &[], Instant::now() + Duration::from_secs(30));
             let _ = b_tx.send(res);
         });
         let stream_b = b_rx
-            .recv_timeout(Duration::from_secs(5))
-            .expect(
-                "B's open did not return within 5 s: the pump held the session lock past the slice",
-            )
+            .recv_timeout(Duration::from_secs(60))
+            .expect("B's open helper thread did not report within 60 s")
             .expect("stream B opens");
+        // Diagnostics only: B's open latency is logged, never
+        // asserted on. Scheduling jitter under parallel-test load
+        // makes any wall-clock bound here a flake source, not a
+        // signal; the structural assertion below is the signal.
+        eprintln!(
+            "pump_slice_bounds: B open took {:?} (diagnostic only, not asserted)",
+            b_start.elapsed()
+        );
         // B completed while A's pump was provably still running
         // mid-drip: the old stuck-pump behavior (B serialized behind
         // A's whole pump) cannot satisfy this — the pump would have

@@ -43,11 +43,12 @@
 
 use std::collections::HashMap;
 use std::ops::Range;
+use std::rc::Rc;
 use std::sync::Arc;
 
 use bowser_css::{
-    ComputedStyle, CssValue, Filter, TransformContext, TransformOrigin, evaluate_transform,
-    length_to_px, props, resolve_absolute_length,
+    ComputedStyle, CssValue, Filter, Stylesheet, TransformContext, TransformOrigin,
+    evaluate_transform, length_to_px, props, resolve_absolute_length,
 };
 use bowser_dom::{Document, NodeId, NodeKind};
 use bowser_layout::{
@@ -1239,6 +1240,24 @@ pub struct DisplayListBuilder {
     /// is impossible — the epoch exists to bound memory, not to fix
     /// staleness.
     style_epoch: u64,
+    /// Carried `::backdrop` computed styles by originating DOM node
+    /// (w81 backdrop, W4; see [`paint_backdrop`]). Paint receives
+    /// no stylesheets, so it cannot run the pseudo cascade itself:
+    /// the caller that owns the cascade supplies precomputed
+    /// styles here — production callers collect them with
+    /// [`collect_backdrop_styles`] and pass them through
+    /// [`build_display_list_with_backdrop_styles`] or
+    /// [`build_display_list_reused_with_backdrop_styles`] — and
+    /// paint falls back to the UA rule (modal-dialog dim only)
+    /// for nodes absent from the map. Cleared by
+    /// [`begin_reused_build`](Self::begin_reused_build) like the
+    /// other per-build state, so a reused builder never paints a
+    /// previous frame's backdrop style: reused callers must use
+    /// the `_with_backdrop_styles` entry point (which sets the
+    /// styles *after* the begin call), never a bare
+    /// [`set_backdrop_styles`](Self::set_backdrop_styles) before
+    /// it.
+    backdrop_styles: FnvHashMap<NodeId, Rc<ComputedStyle>>,
 }
 
 impl DisplayListBuilder {
@@ -1251,6 +1270,7 @@ impl DisplayListBuilder {
             gradient_cache: FnvHashMap::default(),
             filter_cache: HashMap::new(),
             style_epoch: 0,
+            backdrop_styles: FnvHashMap::default(),
         }
     }
 
@@ -1277,6 +1297,7 @@ impl DisplayListBuilder {
         std::mem::swap(&mut self.list, out);
         self.next_image_id = 1;
         self.column_rules.clear();
+        self.backdrop_styles.clear();
         if style_changed {
             self.style_epoch = self.style_epoch.wrapping_add(1);
             self.gradient_cache.clear();
@@ -1297,6 +1318,22 @@ impl DisplayListBuilder {
     /// spec when it visits the spec's container.
     pub(crate) fn set_column_rules(&mut self, specs: Vec<ColumnRuleSpec>) -> &mut Self {
         self.column_rules.insert_all(specs);
+        self
+    }
+
+    /// Stash carried `::backdrop` computed styles for this build
+    /// (see the `backdrop_styles` field docs and
+    /// [`paint_backdrop`]). The caller re-sets them per build;
+    /// [`begin_reused_build`](Self::begin_reused_build) clears them,
+    /// so for a reused builder call this *after* the begin call —
+    /// or, preferably, use
+    /// [`build_display_list_reused_with_backdrop_styles`], which
+    /// orders the two calls correctly.
+    pub fn set_backdrop_styles(&mut self, styles: HashMap<NodeId, Rc<ComputedStyle>>) -> &mut Self {
+        // The builder's map uses the crate's FNV hasher; the
+        // public setter takes the plain std map so the private
+        // hasher type never leaks into a public signature.
+        self.backdrop_styles = styles.into_iter().collect();
         self
     }
 
@@ -1751,6 +1788,12 @@ impl Default for DisplayListBuilder {
 fn css_color(style: &ComputedStyle, property: u8) -> Option<Color> {
     match style.get_by_index(property) {
         Some(CssValue::Color(c)) => Some(Color::rgba8(c.r, c.g, c.b, c.a)),
+        // Named colors keep their keyword alongside the resolved
+        // RGB in the pseudo cascade (the element cascade folds
+        // them to `Color`; see `paint_backdrop`'s note): a
+        // `::backdrop` (or `::before` / `::after`) background
+        // written as `red` must paint exactly like `rgb(255, 0, 0)`.
+        Some(CssValue::NamedColor { color: c, .. }) => Some(Color::rgba8(c.r, c.g, c.b, c.a)),
         _ => None,
     }
 }
@@ -2900,6 +2943,7 @@ fn paint_step_child<'a>(
     child_npa: Option<*const LayoutBox>,
     pending: &mut PendingOofList<'a>,
     doc_order: &FnvHashMap<*const LayoutBox, usize>,
+    suppress_top_layer: bool,
 ) {
     match sc {
         StepChild::InFlow { box_, uctx } => build_box(
@@ -2916,6 +2960,7 @@ fn paint_step_child<'a>(
             pending,
             false,
             doc_order,
+            suppress_top_layer,
         ),
         StepChild::Oof(p) => build_box(
             b,
@@ -2931,6 +2976,7 @@ fn paint_step_child<'a>(
             pending,
             false,
             doc_order,
+            suppress_top_layer,
         ),
     }
 }
@@ -2993,14 +3039,92 @@ fn paint_step_child<'a>(
 /// containing block (CSS 2.1 §11.1.1 — see [`PendingOofList`]). The
 /// root is excluded, like `clip_stack`: its overflow is the viewport's,
 /// i.e. the containing block's own for viewport-anchored boxes.
+///
+/// Top layer: a top-layer box itself is never deferred here — it
+/// paints in the paint-last pass, not at any drain anchor — but the
+/// walk still recurses into its subtree, so its out-of-flow
+/// descendants are discovered. A descendant whose computed anchor
+/// sits outside the top-layer subtree (a `fixed` descendant, or an
+/// `absolute` descendant of a static top-layer element, whose
+/// containing block sits above it) is re-anchored at the top-layer
+/// box itself: the top layer acts as the containing block for its
+/// descendants, so they must drain during the paint-last pass,
+/// inside the top-layer box's subtree, not during the normal walk
+/// at an outside anchor (where they would paint before the box
+/// they belong to). Their re-applied clips are exactly the
+/// overflow clips strictly between the top-layer box and the
+/// descendant; clips above the top-layer box no longer apply, and
+/// the top-layer box's own clip applies via nesting at the drain.
+/// Descendants whose anchor already sits inside the top-layer
+/// subtree keep it unchanged.
 /// `doc_order`
 /// records document-order ranks, but only for boxes that join the z-index
 /// steps (see [`joins_z_steps`]): they are the only ones that merge with
 /// drained out-of-flow runs inside z-index steps, so the map stays empty
 /// (zero allocation) for ordinary trees.
-// Thirteen parameters: the discovery walk mirrors `build_box`'s context,
-// so its ancestor state travels as arguments (precedent: `#[allow]`s in
-// `bowser_net` and `bowser_layout` for the same reason).
+/// True when `anchor` sits at or below (deeper than) `top_layer` on
+/// the innermost-first `ancestors` chain — i.e. the anchor is inside
+/// the top-layer subtree, not above it. `None` (the viewport) and an
+/// anchor absent from the chain both count as outside. The anchor
+/// check runs first so `anchor == top_layer` counts as inside.
+fn anchor_inside_top_layer(
+    anchor: Option<*const LayoutBox>,
+    top_layer: *const LayoutBox,
+    ancestors: Option<&AncestorFrame<'_>>,
+) -> bool {
+    let Some(anchor) = anchor else {
+        return false;
+    };
+    let mut chain = ancestors;
+    while let Some(f) = chain {
+        if f.ptr == anchor {
+            return true;
+        }
+        if f.ptr == top_layer {
+            return false;
+        }
+        chain = f.parent;
+    }
+    false
+}
+
+/// Overflow clips of the ancestors strictly between `top_layer` and
+/// the box being deferred, outermost first: the clips a top-layer
+/// clamped entry (see [`discover_oof`]) must re-apply at its drain
+/// inside the top-layer box, because the drain sits outside those
+/// intermediate boxes' subtrees. The top-layer box's own clip is
+/// excluded: it applies via nesting at the drain site. Boxes above
+/// the top-layer box are excluded too: the top layer escapes them.
+fn clips_below_top_layer(
+    clip_stack: &[ClipFrame],
+    top_layer: *const LayoutBox,
+    ancestors: Option<&AncestorFrame<'_>>,
+) -> Vec<(Rect, [f32; 4])> {
+    let mut below: Vec<*const LayoutBox> = Vec::new();
+    let mut chain = ancestors;
+    while let Some(f) = chain {
+        if f.ptr == top_layer {
+            break;
+        }
+        if f.clips {
+            below.push(f.ptr);
+        }
+        chain = f.parent;
+    }
+    clip_stack
+        .iter()
+        .filter(|f| below.contains(&f.ptr))
+        .map(|f| (f.rect, f.radii))
+        .collect()
+}
+
+// The discovery walk mirrors `build_box`'s context, so its ancestor
+// state travels as arguments (precedent: `#[allow]`s in `bowser_net`
+// and `bowser_layout` for the same reason). `top_layer` is the
+// document's top layer in promotion order (empty for ordinary trees);
+// `in_top_layer` is the nearest enclosing top-layer box when the
+// walk is inside one, else `None` (see the top-layer paragraph in
+// the `discover_oof` doc comment below).
 #[allow(clippy::too_many_arguments)]
 fn discover_oof<'a, 'c>(
     box_: &'a LayoutBox,
@@ -3016,6 +3140,8 @@ fn discover_oof<'a, 'c>(
     clip_stack: &mut Vec<ClipFrame>,
     is_root: bool,
     ancestors: Option<&'c AncestorFrame<'c>>,
+    top_layer: &[NodeId],
+    in_top_layer: Option<*const LayoutBox>,
 ) {
     let self_ptr = box_ as *const LayoutBox;
     // One `creates_stacking_context` read serves both the z-step
@@ -3038,6 +3164,7 @@ fn discover_oof<'a, 'c>(
     if matches!(vis, Some("hidden") | Some("collapse")) {
         return;
     }
+
     // Ancestor frame for §11.1.1 escape-path capture (see the doc
     // comment): linked innermost-first through the call stack, so no
     // heap allocation. Linked after the `visibility: hidden` early
@@ -3126,7 +3253,7 @@ fn discover_oof<'a, 'c>(
             // context below the containing block wins the drain anchor,
             // else the containing-block anchor is unchanged.
             let z_indexed = child.z_index.is_some();
-            let anchor = if z_indexed {
+            let mut anchor = if z_indexed {
                 child_nsc_full.or(cb)
             } else if fixed {
                 child_nsc_vp
@@ -3137,7 +3264,7 @@ fn discover_oof<'a, 'c>(
             // must paint outside the anchor's own overflow clip
             // (CSS 2.1 §11.1.1 — only the containing block's overflow
             // may clip an out-of-flow descendant).
-            let escape_anchor_clip = if fixed {
+            let mut escape_anchor_clip = if fixed {
                 anchor.is_some()
             } else {
                 anchor != cb
@@ -3150,7 +3277,7 @@ fn discover_oof<'a, 'c>(
             // push is exactly redundant with the nested clip — except
             // under another entry's escape toggle, where it is
             // load-bearing.)
-            let outer_clips = if escape_anchor_clip {
+            let mut outer_clips = if escape_anchor_clip {
                 cb.and_then(|cb_ptr| {
                     clip_stack
                         .iter()
@@ -3161,6 +3288,20 @@ fn discover_oof<'a, 'c>(
             } else {
                 Vec::new()
             };
+            // Top-layer clamp (see the `discover_oof` doc comment):
+            // a descendant of a top-layer box whose anchor sits
+            // outside that box drains at the box itself instead, so
+            // it moves with the top layer into the paint-last pass.
+            // The escape-wraps recording below is skipped for it:
+            // `escape_anchor_clip` is false, and its intermediate
+            // clips travel in `outer_clips`, not via nesting.
+            if let Some(tl) = in_top_layer
+                && !anchor_inside_top_layer(anchor, tl, ancestors)
+            {
+                anchor = Some(tl);
+                escape_anchor_clip = false;
+                outer_clips = clips_below_top_layer(clip_stack, tl, ancestors);
+            }
             // CSS 2.1 §11.1.1 escape path: the overflow-clipping boxes
             // strictly between the drain anchor and the containing block.
             // The drain paints inside the anchor's subtree, so each such
@@ -3213,14 +3354,21 @@ fn discover_oof<'a, 'c>(
                     }
                 }
             }
-            pending.push(PendingOof {
-                box_: child,
-                anchor,
-                escape_anchor_clip,
-                outer_clips,
-                parent_style: style,
-                uctx: child_ctx,
-            });
+            // A top-layer box itself is never deferred: the paint-last
+            // pass paints it. Its subtree is still discovered below
+            // (with the top-layer barrier set to it), so its own
+            // out-of-flow descendants drain at or inside it.
+            let child_is_top_layer = child.node.is_some_and(|n| top_layer.contains(&n));
+            if !child_is_top_layer {
+                pending.push(PendingOof {
+                    box_: child,
+                    anchor,
+                    escape_anchor_clip,
+                    outer_clips,
+                    parent_style: style,
+                    uctx: child_ctx,
+                });
+            }
             // The deferred box's own subtree still needs discovery: its
             // out-of-flow descendants anchor at it (it is positioned),
             // so the below-containing-block accumulation restarts here.
@@ -3242,6 +3390,12 @@ fn discover_oof<'a, 'c>(
                 clip_stack,
                 false,
                 ancestors,
+                top_layer,
+                if child_is_top_layer {
+                    Some(child_ptr)
+                } else {
+                    in_top_layer
+                },
             );
         } else if is_positioned(child) && child.z_index.is_some() && !is_stacking_context(box_) {
             // Appendix E hoist for in-flow content: a positioned box with
@@ -3256,17 +3410,30 @@ fn discover_oof<'a, 'c>(
             // restores correctness where another entry's escape toggle
             // popped a clip the drain nests inside.
             let child_ptr = child as *const LayoutBox;
-            let anchor = nsc_full;
-            let outer_clips: Vec<(Rect, [f32; 4])> =
+            // Top-layer clamp, as in the out-of-flow branch above: a
+            // hoisted box inside a top-layer subtree whose anchor
+            // sits outside it drains at the top-layer box instead,
+            // keeping only the clips strictly inside that subtree.
+            let mut anchor = nsc_full;
+            let mut outer_clips: Vec<(Rect, [f32; 4])> =
                 clip_stack.iter().map(|f| (f.rect, f.radii)).collect();
-            pending.push(PendingOof {
-                box_: child,
-                anchor,
-                escape_anchor_clip: false,
-                outer_clips,
-                parent_style: style,
-                uctx: child_ctx,
-            });
+            if let Some(tl) = in_top_layer
+                && !anchor_inside_top_layer(anchor, tl, ancestors)
+            {
+                anchor = Some(tl);
+                outer_clips = clips_below_top_layer(clip_stack, tl, ancestors);
+            }
+            let child_is_top_layer = child.node.is_some_and(|n| top_layer.contains(&n));
+            if !child_is_top_layer {
+                pending.push(PendingOof {
+                    box_: child,
+                    anchor,
+                    escape_anchor_clip: false,
+                    outer_clips,
+                    parent_style: style,
+                    uctx: child_ctx,
+                });
+            }
             // The hoisted box's own subtree still needs discovery (it is
             // positioned, so its out-of-flow descendants anchor at it);
             // it is itself a stacking context for the widened
@@ -3286,8 +3453,19 @@ fn discover_oof<'a, 'c>(
                 clip_stack,
                 false,
                 ancestors,
+                top_layer,
+                if child_is_top_layer {
+                    Some(child_ptr)
+                } else {
+                    in_top_layer
+                },
             );
         } else {
+            // An in-flow top-layer child sets the barrier for its
+            // own subtree (its descendants drain at or inside it);
+            // any other child inherits the enclosing barrier.
+            let child_ptr = child as *const LayoutBox;
+            let child_is_top_layer = child.node.is_some_and(|n| top_layer.contains(&n));
             discover_oof(
                 child,
                 style,
@@ -3302,6 +3480,12 @@ fn discover_oof<'a, 'c>(
                 clip_stack,
                 false,
                 ancestors,
+                top_layer,
+                if child_is_top_layer {
+                    Some(child_ptr)
+                } else {
+                    in_top_layer
+                },
             );
         }
     }
@@ -3761,10 +3945,324 @@ pub fn build_display_list_reused(
     builder.finish_reused_build(out);
 }
 
+/// [`build_display_list`] with carried `::backdrop` computed
+/// styles (w81 backdrop, W4): `backdrop_styles` maps each
+/// top-layer originating node to its `::backdrop` style as
+/// computed by the cascade owner (see [`paint_backdrop`]).
+/// Production callers obtain the map from
+/// [`collect_backdrop_styles`] (headless and WPT renders do);
+/// without it paint falls back to the UA rule (modal-dialog dim
+/// only).
+pub fn build_display_list_with_backdrop_styles(
+    root: &LayoutBox,
+    doc: &Document,
+    font_resolver: &mut dyn FnMut(&ComputedStyle) -> FontKey,
+    image_resolver: &mut dyn FnMut(&str) -> Option<(ImageId, DecodedImage)>,
+    viewport: Size,
+    backdrop_styles: HashMap<NodeId, Rc<ComputedStyle>>,
+) -> DisplayList {
+    let mut b = DisplayListBuilder::new();
+    b.set_backdrop_styles(backdrop_styles);
+    let mut scratch = StepScratch::new();
+    build_display_list_inner(
+        &mut b,
+        root,
+        doc,
+        font_resolver,
+        image_resolver,
+        viewport,
+        &mut scratch,
+    );
+    b.build()
+}
+
+/// Collect the carried `::backdrop` styles for a build (w81
+/// backdrop, production wiring): one pseudo-cascade query per
+/// top-layer node, over the same author sheets layout ran with
+/// and the UA stylesheet (whose `dialog::backdrop` dim is exactly
+/// the UA fallback [`paint_backdrop`] paints, so a carried UA-only
+/// style renders identically to no carried style).
+///
+/// This is deliberately a paint-time re-query, not a
+/// box-construction carry: box construction (`bowser_layout`)
+/// builds and discards its own `Styler` and `LayoutBox` carries
+/// no pseudo styles, so threading styles through it would mean a
+/// new `LayoutBox` field or a changed `layout()` return — a
+/// layout-crate change, not a paint one. The re-query is
+/// equivalent (same cascade, same sheets, same atoms — see
+/// `bowser_layout`'s `query_backdrop_style`) and cheap: the top
+/// layer holds a handful of nodes, and one fresh `Styler` per
+/// node is negligible next to a full layout. Callers must
+/// re-collect per build: styles go stale exactly when layout
+/// does, and the map is keyed by DOM node, so a relayout's new
+/// tree reuses the same keys.
+///
+/// Gated to [`Document::top_layer`]: `paint_backdrop` would
+/// ignore non-top-layer entries anyway, and the gate keeps the
+/// map — and the cascade work — proportional to shown dialogs /
+/// popovers, not to document size.
+pub fn collect_backdrop_styles(
+    doc: &Document,
+    author: &[&Stylesheet],
+    viewport: Size,
+) -> HashMap<NodeId, Rc<ComputedStyle>> {
+    let ua = bowser_css::default_ua_stylesheet();
+    let vp = bowser_css::Viewport {
+        w: viewport.w,
+        h: viewport.h,
+    };
+    let mut styles = HashMap::new();
+    for &node in doc.top_layer() {
+        if let Some(style) = bowser_css::compute_pseudo_style(
+            doc,
+            node,
+            author,
+            &ua,
+            &vp,
+            "backdrop",
+            bowser_css::BACKDROP_ATOMS,
+        ) {
+            styles.insert(node, Rc::new(style));
+        }
+    }
+    styles
+}
+
+/// [`build_display_list_reused`] with carried `::backdrop`
+/// computed styles: the reused builder's production entry point
+/// for author backdrops.
+///
+/// The ordering is the whole point: [`DisplayListBuilder::
+/// begin_reused_build`] clears `backdrop_styles`, so the styles
+/// are set *after* the begin call and before the walk. A bare
+/// `set_backdrop_styles` before `build_display_list_reused`
+/// would be silently discarded by the begin call, and the build
+/// would fall back to the UA dim — this entry point makes that
+/// mistake unrepresentable. The windowed frame path still calls
+/// plain [`build_display_list_reused`] (its call site lives in
+/// `bowser_app::window`, outside this crate); switching it to
+/// this entry point, fed by [`collect_backdrop_styles`], is a
+/// one-call change there.
+#[allow(clippy::too_many_arguments)] // mirrors `build_display_list_reused` plus the styles map
+pub fn build_display_list_reused_with_backdrop_styles(
+    builder: &mut DisplayListBuilder,
+    out: &mut DisplayList,
+    root: &LayoutBox,
+    doc: &Document,
+    font_resolver: &mut dyn FnMut(&ComputedStyle) -> FontKey,
+    image_resolver: &mut dyn FnMut(&str) -> Option<(ImageId, DecodedImage)>,
+    viewport: Size,
+    style_changed: bool,
+    backdrop_styles: HashMap<NodeId, Rc<ComputedStyle>>,
+) {
+    builder.begin_reused_build(out, style_changed);
+    builder.set_backdrop_styles(backdrop_styles);
+    let mut scratch = StepScratch::new();
+    build_display_list_inner(
+        builder,
+        root,
+        doc,
+        font_resolver,
+        image_resolver,
+        viewport,
+        &mut scratch,
+    );
+    builder.finish_reused_build(out);
+}
+
+/// Paint `box_`'s `::backdrop` (w81 backdrop, W4), or nothing.
+///
+/// Generation rule: only a top-layer box generates a backdrop
+/// (checked here via [`Document::is_in_top_layer`]); a
+/// non-top-layer box — closed dialog, non-modal dialog, plain
+/// element — paints none, whatever its pseudo style says.
+///
+/// Ordering / composition with the paint-last pass: this runs at
+/// the very start of [`build_box`] for the originator, before
+/// its blend/opacity/transform groups and before its own
+/// background, so the backdrop item lands directly below the
+/// originator's own items. A topmost top-layer box is built in
+/// the paint-last pass at the root, so its backdrop lands above
+/// everything painted before it (all normal content and all
+/// earlier-promoted top-layer boxes) and below its own box —
+/// exactly the spec order. A top-layer box nested inside another
+/// top-layer box is built inside its ancestor's subtree
+/// (`suppress_top_layer` is false there), so its backdrop lands
+/// inside that subtree: above the ancestor's earlier content,
+/// below the nested originator — the same relative order, with
+/// one documented caveat: it sits inside the ancestor's
+/// stacking-context groups and overflow clips, where the spec's
+/// top-layer item would escape them. Hoisting nested backdrops
+/// out of the ancestor subtree is future work; the common
+/// single-dialog case is exact.
+///
+/// Geometry: the UA `::backdrop` rule is `position: fixed;
+/// inset: 0`, so the backdrop rect is the viewport, regardless
+/// of the originator's rect (author inset overrides are not
+/// honored by paint v1 — see below).
+///
+/// Color source, in order:
+/// 1. A carried style from `backdrop_styles`: its
+///    `background-color` (transparent paints nothing, and an
+///    explicit `display: none` or `visibility: hidden` /
+///    `collapse` suppresses the backdrop entirely).
+///    This is how author `::backdrop` rules paint.
+/// 2. Otherwise the UA fallback: a modal dialog dims with
+///    `rgba(0, 0, 0, 0.1)` (the HTML UA rule); every other
+///    top-layer element (popovers) has a transparent UA
+///    backdrop and paints nothing until styled — the
+///    popover-backdrop rule.
+///
+/// Paint v1 fills `background-color` only: backdrop
+/// `background-image` / gradients, `backdrop-filter`, opacity,
+/// borders, and author inset/position overrides are not rendered
+/// (the style is still fully queryable via `getComputedStyle`).
+/// Hit-testing the backdrop (clicks on it dismissing a dialog)
+/// is not paint work and is not implemented here.
+fn paint_backdrop(b: &mut DisplayListBuilder, box_: &LayoutBox, doc: &Document, viewport: Size) {
+    let Some(node) = box_.node else {
+        return;
+    };
+    if !doc.is_in_top_layer(node) {
+        return;
+    }
+    let rect = Rect {
+        x: 0.0,
+        y: 0.0,
+        w: viewport.w,
+        h: viewport.h,
+    };
+    if let Some(style) = b.backdrop_styles.get(&node) {
+        if style
+            .get_str_by_index(props::DISPLAY)
+            .is_some_and(|d| d.eq_ignore_ascii_case("none"))
+        {
+            return;
+        }
+        // Like `display: none`, a hidden or collapsed backdrop
+        // paints nothing (its box still exists for hit-testing /
+        // `getComputedStyle` purposes, but no fill is emitted).
+        if style
+            .get_str_by_index(props::VISIBILITY)
+            .is_some_and(|v| v.eq_ignore_ascii_case("hidden") || v.eq_ignore_ascii_case("collapse"))
+        {
+            return;
+        }
+        if let Some(color) = css_color(style, props::BACKGROUND_COLOR)
+            && color.a() > 0.0
+        {
+            b.push_fill_rect(rect, color);
+        }
+        return;
+    }
+    // UA fallback (no carried style): modal dialogs dim, everything
+    // else is transparent.
+    if doc.is_dialog_modal(node) {
+        b.push_fill_rect(rect, Color::rgba8(0, 0, 0, 26));
+    }
+}
+
+/// One top-layer box deferred for paint-last emission (see
+/// [`collect_top_layer`]): the box itself, plus the inheritance
+/// context its DOM parent would have handed [`build_box`] (the
+/// parent's style/units and the `border-collapse` state), so painting
+/// it at the root renders exactly as painting it in place would have
+/// — minus the ancestor stacking contexts, opacity/blend/transform
+/// groups, and overflow clips it escapes by being in the top layer.
+struct TopLayerEntry<'a> {
+    box_: &'a LayoutBox,
+    parent_style: Option<&'a ComputedStyle>,
+    uctx: UnitCtx,
+    in_collapse: bool,
+}
+
+/// True when `box_` is a member of the document's top layer
+/// (a shown popover today; a dialog once that API lands — the
+/// mechanism is deliberately agnostic about *why* the node is in
+/// the top layer).
+fn is_top_layer_box(box_: &LayoutBox, doc: &Document) -> bool {
+    box_.node.is_some_and(|n| doc.is_in_top_layer(n))
+}
+
+/// Collect the topmost top-layer boxes in the tree, in DOM order
+/// (the caller re-sorts into [`Document::top_layer`] promotion
+/// order). The walk mirrors [`build_box`]'s context computation
+/// (inherited style, resolved font size, `border-collapse` state)
+/// and its `visibility: hidden` subtree skipping, so a hidden
+/// top-layer box is never collected and a collected box paints
+/// with its DOM parent's context, not the root's.
+///
+/// A top-layer box nested inside another top-layer box is *not*
+/// collected separately: it paints inside its ancestor's subtree
+/// when that ancestor is painted last, which is also its paint
+/// position relative to the other top-layer boxes (a descendant
+/// cannot paint before its ancestor's background anyway).
+///
+/// Ordering only: this pass records no geometry and changes no
+/// layout. Ancestor stacking contexts, groups, and clips are
+/// escaped by painting at the root, not by restyling anything.
+fn collect_top_layer<'a>(
+    box_: &'a LayoutBox,
+    doc: &Document,
+    parent_style: Option<&'a ComputedStyle>,
+    uctx: UnitCtx,
+    in_collapse: bool,
+    out: &mut Vec<TopLayerEntry<'a>>,
+) {
+    let style = box_.style.as_deref().or(parent_style);
+    let vis = style.and_then(|s| s.get_str_by_index(props::VISIBILITY));
+    if matches!(vis, Some("hidden") | Some("collapse")) {
+        return;
+    }
+    if is_top_layer_box(box_, doc) {
+        out.push(TopLayerEntry {
+            box_,
+            parent_style,
+            uctx,
+            in_collapse,
+        });
+        return;
+    }
+    let font_size = match box_.style.as_ref() {
+        Some(s) => resolve_font_size(
+            s.get_by_index(props::FONT_SIZE),
+            uctx.parent_fs,
+            uctx.root_fs,
+            uctx.viewport.0,
+            uctx.viewport.1,
+        ),
+        None => uctx.parent_fs,
+    };
+    let child_collapse = if box_.box_type == BoxType::Table {
+        box_.style.as_ref().is_some_and(|s| {
+            s.get_str_by_index(props::BORDER_COLLAPSE)
+                .is_some_and(|v| v.eq_ignore_ascii_case("collapse"))
+        })
+    } else {
+        in_collapse
+    };
+    for child in &box_.children {
+        collect_top_layer(
+            child,
+            doc,
+            style,
+            UnitCtx {
+                parent_fs: font_size,
+                ..uctx
+            },
+            child_collapse,
+            out,
+        );
+    }
+}
+
 /// The box walk shared by [`build_display_list_with_scratch`] and
 /// [`build_display_list_reused`]: drains layout's `column-rule` specs
 /// for this pass, discovers out-of-flow boxes up front, and paints the
-/// tree per CSS 2.1 Appendix E into `b`.
+/// tree per CSS 2.1 Appendix E into `b`, with top-layer boxes hoisted
+/// out of their DOM stacking contexts and painted last, in
+/// [`Document::top_layer`] promotion order (see [`collect_top_layer`]
+/// and the top-layer pass at the end of this function).
 fn build_display_list_inner<'a>(
     b: &mut DisplayListBuilder,
     root: &'a LayoutBox,
@@ -3802,6 +4300,48 @@ fn build_display_list_inner<'a>(
         viewport,
     };
     let mut pending = PendingOofList::default();
+    // Top-layer collection, before discovery: the promotion-ordered
+    // list of boxes the normal walk must skip and the paint-last
+    // pass below must emit. Empty (and the whole pass skipped) for
+    // ordinary trees, so their paint is untouched.
+    let top_layer_nodes: Vec<NodeId> = doc.top_layer().to_vec();
+    let mut top_layer_entries: Vec<TopLayerEntry<'a>> = Vec::new();
+    if !top_layer_nodes.is_empty() {
+        collect_top_layer(root, doc, None, uctx, false, &mut top_layer_entries);
+        // The normal walk below always paints the root itself:
+        // suppression only skips top-layer *children* of a box, never
+        // the box the walk starts from. A root promoted to the top
+        // layer (reachable only via the test-only
+        // `promote_to_top_layer` API) would therefore paint twice
+        // — once in place, once in the paint-last pass — unless it
+        // is excluded from collection here.
+        top_layer_entries.retain(|e| !std::ptr::eq(e.box_, root));
+        // LIMITATION (pre-existing, production-irrelevant): the
+        // retain fixes only the promoted root itself.
+        // `collect_top_layer` returns at the first top-layer box
+        // it walks, so a top-layer descendant of a promoted root
+        // is neither collected here (the walk stopped at the root)
+        // nor painted in place (the normal walk suppresses it as
+        // a top-layer child). In production the html root is never
+        // top-layer and promotion is a test-only API, so this gap
+        // is unreachable there; recursing into the children of a
+        // top-layer root to collect such descendants is out of
+        // scope for this fix — collection behavior is unchanged.
+        // DOM order from the walk -> promotion order from the
+        // document: later entries paint above earlier ones.
+        let rank: FnvHashMap<NodeId, usize> = top_layer_nodes
+            .iter()
+            .copied()
+            .enumerate()
+            .map(|(i, n)| (n, i))
+            .collect();
+        top_layer_entries.sort_by_key(|e| {
+            e.box_
+                .node
+                .and_then(|n| rank.get(&n).copied())
+                .unwrap_or(usize::MAX)
+        });
+    }
     // Up-front out-of-flow discovery: anchor every absolutely/fixed-
     // positioned box at its containing block before any paint item is
     // emitted, so the Appendix E drains in `build_box` see the complete
@@ -3835,6 +4375,8 @@ fn build_display_list_inner<'a>(
             // The root is excluded from the ancestor chain (see
             // `discover_oof`).
             None,
+            &top_layer_nodes,
+            None,
         );
     }
     build_box(
@@ -3851,7 +4393,36 @@ fn build_display_list_inner<'a>(
         &mut pending,
         true,
         &doc_order,
+        // Suppress top-layer boxes in the normal walk: they paint
+        // in the pass below, not at their DOM slot.
+        true,
     );
+    // Top-layer pass: paint the collected boxes last, in promotion
+    // order, at the root — outside every ancestor stacking context,
+    // group, and clip. `suppress_top_layer` is false here so a
+    // top-layer box nested inside another one paints inside its
+    // ancestor's subtree as usual. This pass also drains any
+    // out-of-flow descendants anchored at a top-layer box (see
+    // `discover_oof`'s top-layer clamping), which the normal walk
+    // never visited because it skipped the top-layer subtree.
+    for entry in &top_layer_entries {
+        build_box(
+            b,
+            scratch,
+            entry.box_,
+            doc,
+            font_resolver,
+            image_resolver,
+            entry.parent_style,
+            entry.uctx,
+            entry.in_collapse,
+            None,
+            &mut pending,
+            false,
+            &doc_order,
+            false,
+        );
+    }
     // Up-front discovery plus per-containing-block drains provably
     // empty the list: every deferred box is removed exactly once, at its
     // own containing block's steps (viewport-anchored boxes at the
@@ -3887,6 +4458,7 @@ fn build_display_list_inner<'a>(
             &mut pending,
             false,
             &doc_order,
+            false,
         );
     }
 }
@@ -3932,7 +4504,10 @@ fn push_own_clip(b: &mut DisplayListBuilder, rect: Rect, radii: [f32; 4]) {
 // call — the root stacking context, which also drains viewport-anchored
 // boxes into its own Appendix E steps; `doc_order` ranks positioned
 // boxes in document order for z-index tie-breaking (empty for ordinary
-// trees — no allocation in the hot path).
+// trees — no allocation in the hot path); `suppress_top_layer` skips
+// top-layer children in this subtree (the normal walk — true only
+// there; the paint-last pass paints with it false so a top-layer box
+// nested inside another one still paints inside its ancestor).
 #[allow(clippy::too_many_arguments)]
 fn build_box<'a>(
     b: &mut DisplayListBuilder,
@@ -3948,7 +4523,11 @@ fn build_box<'a>(
     pending: &mut PendingOofList<'a>,
     is_root: bool,
     doc_order: &FnvHashMap<*const LayoutBox, usize>,
+    suppress_top_layer: bool,
 ) {
+    // Gated on a non-empty top layer so ordinary trees pay one
+    // slice-length check per box, not a membership scan per child.
+    let suppress_top_layer = suppress_top_layer && !doc.top_layer().is_empty();
     // Nearest style for inherited text properties (text boxes have none).
     let style = box_.style.as_deref().or(parent_style);
 
@@ -3993,6 +4572,23 @@ fn build_box<'a>(
     let vis = style.and_then(|s| s.get_str_by_index(props::VISIBILITY));
     if matches!(vis, Some("hidden") | Some("collapse")) {
         return;
+    }
+
+    // `::backdrop` (w81 backdrop, W4): directly below this box's
+    // own items, before any of its groups open — see
+    // [`paint_backdrop`] for the ordering proof and caveats.
+    // Gated on a non-empty top layer so ordinary trees pay one
+    // slice-length check, not a membership scan, per box.
+    if !doc.top_layer().is_empty() {
+        paint_backdrop(
+            b,
+            box_,
+            doc,
+            Size {
+                w: uctx.viewport.0,
+                h: uctx.viewport.1,
+            },
+        );
     }
 
     // Blend group around the whole subtree (background included),
@@ -4533,6 +5129,10 @@ fn build_box<'a>(
                     // Deferred up front; drains at its containing block.
                     continue;
                 }
+                if suppress_top_layer && is_top_layer_box(child, doc) {
+                    // Paints last at the root, not at its DOM slot.
+                    continue;
+                }
                 // Pass 0 paints step-3 (block-level) children, pass 1
                 // paints step-5 (inline-level) children.
                 if (pass == 0) != is_block_level(child) {
@@ -4572,6 +5172,7 @@ fn build_box<'a>(
                     pending,
                     false,
                     doc_order,
+                    suppress_top_layer,
                 );
             }
         }
@@ -4595,6 +5196,10 @@ fn build_box<'a>(
             if is_out_of_flow(child) {
                 // Already deferred by the up-front discovery pass; drained
                 // into the z-index steps below.
+                continue;
+            }
+            if suppress_top_layer && is_top_layer_box(child, doc) {
+                // Paints last at the root, not at its DOM slot.
                 continue;
             }
             if is_positioned(child) && child.z_index.is_some() && !is_stacking_context(box_) {
@@ -4759,6 +5364,7 @@ fn build_box<'a>(
                 child_npa,
                 pending,
                 doc_order,
+                suppress_top_layer,
             );
             for _ in 0..outer_clip_count {
                 b.pop_clip();
@@ -5917,6 +6523,500 @@ mod tests {
             .position(|&c| c == (0, 0, 255))
             .expect("b fill");
         assert!(b < a, "order -1 ({b}) must paint before order 0 ({a})");
+    }
+
+    /// Top-layer paint order: shown popovers paint last, in
+    /// promotion (show) order, not DOM order — even when one sits
+    /// inside a low stacking context and even above a `z-index: 999`
+    /// element. Fail-before: the fixed popovers drain at the root's
+    /// Appendix E steps in DOM order, so the first popover paints
+    /// before the second and the `z-index: 999` box paints above all
+    /// of them.
+    #[test]
+    fn top_layer_paints_last_in_promotion_order() {
+        let (mut doc, _quirks) = Document::parse_html(
+            r#"<div id="first" popover="manual"></div><div id="second" popover="manual"></div><div id="sc"><div id="nested" popover="manual"></div></div><div id="high"></div>"#
+                .as_bytes(),
+        );
+        let first = doc.get_element_by_id("first").expect("first popover");
+        let second = doc.get_element_by_id("second").expect("second popover");
+        let nested = doc.get_element_by_id("nested").expect("nested popover");
+        // Reverse DOM order: second shown before first, nested last.
+        doc.show_popover(second).expect("show second");
+        doc.show_popover(first).expect("show first");
+        doc.show_popover(nested).expect("show nested");
+        assert_eq!(doc.top_layer(), &[second, first, nested]);
+        let author = bowser_css::parse_stylesheet(
+            "body { margin: 0; } \
+             #first { background-color: red; width: 100px; height: 100px; position: fixed; top: 10px; left: 10px; margin: 0; } \
+             #second { background-color: blue; width: 100px; height: 100px; position: fixed; top: 10px; left: 10px; margin: 0; } \
+             #nested { background-color: #800080; width: 100px; height: 100px; position: fixed; top: 10px; left: 10px; margin: 0; } \
+             #sc { position: relative; z-index: 0; } \
+             #high { position: relative; z-index: 999; background-color: green; width: 200px; height: 200px; }",
+        );
+        let viewport = Size { w: 800.0, h: 600.0 };
+        let root =
+            bowser_layout::layout(&doc, &[&author], viewport, &bowser_layout::FixedFontMetrics);
+        let list = build_display_list_with_images(&root, &doc, &mut |_| None, viewport);
+        let colors = fill_colors(&list);
+        let pos = |c: (u8, u8, u8)| colors.iter().position(|&x| x == c).expect("fill");
+        let high = pos((0, 128, 0));
+        let second = pos((0, 0, 255));
+        let first = pos((255, 0, 0));
+        let nested = pos((128, 0, 128));
+        assert!(
+            high < second && second < first && first < nested,
+            "paint order must be high, second, first, nested; got high={high} second={second} first={first} nested={nested} in {colors:?}"
+        );
+    }
+
+    /// Top-layer generality: the mechanism is keyed on
+    /// [`Document::top_layer`], not on popovers. A plain static
+    /// element promoted to the top layer, nested inside a low
+    /// stacking context, paints last — and its absolutely-positioned
+    /// descendant moves with it (re-anchored at the top-layer box
+    /// during discovery) instead of draining at the viewport during
+    /// the normal walk.
+    #[test]
+    fn top_layer_static_element_with_absolute_descendant_paints_last() {
+        let (mut doc, _quirks) = Document::parse_html(
+            r#"<div id="sc"><div id="top"><div id="inner"></div></div></div><div id="high"></div>"#
+                .as_bytes(),
+        );
+        let top = doc.get_element_by_id("top").expect("top element");
+        doc.promote_to_top_layer(top);
+        assert!(doc.is_in_top_layer(top));
+        let author = bowser_css::parse_stylesheet(
+            "body { margin: 0; } \
+             #sc { position: relative; z-index: 0; } \
+             #top { background-color: #ff8000; width: 100px; height: 100px; } \
+             #inner { position: absolute; top: 0; left: 0; width: 20px; height: 20px; background-color: yellow; } \
+             #high { position: relative; z-index: 999; background-color: green; width: 200px; height: 200px; }",
+        );
+        let viewport = Size { w: 800.0, h: 600.0 };
+        let root =
+            bowser_layout::layout(&doc, &[&author], viewport, &bowser_layout::FixedFontMetrics);
+        let list = build_display_list_with_images(&root, &doc, &mut |_| None, viewport);
+        let colors = fill_colors(&list);
+        let pos = |c: (u8, u8, u8)| colors.iter().position(|&x| x == c).expect("fill");
+        let high = pos((0, 128, 0));
+        let top = pos((255, 128, 0));
+        let inner = pos((255, 255, 0));
+        assert!(
+            high < top && top < inner,
+            "paint order must be high, top, inner; got high={high} top={top} inner={inner} in {colors:?}"
+        );
+    }
+
+    /// A root box promoted to the top layer (reachable only via
+    /// the test-only `promote_to_top_layer` API — the root is never
+    /// a suppressed child) must still paint exactly once: the
+    /// normal walk paints the root, so the paint-last pass must
+    /// not paint it a second time.
+    #[test]
+    fn top_layer_root_promotion_paints_root_once() {
+        let (mut doc, _quirks) = Document::parse_html(r#"<div id="kid"></div>"#.as_bytes());
+        let html = doc.document_element().expect("document element");
+        doc.promote_to_top_layer(html);
+        assert!(doc.is_in_top_layer(html));
+        let author = bowser_css::parse_stylesheet(
+            "html { background-color: red; } body { margin: 0; } \\
+             #kid { background-color: blue; width: 50px; height: 50px; }",
+        );
+        let viewport = Size { w: 800.0, h: 600.0 };
+        let root =
+            bowser_layout::layout(&doc, &[&author], viewport, &bowser_layout::FixedFontMetrics);
+        let list = build_display_list_with_images(&root, &doc, &mut |_| None, viewport);
+        let colors = fill_colors(&list);
+        let reds = colors.iter().filter(|&&c| c == (255, 0, 0)).count();
+        assert_eq!(
+            reds, 1,
+            "promoted root must paint once, got {reds} red fills in {colors:?}"
+        );
+    }
+
+    /// `::backdrop` paint order (w81 backdrop, W4), UA fallback
+    /// path: each modal dialog's dim backdrop paints directly
+    /// below its own box, above everything beneath it in the top
+    /// layer — in promotion order, not DOM order — and above
+    /// normal page content. Fail-before: no backdrop item at all.
+    /// This is the composition proof for the paint-last pass:
+    /// the backdrops ride the same promotion-ordered pass as
+    /// their originators, one backdrop per originator, in order.
+    #[test]
+    fn backdrop_paints_below_originator_in_promotion_order() {
+        let (mut doc, _quirks) = Document::parse_html(
+            r#"<div id="page"></div><dialog id="first"></dialog><dialog id="second"></dialog>"#
+                .as_bytes(),
+        );
+        let first = doc.get_element_by_id("first").expect("first dialog");
+        let second = doc.get_element_by_id("second").expect("second dialog");
+        // Promotion order is second, then first (reverse DOM).
+        doc.show_dialog_modal(second).expect("show second");
+        doc.show_dialog_modal(first).expect("show first");
+        assert_eq!(doc.top_layer(), &[second, first]);
+        let author = bowser_css::parse_stylesheet(
+            "body { margin: 0; } \
+             #page { background-color: green; width: 200px; height: 200px; } \
+             #first { background-color: red; width: 100px; height: 100px; margin: 0; } \
+             #second { background-color: blue; width: 100px; height: 100px; margin: 0; }",
+        );
+        let viewport = Size { w: 800.0, h: 600.0 };
+        let root =
+            bowser_layout::layout(&doc, &[&author], viewport, &bowser_layout::FixedFontMetrics);
+        let list = build_display_list_with_images(&root, &doc, &mut |_| None, viewport);
+        let fills: Vec<(Rect, Color)> = list
+            .items
+            .iter()
+            .filter_map(|it| match it {
+                DisplayItem::FillRect { rect, color } => Some((*rect, *color)),
+                _ => None,
+            })
+            .collect();
+        let dim = Color::rgba8(0, 0, 0, 26);
+        let viewport_rect = Rect {
+            x: 0.0,
+            y: 0.0,
+            w: 800.0,
+            h: 600.0,
+        };
+        let page = fills
+            .iter()
+            .position(|&(_, c)| c == Color::rgba8(0, 128, 0, 255))
+            .expect("page fill");
+        let dims: Vec<usize> = fills
+            .iter()
+            .enumerate()
+            .filter(|&(_, &(r, c))| r == viewport_rect && c == dim)
+            .map(|(i, _)| i)
+            .collect();
+        assert_eq!(
+            dims.len(),
+            2,
+            "two viewport backdrops expected, got {fills:?}"
+        );
+        let blue = fills
+            .iter()
+            .position(|&(_, c)| c == Color::rgba8(0, 0, 255, 255))
+            .expect("second dialog fill");
+        let red = fills
+            .iter()
+            .position(|&(_, c)| c == Color::rgba8(255, 0, 0, 255))
+            .expect("first dialog fill");
+        assert!(
+            page < dims[0] && dims[0] < blue && blue < dims[1] && dims[1] < red,
+            "paint order must be page, backdrop(second), second, backdrop(first), first; got page={page} dims={dims:?} blue={blue} red={red} in {fills:?}"
+        );
+    }
+
+    /// `::backdrop` generation gate in paint: a shown popover
+    /// and a non-modal dialog paint no backdrop on the UA
+    /// fallback path — the popover's UA backdrop is transparent
+    /// and the non-modal dialog is not in the top layer at all.
+    #[test]
+    fn backdrop_popover_and_non_modal_dialog_paint_nothing() {
+        let (mut doc, _quirks) = Document::parse_html(
+            r#"<div id="pop" popover="manual"></div><dialog id="dlg"></dialog>"#.as_bytes(),
+        );
+        let pop = doc.get_element_by_id("pop").expect("popover");
+        let dlg = doc.get_element_by_id("dlg").expect("dialog");
+        doc.show_popover(pop).expect("show popover");
+        doc.show_dialog(dlg).expect("show non-modal dialog");
+        assert!(doc.is_in_top_layer(pop));
+        assert!(!doc.is_in_top_layer(dlg));
+        let author = bowser_css::parse_stylesheet(
+            "body { margin: 0; } \
+             #pop { background-color: red; width: 100px; height: 100px; margin: 0; } \
+             #dlg { background-color: blue; width: 100px; height: 100px; margin: 0; }",
+        );
+        let viewport = Size { w: 800.0, h: 600.0 };
+        let root =
+            bowser_layout::layout(&doc, &[&author], viewport, &bowser_layout::FixedFontMetrics);
+        let list = build_display_list_with_images(&root, &doc, &mut |_| None, viewport);
+        let dim = Color::rgba8(0, 0, 0, 26);
+        assert!(
+            !list.items.iter().any(|it| matches!(it,
+                DisplayItem::FillRect { color, .. } if *color == dim)),
+            "no UA dim backdrop expected for popover / non-modal dialog"
+        );
+        assert!(
+            list.items.iter().any(|it| matches!(it,
+                DisplayItem::FillRect { color, .. } if *color == Color::rgba8(255, 0, 0, 255))),
+            "popover itself must still paint"
+        );
+    }
+
+    /// Carried author `::backdrop` styles paint (via
+    /// [`build_display_list_with_backdrop_styles`]): a styled
+    /// popover backdrop fills the viewport directly below the
+    /// popover, and `display: none` on a backdrop suppresses it.
+    /// The carried styles here come from the real pseudo cascade
+    /// ([`bowser_css::compute_pseudo_style`]), not hand-built
+    /// styles, so this also proves the cascade-to-paint handoff
+    /// shape the layout integration will use.
+    #[test]
+    fn backdrop_carried_author_style_paints_and_none_suppresses() {
+        let (mut doc, _quirks) = Document::parse_html(
+            r#"<div id="pop" popover="manual"></div><div id="gone" popover="manual"></div>"#
+                .as_bytes(),
+        );
+        let pop = doc.get_element_by_id("pop").expect("popover");
+        let gone = doc
+            .get_element_by_id("gone")
+            .expect("hidden-backdrop popover");
+        doc.show_popover(pop).expect("show popover");
+        doc.show_popover(gone).expect("show gone popover");
+        let author = bowser_css::parse_stylesheet(
+            "body { margin: 0; } \
+             #pop { background-color: blue; width: 100px; height: 100px; margin: 0; } \
+             #gone { background-color: green; width: 100px; height: 100px; margin: 0; } \
+             #pop::backdrop { background-color: red; } \
+             #gone::backdrop { display: none; background-color: red; }",
+        );
+        let ua = bowser_css::default_ua_stylesheet();
+        let vp = bowser_css::Viewport { w: 800.0, h: 600.0 };
+        let mut styles = HashMap::new();
+        for node in [pop, gone] {
+            let style = bowser_css::compute_pseudo_style(
+                &doc,
+                node,
+                &[&author],
+                &ua,
+                &vp,
+                "backdrop",
+                bowser_css::BACKDROP_ATOMS,
+            )
+            .expect("backdrop style");
+            styles.insert(node, Rc::new(style));
+        }
+        let viewport = Size { w: 800.0, h: 600.0 };
+        let root =
+            bowser_layout::layout(&doc, &[&author], viewport, &bowser_layout::FixedFontMetrics);
+        let list = build_display_list_with_backdrop_styles(
+            &root,
+            &doc,
+            &mut |_| FontKey(0),
+            &mut |_| None,
+            viewport,
+            styles,
+        );
+        let fills: Vec<(Rect, Color)> = list
+            .items
+            .iter()
+            .filter_map(|it| match it {
+                DisplayItem::FillRect { rect, color } => Some((*rect, *color)),
+                _ => None,
+            })
+            .collect();
+        let viewport_rect = Rect {
+            x: 0.0,
+            y: 0.0,
+            w: 800.0,
+            h: 600.0,
+        };
+        let reds: Vec<usize> = fills
+            .iter()
+            .enumerate()
+            .filter(|&(_, &(r, c))| r == viewport_rect && c == Color::rgba8(255, 0, 0, 255))
+            .map(|(i, _)| i)
+            .collect();
+        // Exactly one viewport red fill (the styled popover's
+        // backdrop); the `display: none` backdrop paints none, and
+        // neither popover's own 100x100 fill counts (wrong rect).
+        assert_eq!(
+            reds.len(),
+            1,
+            "one carried backdrop fill expected, got {fills:?}"
+        );
+        let blue = fills
+            .iter()
+            .position(|&(_, c)| c == Color::rgba8(0, 0, 255, 255))
+            .expect("popover fill");
+        assert!(
+            reds[0] < blue,
+            "carried backdrop must paint below its originator"
+        );
+    }
+
+    /// Carried `visibility: hidden` / `collapse` on a `::backdrop`
+    /// suppresses its fill, mirroring the `display: none` check:
+    /// two shown popovers whose backdrops are hidden / collapsed
+    /// paint no viewport backdrop at all.
+    #[test]
+    fn backdrop_carried_visibility_hidden_and_collapse_paint_nothing() {
+        let (mut doc, _quirks) = Document::parse_html(
+            r#"<div id="hid" popover="manual"></div><div id="col" popover="manual"></div>"#
+                .as_bytes(),
+        );
+        let hid = doc
+            .get_element_by_id("hid")
+            .expect("hidden-backdrop popover");
+        let col = doc
+            .get_element_by_id("col")
+            .expect("collapsed-backdrop popover");
+        doc.show_popover(hid).expect("show hid popover");
+        doc.show_popover(col).expect("show col popover");
+        let author = bowser_css::parse_stylesheet(
+            "body { margin: 0; } #hid { background-color: blue; width: 100px; height: 100px; margin: 0; } #col { background-color: green; width: 100px; height: 100px; margin: 0; } #hid::backdrop { visibility: hidden; background-color: red; } #col::backdrop { visibility: collapse; background-color: red; }",
+        );
+        let ua = bowser_css::default_ua_stylesheet();
+        let vp = bowser_css::Viewport { w: 800.0, h: 600.0 };
+        let mut styles = HashMap::new();
+        for node in [hid, col] {
+            let style = bowser_css::compute_pseudo_style(
+                &doc,
+                node,
+                &[&author],
+                &ua,
+                &vp,
+                "backdrop",
+                bowser_css::BACKDROP_ATOMS,
+            )
+            .expect("backdrop style");
+            styles.insert(node, Rc::new(style));
+        }
+        let viewport = Size { w: 800.0, h: 600.0 };
+        let root =
+            bowser_layout::layout(&doc, &[&author], viewport, &bowser_layout::FixedFontMetrics);
+        let list = build_display_list_with_backdrop_styles(
+            &root,
+            &doc,
+            &mut |_| FontKey(0),
+            &mut |_| None,
+            viewport,
+            styles,
+        );
+        let fills: Vec<(Rect, Color)> = list
+            .items
+            .iter()
+            .filter_map(|it| match it {
+                DisplayItem::FillRect { rect, color } => Some((*rect, *color)),
+                _ => None,
+            })
+            .collect();
+        let viewport_rect = Rect {
+            x: 0.0,
+            y: 0.0,
+            w: 800.0,
+            h: 600.0,
+        };
+        let reds: Vec<&(Rect, Color)> = fills
+            .iter()
+            .filter(|&&(r, c)| r == viewport_rect && c == Color::rgba8(255, 0, 0, 255))
+            .collect();
+        assert!(
+            reds.is_empty(),
+            "hidden/collapse backdrops must paint nothing, got {fills:?}"
+        );
+    }
+
+    /// Production backdrop wiring end to end (w81fix F-D item 5):
+    /// styles from [`collect_backdrop_styles`] — the real pseudo
+    /// cascade over the author sheets, not a hand-built map —
+    /// through the reused builder entry point
+    /// ([`build_display_list_reused_with_backdrop_styles`]): an
+    /// author `dialog::backdrop` color paints, an author
+    /// `display: none` backdrop suppresses even the modal UA dim,
+    /// and an author popover backdrop paints. A second reused
+    /// build with an empty map proves the begin call clears the
+    /// previous frame's carried styles: the author colors are
+    /// gone and both modal dialogs fall back to the UA dim.
+    #[test]
+    fn backdrop_production_collection_via_reused_builder() {
+        let (mut doc, _quirks) = Document::parse_html(
+            r#"<dialog id="d"></dialog><dialog id="gone"></dialog><div id="pop" popover="manual"></div>"#
+                .as_bytes(),
+        );
+        let d = doc.get_element_by_id("d").expect("dialog");
+        let gone = doc.get_element_by_id("gone").expect("gone dialog");
+        let pop = doc.get_element_by_id("pop").expect("popover");
+        doc.show_dialog_modal(d).expect("show modal dialog");
+        doc.show_dialog_modal(gone).expect("show gone modal dialog");
+        doc.show_popover(pop).expect("show popover");
+        let author = bowser_css::parse_stylesheet(
+            "body { margin: 0; } #d::backdrop { background-color: red; } #gone::backdrop { display: none; background-color: red; } #pop::backdrop { background-color: green; }",
+        );
+        let viewport = Size { w: 800.0, h: 600.0 };
+        let root =
+            bowser_layout::layout(&doc, &[&author], viewport, &bowser_layout::FixedFontMetrics);
+        let styles = collect_backdrop_styles(&doc, &[&author], viewport);
+        assert_eq!(
+            styles.len(),
+            3,
+            "collector must cover every top-layer node, got {}",
+            styles.len()
+        );
+        let viewport_rect = Rect {
+            x: 0.0,
+            y: 0.0,
+            w: 800.0,
+            h: 600.0,
+        };
+        let viewport_fill_colors = |list: &DisplayList| -> Vec<Color> {
+            list.items
+                .iter()
+                .filter_map(|it| match it {
+                    DisplayItem::FillRect { rect, color } if *rect == viewport_rect => Some(*color),
+                    _ => None,
+                })
+                .collect()
+        };
+        let mut builder = DisplayListBuilder::new();
+        let mut out = DisplayList::new();
+        build_display_list_reused_with_backdrop_styles(
+            &mut builder,
+            &mut out,
+            &root,
+            &doc,
+            &mut |_| FontKey(0),
+            &mut |_| None,
+            viewport,
+            true,
+            styles,
+        );
+        let colors = viewport_fill_colors(&out);
+        let red = Color::rgba8(255, 0, 0, 255);
+        let green = Color::rgba8(0, 128, 0, 255);
+        let dim = Color::rgba8(0, 0, 0, 26);
+        assert_eq!(
+            colors.iter().filter(|&&c| c == red).count(),
+            1,
+            "author dialog backdrop must paint once, got {colors:?}"
+        );
+        assert_eq!(
+            colors.iter().filter(|&&c| c == green).count(),
+            1,
+            "author popover backdrop must paint once, got {colors:?}"
+        );
+        assert_eq!(
+            colors.iter().filter(|&&c| c == dim).count(),
+            0,
+            "display:none backdrop must suppress the modal dim, got {colors:?}"
+        );
+        // Second reused build, empty map: carried styles are
+        // cleared by the begin call, so both modal dialogs fall
+        // back to the UA dim and no author color remains.
+        build_display_list_reused_with_backdrop_styles(
+            &mut builder,
+            &mut out,
+            &root,
+            &doc,
+            &mut |_| FontKey(0),
+            &mut |_| None,
+            viewport,
+            true,
+            HashMap::new(),
+        );
+        let colors = viewport_fill_colors(&out);
+        assert_eq!(
+            colors.iter().filter(|&&c| c == dim).count(),
+            2,
+            "empty-map rebuild must restore both UA dims, got {colors:?}"
+        );
+        assert!(
+            !colors.iter().any(|&c| c == red || c == green),
+            "empty-map rebuild must drop author colors, got {colors:?}"
+        );
     }
 
     /// Floats paint above in-flow block backgrounds (Appendix E step 4

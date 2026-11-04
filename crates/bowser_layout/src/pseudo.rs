@@ -25,7 +25,9 @@
 //! [`Display::Block`]) and its stored style keeps the raw
 //! `table-caption` string, so the existing caption path collects it.
 
-use bowser_css::{BEFORE_AFTER_ATOMS, ComputedStyle, CssValue, Styler, counter_adjustments, props};
+use bowser_css::{
+    BACKDROP_ATOMS, BEFORE_AFTER_ATOMS, ComputedStyle, CssValue, Styler, counter_adjustments, props,
+};
 use bowser_dom::{Document, NodeId, NodeKind};
 use std::cell::RefCell;
 use std::collections::HashMap;
@@ -41,10 +43,26 @@ use super::style::{
 };
 
 /// Which generated-content pseudo-element to query / attach.
+///
+/// `Backdrop` is the CSS Position 4 `::backdrop` pseudo-element:
+/// unlike `Before` / `After` it carries no `content` text (its box
+/// is the viewport-filling overlay, not generated text), so it has
+/// no `PseudoContent` shape — callers use
+/// [`query_backdrop_style`] for its computed style and gate box
+/// generation on top-layer membership themselves (see that
+/// function's docs). It is listed here so the kind, the name, and
+/// the allowed-atom set stay in one place with the other pseudos.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub(crate) enum PseudoKind {
     Before,
     After,
+    // No box is constructed for a backdrop (paint renders it
+    // directly below its originator from a carried style — see
+    // `query_backdrop_style`): the variant itself is the
+    // generation-gate contract, so silence the interim
+    // never-constructed warning rather than dropping it.
+    #[allow(dead_code)]
+    Backdrop,
 }
 
 impl PseudoKind {
@@ -54,6 +72,7 @@ impl PseudoKind {
         match self {
             PseudoKind::Before => "before",
             PseudoKind::After => "after",
+            PseudoKind::Backdrop => "backdrop",
         }
     }
 }
@@ -501,6 +520,54 @@ pub(crate) fn query_after_style(styler: &Styler, node: NodeId) -> Option<Rc<Comp
     styler.pseudo_style_for_shared(node, PseudoKind::After.name(), BEFORE_AFTER_ATOMS)
 }
 
+/// `node`'s `::backdrop` computed style over [`BACKDROP_ATOMS`]
+/// (w81 backdrop, W4), or `None` when no rule targets it. The UA
+/// stylesheet always carries a `::backdrop` rule, so this is
+/// `Some` for every element in practice — including elements that
+/// must NOT generate a backdrop box.
+///
+/// Generation gate (callers must enforce it; this query does
+/// not): a backdrop box exists only for an element in the
+/// document's top layer (`Document::is_in_top_layer`). That is
+/// also the popover rule: a shown popover IS in the top layer, so
+/// it gets a backdrop box, but its UA backdrop is transparent
+/// (only `dialog::backdrop` carries the UA dim), so it paints
+/// nothing until an author `::backdrop` rule styles it. A
+/// non-modal dialog is not in the top layer and generates no
+/// backdrop; a closed element likewise generates none. The query
+/// stays ungated deliberately: `getComputedStyle(el, "::backdrop")`
+/// must answer the UA style even for a non-top-layer element
+/// (the WPT `backdrop-ua-style` test queries a plain `div`).
+///
+/// Unlike `::before` / `::after`, there is no `content` gate and
+/// no [`attach`] step: the backdrop box is a fixed,
+/// viewport-filling box painted by the paint-last pass directly
+/// below its originator, not a child box of the originator, so
+/// this style is consumed by paint (via the carried backdrop
+/// styles map — see `bowser_paint`'s backdrop note), not by
+/// [`attach`]. Do not pass [`PseudoKind::Backdrop`] to
+/// [`query_pseudo_content`] / [`attach`]: those are
+/// generated-content paths and a backdrop has no text content.
+// The cascade side of the production backdrop wiring: paint
+// call sites collect author backdrop styles with
+// `bowser_paint::collect_backdrop_styles`, which runs the same
+// pseudo cascade path (it cannot call this query directly —
+// this fn is `pub(crate)` to layout — so it calls
+// `bowser_css::compute_pseudo_style`, which reaches the same
+// `pseudo_style_for_shared` path with the same atoms and UA
+// sheet) per top-layer node and hands the map to the
+// display-list builders. Box-construction-native
+// carrying — stashing the style on the `LayoutBox` during
+// `build_box_tree` — is still future work in `boxes.rs` /
+// `lib.rs`; the paint-time collection is equivalent (same
+// cascade over the same sheets) and is what production uses
+// today. Within this crate the query is still test-only, so
+// silence the interim never-used warning rather than dropping it.
+#[allow(dead_code)]
+pub(crate) fn query_backdrop_style(styler: &Styler, node: NodeId) -> Option<Rc<ComputedStyle>> {
+    styler.pseudo_style_for_shared(node, PseudoKind::Backdrop.name(), BACKDROP_ATOMS)
+}
+
 /// Synthesize the pseudo box for `content` as a child of the element box
 /// `idx`: an inline wrapper carrying the pseudo style, holding one text
 /// child. `::before` prepends, `::after` appends. Mirrors
@@ -615,5 +682,80 @@ pub(crate) fn attach(
         if let Some(pos) = children.iter().rposition(|&c| c == pseudo_idx) {
             children[..=pos].rotate_right(1);
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use bowser_css::{Viewport, default_ua_stylesheet, parse_stylesheet};
+
+    fn backdrop_style(html: &str, css: &str, id: &str) -> Option<Rc<ComputedStyle>> {
+        let (doc, _) = Document::parse_html(html.as_bytes());
+        let ua = default_ua_stylesheet();
+        let ss = parse_stylesheet(css);
+        let binding = [&ss];
+        let styler = Styler::new(&doc, &binding, &ua, Viewport { w: 800.0, h: 600.0 });
+        let node = doc.get_element_by_id(id).expect("backdrop test element");
+        // Exercise the generation gate the callers enforce: the
+        // query itself is ungated (see `query_backdrop_style`), so
+        // this helper returns the style regardless and the tests
+        // below assert top-layer membership separately.
+        query_backdrop_style(&styler, node)
+    }
+
+    #[test]
+    fn backdrop_kind_name_and_ua_style() {
+        assert_eq!(PseudoKind::Backdrop.name(), "backdrop");
+        let style =
+            backdrop_style("<dialog id=\"d\"></dialog>", "", "d").expect("UA ::backdrop style");
+        assert_eq!(style.get_str_by_index(props::POSITION), Some("fixed"));
+        assert_eq!(style.get_str_by_index(props::DISPLAY), Some("block"));
+        for slot in [props::TOP, props::RIGHT, props::BOTTOM, props::LEFT] {
+            assert_eq!(
+                style.get_by_index(slot),
+                Some(&CssValue::Length(0.0, bowser_css::LengthUnit::Px))
+            );
+        }
+    }
+
+    #[test]
+    fn backdrop_author_rule_overrides_ua_dim() {
+        let style = backdrop_style(
+            "<dialog id=\"d\"></dialog>",
+            "dialog::backdrop { background-color: red; }",
+            "d",
+        )
+        .expect("dialog ::backdrop style");
+        assert_eq!(
+            style.get_by_index(props::BACKGROUND_COLOR),
+            Some(&CssValue::Color(bowser_css::Color {
+                r: 255,
+                g: 0,
+                b: 0,
+                a: 255
+            }))
+        );
+    }
+
+    #[test]
+    fn backdrop_query_is_ungated_but_generation_is_top_layer_only() {
+        // A plain div queries a UA backdrop style, but it is not
+        // in the top layer, so no box may be generated for it —
+        // the gate the box/paint callers enforce on top of this
+        // query. The modal dialog is in the top layer.
+        let (mut doc, _) =
+            Document::parse_html("<div id=\"plain\"></div><dialog id=\"d\"></dialog>".as_bytes());
+        let plain = doc.get_element_by_id("plain").expect("plain div");
+        let dialog = doc.get_element_by_id("d").expect("dialog");
+        doc.show_dialog_modal(dialog).unwrap();
+        assert!(!doc.is_in_top_layer(plain));
+        assert!(doc.is_in_top_layer(dialog));
+        let ua = default_ua_stylesheet();
+        let ss = parse_stylesheet("");
+        let binding = [&ss];
+        let styler = Styler::new(&doc, &binding, &ua, Viewport { w: 800.0, h: 600.0 });
+        assert!(query_backdrop_style(&styler, plain).is_some());
+        assert!(query_backdrop_style(&styler, dialog).is_some());
     }
 }

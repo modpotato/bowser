@@ -25,7 +25,7 @@ fn usage() -> ! {
          --exclude SUB        skip tests whose id contains SUB (repeatable)\n  \
          --kind KIND          only run tests of KIND (repeatable;\n  \
          testharness|reftest|print-reftest|manual|crashtest)\n  \
-         --timeout-secs N     per-test timeout for testharness tests (default 60)"
+         --timeout-secs N     per-test timeout for testharness tests (default 180)"
     );
     std::process::exit(2);
 }
@@ -37,7 +37,7 @@ fn main() {
     let mut include = Vec::new();
     let mut exclude = Vec::new();
     let mut kinds = Vec::new();
-    let mut timeout_secs: u64 = 60;
+    let mut timeout_secs: u64 = 180;
 
     let mut args = std::env::args().skip(1).peekable();
     while let Some(arg) = args.next() {

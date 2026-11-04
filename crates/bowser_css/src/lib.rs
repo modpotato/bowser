@@ -27,9 +27,10 @@ mod token;
 mod value;
 
 pub use cascade::{
-    BEFORE_AFTER_ATOMS, ComputedStyle, MAX_GRID_LINE, SnapAlign, SnapStop, SnapType, Styler,
-    Viewport, compute_style, content_text, counter_adjustments, default_ua_stylesheet,
-    is_valid_for_property, props, selectors_are_subtree_local,
+    BACKDROP_ATOMS, BEFORE_AFTER_ATOMS, ComputedStyle, MAX_GRID_LINE, SnapAlign, SnapStop,
+    SnapType, Styler, Viewport, compute_pseudo_style, compute_style, content_text,
+    counter_adjustments, default_ua_stylesheet, is_valid_for_property, props,
+    selectors_are_subtree_local,
 };
 pub use cbprops::{Filter, FilterFunction, establishes_fixed_cb};
 pub use kwatom::{Keyword, KeywordAtom};

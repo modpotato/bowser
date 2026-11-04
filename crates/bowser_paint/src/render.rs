@@ -159,10 +159,11 @@
 //! fontless CPU bridge: identical with and without a GPU adapter, and text
 //! runs rasterize to nothing there.
 
+use std::collections::HashMap;
 use std::rc::Rc;
 
 use bowser_css::{ComputedStyle, CssValue, Stylesheet, props};
-use bowser_dom::Document;
+use bowser_dom::{Document, NodeId};
 use bowser_layout::{FontMetrics, LayoutBox, Size};
 
 use crate::display_list::{DecodedImage, DisplayList, FontKey, ImageId};
@@ -306,6 +307,36 @@ fn build_display_list_with_fonts(
     )
 }
 
+/// [`build_display_list_with_fonts`] with carried `::backdrop`
+/// styles (see [`crate::display_list::collect_backdrop_styles`]):
+/// the same font resolution, but author backdrops paint instead
+/// of only the UA modal dim.
+fn build_display_list_with_fonts_and_backdrop_styles(
+    root: &LayoutBox,
+    doc: &Document,
+    fonts: &mut FontCache,
+    image_resolver: &mut dyn FnMut(&str) -> Option<(ImageId, DecodedImage)>,
+    viewport: Size,
+    backdrop_styles: HashMap<NodeId, Rc<ComputedStyle>>,
+) -> DisplayList {
+    crate::display_list::build_display_list_with_backdrop_styles(
+        root,
+        doc,
+        &mut |style: &ComputedStyle| {
+            fonts
+                .resolve(
+                    css_font_family(style),
+                    css_font_weight(style),
+                    css_font_style(style),
+                )
+                .unwrap_or(FontKey(0))
+        },
+        image_resolver,
+        viewport,
+        backdrop_styles,
+    )
+}
+
 /// `get_font_data` hook over a [`FontCache`] snapshot, for the CPU backend
 /// (whose hook is `Rc`, not `Send`).
 fn font_data_hook(fonts: &FontCache) -> Rc<dyn Fn(FontKey) -> Option<FontData>> {
@@ -374,6 +405,67 @@ pub fn render_layout_to_rgba_with_scroll(
     };
     composite_over_white(&mut pixels);
     pixels
+}
+
+/// [`render_layout_to_rgba_with_scroll`] with carried `::backdrop`
+/// styles: author backdrops (collected with
+/// [`crate::display_list::collect_backdrop_styles`]) paint through
+/// both the GPU path and the CPU fallback; nodes absent from the
+/// map fall back to the UA modal dim exactly as the plain entry
+/// point does.
+pub fn render_layout_to_rgba_with_scroll_and_backdrop_styles(
+    root: &LayoutBox,
+    doc: &Document,
+    viewport: Size,
+    image_resolver: &mut dyn FnMut(&str) -> Option<(ImageId, DecodedImage)>,
+    scroll: (f32, f32),
+    backdrop_styles: HashMap<NodeId, Rc<ComputedStyle>>,
+) -> Vec<u8> {
+    let Some((w, h)) = viewport_whole(viewport) else {
+        return Vec::new();
+    };
+    let mut fonts = FontCache::new();
+    let display_list = build_display_list_with_fonts_and_backdrop_styles(
+        root,
+        doc,
+        &mut fonts,
+        image_resolver,
+        viewport,
+        backdrop_styles,
+    );
+    let mut pixels = if let Some(p) = crate::wgpu_be::WgpuBackend::render_offscreen_with_scroll(
+        &display_list,
+        w,
+        h,
+        &fonts,
+        scroll,
+    ) {
+        p
+    } else {
+        let mut cpu = crate::cpu::CpuBackend::new(font_data_hook(&fonts));
+        cpu.render_to_rgba_full(&display_list, w, h, 1.0, scroll)
+    };
+    composite_over_white(&mut pixels);
+    pixels
+}
+
+/// [`render_layout_to_rgba_with_scroll_and_backdrop_styles`] with
+/// a zero scroll offset.
+pub fn render_layout_to_rgba_with_backdrop_styles(
+    root: &LayoutBox,
+    doc: &Document,
+    viewport: Size,
+    image_resolver: &mut dyn FnMut(&str) -> Option<(ImageId, DecodedImage)>,
+    backdrop_styles: HashMap<NodeId, Rc<ComputedStyle>>,
+) -> Vec<u8> {
+    render_layout_to_rgba_with_scroll_and_backdrop_styles(
+        root,
+        doc,
+        viewport,
+        image_resolver,
+        (0.0, 0.0),
+        backdrop_styles,
+    )
 }
 
 /// Deterministic CPU-only twin of [`render_layout_to_rgba`]: never tries
@@ -572,6 +664,54 @@ mod tests {
         assert!(
             layout_width(&root) > layout_width(&plain),
             "64px text must lay out wider than default-size text"
+        );
+    }
+
+    /// Author `::backdrop` through the render entry point: a modal
+    /// dialog's collected backdrop style paints the viewport
+    /// corner red, while an empty map falls back to the light-gray
+    /// UA dim — the same production wiring the headless / WPT
+    /// renderers use, checked at the pixel level.
+    #[test]
+    fn render_with_collected_backdrop_styles_paints_author_backdrop() {
+        let (mut doc, _quirks) = Document::parse_html(b"<dialog id=\"d\"></dialog>");
+        let d = doc.get_element_by_id("d").expect("dialog");
+        doc.show_dialog_modal(d).expect("show modal dialog");
+        let author = bowser_css::parse_stylesheet("dialog::backdrop { background-color: red; }");
+        let viewport = Size { w: 200.0, h: 150.0 };
+        let root =
+            bowser_layout::layout(&doc, &[&author], viewport, &bowser_layout::FixedFontMetrics);
+        let styles = crate::display_list::collect_backdrop_styles(&doc, &[&author], viewport);
+        let pixel = |pixels: &[u8], x: usize, y: usize| -> [u8; 4] {
+            let i = (y * 200 + x) * 4;
+            [pixels[i], pixels[i + 1], pixels[i + 2], pixels[i + 3]]
+        };
+        let pixels = render_layout_to_rgba_with_scroll_and_backdrop_styles(
+            &root,
+            &doc,
+            viewport,
+            &mut |_| None,
+            (0.0, 0.0),
+            styles,
+        );
+        assert_eq!(pixels.len(), 200 * 150 * 4);
+        assert_eq!(
+            pixel(&pixels, 199, 149),
+            [255, 0, 0, 255],
+            "author backdrop must cover the viewport corner"
+        );
+        let dim_pixels = render_layout_to_rgba_with_scroll_and_backdrop_styles(
+            &root,
+            &doc,
+            viewport,
+            &mut |_| None,
+            (0.0, 0.0),
+            std::collections::HashMap::new(),
+        );
+        let dim = pixel(&dim_pixels, 199, 149);
+        assert!(
+            dim[0] > 200 && dim[0] == dim[1] && dim[1] == dim[2],
+            "empty map must fall back to the light-gray UA dim, got {dim:?}"
         );
     }
 

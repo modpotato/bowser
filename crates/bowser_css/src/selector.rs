@@ -135,6 +135,14 @@ pub(crate) enum PseudoClass {
     /// currently in the document's top layer (see
     /// [`bowser_dom::Document::is_popover_open`]).
     PopoverOpen,
+    /// `:open` (w81 phase 2): see
+    /// [`bowser_dom::Document::is_open_element`] — an open dialog,
+    /// a shown popover, or an open `details` element.
+    Open,
+    /// `:modal` (w81 phase 2): see
+    /// [`bowser_dom::Document::is_dialog_modal`] — a dialog shown
+    /// via `showModal` and not since demoted.
+    Modal,
     /// `:disabled` / `:enabled`: disableable form controls.
     Disabled,
     Enabled,
@@ -786,6 +794,8 @@ fn parse_pseudo(cur: &mut SelCursor, c: &mut CompoundSelector) -> Result<(), Sel
                 "focus" => c.pseudos.push(PseudoClass::Focus),
                 "checked" => c.pseudos.push(PseudoClass::Checked),
                 "popover-open" => c.pseudos.push(PseudoClass::PopoverOpen),
+                "open" => c.pseudos.push(PseudoClass::Open),
+                "modal" => c.pseudos.push(PseudoClass::Modal),
                 "disabled" => c.pseudos.push(PseudoClass::Disabled),
                 "enabled" => c.pseudos.push(PseudoClass::Enabled),
                 // Legacy single-colon pseudo-elements.

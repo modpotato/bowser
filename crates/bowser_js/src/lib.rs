@@ -59,6 +59,12 @@ mod opcode;
 
 mod compiler;
 
+/// Web Animations (WAAPI) surface skeleton (w81): `Element.animate()`
+/// plus the animation-state registry worker B's keyframe-effect
+/// engine plugs into. Value application is NOT implemented here yet
+/// (see `animation::apply_animations`); the `getComputedStyle` hooks
+/// for it are wired in `bindings.rs`, after the transition hook.
+mod animation;
 mod bindings;
 /// `TextEncoder`/`TextDecoder` per the WHATWG Encoding Standard, installed
 /// on the page global next to the URL bindings.

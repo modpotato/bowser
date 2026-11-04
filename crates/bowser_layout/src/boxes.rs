@@ -921,18 +921,78 @@ fn default_intrinsic_for_tag(tag: &str) -> Option<IntrinsicDims> {
     }
 }
 
+/// The intrinsic content height for an `<input>` with no map entry,
+/// or `None` when the input type renders a non-text control and keeps
+/// the v1 0x0 default. An `<input>` is not a missing image: a text,
+/// button, or file control renders a single line of control text, so
+/// its content height is its computed line-height — font-metrics
+/// derived (`StyleData::line_height`, which already resolved
+/// `line-height: normal` through the font backend), never a magic
+/// constant. That is what keeps stacked `display: table` (remapped to
+/// block) inputs from sharing a top in
+/// `css-tables/table-model-fixup-2`: the `table` cases assert unequal
+/// tops, which a zero-height pair fails vacuously. Width is untouched
+/// (still 0 with no entry): only the height is claimed here, and CSS
+/// width/height still override at layout time.
+/// Per-type rule: missing/unknown types default to text per HTML (an
+/// unknown `type` value is the text state), as do the other single-line
+/// text-entry states (`search`, `password`, `email`, `url`, `tel`,
+/// `number`, and the date/time states) and the button states
+/// (`button`, `submit`, `reset`) plus `file`, whose control is a
+/// button beside a single line of text. The non-text controls
+/// (`hidden`, `image`, `checkbox`, `radio`, `range`, `color`) keep
+/// 0x0 until they get real control rendering; `image` in particular
+/// must stay image-like (a decoded resource supplies its size, a
+/// missing one lays out empty, exactly like `<img>`).
+fn input_default_line_height(tag: &str, type_attr: Option<&str>, line_height: f32) -> Option<f32> {
+    if tag != "input" {
+        return None;
+    }
+    // ASCII case-insensitive compare without allocating a lowered copy:
+    // this runs for every replaced node in box construction.
+    let ty = type_attr.map(str::trim).unwrap_or("");
+    let non_text = ["hidden", "image", "checkbox", "radio", "range", "color"]
+        .iter()
+        .any(|t| ty.eq_ignore_ascii_case(t));
+    if non_text {
+        None
+    } else {
+        Some(sane_len(line_height).max(0.0))
+    }
+}
+
 /// Sanitize a caller-supplied intrinsics entry: NaN/negative/infinite
 /// dimensions degrade to finite nonnegative instead of poisoning
 /// layout. A missing entry falls back to the tag default (300x150
-/// unknown for `<iframe>` etc., 0x0 for `<img>`).
-fn sanitize_intrinsic(entry: Option<IntrinsicDims>, tag: &str) -> IntrinsicDims {
+/// unknown for `<iframe>` etc., 0x0 for `<img>`), except for an
+/// `<input>` whose caller passed its computed line-height: that yields
+/// the [`input_default_line_height`] height with the v1 0 width. The
+/// line-height argument is `Some` only for `<input>` nodes (computed
+/// by the caller from the node's `type` attribute); every other tag
+/// passes `None` and is unaffected.
+fn sanitize_intrinsic(
+    entry: Option<IntrinsicDims>,
+    tag: &str,
+    input_line_height: Option<f32>,
+) -> IntrinsicDims {
     match entry {
         Some(d) => IntrinsicDims {
             w: d.w.map(|w| sane_len(w).max(0.0)),
             h: d.h.map(|h| sane_len(h).max(0.0)),
             ratio: d.ratio.filter(|r| *r > 0.0 && r.is_finite()),
         },
-        None => default_intrinsic_for_tag(tag).unwrap_or(IntrinsicDims::from_size(0.0, 0.0)),
+        None => {
+            if tag == "input"
+                && let Some(h) = input_line_height
+            {
+                return IntrinsicDims {
+                    w: Some(0.0),
+                    h: Some(h),
+                    ratio: None,
+                };
+            }
+            default_intrinsic_for_tag(tag).unwrap_or(IntrinsicDims::from_size(0.0, 0.0))
+        }
     }
 }
 
@@ -1890,8 +1950,12 @@ fn build_box_tree_rooted(
         // element *below* the root; a replaced subtree root needs the
         // same treatment (sanitized like pass 1) or it would size 0x0.
         let tag = tag_name(doc, root_el);
-        forest.nodes[root_idx].intrinsic =
-            Some(sanitize_intrinsic(intrinsics.get(&root_el).copied(), tag));
+        let root_line_height = forest.nodes[root_idx].data.line_height;
+        forest.nodes[root_idx].intrinsic = Some(sanitize_intrinsic(
+            intrinsics.get(&root_el).copied(),
+            tag,
+            input_default_line_height(tag, doc.get_attribute(root_el, "type"), root_line_height),
+        ));
     }
 
     // Pass 1: raw tree, iterative.
@@ -2255,9 +2319,20 @@ fn build_box_tree_rooted(
                     // still override at layout time. Map entries are
                     // sanitized: NaN/negative/infinite sizes from the
                     // caller degrade to finite nonnegative instead of
-                    // poisoning layout.
-                    forest.nodes[idx].intrinsic =
-                        Some(sanitize_intrinsic(intrinsics.get(&item.dom).copied(), tag));
+                    // poisoning layout. An `<input>` with no entry
+                    // instead takes its computed line-height as its
+                    // intrinsic content height (see
+                    // [`input_default_line_height`]).
+                    let line_height = forest.nodes[idx].data.line_height;
+                    forest.nodes[idx].intrinsic = Some(sanitize_intrinsic(
+                        intrinsics.get(&item.dom).copied(),
+                        tag,
+                        input_default_line_height(
+                            tag,
+                            doc.get_attribute(item.dom, "type"),
+                            line_height,
+                        ),
+                    ));
                 }
                 if !is_template {
                     let (fs, ws, tt, rtl, bidi) = {
@@ -2581,14 +2656,53 @@ mod tests {
         // `<iframe>`/`<embed>`/`<object>`/`<video>` with no loaded
         // content: unknown dimensions (300x150 default, no ratio) per
         // CSS 2.1 §10.3.2; `<img>` with no entry stays 0x0.
-        let iframe = sanitize_intrinsic(None, "iframe");
+        let iframe = sanitize_intrinsic(None, "iframe", None);
         assert_eq!(iframe.w, None);
         assert_eq!(iframe.h, None);
         assert_eq!(iframe.ratio, None);
         assert_eq!(iframe.width_or_default(), 300.0);
         assert_eq!(iframe.height_or_default(), 150.0);
-        let img = sanitize_intrinsic(None, "img");
+        let img = sanitize_intrinsic(None, "img", None);
         assert_eq!(img, IntrinsicDims::from_size(0.0, 0.0));
+        // An `<input>` with no entry takes its computed line-height as
+        // its intrinsic content height (width still 0); without a
+        // line-height argument, or for a non-text control, it stays 0x0.
+        let text_input = sanitize_intrinsic(None, "input", Some(19.2));
+        assert_eq!(text_input.w, Some(0.0));
+        assert_eq!(text_input.h, Some(19.2));
+        assert_eq!(text_input.ratio, None);
+        let bare_input = sanitize_intrinsic(None, "input", None);
+        assert_eq!(bare_input, IntrinsicDims::from_size(0.0, 0.0));
+        assert_eq!(
+            input_default_line_height("input", Some("text"), 19.2),
+            Some(19.2)
+        );
+        assert_eq!(
+            input_default_line_height("input", Some("button"), 19.2),
+            Some(19.2)
+        );
+        assert_eq!(
+            input_default_line_height("input", Some("file"), 19.2),
+            Some(19.2)
+        );
+        assert_eq!(input_default_line_height("input", None, 19.2), Some(19.2));
+        assert_eq!(
+            input_default_line_height("input", Some("bogus"), 19.2),
+            Some(19.2)
+        );
+        assert_eq!(
+            input_default_line_height("input", Some("checkbox"), 19.2),
+            None
+        );
+        assert_eq!(
+            input_default_line_height("input", Some("hidden"), 19.2),
+            None
+        );
+        assert_eq!(
+            input_default_line_height("input", Some("image"), 19.2),
+            None
+        );
+        assert_eq!(input_default_line_height("img", Some("text"), 19.2), None);
         // Caller-supplied entries survive sanitization.
         let svg = sanitize_intrinsic(
             Some(IntrinsicDims {
@@ -2597,6 +2711,7 @@ mod tests {
                 ratio: Some(10.0),
             }),
             "img",
+            None,
         );
         assert_eq!(svg.ratio, Some(10.0));
         assert_eq!(svg.width_or_default(), 300.0);

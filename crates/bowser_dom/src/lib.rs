@@ -553,6 +553,45 @@ impl fmt::Display for PopoverError {
     }
 }
 
+/// What pressing Escape dismisses: the single top-layer member
+/// that is dismissible by Escape. A `manual` (or `hint`) popover
+/// on top dismisses nothing, even when a dismissible element sits
+/// below it — the topmost member owns the key.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum EscapeTarget {
+    /// A modal dialog: close it with its `returnValue` unchanged
+    /// (the caller fires `cancel` first and `close` after).
+    ModalDialog(NodeId),
+    /// An `auto` popover: hide it (the caller fires `toggle`).
+    AutoPopover(NodeId),
+}
+
+/// Failure of a dialog show/showModal/close call, named after the
+/// `DOMException` the JS bindings surface it as (same convention as
+/// [`PopoverError`]: the engine has no `DOMException` type, so
+/// bindings report these as `TypeError`s whose message carries the
+/// DOM name).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum DialogError {
+    /// The element is not an HTML `dialog` element.
+    NotSupported,
+    /// Not connected, or already open (for `show`/`showModal`).
+    InvalidState,
+}
+
+impl fmt::Display for DialogError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            DialogError::NotSupported => {
+                f.write_str("NotSupportedError: element is not a dialog element")
+            }
+            DialogError::InvalidState => {
+                f.write_str("InvalidStateError: dialog is not connected or already open")
+            }
+        }
+    }
+}
+
 /// An HTML document: the arena that owns every node.
 #[derive(Clone, Debug)]
 pub struct Document {
@@ -632,6 +671,24 @@ pub struct Document {
     /// attribute that was never shown is not in it, and an element
     /// whose `popover` attribute is removed while open is demoted.
     top_layer: Vec<NodeId>,
+    /// Modal dialogs (HTML §4.11.4, w81 phase 2): the subset of
+    /// open dialogs shown via `showModal` (or adopted as such from
+    /// the parse shim). Membership is what makes `:modal` match
+    /// (see [`Document::is_dialog_modal`]); a modal dialog is also
+    /// in [`Document::top_layer`], so demotion always clears this
+    /// set too (see [`Document::demote_top_layer_subtree`] and the
+    /// `open`-attribute branch of [`Document::remove_attribute`]).
+    /// A dialog opened via `show()` or via a bare `open` attribute
+    /// is never in this set. Nodes are arena-allocated and never
+    /// freed, so the set only grows with the node count.
+    dialog_modal: HashSet<NodeId>,
+    /// Per-dialog `returnValue` (HTML §4.11.4, w81 phase 2): the
+    /// value last passed to `close(returnValue)` (or set through
+    /// the IDL accessor). Not a content attribute, so it lives
+    /// here rather than on the element: it survives close and
+    /// re-show, and defaults to `""` when absent (see
+    /// [`Document::dialog_return_value`]).
+    dialog_return_values: HashMap<NodeId, String>,
     /// Scratch walk stack for [`Document::set_subtree_flags`], cleared
     /// and reused on every call so the flag walk never allocates. A
     /// plain `Vec` keeps [`Document`] `Send + Sync`.
@@ -734,6 +791,8 @@ impl Document {
             dirty_style_subtrees: HashSet::new(),
             shadow_hosts: HashMap::new(),
             top_layer: Vec::new(),
+            dialog_modal: HashSet::new(),
+            dialog_return_values: HashMap::new(),
             flag_stack: Vec::new(),
             clone_stack: Vec::new(),
             text_cache: HashSet::new(),
@@ -1929,6 +1988,18 @@ impl Document {
             if name.eq_ignore_ascii_case("popover") {
                 self.remove_from_top_layer(el);
             }
+            // Removing the `open` attribute from a dialog closes it
+            // as far as state goes (w81 phase 2): a modal dialog
+            // leaves the top layer and loses its modal flag, so it
+            // can never linger as an invisible top-layer member.
+            // No `close` event fires here — that event is fired
+            // only by [`Document::close_dialog`] (the spec warns
+            // that toggling `open` directly skips the event, and
+            // direct attribute removal is the same shape).
+            if name.eq_ignore_ascii_case("open") && self.is_dialog_element(el) {
+                self.dialog_modal.remove(&el);
+                self.remove_from_top_layer(el);
+            }
             // As in `set_attribute`: any attribute can take part in
             // selector matching, so removal re-runs the style stage.
             // The removal's restyle scope is subtree-local like a write.
@@ -1963,6 +2034,11 @@ impl Document {
             }
         }
         for n in members {
+            // A demoted dialog loses its modal flag with its
+            // top-layer membership (w81 phase 2): a removed modal
+            // dialog that is reinserted comes back non-modal, like
+            // a removed popover comes back hidden.
+            self.dialog_modal.remove(&n);
             self.remove_from_top_layer(n);
         }
     }
@@ -2112,6 +2188,249 @@ impl Document {
                 }
             }
         }
+    }
+
+    // ------------------------------------------------------------------
+    // Dialog API (HTML §4.11.4, w81 phase 2)
+    // ------------------------------------------------------------------
+
+    /// True when `node` is an HTML-namespace `dialog` element.
+    /// A foreign-namespace element named `dialog` is not one: the
+    /// dialog API is an HTML-element API, like `showPopover`'s
+    /// `popover` attribute is an HTML attribute.
+    pub fn is_dialog_element(&self, node: NodeId) -> bool {
+        match self.element_data(node) {
+            Some(d) => {
+                d.namespace == Namespace::Html && d.tag_name.as_str().eq_ignore_ascii_case("dialog")
+            }
+            None => false,
+        }
+    }
+
+    /// True when `node` is a dialog carrying the `open` attribute.
+    /// This is the dialog's open state: it covers dialogs opened
+    /// via `show()` / `showModal()`, dialogs written with a bare
+    /// `open` attribute in markup, and dialogs whose `open` IDL
+    /// attribute was set directly — all three render open (UA
+    /// `dialog[open]` rule), and all three are what `:open`
+    /// matches. It deliberately does NOT require top-layer
+    /// membership: a non-modal dialog is open without ever being
+    /// promoted.
+    pub fn is_dialog_open(&self, node: NodeId) -> bool {
+        self.is_dialog_element(node) && self.has_attribute(node, "open")
+    }
+
+    /// True when `node` is a modal dialog: open via `showModal`
+    /// (or adopted as modal from the parse shim) and not since
+    /// demoted. This is exactly what `:modal` matches.
+    pub fn is_dialog_modal(&self, node: NodeId) -> bool {
+        self.is_dialog_open(node) && self.dialog_modal.contains(&node)
+    }
+
+    /// True when `node` is in an open state for `:open` matching:
+    /// an open dialog, a shown popover, or an open `details`
+    /// element (Selectors 4 `:open` covers all three; the popover
+    /// case is why popover tests assert `matches(':open')`).
+    pub fn is_open_element(&self, node: NodeId) -> bool {
+        if self.is_dialog_open(node) || self.is_popover_open(node) {
+            return true;
+        }
+        match self.element_data(node) {
+            Some(d) => {
+                d.namespace == Namespace::Html
+                    && d.tag_name.as_str().eq_ignore_ascii_case("details")
+                    && self.has_attribute(node, "open")
+            }
+            None => false,
+        }
+    }
+
+    /// The dialog's `returnValue`: the value last passed to
+    /// [`Document::close_dialog`] or set through the IDL accessor,
+    /// `""` when neither has happened. Always `""` for
+    /// non-dialogs (fail-closed, like the other dialog queries).
+    pub fn dialog_return_value(&self, node: NodeId) -> &str {
+        if !self.is_dialog_element(node) {
+            return "";
+        }
+        self.dialog_return_values
+            .get(&node)
+            .map(String::as_str)
+            .unwrap_or("")
+    }
+
+    /// Set a dialog's `returnValue` through the IDL accessor path.
+    /// No-op for non-dialogs. Does not open, close, or fire
+    /// anything: setting `returnValue` alone is observable only
+    /// on the next read (or the next `close()` without an
+    /// argument, which keeps the stored value).
+    pub fn set_dialog_return_value(&mut self, node: NodeId, value: &str) {
+        if self.is_dialog_element(node) {
+            self.dialog_return_values.insert(node, value.to_string());
+        }
+    }
+
+    /// Mark `node` as a modal dialog without validating state:
+    /// the raw set operation behind parse-shim adoption and the
+    /// style-rebuild promotion (both validate first — the node
+    /// is a dialog, carries `open`, and is being promoted to the
+    /// top layer). Callers modelling a spec API use
+    /// [`Document::show_dialog_modal`], not this.
+    pub fn mark_dialog_modal(&mut self, node: NodeId) {
+        if self.is_dialog_element(node) {
+            self.dialog_modal.insert(node);
+        }
+    }
+
+    /// `HTMLDialogElement.show()`: open non-modally. Sets the
+    /// `open` attribute and nothing else — no top-layer
+    /// promotion, no modal flag (a shown dialog renders via the
+    /// UA `dialog[open]` rule, not the top layer).
+    /// `NotSupported` when the element is not a dialog,
+    /// `InvalidState` when it is not connected or already open
+    /// (an `open` attribute from markup counts as open here, so
+    /// `show()` on a `<dialog open>` throws, per spec).
+    pub fn show_dialog(&mut self, node: NodeId) -> Result<(), DialogError> {
+        if !self.is_dialog_element(node) {
+            return Err(DialogError::NotSupported);
+        }
+        if !self.is_attached(node) || self.is_dialog_open(node) {
+            return Err(DialogError::InvalidState);
+        }
+        self.set_attribute(node, "open", "");
+        Ok(())
+    }
+
+    /// `HTMLDialogElement.showModal()`: open modally. Sets the
+    /// `open` attribute, promotes to the top layer, and marks the
+    /// dialog modal. Same errors as [`Document::show_dialog`].
+    /// Focus handling (previously-focused element, focus trap)
+    /// is deliberately NOT here: later workers (W4/W5) own it.
+    pub fn show_dialog_modal(&mut self, node: NodeId) -> Result<(), DialogError> {
+        if !self.is_dialog_element(node) {
+            return Err(DialogError::NotSupported);
+        }
+        if !self.is_attached(node) || self.is_dialog_open(node) {
+            return Err(DialogError::InvalidState);
+        }
+        self.set_attribute(node, "open", "");
+        self.dialog_modal.insert(node);
+        // Move to the end, not just promote: a dialog already in
+        // the top layer as a popover keeps its old position under
+        // a deduped promote, so modal promotion must demote first
+        // and re-promote last, or the modal would stack below
+        // members promoted after its popover show.
+        self.remove_from_top_layer(node);
+        self.promote_to_top_layer(node);
+        Ok(())
+    }
+
+    /// `HTMLDialogElement.close(returnValue)`: close the dialog.
+    /// Returns `true` when the dialog was open and is now closed
+    /// (the bindings fire the `close` event exactly then);
+    /// returns `false` — a no-op, no event — when the dialog was
+    /// not open. When `return_value` is `Some`, it replaces the
+    /// stored `returnValue` before closing; `None` (argument
+    /// omitted) keeps the stored value. Closing removes the
+    /// `open` attribute, which (via
+    /// [`Document::remove_attribute`]) demotes a modal dialog
+    /// from the top layer and clears its modal flag.
+    /// `NotSupported` when the element is not a dialog; closing
+    /// a closed dialog is NOT an error.
+    pub fn close_dialog(
+        &mut self,
+        node: NodeId,
+        return_value: Option<&str>,
+    ) -> Result<bool, DialogError> {
+        if !self.is_dialog_element(node) {
+            return Err(DialogError::NotSupported);
+        }
+        if !self.is_dialog_open(node) {
+            return Ok(false);
+        }
+        if let Some(v) = return_value {
+            self.dialog_return_values.insert(node, v.to_string());
+        }
+        self.remove_attribute(node, "open");
+        Ok(true)
+    }
+
+    // ------------------------------------------------------------------
+    // Light-dismiss / Escape (HTML §4.11.4 cancel, §6.12; w81 W-LD)
+    // ------------------------------------------------------------------
+
+    /// The topmost modal dialog, if any, regardless of what sits
+    /// above it in the top layer. This is the focus-trap scope,
+    /// not the Escape target (see [`Document::topmost_escape_target`]).
+    pub fn topmost_modal_dialog(&self) -> Option<NodeId> {
+        self.top_layer
+            .iter()
+            .rev()
+            .find(|n| self.is_dialog_modal(**n))
+            .copied()
+    }
+
+    /// The topmost open `popover=auto` element, if any, regardless
+    /// of what sits above it in the top layer.
+    pub fn topmost_auto_popover(&self) -> Option<NodeId> {
+        self.top_layer
+            .iter()
+            .rev()
+            .find(|n| {
+                self.is_popover_open(**n) && self.popover_state(**n) == Some(PopoverState::Auto)
+            })
+            .copied()
+    }
+
+    /// What Escape dismisses, if anything: the top-layer member
+    /// itself, not the topmost dismissible member below it. When
+    /// the top member is a modal dialog it wins over any popover
+    /// below; when it is an `auto` popover it wins over any dialog
+    /// below; when it is anything else (a `manual` popover, or a
+    /// member this engine does not dismiss) Escape does nothing.
+    /// This is a pure query: the caller runs the `cancel` check
+    /// (dialogs) and fires the event before closing/hiding.
+    pub fn topmost_escape_target(&self) -> Option<EscapeTarget> {
+        let top = *self.top_layer.last()?;
+        if self.is_dialog_modal(top) {
+            Some(EscapeTarget::ModalDialog(top))
+        } else if self.is_popover_open(top) && self.popover_state(top) == Some(PopoverState::Auto) {
+            Some(EscapeTarget::AutoPopover(top))
+        } else {
+            None
+        }
+    }
+
+    /// The popover a press/release at `clicked` would light-dismiss,
+    /// without dismissing it: the topmost `auto` popover, when it is
+    /// itself the top-layer member and `clicked` is outside it.
+    /// `None` (no hit: backdrop, empty area) counts as outside.
+    /// Callers that track pointerdown/pointerup pairs (HTML §6.12.2)
+    /// compare this candidate at press and at release and dismiss
+    /// only when both resolve to the same popover; see
+    /// [`Document::light_dismiss_popover`] for the one-shot form.
+    pub fn light_dismiss_candidate(&self, clicked: Option<NodeId>) -> Option<NodeId> {
+        let top = self.topmost_auto_popover()?;
+        if self.top_layer.last() != Some(&top) {
+            return None;
+        }
+        if let Some(c) = clicked
+            && (c == top || self.ancestors(c).contains(&top))
+        {
+            return None;
+        }
+        Some(top)
+    }
+
+    /// Light-dismiss (HTML §6.12): hide the popover
+    /// [`Document::light_dismiss_candidate`] names for `clicked`,
+    /// if any. Returns the hidden node, or `None` when nothing was
+    /// dismissed. The caller fires the `toggle` event and clears
+    /// focus inside the popover when this returns `Some`.
+    pub fn light_dismiss_popover(&mut self, clicked: Option<NodeId>) -> Option<NodeId> {
+        let top = self.light_dismiss_candidate(clicked)?;
+        self.hide_popover(top).ok()?;
+        Some(top)
     }
 
     /// True when the element has an attribute with the given name. Name
@@ -4082,10 +4401,12 @@ struct Compound {
     classes: Vec<String>,
     attrs: Vec<AttrSelector>,
     /// `:popover-open`: the element is a shown popover (see
-    /// [`Document::is_popover_open`]). The only pseudo-class this
-    /// mini-parser supports; every other pseudo-class or
-    /// pseudo-element is a parse error, as before.
+    /// [`Document::is_popover_open`]).
     popover_open: bool,
+    /// `:open` (w81 phase 2): see [`Document::is_open_element`].
+    open: bool,
+    /// `:modal` (w81 phase 2): see [`Document::is_dialog_modal`].
+    modal: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -4315,10 +4636,16 @@ fn parse_compound(tok: &str) -> Result<Compound, SelectorParseError> {
                 // them before matching), so `:POPOVER-OPEN` matches
                 // here too. Every other name still errors, including
                 // the empty name from `::backdrop` and `:not(...)`.
-                if !name.eq_ignore_ascii_case("popover-open") {
+                // w81 phase 2 adds `:open` and `:modal` (dialog).
+                if name.eq_ignore_ascii_case("popover-open") {
+                    c.popover_open = true;
+                } else if name.eq_ignore_ascii_case("open") {
+                    c.open = true;
+                } else if name.eq_ignore_ascii_case("modal") {
+                    c.modal = true;
+                } else {
                     return Err(err("unsupported pseudo-class in selector"));
                 }
-                c.popover_open = true;
                 any = true;
                 i = j;
             }
@@ -4512,10 +4839,15 @@ impl TagNameQuery {
         if data.namespace == Namespace::Html {
             // Spill-first ordering (mirrors `bowser_css::matching`): an
             // element whose tag name is not in the atom table — e.g.
-            // `createElementNS(Namespace::Html, "DIV")` keeps its case
-            // and spills — falls back to the ASCII case-insensitive
-            // string compare instead of silently missing on
-            // `UNKNOWN == atom`.
+            // a foreign-namespace name from `createElementNS`, whose
+            // case is preserved and which spills, or an unknown
+            // (custom) HTML tag — falls back to the ASCII
+            // case-insensitive string compare instead of silently
+            // missing on `UNKNOWN == atom`. A mixed-case HTML
+            // well-known name is not such a case anymore:
+            // `createElementNS` lowercases HTML-namespace names
+            // since w80fix F1, so `createElementNS(Namespace::Html,
+            // "DIV")` becomes `div` and matches via its atom.
             if data.tag_name.atom() == NameAtom::UNKNOWN {
                 data.tag_name.as_str().eq_ignore_ascii_case(&self.text)
             } else {
@@ -4687,6 +5019,12 @@ impl Document {
             }
         }
         if c.popover_open && !self.is_popover_open(el) {
+            return false;
+        }
+        if c.open && !self.is_open_element(el) {
+            return false;
+        }
+        if c.modal && !self.is_dialog_modal(el) {
             return false;
         }
         true
@@ -5086,5 +5424,192 @@ mod w65_p_dom_tests {
             assert_eq!(doc.get_element_by_id("never-seen"), None);
         }
         assert_eq!(doc.get_element_by_id("real"), Some(e));
+    }
+}
+
+#[cfg(test)]
+mod w81_light_dismiss_tests {
+    use super::*;
+
+    /// One shared stage under the document root: a Document node
+    /// accepts a single element child, so every test element hangs
+    /// off this one host (separate top-level hosts are silently
+    /// rejected by `append_child`'s document-validity check).
+    fn stage(doc: &mut Document) -> NodeId {
+        let host = doc.create_element("div");
+        doc.append_child(doc.root(), host);
+        host
+    }
+
+    fn attached(doc: &mut Document, host: NodeId, tag: &str) -> NodeId {
+        let el = doc.create_element(tag);
+        doc.append_child(host, el);
+        el
+    }
+
+    fn open_modal(doc: &mut Document, host: NodeId) -> NodeId {
+        let dlg = attached(doc, host, "dialog");
+        doc.show_dialog_modal(dlg).expect("showModal");
+        dlg
+    }
+
+    fn open_popover(doc: &mut Document, host: NodeId, state: &str) -> NodeId {
+        let pop = attached(doc, host, "div");
+        doc.set_attribute(pop, "popover", state);
+        doc.show_popover(pop).expect("showPopover");
+        pop
+    }
+
+    #[test]
+    fn escape_target_is_top_layer_member_only() {
+        let mut doc = Document::new();
+        assert_eq!(doc.topmost_escape_target(), None, "nothing open");
+        let host = stage(&mut doc);
+        let dlg = open_modal(&mut doc, host);
+        assert_eq!(
+            doc.topmost_escape_target(),
+            Some(EscapeTarget::ModalDialog(dlg))
+        );
+        // An auto popover promoted above the dialog wins the key.
+        let pop = open_popover(&mut doc, host, "auto");
+        assert_eq!(
+            doc.topmost_escape_target(),
+            Some(EscapeTarget::AutoPopover(pop))
+        );
+        // Hiding the popover hands the key back to the dialog.
+        doc.hide_popover(pop).expect("hide");
+        assert_eq!(
+            doc.topmost_escape_target(),
+            Some(EscapeTarget::ModalDialog(dlg))
+        );
+        // A manual popover on top dismisses nothing, even with a
+        // dismissible dialog below it.
+        let manual = open_popover(&mut doc, host, "manual");
+        assert_eq!(doc.topmost_escape_target(), None);
+        doc.hide_popover(manual).expect("hide manual");
+        assert_eq!(
+            doc.topmost_escape_target(),
+            Some(EscapeTarget::ModalDialog(dlg))
+        );
+        // A hint popover on top likewise blocks the key.
+        let hint = open_popover(&mut doc, host, "hint");
+        assert_eq!(doc.topmost_escape_target(), None);
+        doc.hide_popover(hint).expect("hide hint");
+    }
+
+    #[test]
+    fn escape_close_keeps_dialog_return_value() {
+        let mut doc = Document::new();
+        let host = stage(&mut doc);
+        let dlg = open_modal(&mut doc, host);
+        doc.set_dialog_return_value(dlg, "ok");
+        assert_eq!(
+            doc.topmost_escape_target(),
+            Some(EscapeTarget::ModalDialog(dlg))
+        );
+        // Escape closes with no argument: the stored value survives.
+        assert!(doc.close_dialog(dlg, None).expect("close"));
+        assert!(!doc.is_dialog_open(dlg));
+        assert_eq!(doc.dialog_return_value(dlg), "ok");
+    }
+
+    #[test]
+    fn topmost_queries_ignore_lower_members() {
+        let mut doc = Document::new();
+        let host = stage(&mut doc);
+        let dlg = open_modal(&mut doc, host);
+        let manual = open_popover(&mut doc, host, "manual");
+        let auto = open_popover(&mut doc, host, "auto");
+        assert_eq!(doc.topmost_modal_dialog(), Some(dlg));
+        assert_eq!(doc.topmost_auto_popover(), Some(auto));
+        // The manual popover is open but never an auto candidate.
+        assert!(doc.is_popover_open(manual));
+        assert_ne!(doc.topmost_auto_popover(), Some(manual));
+    }
+
+    #[test]
+    fn light_dismiss_closes_only_topmost_auto_on_outside_press() {
+        let mut doc = Document::new();
+        let host = stage(&mut doc);
+        let manual = open_popover(&mut doc, host, "manual");
+        let auto = open_popover(&mut doc, host, "auto");
+        // No hit (backdrop / empty area) is outside: only the auto
+        // popover closes, the manual one stays.
+        assert_eq!(doc.light_dismiss_popover(None), Some(auto));
+        assert!(!doc.is_popover_open(auto));
+        assert!(doc.is_popover_open(manual));
+        // Nothing dismissible left: a further outside press is a no-op.
+        assert_eq!(doc.light_dismiss_popover(None), None);
+
+        // Inside presses never dismiss, neither on the popover
+        // itself nor on a descendant.
+        let auto2 = open_popover(&mut doc, host, "auto");
+        let inner = doc.create_element("span");
+        doc.append_child(auto2, inner);
+        assert_eq!(doc.light_dismiss_popover(Some(auto2)), None);
+        assert_eq!(doc.light_dismiss_popover(Some(inner)), None);
+        assert!(doc.is_popover_open(auto2));
+        // An unrelated element is outside: it dismisses.
+        let other = attached(&mut doc, host, "div");
+        assert_eq!(doc.light_dismiss_popover(Some(other)), Some(auto2));
+        assert!(!doc.is_popover_open(auto2));
+    }
+
+    #[test]
+    fn show_dialog_modal_moves_popover_promoted_dialog_to_end() {
+        let mut doc = Document::new();
+        let host = stage(&mut doc);
+        let dlg = attached(&mut doc, host, "dialog");
+        doc.set_attribute(dlg, "popover", "auto");
+        doc.show_popover(dlg).expect("show as popover");
+        let manual = open_popover(&mut doc, host, "manual");
+        assert_eq!(
+            doc.top_layer().last(),
+            Some(&manual),
+            "precondition: the manual popover sits above the dialog"
+        );
+        doc.show_dialog_modal(dlg).expect("showModal");
+        assert!(doc.is_dialog_modal(dlg));
+        assert_eq!(
+            doc.top_layer().last(),
+            Some(&dlg),
+            "modal promotion must move the dialog to the end, not keep its popover position"
+        );
+    }
+
+    #[test]
+    fn light_dismiss_candidate_is_a_pure_query() {
+        let mut doc = Document::new();
+        let host = stage(&mut doc);
+        let auto = open_popover(&mut doc, host, "auto");
+        assert_eq!(doc.light_dismiss_candidate(None), Some(auto));
+        assert!(
+            doc.is_popover_open(auto),
+            "naming the candidate must not dismiss it"
+        );
+        let other = attached(&mut doc, host, "div");
+        assert_eq!(doc.light_dismiss_candidate(Some(other)), Some(auto));
+        assert_eq!(doc.light_dismiss_candidate(Some(auto)), None);
+        let inner = doc.create_element("span");
+        doc.append_child(auto, inner);
+        assert_eq!(doc.light_dismiss_candidate(Some(inner)), None);
+    }
+
+    #[test]
+    fn light_dismiss_never_closes_manual_and_never_reaches_past_modal() {
+        let mut doc = Document::new();
+        let host = stage(&mut doc);
+        let manual = open_popover(&mut doc, host, "manual");
+        assert_eq!(doc.light_dismiss_popover(None), None);
+        assert!(doc.is_popover_open(manual));
+
+        // A modal dialog above an auto popover blocks the press:
+        // the popover below survives an outside press.
+        let mut doc = Document::new();
+        let host = stage(&mut doc);
+        let auto = open_popover(&mut doc, host, "auto");
+        let _dlg = open_modal(&mut doc, host);
+        assert_eq!(doc.light_dismiss_popover(None), None);
+        assert!(doc.is_popover_open(auto));
     }
 }

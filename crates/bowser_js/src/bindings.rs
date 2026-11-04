@@ -211,6 +211,10 @@ const PROMISE_KEY: &str = "\u{0}bowser:promise";
 const RESPONSE_KEY: &str = "\u{0}bowser:response";
 /// Computed-style handle, stored on declaration wrapper objects.
 const STYLE_KEY: &str = "\u{0}bowser:style";
+/// Animation registry id, stored on JS `Animation` objects (see
+/// `crate::animation` for the key format): a `Float` carrying the
+/// `u64` registry id (the `PARSE_CTX_KEY` precedent for `u64` ids).
+const ANIMATION_KEY: &str = "\u{0}bowser:animation";
 /// FontFace handle, stored on `FontFace` wrapper objects (see the
 /// FontFace/FontFaceSet section): the key into
 /// [`GcRoots::font_faces`].
@@ -2825,19 +2829,53 @@ fn adopt_shim_scroll(ctx: ContextId, roots: &RefCell<ParseShimRoots>) {
     apis.shim_element_scroll = resolved;
 }
 
-/// Adopt the parse shim's top layer into the production document
-/// (w80): a popover shown by a parser-inserted script stays shown
-/// after the production install. Resolution mirrors
-/// [`adopt_shim_scroll`]: each recorded arena resolves through its
-/// wrapper record (id first, unified ordinal second), skipping
-/// detached records, and only elements that still carry a `popover`
-/// attribute promote.
-fn adopt_shim_top_layer(ctx: ContextId, roots: &RefCell<ParseShimRoots>) {
-    let (arenas, records) = {
-        let roots = roots.borrow();
-        (roots.top_layer_ordered(), roots.element_wrappers.clone())
+/// Resolve a recorded shim element wrapper to its production
+/// node, exactly like `upgrade_shim_element_wrappers`: a candidate
+/// whose tag (or namespace) differs from the recorded one is a
+/// different element — with duplicate `id`s the `id` candidate can
+/// name a same-`id` element that was never shown, so an unverified
+/// `id` hit must never promote. The ordinal candidate wins when it
+/// self-consistently carries the recorded `id`; the `id` candidate
+/// only wins when the ordinal no longer does (the element moved
+/// after the last identity refresh). The verification itself is the
+/// shared `upgrade_tag_ok` predicate (w80fix F-SMALL2): exact match
+/// for foreign namespaces, ASCII case-insensitive for HTML.
+fn resolve_shim_record(doc: &Document, rec: &ParseShimElementRecord) -> Option<NodeId> {
+    let tag_ok =
+        |n: NodeId| upgrade_tag_ok(rec.tag_name.as_deref(), rec.namespace.as_ref(), doc.kind(n));
+    let ord_node = rec
+        .ordinal
+        .and_then(|ord| doc.get_elements_by_tag_name("*").item(ord))
+        .filter(|&n| tag_ok(n));
+    let id_node = rec
+        .id_attr
+        .as_deref()
+        .and_then(|id| doc.get_element_by_id(id))
+        .filter(|&n| tag_ok(n));
+    let ordinal_carries_id = |n: NodeId| {
+        rec.id_attr
+            .as_deref()
+            .is_none_or(|id| doc.get_attribute(n, "id") == Some(id))
     };
-    if arenas.is_empty() {
+    match (ord_node, id_node) {
+        (Some(o), Some(_)) if ordinal_carries_id(o) => Some(o),
+        (_, Some(i)) => Some(i),
+        (Some(o), None) => Some(o),
+        (None, None) => None,
+    }
+}
+
+fn adopt_shim_top_layer(ctx: ContextId, roots: &RefCell<ParseShimRoots>) {
+    let (show_order, dialog_modal, return_values, records) = {
+        let roots = roots.borrow();
+        (
+            roots.top_layer_show_ordered(),
+            roots.dialog_modal.clone(),
+            roots.dialog_return.clone(),
+            roots.element_wrappers.clone(),
+        )
+    };
+    if show_order.is_empty() && return_values.is_empty() {
         return;
     }
     let Some(apis_rc) = web_apis(ctx) else { return };
@@ -2849,56 +2887,74 @@ fn adopt_shim_top_layer(ctx: ContextId, roots: &RefCell<ParseShimRoots>) {
         return;
     };
     let mut doc = doc_rc.borrow_mut();
-    // Iterate in show order (see `ParseShimRoots::top_layer_order`),
-    // so coexisting popovers keep their promotion order in the
-    // production document instead of landing in hash order.
-    for arena in arenas {
+    // Iterate in the single unified show order (see
+    // `ParseShimRoots::top_layer_show_order`), so an interleaved
+    // dialog/popover show sequence keeps its order in the
+    // production document instead of landing popovers-first
+    // (the old two-loop shape) and inverting the middle pair.
+    // Each kind keeps its own backstop check: a detached or
+    // attribute-stripped arena is skipped, like before. A
+    // modal dialog's `open` attribute itself rides the
+    // snapshot, so only the top-layer promotion and the modal
+    // flag need adopting here.
+    for (arena, kind) in show_order {
         let Some(rec) = records
             .iter()
             .find(|rec| rec.el.arena_index() == arena && !rec.detached)
         else {
             continue;
         };
-        // Resolve exactly like `upgrade_shim_element_wrappers`:
-        // a candidate whose tag (or namespace) differs from the
-        // recorded one is a different element — with duplicate
-        // `id`s the `id` candidate can name a same-`id` element
-        // that was never shown, so an unverified `id` hit must
-        // never promote. The ordinal candidate wins when it
-        // self-consistently carries the recorded `id`; the `id`
-        // candidate only wins when the ordinal no longer does
-        // (the element moved after the last identity refresh).
-        // The verification itself is the shared `upgrade_tag_ok`
-        // predicate (w80fix F-SMALL2): exact match for foreign
-        // namespaces, ASCII case-insensitive for HTML — the
-        // adopt copy must not drift from the upgrade copy again.
-        let tag_ok = |n: NodeId| {
-            upgrade_tag_ok(rec.tag_name.as_deref(), rec.namespace.as_ref(), doc.kind(n))
+        let Some(node) = resolve_shim_record(&doc, rec) else {
+            continue;
         };
-        let ord_node = rec
-            .ordinal
-            .and_then(|ord| doc.get_elements_by_tag_name("*").item(ord))
-            .filter(|&n| tag_ok(n));
-        let id_node = rec
-            .id_attr
-            .as_deref()
-            .and_then(|id| doc.get_element_by_id(id))
-            .filter(|&n| tag_ok(n));
-        let ordinal_carries_id = |n: NodeId| {
-            rec.id_attr
-                .as_deref()
-                .is_none_or(|id| doc.get_attribute(n, "id") == Some(id))
-        };
-        let node = match (ord_node, id_node) {
-            (Some(o), Some(_)) if ordinal_carries_id(o) => Some(o),
-            (_, Some(i)) => Some(i),
-            (Some(o), None) => Some(o),
-            (None, None) => None,
-        };
-        if let Some(node) = node
-            && doc.get_attribute(node, "popover").is_some()
+        match kind {
+            TopLayerShowKind::Popover => {
+                if doc.get_attribute(node, "popover").is_some() {
+                    doc.promote_to_top_layer(node);
+                }
+            }
+            TopLayerShowKind::ModalDialog => {
+                if doc.is_dialog_element(node)
+                    && doc.get_attribute(node, "open").is_some()
+                {
+                    doc.promote_to_top_layer(node);
+                    doc.mark_dialog_modal(node);
+                }
+            }
+        }
+        // w81fix R3 M2: the unified entry carries only one kind,
+        // so a dual `<dialog popover>` shown modal-then-popover
+        // flips its entry to `Popover` and the match above never
+        // marks it modal — production would then treat it as a
+        // plain popover (wrong Escape/focus/paint, `:modal`
+        // misses). Modal state lives in `dialog_modal`
+        // independently of the entry kind, so mark (and promote)
+        // whenever that set contains the arena. This is
+        // idempotent for a pure modal dialog, and the
+        // dialog+`open` guards keep a detached or
+        // attribute-stripped arena from adopting as modal.
+        if dialog_modal.contains(&arena)
+            && doc.is_dialog_element(node)
+            && doc.get_attribute(node, "open").is_some()
         {
             doc.promote_to_top_layer(node);
+            doc.mark_dialog_modal(node);
+        }
+    }
+    // w81 phase 2: adopt stored dialog `returnValue`s (set via
+    // mid-parse `close(arg)` or the `returnValue` accessor) onto
+    // the resolved production dialogs, modal or not.
+    for (arena, value) in &return_values {
+        let Some(rec) = records
+            .iter()
+            .find(|rec| rec.el.arena_index() == *arena && !rec.detached)
+        else {
+            continue;
+        };
+        if let Some(node) = resolve_shim_record(&doc, rec)
+            && doc.is_dialog_element(node)
+        {
+            doc.set_dialog_return_value(node, value);
         }
     }
 }
@@ -3674,6 +3730,19 @@ const SHIM_ELEMENT_OWN_NAMES: &[&str] = &[
     "showPopover",
     "hidePopover",
     "togglePopover",
+    // w81 phase 2: stripped at upgrade so the production
+    // prototype's dialog methods/accessors serve upgraded
+    // wrappers (the shim's parse natives fail closed once the
+    // host is gone).
+    "show",
+    "showModal",
+    "close",
+    "open",
+    "returnValue",
+    // w81: stripped at upgrade so the production prototype's
+    // `animate` (not the shim's parse native, which fails closed
+    // once the host is gone) serves upgraded wrappers.
+    "animate",
     "cloneNode",
     "scrollTo",
     "scrollBy",
@@ -4343,6 +4412,30 @@ fn install_web_apis_inner(
             def_native(heap, element_proto, "showPopover", n_show_popover)?;
             def_native(heap, element_proto, "hidePopover", n_hide_popover)?;
             def_native(heap, element_proto, "togglePopover", n_toggle_popover)?;
+            // Dialog API (HTML §4.11.4, w81 phase 2): `show` /
+            // `showModal` / `close` plus the `open` and
+            // `returnValue` IDL attributes, on the shared element
+            // prototype like the popover methods above (there is
+            // no separate `HTMLDialogElement.prototype` in this
+            // engine). The parse shim installs its own copies on
+            // its wrappers (see `wrap_parse_element`).
+            def_native(heap, element_proto, "show", n_show_dialog)?;
+            def_native(heap, element_proto, "showModal", n_show_dialog_modal)?;
+            def_native(heap, element_proto, "close", n_close_dialog)?;
+            def_accessor(
+                heap,
+                element_proto,
+                "open",
+                n_dialog_open_get,
+                n_dialog_open_set,
+            )?;
+            def_accessor(
+                heap,
+                element_proto,
+                "returnValue",
+                n_dialog_return_value_get,
+                n_dialog_return_value_set,
+            )?;
             // w79k: `Element.querySelector`/`querySelectorAll`, scoped
             // to the receiver's descendants. (The parse shim's versions
             // are stripped at upgrade, and until now `element_proto`
@@ -4566,6 +4659,19 @@ fn install_web_apis_inner(
                 n_parent_element_get,
                 n_readonly_set,
             )?;
+            // Web Animations (w81): `Element.animate()` on the shared
+            // element prototype, so production wrappers (and upgraded
+            // shim wrappers, which keep this prototype) all expose it
+            // and `'animate' in Element.prototype` is `true`. The
+            // parse shim installs its own copy on its wrappers (see
+            // `wrap_parse_element`): the two surfaces share the
+            // registry in `crate::animation`, not code, because the
+            // shim's elements live in the parser's tree, not a
+            // `Document`. Known deviation, same pre-existing class
+            // as `hasAttribute` / `querySelector`: text and comment
+            // wrappers share this prototype, so they see `animate`
+            // too, where browsers give `undefined`.
+            def_native(heap, element_proto, "animate", n_element_animate)?;
             Ok(())
         },
     )?;
@@ -4578,10 +4684,11 @@ fn install_web_apis_inner(
     install_node_list(heap, global, &apis.gc_roots, id)?;
 
     // `Element` constructor global: WAAPI-style feature detection
-    // (`'animate' in Element.prototype`) must degrade to `false`, not
-    // throw `ReferenceError`. The constructor itself is per-WebIDL
-    // (throws); `Element.prototype` is the element prototype the
-    // wrappers already link to, so `instanceof Element` works too.
+    // (`'animate' in Element.prototype`) is `true` (w81: `animate`
+    // lives on the shared element prototype above); the constructor
+    // itself is per-WebIDL (throws). `Element.prototype` is the
+    // element prototype the wrappers already link to, so
+    // `instanceof Element` works too.
     let element_ctor =
         heap.alloc_object(Object::new(ObjectKind::NativeFunction(n_element_ctor)))?;
     // `Element` is a constructor per WebIDL (its body throws "Illegal
@@ -6140,6 +6247,12 @@ fn sync_props(
     let (tag, node_name, text, parent, doc_root) = {
         let doc_rc = apis.live_document()?;
         let doc = doc_rc.borrow();
+        // Known spec deviation, pre-existing, pinned not fixed:
+        // `tagName` uppercases unconditionally here, so a foreign
+        // element reads `FOREIGNOBJECT` where DOM keeps the stored
+        // case (`foreignObject`: uppercasing applies to
+        // HTML-namespace elements only). `nodeName` below shares
+        // this same path. Behavior intentionally unchanged.
         let tag = if want_tag {
             match doc.kind(node) {
                 NodeKind::Element(d) => Some(d.tag_name.to_ascii_uppercase()),
@@ -10356,10 +10469,12 @@ fn n_element_ctor(_heap: &mut Heap, _this: Value, _args: &[Value]) -> Result<Val
 }
 
 /// Build a minimal `Element` constructor + prototype pair, without any
-/// global install: the parse shim's `Element` global (feature-detection
-/// degradation — `'animate' in Element.prototype` is `false` instead of
-/// throwing `ReferenceError`). The production install links its
-/// constructor to the real shared element prototype instead.
+/// global install: the parse shim's `Element` global (w81: `animate`
+/// is present on this prototype, so `'animate' in Element.prototype`
+/// is `true` instead of degrading to `false` — the constructor itself
+/// still throws per WebIDL, so `new Element()` never succeeds). The
+/// production install links its constructor to the real shared
+/// element prototype instead.
 fn build_element_ctor(heap: &mut Heap) -> Result<(Gc<Object>, Gc<Object>), AllocError> {
     let element_ctor =
         heap.alloc_object(Object::new(ObjectKind::NativeFunction(n_element_ctor)))?;
@@ -10381,6 +10496,11 @@ fn build_element_ctor(heap: &mut Heap) -> Result<(Gc<Object>, Gc<Object>), Alloc
                 "constructor",
                 Value::Object(element_ctor),
             )?;
+            // w81: the shim's `Element.prototype.animate` (the parse
+            // native, like the shim wrappers' own copy in
+            // `wrap_parse_element` — this prototype is only a
+            // feature-detection surface, not a wrapper prototype).
+            def_native(heap, element_proto, "animate", n_parse_el_animate)?;
             Ok(())
         })?;
         def(
@@ -12183,6 +12303,186 @@ fn n_toggle_popover(heap: &mut Heap, this: Value, args: &[Value]) -> Result<Valu
         .toggle_popover(node, force)
         .map_err(|e| err_type(format!("togglePopover: {e}")))?;
     Ok(Value::Bool(open))
+}
+
+/// `HTMLDialogElement.show()` (HTML §4.11.4, w81 phase 2):
+/// open non-modally. Errors surface as `TypeError`s whose message
+/// carries the DOM name (the popover convention):
+/// `NotSupportedError` for a non-dialog receiver,
+/// `InvalidStateError` when detached or already open. No
+/// top-layer promotion, no modal flag, no focus move (W4/W5).
+fn n_show_dialog(heap: &mut Heap, this: Value, _args: &[Value]) -> Result<Value, NativeError> {
+    let rc = apis_rc(heap, this)?;
+    let node = {
+        let g = rc.borrow();
+        target_node(heap, this, &g)?
+    };
+    let doc_rc = rc.borrow().live_document()?;
+    doc_rc
+        .borrow_mut()
+        .show_dialog(node)
+        .map_err(|e| err_type(format!("show: {e}")))?;
+    Ok(Value::Undefined)
+}
+
+/// `HTMLDialogElement.showModal()` (w81 phase 2): open modally —
+/// `open` attribute, top-layer promotion, modal flag. Same error
+/// shape as [`n_show_dialog`].
+fn n_show_dialog_modal(
+    heap: &mut Heap,
+    this: Value,
+    _args: &[Value],
+) -> Result<Value, NativeError> {
+    let rc = apis_rc(heap, this)?;
+    let node = {
+        let g = rc.borrow();
+        target_node(heap, this, &g)?
+    };
+    let doc_rc = rc.borrow().live_document()?;
+    doc_rc
+        .borrow_mut()
+        .show_dialog_modal(node)
+        .map_err(|e| err_type(format!("showModal: {e}")))?;
+    Ok(Value::Undefined)
+}
+
+/// `HTMLDialogElement.close(returnValue)` (w81 phase 2): close
+/// the dialog, storing `returnValue` when an argument is given
+/// (an omitted argument — `undefined` — keeps the stored value),
+/// and fire a trusted, non-bubbling `close` event at the dialog
+/// exactly when it was open. Closing a closed dialog is a no-op
+/// (no event); a non-dialog receiver is `NotSupportedError`.
+/// The document borrow is dropped before dispatch, so a listener
+/// that re-opens the dialog re-enters a clean state.
+fn n_close_dialog(heap: &mut Heap, this: Value, args: &[Value]) -> Result<Value, NativeError> {
+    let rc = apis_rc(heap, this)?;
+    let node = {
+        let g = rc.borrow();
+        target_node(heap, this, &g)?
+    };
+    let return_value = match args.first().copied().unwrap_or(Value::Undefined) {
+        Value::Undefined => None,
+        v => Some(arg_to_string(&mut *heap, v)?),
+    };
+    let doc_rc = rc.borrow().live_document()?;
+    let closed = doc_rc
+        .borrow_mut()
+        .close_dialog(node, return_value.as_deref())
+        .map_err(|e| err_type(format!("close: {e}")))?;
+    if !closed {
+        return Ok(Value::Undefined);
+    }
+    let (event_val, handle) = {
+        let mut g = rc.borrow_mut();
+        wrap_event(heap, &mut g, dom::Event::new("close", false, false), true)
+            .map_err(|_| NativeError::OutOfMemory)?
+    };
+    // The fresh event wrapper sits in no traced root yet: hold it
+    // as a temporary root across the dispatch (a listener's
+    // allocation could otherwise collect it mid-dispatch).
+    let base = heap.protect(event_val);
+    let r = run_event_dispatch(heap, &rc, node, event_val, handle);
+    heap.release_temp(base);
+    r?;
+    Ok(Value::Undefined)
+}
+
+/// `HTMLDialogElement.open` getter (w81 phase 2): reflects the
+/// `open` attribute on dialogs; `false` for any other receiver
+/// (a non-dialog has no open state to reflect).
+fn n_dialog_open_get(heap: &mut Heap, this: Value, _args: &[Value]) -> Result<Value, NativeError> {
+    let rc = apis_rc(heap, this)?;
+    let node = {
+        let g = rc.borrow();
+        target_node(heap, this, &g)?
+    };
+    let doc_rc = rc.borrow().live_document()?;
+    Ok(Value::Bool(doc_rc.borrow().is_dialog_open(node)))
+}
+
+/// `HTMLDialogElement.open` setter (w81 phase 2): direct
+/// attribute reflection, per spec discouraged but supported.
+/// Setting `true` on a closed dialog opens it non-modally
+/// (attribute only — no top-layer promotion, so a `showModal`
+/// dialog re-opened this way stays modal only if it was already
+/// open); setting `false` removes the attribute, which demotes
+/// a modal dialog without firing `close` (the spec's warning
+/// about toggling `open` directly). Throws on a non-dialog
+/// receiver rather than silently no-opping.
+fn n_dialog_open_set(heap: &mut Heap, this: Value, args: &[Value]) -> Result<Value, NativeError> {
+    let rc = apis_rc(heap, this)?;
+    let node = {
+        let g = rc.borrow();
+        target_node(heap, this, &g)?
+    };
+    let doc_rc = rc.borrow().live_document()?;
+    if !doc_rc.borrow().is_dialog_element(node) {
+        return Err(err_type(
+            "open: NotSupportedError: element is not a dialog element",
+        ));
+    }
+    let value = match args.first().copied().unwrap_or(Value::Undefined) {
+        Value::Undefined => false,
+        Value::Bool(b) => b,
+        Value::Int(i) => i != 0,
+        Value::Float(f) => f != 0.0 && !f.is_nan(),
+        Value::Null => false,
+        Value::Str(s) => !s.as_wtf8().is_empty(),
+        _ => true,
+    };
+    if value {
+        doc_rc.borrow_mut().set_attribute(node, "open", "");
+    } else {
+        doc_rc.borrow_mut().remove_attribute(node, "open");
+    }
+    Ok(Value::Undefined)
+}
+
+/// `HTMLDialogElement.returnValue` getter (w81 phase 2): the
+/// stored value, `""` for a non-dialog receiver or a dialog
+/// that has never been closed with (or assigned) a value.
+fn n_dialog_return_value_get(
+    heap: &mut Heap,
+    this: Value,
+    _args: &[Value],
+) -> Result<Value, NativeError> {
+    let rc = apis_rc(heap, this)?;
+    let node = {
+        let g = rc.borrow();
+        target_node(heap, this, &g)?
+    };
+    let doc_rc = rc.borrow().live_document()?;
+    let val = doc_rc.borrow().dialog_return_value(node).to_string();
+    heap.alloc_str(&val)
+        .map(Value::Str)
+        .map_err(|_| NativeError::OutOfMemory)
+}
+
+/// `HTMLDialogElement.returnValue` setter (w81 phase 2): stores
+/// the value without opening, closing, or firing anything.
+/// Throws on a non-dialog receiver.
+fn n_dialog_return_value_set(
+    heap: &mut Heap,
+    this: Value,
+    args: &[Value],
+) -> Result<Value, NativeError> {
+    let rc = apis_rc(heap, this)?;
+    let node = {
+        let g = rc.borrow();
+        target_node(heap, this, &g)?
+    };
+    let doc_rc = rc.borrow().live_document()?;
+    if !doc_rc.borrow().is_dialog_element(node) {
+        return Err(err_type(
+            "returnValue: NotSupportedError: element is not a dialog element",
+        ));
+    }
+    let value = arg_to_string(
+        &mut *heap,
+        args.first().copied().unwrap_or(Value::Undefined),
+    )?;
+    doc_rc.borrow_mut().set_dialog_return_value(node, &value);
+    Ok(Value::Undefined)
 }
 
 fn n_closest(heap: &mut Heap, this: Value, args: &[Value]) -> Result<Value, NativeError> {
@@ -18983,6 +19283,431 @@ fn synthesize_border_shorthands(props: &mut HashMap<String, String>) {
     }
 }
 
+// Web Animations (WAAPI) surface (w81, worker A).
+//
+// `Element.animate()` on both surfaces (production native
+// `n_element_animate`, parse-shim native `n_parse_el_animate`)
+// shares one parser and one object builder here; only the target
+// key differs (see `crate::animation` for the key format). The
+// returned `Animation` object carries the registry id in the hidden
+// `ANIMATION_KEY` property; its methods are thin natives over
+// `crate::animation`. Value application to computed style is NOT
+// done here — that is worker B's `apply_animations` body.
+//
+// Leniency, stated not hidden (mirrors `crate::animation`): invalid
+// enum / easing strings fall back to defaults instead of throwing,
+// and a non-finite `currentTime` assignment is ignored, so an
+// exotic-but-harmless harness call cannot turn a whole file into a
+// test error. Numeric leniency, also intentional, not a spec
+// oversight: a negative `iterations` clamps to `0` (never
+// negative), while `iterationStart` is NOT clamped at `0` (a
+// negative start passes through), and negative top-level or
+// member durations / delays / end delays are NOT rejected either
+// (they pass through unclamped) — the engine tolerates them
+// rather than throwing, and nothing here normalizes them away.
+// A property-indexed keyframe object is NOT supported
+// (a bare object reads as a single keyframe); keyframe sequences
+// are capped at 4096 entries to bound the read loop.
+
+/// The registry id behind an `Animation` receiver.
+fn animation_id_of(heap: &Heap, this: Value) -> Result<u64, NativeError> {
+    let Value::Object(obj) = this else {
+        return Err(err_type("Animation method called on incompatible receiver"));
+    };
+    match heap.get_property(obj, Wtf8::from_str(ANIMATION_KEY)) {
+        Some(p) => match p.value {
+            Value::Float(f) => Ok(f as u64),
+            Value::Int(i) => Ok(i as u64),
+            _ => Err(err_type("Animation called on a corrupt animation object")),
+        },
+        None => Err(err_type("Animation method called on incompatible receiver")),
+    }
+}
+
+/// A JS number for a millisecond time: integral values in `i32`
+/// range read back as `Int` (matching the engine's other count /
+/// time natives), everything else as `Float`.
+fn animation_number_value(ms: f64) -> Value {
+    if ms.fract() == 0.0 && ms >= f64::from(i32::MIN) && ms <= f64::from(i32::MAX) {
+        Value::Int(ms as i32)
+    } else {
+        Value::Float(ms)
+    }
+}
+
+/// Parse one keyframe object into `crate::animation::Keyframe`.
+/// Reserved members (`offset`, `composite`, `easing`) are read as
+/// keyframe metadata, never as CSS properties; every other own
+/// property becomes a dashed-name property pair.
+fn parse_one_keyframe(
+    heap: &mut Heap,
+    obj: Gc<Object>,
+) -> Result<crate::animation::Keyframe, NativeError> {
+    use crate::animation::{Composite, Keyframe, camel_to_dashed};
+    let offset = match dict_get(heap, obj, "offset")? {
+        Some(v) => {
+            let n = to_number(v)?;
+            if n.is_finite() { Some(n) } else { None }
+        }
+        None => None,
+    };
+    let composite = match dict_get(heap, obj, "composite")? {
+        Some(v) => Composite::parse(&arg_to_string(heap, v)?).unwrap_or_default(),
+        None => Composite::default(),
+    };
+    let easing = match dict_get(heap, obj, "easing")? {
+        Some(v) => crate::transition::parse_timing(&arg_to_string(heap, v)?),
+        None => None,
+    };
+    let mut properties = Vec::new();
+    for key in heap.own_property_keys(obj) {
+        let name = key.as_wtf8().to_string();
+        if name == "offset" || name == "composite" || name == "easing" {
+            continue;
+        }
+        if name.starts_with('\u{0}') {
+            continue;
+        }
+        let Some(p) = heap.get_property(obj, key.as_wtf8()) else {
+            continue;
+        };
+        if p.value.is_undefined() || p.value.is_null() {
+            continue;
+        }
+        let value = arg_to_string(heap, p.value)?;
+        properties.push((camel_to_dashed(&name), value));
+    }
+    Ok(Keyframe {
+        offset,
+        composite,
+        easing,
+        properties,
+    })
+}
+
+/// Parse the `keyframes` argument: `null` / `undefined` is an empty
+/// list; an object with a numeric `length` is a sequence of keyframe
+/// objects; any other object is a single keyframe.
+fn parse_keyframes(
+    heap: &mut Heap,
+    arg: Value,
+) -> Result<Vec<crate::animation::Keyframe>, NativeError> {
+    match arg {
+        Value::Undefined | Value::Null => Ok(Vec::new()),
+        Value::Object(obj) => match heap.get_property(obj, Wtf8::from_str("length")) {
+            Some(p) => {
+                let len = to_u32_webidl(p.value)? as usize;
+                let len = len.min(4096);
+                let mut out = Vec::with_capacity(len);
+                for i in 0..len {
+                    let item = heap
+                        .get_property(obj, Wtf8::from_str(&i.to_string()))
+                        .map(|p| p.value);
+                    let Some(Value::Object(kf)) = item else {
+                        return Err(err_type("animate: keyframes must contain objects"));
+                    };
+                    out.push(parse_one_keyframe(heap, kf)?);
+                }
+                Ok(out)
+            }
+            None => Ok(vec![parse_one_keyframe(heap, obj)?]),
+        },
+        _ => Err(err_type("animate: keyframes must be an object or array")),
+    }
+}
+
+/// Parse one timing member that may be a millisecond number, a
+/// serialized `<time>` string, or `"auto"` (which means `0` here,
+/// as for `animate()`-created effects). Anything else falls back to
+/// `default_ms` (module leniency note).
+fn parse_time_option(
+    heap: &mut Heap,
+    obj: Gc<Object>,
+    name: &str,
+    default_ms: f64,
+) -> Result<f64, NativeError> {
+    match dict_get(heap, obj, name)? {
+        None => Ok(default_ms),
+        Some(Value::Int(i)) => Ok(f64::from(i)),
+        Some(Value::Float(f)) => Ok(if f.is_nan() { default_ms } else { f }),
+        Some(v) => {
+            let s = arg_to_string(heap, v)?;
+            let s = s.trim().to_ascii_lowercase();
+            if s == "auto" {
+                Ok(0.0)
+            } else {
+                Ok(crate::transition::parse_time(&s)
+                    .map(|secs| secs * 1000.0)
+                    .unwrap_or(default_ms))
+            }
+        }
+    }
+}
+
+/// Parse the `options` argument: absent / `null` / `undefined` is
+/// the default; a number is a millisecond duration; a string is a
+/// serialized duration (`"auto"` is `0`); an object reads the
+/// `KeyframeAnimationOptions` members, defaulting anything absent
+/// or invalid (module leniency note).
+fn parse_animation_options(
+    heap: &mut Heap,
+    arg: Value,
+) -> Result<crate::animation::AnimationOptions, NativeError> {
+    use crate::animation::{AnimationOptions, Direction, Fill};
+    match arg {
+        Value::Undefined | Value::Null => Ok(AnimationOptions::default()),
+        Value::Int(i) => Ok(AnimationOptions {
+            duration_ms: f64::from(i),
+            ..AnimationOptions::default()
+        }),
+        Value::Float(f) => Ok(AnimationOptions {
+            duration_ms: if f.is_nan() { 0.0 } else { f },
+            ..AnimationOptions::default()
+        }),
+        Value::Str(s) => {
+            // A string is a serialized duration, like the
+            // `duration` member of the object form: `"auto"` is
+            // `0`, a `<time>` parses to milliseconds, anything
+            // else falls back to the default duration (module
+            // leniency note) instead of throwing.
+            let t = s.as_wtf8().to_string();
+            let t = t.trim().to_ascii_lowercase();
+            let duration_ms = if t == "auto" {
+                0.0
+            } else {
+                crate::transition::parse_time(&t)
+                    .map(|secs| secs * 1000.0)
+                    .unwrap_or_default()
+            };
+            Ok(AnimationOptions {
+                duration_ms,
+                ..AnimationOptions::default()
+            })
+        }
+        Value::Object(obj) => {
+            let duration_ms = parse_time_option(heap, obj, "duration", 0.0)?;
+            let delay_ms = parse_time_option(heap, obj, "delay", 0.0)?;
+            let end_delay_ms = parse_time_option(heap, obj, "endDelay", 0.0)?;
+            let easing = match dict_get(heap, obj, "easing")? {
+                Some(v) => AnimationOptions::easing_from_str(&arg_to_string(heap, v)?),
+                None => AnimationOptions::default().easing,
+            };
+            let fill = match dict_get(heap, obj, "fill")? {
+                Some(v) => Fill::parse(&arg_to_string(heap, v)?).unwrap_or_default(),
+                None => Fill::default(),
+            };
+            let direction = match dict_get(heap, obj, "direction")? {
+                Some(v) => Direction::parse(&arg_to_string(heap, v)?).unwrap_or_default(),
+                None => Direction::default(),
+            };
+            let iterations = match dict_get(heap, obj, "iterations")? {
+                Some(v) => {
+                    let n = to_number(v)?;
+                    if n.is_nan() { 1.0 } else { n.max(0.0) }
+                }
+                None => 1.0,
+            };
+            let iteration_start = match dict_get(heap, obj, "iterationStart")? {
+                Some(v) => {
+                    let n = to_number(v)?;
+                    if n.is_nan() { 0.0 } else { n }
+                }
+                None => 0.0,
+            };
+            Ok(AnimationOptions {
+                duration_ms,
+                delay_ms,
+                end_delay_ms,
+                easing,
+                fill,
+                direction,
+                iterations,
+                iteration_start,
+            })
+        }
+        _ => Err(err_type("animate: options must be an object or number")),
+    }
+}
+
+/// Build the JS `Animation` object for registry id `id`: the hidden
+/// id property plus the `pause` / `play` / `cancel` / `finish`
+/// methods and the `currentTime` / `playState` accessors.
+fn build_animation_object(heap: &mut Heap, id: u64) -> Result<Value, NativeError> {
+    let obj = heap
+        .alloc_object(Object::new(ObjectKind::Ordinary))
+        .map_err(|_| NativeError::OutOfMemory)?;
+    with_temp_root(
+        heap,
+        Value::Object(obj),
+        |heap| -> Result<(), NativeError> {
+            let oom = |_: AllocError| NativeError::OutOfMemory;
+            def(heap, obj, ANIMATION_KEY, Value::Float(id as f64)).map_err(oom)?;
+            def_native(heap, obj, "pause", n_animation_pause).map_err(oom)?;
+            def_native(heap, obj, "play", n_animation_play).map_err(oom)?;
+            def_native(heap, obj, "cancel", n_animation_cancel).map_err(oom)?;
+            def_native(heap, obj, "finish", n_animation_finish).map_err(oom)?;
+            def_accessor(
+                heap,
+                obj,
+                "currentTime",
+                n_animation_current_time_get,
+                n_animation_current_time_set,
+            )
+            .map_err(oom)?;
+            def_accessor(
+                heap,
+                obj,
+                "playState",
+                n_animation_play_state_get,
+                n_readonly_set,
+            )
+            .map_err(oom)?;
+            Ok(())
+        },
+    )?;
+    Ok(Value::Object(obj))
+}
+
+/// Shared `animate()` body once the target key is known: parse the
+/// arguments, register a running animation, and return its object.
+fn animate_for_target(
+    heap: &mut Heap,
+    target_key: String,
+    args: &[Value],
+) -> Result<Value, NativeError> {
+    let keyframes = parse_keyframes(heap, args.first().copied().unwrap_or(Value::Undefined))?;
+    let options = parse_animation_options(heap, args.get(1).copied().unwrap_or(Value::Undefined))?;
+    let id = crate::animation::create_animation(target_key, keyframes, options);
+    build_animation_object(heap, id)
+}
+
+/// `Element.animate(keyframes, options)` on the production surface.
+fn n_element_animate(heap: &mut Heap, this: Value, args: &[Value]) -> Result<Value, NativeError> {
+    let rc = apis_rc(heap, this)?;
+    let node = {
+        let g = rc.borrow();
+        target_node(heap, this, &g)?
+    };
+    animate_for_target(heap, format!("prod:{node:?}"), args)
+}
+
+/// `Element.animate(keyframes, options)` on the parse shim. The key
+/// is built from the `ScriptElement`'s arena index, exactly as
+/// `n_parse_get_computed_style` builds it (see `crate::animation`).
+fn n_parse_el_animate(heap: &mut Heap, this: Value, args: &[Value]) -> Result<Value, NativeError> {
+    let (id, _host, el) = parse_el_host(heap, this, "animate")?;
+    animate_for_target(heap, format!("parse:{id}:{}", el.arena_index()), args)
+}
+
+fn n_animation_pause(heap: &mut Heap, this: Value, _args: &[Value]) -> Result<Value, NativeError> {
+    let id = animation_id_of(heap, this)?;
+    if !crate::animation::pause(id) {
+        return Err(err_type("Animation: stale animation"));
+    }
+    Ok(Value::Undefined)
+}
+
+fn n_animation_play(heap: &mut Heap, this: Value, _args: &[Value]) -> Result<Value, NativeError> {
+    let id = animation_id_of(heap, this)?;
+    if !crate::animation::play(id) {
+        return Err(err_type("Animation: stale animation"));
+    }
+    Ok(Value::Undefined)
+}
+
+fn n_animation_cancel(heap: &mut Heap, this: Value, _args: &[Value]) -> Result<Value, NativeError> {
+    let id = animation_id_of(heap, this)?;
+    if !crate::animation::cancel(id) {
+        return Err(err_type("Animation: stale animation"));
+    }
+    Ok(Value::Undefined)
+}
+
+fn n_animation_finish(heap: &mut Heap, this: Value, _args: &[Value]) -> Result<Value, NativeError> {
+    let id = animation_id_of(heap, this)?;
+    // WAAPI §4.5.13 step 1, via `finish_checked`: `None` is a
+    // stale (unknown) animation, but `Some(false)` is the spec
+    // throw — an infinite associated effect end — and must
+    // surface as `InvalidStateError`, not the stale-animation
+    // error the old `finish()` mapping produced for both.
+    match crate::animation::finish_checked(id) {
+        Some(true) => Ok(Value::Undefined),
+        Some(false) => Err(err_type(
+            "finish: InvalidStateError: animation has an infinite associated effect end",
+        )),
+        None => Err(err_type("Animation: stale animation")),
+    }
+}
+
+fn n_animation_current_time_get(
+    heap: &mut Heap,
+    this: Value,
+    _args: &[Value],
+) -> Result<Value, NativeError> {
+    let id = animation_id_of(heap, this)?;
+    match crate::animation::current_time(id) {
+        None => Err(err_type("Animation: stale animation")),
+        Some(None) => Ok(Value::Null),
+        Some(Some(ms)) => Ok(animation_number_value(ms)),
+    }
+}
+
+fn n_animation_current_time_set(
+    heap: &mut Heap,
+    this: Value,
+    args: &[Value],
+) -> Result<Value, NativeError> {
+    let id = animation_id_of(heap, this)?;
+    match args.first().copied().unwrap_or(Value::Undefined) {
+        // `undefined` and non-finite assignments are ignored
+        // (skeleton leniency); `null` clears the animation to idle.
+        Value::Undefined => Ok(Value::Undefined),
+        Value::Null => {
+            if !crate::animation::set_current_time(id, None) {
+                return Err(err_type("Animation: stale animation"));
+            }
+            Ok(Value::Undefined)
+        }
+        v => {
+            let n = to_number(v)?;
+            if n.is_finite() && !crate::animation::set_current_time(id, Some(n)) {
+                return Err(err_type("Animation: stale animation"));
+            }
+            Ok(Value::Undefined)
+        }
+    }
+}
+
+fn n_animation_play_state_get(
+    heap: &mut Heap,
+    this: Value,
+    _args: &[Value],
+) -> Result<Value, NativeError> {
+    let id = animation_id_of(heap, this)?;
+    match crate::animation::play_state_str(id) {
+        None => Err(err_type("Animation: stale animation")),
+        Some(state) => heap
+            .alloc_str(state)
+            .map(Value::Str)
+            .map_err(|_| NativeError::OutOfMemory),
+    }
+}
+
+/// Whether a `getComputedStyle` pseudo-element argument selects
+/// `::backdrop`: exactly one or two leading colons after trimming
+/// whitespace, then `backdrop` case-insensitively. A bare
+/// `backdrop` (no colons) or `:::backdrop` (three colons) is not a
+/// pseudo at all: it falls back to the element's style, like any
+/// other unrecognized pseudo. The old shape stripped all leading
+/// colons, so both misspellings silently queried the backdrop.
+fn is_backdrop_pseudo_arg(arg: &str) -> bool {
+    let t = arg.trim();
+    let rest = t
+        .strip_prefix("::")
+        .or_else(|| t.strip_prefix(':'));
+    rest.is_some_and(|r| r.eq_ignore_ascii_case("backdrop"))
+}
+
 fn n_get_computed_style(
     heap: &mut Heap,
     this: Value,
@@ -18997,12 +19722,56 @@ fn n_get_computed_style(
     // Privacy: `compute_style` matches selectors with `matches`, i.e. the
     // default `ElementState` with `visited: false`. The real visited bit is
     // never consulted, so `:visited` rules cannot leak through this path.
+    //
+    // Pseudo-element argument (w81 backdrop, W4): a second argument
+    // of `"::backdrop"` (one or two leading colons, case-insensitive)
+    // queries the `::backdrop` pseudo style instead of the element's
+    // own style — previously the argument was ignored outright, so
+    // `getComputedStyle(el, "::backdrop")` returned the element's
+    // style. Any other pseudo (including `::before` / `::after`,
+    // whose computed-style surface is a separate worker's scope)
+    // falls back to the element's style, as before; an absent,
+    // empty, or non-string argument is no pseudo at all. The
+    // backdrop query is ungated by top-layer membership, matching
+    // the cascade query: the WPT `backdrop-ua-style` test queries
+    // a plain `div` and expects the UA fixed/inset-0 style.
+    let is_backdrop = matches!(args.get(1), Some(Value::Str(s)) if {
+        is_backdrop_pseudo_arg(&s.as_wtf8().to_string())
+    });
     let props = {
         let g = rc.borrow();
         let doc_rc = g.live_document()?;
         let doc = doc_rc.borrow();
         let author: Vec<&Stylesheet> = g.author_stylesheets.iter().collect();
-        let computed = compute_style(&doc, node, &author, &g.ua_stylesheet, &g.viewport);
+        let computed = if is_backdrop {
+            match bowser_css::compute_pseudo_style(
+                &doc,
+                node,
+                &author,
+                &g.ua_stylesheet,
+                &g.viewport,
+                "backdrop",
+                bowser_css::BACKDROP_ATOMS,
+            ) {
+                Some(c) => c,
+                // A missing backdrop style must not become the
+                // element style (whole L9): the old fallback
+                // substituted the element's computed style here,
+                // so a backdrop query leaked it wholesale. Answer
+                // an empty declaration instead — every property
+                // reads `""` — which is also the shape the parse
+                // shim's backdrop fallback uses.
+                None => {
+                    drop(doc);
+                    drop(g);
+                    let mut g = rc.borrow_mut();
+                    return wrap_style(heap, &mut g, HashMap::new())
+                        .map_err(|_| NativeError::OutOfMemory);
+                }
+            }
+        } else {
+            compute_style(&doc, node, &author, &g.ua_stylesheet, &g.viewport)
+        };
         // Metrics for the CSSOM computed adjustments (border widths,
         // border-spacing): `em` resolves against this element's
         // computed font-size, `rem` against the root element's.
@@ -19029,7 +19798,11 @@ fn n_get_computed_style(
         // nothing between here and the re-resolution touches the
         // document mutably, so the borrow spans the gap and the
         // `String` copy (plus the explicit `drop`) goes away.
-        let style_attr = doc.get_attribute(node, "style");
+        let style_attr = if is_backdrop {
+            None
+        } else {
+            doc.get_attribute(node, "style")
+        };
         let mut props = HashMap::new();
         for prop in STYLE_PROPS {
             // The bare `overflow` slot is never serialized directly:
@@ -19057,7 +19830,7 @@ fn n_get_computed_style(
                 |v| matches!(v, CssValue::Keyword(k) if k.eq_ignore_ascii_case("auto")),
             )
         };
-        if is_auto("margin-left") || is_auto("margin-right") {
+        if !is_backdrop && (is_auto("margin-left") || is_auto("margin-right")) {
             let index = g.layout_box_index.borrow();
             let used = g
                 .layout_tree
@@ -19088,7 +19861,7 @@ fn n_get_computed_style(
         // needed, exactly like the horizontal margins above. Without
         // a published tree there is nothing to resolve against, so
         // the computed `auto` stands.
-        if is_auto("margin-top") || is_auto("margin-bottom") {
+        if !is_backdrop && (is_auto("margin-top") || is_auto("margin-bottom")) {
             let index = g.layout_box_index.borrow();
             let used = g
                 .layout_tree
@@ -19129,7 +19902,7 @@ fn n_get_computed_style(
                     v.trim_end().ends_with('%') || v.trim_start().starts_with("calc(")
                 })
             });
-        if has_pct_margin {
+        if !is_backdrop && has_pct_margin {
             let index = g.layout_box_index.borrow();
             let viewport_w = g.viewport.w;
             let base = g
@@ -19188,7 +19961,7 @@ fn n_get_computed_style(
         // resolution above reads. Without a published tree (or no box
         // for the element) there is nothing to resolve against, so the
         // computed `auto` stands.
-        if is_auto("height") || is_auto("width") {
+        if !is_backdrop && (is_auto("height") || is_auto("width")) {
             let index = g.layout_box_index.borrow();
             let used = g
                 .layout_tree
@@ -19301,7 +20074,32 @@ fn n_get_computed_style(
         // aliases another element. Read-only against the document
         // — only this call's props snapshot is mutated — so there
         // is no dirty or repaint interaction.
-        crate::transition::apply_transitions(&format!("prod:{node:?}"), &mut props);
+        // w81: animated values apply over transitions at the same
+        // key (see `crate::animation` for the key format):
+        // `apply_animations` interpolates keyframed values at the
+        // current time — discrete properties step at their
+        // keyframe offsets, numeric properties interpolate
+        // between neighboring keyframes — and overwrites the
+        // cascaded value for each keyframed property.
+        // Backdrop pseudo styles have no layout box and no
+        // transition/animation registry of their own: the
+        // originator's keyed values must not leak into them.
+        if !is_backdrop {
+            let anim_key = format!("prod:{node:?}");
+            crate::transition::apply_transitions(&anim_key, &mut props);
+            crate::animation::apply_animations(&anim_key, &mut props);
+            // w81fix (F-E): re-synthesize shorthands after
+            // animation/transition application, so an animated
+            // longhand (e.g. `margin-top`) is reflected in its
+            // shorthand (e.g. `margin`). The pre-animation
+            // synthesis above ran on the cascaded longhands, so
+            // without this the shorthand kept the unanimated
+            // value while the longhand showed the animated one.
+            // For unanimated properties this is a no-op: the
+            // longhands are unchanged, so synthesis reproduces
+            // the same shorthand values.
+            synthesize_computed_shorthands(&mut props);
+        }
         props
     };
     let mut g = rc.borrow_mut();
@@ -19853,11 +20651,103 @@ pub(crate) struct ParseShimRoots {
     /// A plain set iterates in hash order, which would adopt
     /// coexisting popovers in nondeterministic order; both
     /// [`adopt_shim_top_layer`] and `build_style_data` iterate
-    /// this order instead. Plain data: no tracing needed.
+    /// [`Self::top_layer_show_order`] instead. Plain data: no
+    /// tracing needed.
     top_layer_order: Vec<usize>,
+    /// The single unified top-layer show sequence (w81fix): every
+    /// currently shown popover and modal dialog, in the order
+    /// they were shown, each tagged with its kind. The per-kind
+    /// orders above cannot express an interleaved sequence — a
+    /// dialog shown, then a popover, then a dialog rebuilt from
+    /// the two lists in kind order (all popovers, then all
+    /// dialogs) inverts the middle pair, breaking Escape / focus
+    /// / paint topmost selection. Both [`adopt_shim_top_layer`]
+    /// and `build_style_data` promote in this order instead.
+    /// Maintained by [`Self::top_layer_insert`] /
+    /// [`Self::top_layer_remove`] /
+    /// [`Self::dialog_open_insert`] /
+    /// [`Self::dialog_open_remove`]: an arena appears at most
+    /// once, at its latest show position, and only while at
+    /// least one of its kinds is still open. Plain data: no
+    /// tracing needed.
+    top_layer_show_order: Vec<(usize, TopLayerShowKind)>,
+    /// Mid-parse dialog state (w81 phase 2), mirroring the
+    /// production [`Document`](bowser_dom::Document) dialog sets:
+    /// arenas opened via the shim's `show`/`showModal` (or still
+    /// carrying an `open` attribute — the method predicates check
+    /// the attribute too, so this set is the method-open record,
+    /// not the whole open state). `dialog_modal` is the modal
+    /// subset (showModal only); its show order lives in the
+    /// unified [`Self::top_layer_show_order`], which is what
+    /// adoption promotes; `dialog_return`
+    /// is the per-arena `returnValue` set via `close(arg)` or
+    /// the `returnValue` accessor. Removal paths prune the open
+    /// / modal sets (never `dialog_return`, which survives
+    /// removal in production too, keyed by the node).
+    dialog_open: HashSet<usize>,
+    dialog_modal: HashSet<usize>,
+    dialog_return: HashMap<usize, String>,
+}
+
+/// One entry of [`ParseShimRoots::top_layer_show_order`]: which
+/// kind of top-layer show put the arena there. A non-modal dialog
+/// `show()` never appears: only popovers and modal dialogs live
+/// in the top layer.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub(crate) enum TopLayerShowKind {
+    Popover,
+    ModalDialog,
 }
 
 impl ParseShimRoots {
+    /// Record a show in the unified sequence: an arena already
+    /// open under the other kind moves to the end under the new
+    /// kind (the latest show is topmost, like production's
+    /// promote-to-end), otherwise it appends.
+    fn top_layer_show_insert(&mut self, arena: usize, kind: TopLayerShowKind) {
+        self.top_layer_show_order.retain(|(a, _)| *a != arena);
+        self.top_layer_show_order.push((arena, kind));
+    }
+
+    /// Drop an arena from the unified sequence for `kind`: when
+    /// the other kind is still open the entry survives under that
+    /// kind at the same position (the element is still top-layer);
+    /// otherwise the entry goes away.
+    fn top_layer_show_remove(&mut self, arena: usize, kind: TopLayerShowKind) {
+        let other = match kind {
+            TopLayerShowKind::Popover => TopLayerShowKind::ModalDialog,
+            TopLayerShowKind::ModalDialog => TopLayerShowKind::Popover,
+        };
+        let other_open = match other {
+            TopLayerShowKind::Popover => self.top_layer.contains(&arena),
+            TopLayerShowKind::ModalDialog => self.dialog_modal.contains(&arena),
+        };
+        if other_open {
+            for entry in self.top_layer_show_order.iter_mut() {
+                if entry.0 == arena {
+                    entry.1 = other;
+                }
+            }
+        } else {
+            self.top_layer_show_order.retain(|(a, _)| *a != arena);
+        }
+    }
+
+    /// The unified show sequence, filtered against the open sets,
+    /// so any entry whose set membership was lost without going
+    /// through the remove helpers (none should exist) cannot
+    /// promote a stale arena.
+    fn top_layer_show_ordered(&self) -> Vec<(usize, TopLayerShowKind)> {
+        self.top_layer_show_order
+            .iter()
+            .copied()
+            .filter(|(a, kind)| match kind {
+                TopLayerShowKind::Popover => self.top_layer.contains(a),
+                TopLayerShowKind::ModalDialog => self.dialog_modal.contains(a),
+            })
+            .collect()
+    }
+
     /// Record a show: insert into the set, appending to the
     /// promotion order only on first insertion (a re-show after a
     /// hide appends anew, so the order is always the latest show
@@ -19865,6 +20755,7 @@ impl ParseShimRoots {
     fn top_layer_insert(&mut self, arena: usize) {
         if self.top_layer.insert(arena) {
             self.top_layer_order.push(arena);
+            self.top_layer_show_insert(arena, TopLayerShowKind::Popover);
         }
     }
 
@@ -19873,6 +20764,7 @@ impl ParseShimRoots {
     fn top_layer_remove(&mut self, arena: usize) {
         if self.top_layer.remove(&arena) {
             self.top_layer_order.retain(|a| *a != arena);
+            self.top_layer_show_remove(arena, TopLayerShowKind::Popover);
         }
     }
 
@@ -19886,6 +20778,27 @@ impl ParseShimRoots {
             .copied()
             .filter(|a| self.top_layer.contains(a))
             .collect()
+    }
+
+    /// Record a dialog show: insert into the open set, and (for
+    /// `showModal`) into the modal set with show-order tracking,
+    /// mirroring [`Self::top_layer_insert`].
+    fn dialog_open_insert(&mut self, arena: usize, modal: bool) {
+        self.dialog_open.insert(arena);
+        if modal && self.dialog_modal.insert(arena) {
+            self.top_layer_show_insert(arena, TopLayerShowKind::ModalDialog);
+        }
+    }
+
+    /// Record a dialog close / demotion: drop from the open and
+    /// modal sets (and the modal order), so a later re-show
+    /// re-appends at the end. The stored `returnValue` is NOT
+    /// dropped here — it survives close in production too.
+    fn dialog_open_remove(&mut self, arena: usize) {
+        self.dialog_open.remove(&arena);
+        if self.dialog_modal.remove(&arena) {
+            self.top_layer_show_remove(arena, TopLayerShowKind::ModalDialog);
+        }
     }
 }
 
@@ -20615,8 +21528,8 @@ pub fn install_parse_document_shim(
             shim_roots.borrow_mut().dom_rect_proto = Some(proto);
         }
         // `Element` constructor global, for the same feature-detection
-        // degradation as production (`'animate' in Element.prototype`
-        // is `false`, not a `ReferenceError`). Defined only when
+        // surface as production (`'animate' in Element.prototype`
+        // is `true` since w81, not a `ReferenceError`). Defined only when
         // absent: a script that overwrites `Element` keeps its
         // override. The prototype is a fresh minimal object — the
         // shim's element wrappers carry their own methods (see
@@ -22053,6 +22966,47 @@ fn prune_shim_top_layer_subtree(
     }
 }
 
+/// Drop one arena from slot `id`'s shim dialog sets (w81 phase
+/// 2): the shim `removeAttribute('open')` demotion, mirroring
+/// production `Document::remove_attribute`, which demotes a
+/// modal dialog when its `open` attribute goes away. Only the
+/// element itself demotes — removing an ancestor's `open`
+/// attribute never closes a descendant dialog. The stored
+/// `returnValue` survives, as in production.
+fn drop_shim_dialog_arena(id: u64, arena: usize) {
+    let roots = PARSE_HOSTS.with(|hosts| hosts.borrow().get(&id).map(|e| e.listeners.clone()));
+    let Some(roots) = roots else { return };
+    roots.borrow_mut().dialog_open_remove(arena);
+}
+
+/// Drop every dialog open/modal arena in the subtree rooted at
+/// `root` (w81 phase 2): the shim element-removal demotion,
+/// mirroring production `Document::demote_top_layer_subtree`
+/// (which also clears modal flags) — removing a dialog (or an
+/// ancestor of one) demotes it, so a later reinsert does not
+/// resurrect the modal state without `showModal`. Like its
+/// popover sibling, the walk runs over the detached subtree
+/// after the host removal, and moves deliberately do NOT go
+/// through here.
+fn prune_shim_dialog_subtree(
+    id: u64,
+    host: &ScriptHost<'static, 'static, 'static>,
+    root: ScriptElement,
+) {
+    let roots = PARSE_HOSTS.with(|hosts| hosts.borrow().get(&id).map(|e| e.listeners.clone()));
+    let Some(roots) = roots else { return };
+    let mut stack = vec![root];
+    let mut arenas = Vec::new();
+    while let Some(el) = stack.pop() {
+        arenas.push(el.arena_index());
+        stack.extend(host.child_elements(el));
+    }
+    let mut g = roots.borrow_mut();
+    for arena in arenas {
+        g.dialog_open_remove(arena);
+    }
+}
+
 /// Whether `el` is connected to `host`'s document: its parent
 /// chain reaches the document element. (`parent_element` reports
 /// `None` both for the document element itself — its parent is
@@ -22436,6 +23390,41 @@ fn wrap_parse_element(
                 .map_err(|_| NativeError::OutOfMemory)?;
             def_native(heap, obj, "togglePopover", n_parse_el_toggle_popover)
                 .map_err(|_| NativeError::OutOfMemory)?;
+            // Dialog API (w81 phase 2) on the parse shim: the
+            // production element prototype's versions cannot serve
+            // parser-tree elements, so the shim carries its own
+            // (see the natives above), stripped at upgrade like
+            // the popover ones.
+            def_native(heap, obj, "show", n_parse_el_show_dialog)
+                .map_err(|_| NativeError::OutOfMemory)?;
+            def_native(heap, obj, "showModal", n_parse_el_show_dialog_modal)
+                .map_err(|_| NativeError::OutOfMemory)?;
+            def_native(heap, obj, "close", n_parse_el_close_dialog)
+                .map_err(|_| NativeError::OutOfMemory)?;
+            def_accessor(
+                heap,
+                obj,
+                "open",
+                n_parse_el_dialog_open_get,
+                n_parse_el_dialog_open_set,
+            )
+            .map_err(|_| NativeError::OutOfMemory)?;
+            def_accessor(
+                heap,
+                obj,
+                "returnValue",
+                n_parse_el_dialog_return_value_get,
+                n_parse_el_dialog_return_value_set,
+            )
+            .map_err(|_| NativeError::OutOfMemory)?;
+            // Web Animations (w81): the parse shim's own `animate`
+            // — shim wrappers carry no prototype chain to the
+            // minimal `Element.prototype` built by
+            // `build_element_ctor`, so the method must live on the
+            // wrapper itself (stripped at upgrade; see
+            // `SHIM_ELEMENT_OWN_NAMES`).
+            def_native(heap, obj, "animate", n_parse_el_animate)
+                .map_err(|_| NativeError::OutOfMemory)?;
             def_accessor(
                 heap,
                 obj,
@@ -22612,6 +23601,11 @@ fn n_parse_el_remove_attribute(
     deref_parse_host(host).remove_attribute(el, &name);
     if name.eq_ignore_ascii_case("popover") {
         drop_shim_top_layer_arena(id, el.arena_index());
+    }
+    // w81 phase 2: removing `open` demotes a shim dialog, like
+    // production `remove_attribute` (no `close` event here either).
+    if name.eq_ignore_ascii_case("open") {
+        drop_shim_dialog_arena(id, el.arena_index());
     }
     Ok(Value::Undefined)
 }
@@ -22915,6 +23909,7 @@ fn n_parse_el_replace_child(
     // w80fix: demote the replaced subtree's top layer, like
     // `removeChild` above.
     prune_shim_top_layer_subtree(id, host_ref, old);
+    prune_shim_dialog_subtree(id, host_ref, old);
     if !parse_is_fragment(heap, new_val) {
         refresh_shim_record_attachment(id, new);
     }
@@ -24747,14 +25742,14 @@ fn synthesize_font_shorthand(decls: &[(String, String)], prop: &str) -> Option<S
 /// The parser always emits all three for a shorthand set, so a
 /// missing longhand yields `None`.
 ///
-/// w79 item 4 (unverified-pending-probe, synthesis intentionally
-/// unchanged): computed `flex` reads `0 0 auto` under generic CSSOM
-/// shorthand serialization, which is the expected form. Whether
-/// Chrome collapses a specified `0 0 auto` set back to `none` needs
-/// a live-browser probe, which cannot run from this worker; and
-/// Bowser loses authorship at expansion, so collapsing here would
-/// risk misreporting longhand-authored `0 0 auto` sets as `none`.
-/// Do not add a collapse until a probe confirms Chrome's behavior.
+/// w79 item 4, verified in w81 (commit b816405): computed `flex`
+/// for `flex: none` is `0 0 auto` (CSS Flexbox 1 §7.1; the w81
+/// parse-shim probe read `0 0 auto` for `none`, and specified
+/// `style.flex` already expands `none` to `0 0 auto`). Synthesis
+/// intentionally unchanged: Bowser loses authorship at expansion,
+/// so collapsing `0 0 auto` back to `none` would misreport
+/// longhand-authored `0 0 auto` sets — which carry identical
+/// longhands to `flex: none` — as `none`. Do not add a collapse.
 fn synthesize_flex_shorthand(decls: &[(String, String)], prop: &str) -> Option<String> {
     if prop != "flex" {
         return None;
@@ -25651,6 +26646,7 @@ fn n_parse_el_text_content_set(
     host_ref.set_text_content(el, &t);
     for kid in kids {
         prune_shim_top_layer_subtree(id, host_ref, kid);
+        prune_shim_dialog_subtree(id, host_ref, kid);
     }
     Ok(Value::Undefined)
 }
@@ -25686,6 +26682,7 @@ fn n_parse_el_inner_html_set(
     host_ref.set_inner_html(el, &h);
     for kid in kids {
         prune_shim_top_layer_subtree(id, host_ref, kid);
+        prune_shim_dialog_subtree(id, host_ref, kid);
     }
     Ok(Value::Undefined)
 }
@@ -27830,9 +28827,10 @@ impl ParseLayoutHook {
         &mut self,
         host: &mut ScriptHost<'_, '_, '_>,
         el: ScriptElement,
-        top_layer: &[usize],
+        top_layer: &[(usize, TopLayerShowKind)],
+        dialog_modal: &HashSet<usize>,
     ) -> Option<HashMap<String, String>> {
-        let data = self.style_data(host, top_layer)?;
+        let data = self.style_data(host, top_layer, dialog_modal)?;
         let node = *data.arena_node.get(&el.arena_index())?;
         let sheet_refs: Vec<&Stylesheet> = data.sheets.iter().collect();
         let viewport = Viewport {
@@ -28189,18 +29187,105 @@ impl ParseLayoutHook {
         Some(props)
     }
 
+    /// `::backdrop` computed props for the parse shim (w81 backdrop,
+    /// W4): the shim counterpart of production
+    /// [`n_get_computed_style`](fn@n_get_computed_style)'s pseudo
+    /// branch. Parser-inserted scripts — including every
+    /// testharness page's inline scripts — run through this shim,
+    /// so without it `getComputedStyle(el, "::backdrop")` in a
+    /// WPT page answers the element's style (the pre-fix
+    /// production bug, on the shim path). Mirrors
+    /// [`computed_props`](Self::computed_props)' projection
+    /// (`PARSE_COMPUTED_PROPS`, overflow synthesis, adjustments,
+    /// shorthand synthesis) but over the pseudo style from
+    /// [`bowser_css::compute_pseudo_style`], and deliberately
+    /// skips everything that resolves against the element's box:
+    /// a backdrop has no box in the shim's partial layout, and
+    /// the originator's geometry must not leak into it (no
+    /// used-value width/height, no margin resolution, no inline
+    /// border-spacing — an element's inline `style` never applies
+    /// to its pseudos). Ungated by top-layer membership, like
+    /// the production query.
+    fn backdrop_computed_props(
+        &mut self,
+        host: &mut ScriptHost<'_, '_, '_>,
+        el: ScriptElement,
+        top_layer: &[(usize, TopLayerShowKind)],
+        dialog_modal: &HashSet<usize>,
+    ) -> Option<HashMap<String, String>> {
+        let data = self.style_data(host, top_layer, dialog_modal)?;
+        let node = *data.arena_node.get(&el.arena_index())?;
+        let sheet_refs: Vec<&Stylesheet> = data.sheets.iter().collect();
+        let viewport = Viewport {
+            w: self.viewport.0 as f32,
+            h: self.viewport.1 as f32,
+        };
+        let computed = bowser_css::compute_pseudo_style(
+            &data.doc,
+            node,
+            &sheet_refs,
+            parse_ua_stylesheet(),
+            &viewport,
+            "backdrop",
+            bowser_css::BACKDROP_ATOMS,
+        )?;
+        let font_px = computed_font_px_of(&computed);
+        let root_px = match data.doc.document_element() {
+            Some(r) if r != node => computed_font_px_of(&bowser_css::compute_style(
+                &data.doc,
+                r,
+                &sheet_refs,
+                parse_ua_stylesheet(),
+                &viewport,
+            )),
+            _ => font_px,
+        };
+        let mut props: HashMap<String, String> = HashMap::new();
+        for (prop, initial, _inherited) in PARSE_COMPUTED_PROPS {
+            if computed_shorthand_longhands(prop).is_some() {
+                continue; // synthesized from the longhands below
+            }
+            let val = match computed.get(prop) {
+                Some(v) => cssom_computed_value(prop, v),
+                None => initial.to_string(),
+            };
+            props.insert(prop.to_string(), val);
+        }
+        // `overflow` serializes from its axes, like the production
+        // surface (the slot itself holds only a bare keyword).
+        if let (Some(x), Some(y)) = (computed.get("overflow-x"), computed.get("overflow-y")) {
+            let xs = css_value_to_string(x);
+            let ys = css_value_to_string(y);
+            props.insert(
+                "overflow".to_string(),
+                if xs == ys { xs } else { format!("{xs} {ys}") },
+            );
+        }
+        let ctx = ComputedAdjustCtx {
+            font_px,
+            root_px,
+            vw: viewport.w,
+            vh: viewport.h,
+        };
+        adjust_computed_props(&mut props, &ctx);
+        synthesize_border_shorthands(&mut props);
+        synthesize_computed_shorthands(&mut props);
+        Some(props)
+    }
+
     /// The style data for the current tree state, cached per
     /// `mutation_count` (see [`Self::snap_data`]'s caching shape).
     fn style_data(
         &mut self,
         host: &mut ScriptHost<'_, '_, '_>,
-        top_layer: &[usize],
+        top_layer: &[(usize, TopLayerShowKind)],
+        dialog_modal: &HashSet<usize>,
     ) -> Option<Rc<ParseStyleData>> {
         let count = host.mutation_count();
         if let Some((_, data)) = self.style_cache.iter().find(|(c, _)| *c == count) {
             return Some(Rc::clone(data));
         }
-        let data = Rc::new(self.build_style_data(host, top_layer)?);
+        let data = Rc::new(self.build_style_data(host, top_layer, dialog_modal)?);
         // `build_style_data`'s snapshot may have flushed buffered
         // text (bumping the count); key the entry by the post-build
         // count, exactly like the layout entries.
@@ -28225,7 +29310,8 @@ impl ParseLayoutHook {
     fn build_style_data(
         &mut self,
         host: &mut ScriptHost<'_, '_, '_>,
-        top_layer: &[usize],
+        top_layer: &[(usize, TopLayerShowKind)],
+        dialog_modal: &HashSet<usize>,
     ) -> Option<ParseStyleData> {
         let root_el = host.document_element()?;
         let mut rec = SnapshotRecorder::new();
@@ -28246,19 +29332,50 @@ impl ParseLayoutHook {
         // without this a mid-parse `showPopover` would be invisible
         // to the cascade (open popovers would still compute
         // `overlay: none`, and `:popover-open` would never match).
-        // Iterate in show order (w80fix): the rebuilt document's
-        // top layer is ordered, so hash order here would scramble
-        // coexisting popovers' paint order. Only elements that
-        // still carry a `popover` attribute promote: a detached or
-        // attribute-stripped arena either never maps onto a
-        // rebuilt node or fails this check (the shim's removal
-        // paths prune the set at the source; this check is the
-        // backstop for anything that changed without them).
-        for &arena in top_layer {
-            if let Some(node) = arena_node.get(&arena)
-                && doc.get_attribute(*node, "popover").is_some()
+        // w81 phase 2: the same loop carries modal dialogs, whose
+        // absence would hide `:modal` and the top-layer `overlay`
+        // exemption. Iterate in the single unified show order
+        // (w81fix): the rebuilt document's top layer is ordered,
+        // so promoting popovers-first-then-dialogs would scramble
+        // an interleaved show sequence's paint order. Only
+        // elements that still carry their attribute promote: a
+        // detached or attribute-stripped arena either never maps
+        // onto a rebuilt node or fails this check (the shim's
+        // removal paths prune the set at the source; this check
+        // is the backstop for anything that changed without them).
+        for &(arena, kind) in top_layer {
+            let Some(node) = arena_node.get(&arena) else {
+                continue;
+            };
+            match kind {
+                TopLayerShowKind::Popover => {
+                    if doc.get_attribute(*node, "popover").is_some() {
+                        doc.promote_to_top_layer(*node);
+                    }
+                }
+                TopLayerShowKind::ModalDialog => {
+                    if doc.is_dialog_element(*node)
+                        && doc.get_attribute(*node, "open").is_some()
+                    {
+                        doc.promote_to_top_layer(*node);
+                        doc.mark_dialog_modal(*node);
+                    }
+                }
+            }
+            // w81fix R3 M2: same dual-element loss as
+            // `adopt_shim_top_layer` — the unified entry carries
+            // only one kind, so a modal-then-popover dual flips to
+            // `Popover` and the match above never marks it modal,
+            // hiding `:modal` from the rebuilt cascade. Mark (and
+            // promote) whenever `dialog_modal` contains the arena,
+            // independent of the entry kind; idempotent for a pure
+            // modal dialog.
+            if dialog_modal.contains(&arena)
+                && doc.is_dialog_element(*node)
+                && doc.get_attribute(*node, "open").is_some()
             {
                 doc.promote_to_top_layer(*node);
+                doc.mark_dialog_modal(*node);
             }
         }
         let sheets: Vec<Stylesheet> = self.harvested_sheets(&rec);
@@ -30149,6 +31266,7 @@ fn n_parse_el_remove_child(
         // w80fix: demote the removed subtree's top layer, so a
         // later reinsert does not resurrect an open popover.
         prune_shim_top_layer_subtree(id, host_ref, child);
+        prune_shim_dialog_subtree(id, host_ref, child);
         Ok(child_val)
     } else {
         Err(err_type("removeChild failed"))
@@ -30432,6 +31550,9 @@ fn n_parse_el_tag_name_get(
     _args: &[Value],
 ) -> Result<Value, NativeError> {
     let (_id, host, el) = parse_el_host(heap, this, "tagName")?;
+    // Same unconditional uppercasing as production `sync_props`
+    // (see there): foreign elements read uppercased too, a pinned
+    // pre-existing spec deviation, not fixed here.
     let name = deref_parse_host(host)
         .tag_name(el)
         .unwrap_or_default()
@@ -30544,6 +31665,7 @@ fn n_parse_el_remove(heap: &mut Heap, this: Value, _args: &[Value]) -> Result<Va
     // like the detached mark: an element already detached holds
     // no top-layer entry, so the prune is a no-op for it.
     prune_shim_top_layer_subtree(id, host_ref, el);
+    prune_shim_dialog_subtree(id, host_ref, el);
     Ok(Value::Undefined)
 }
 
@@ -30596,6 +31718,20 @@ fn parse_popover_apply(
             .get(&id)
             .is_some_and(|entry| entry.listeners.borrow().top_layer.contains(&arena))
     });
+    // w81fix R3 M2: production `Document::show_popover` rejects
+    // any node already in the top layer, including a modal dialog
+    // — but the shim's `is_open` above looks only at the popover
+    // set, so `showModal()` then `showPopover()` on a dual
+    // `<dialog popover>` wrongly succeeded and flipped the
+    // unified entry to `Popover`. Track modal membership
+    // separately; the rejection below is `showPopover`-only, so
+    // `togglePopover` keeps its existing (separate) semantics.
+    let is_dialog_modal = PARSE_HOSTS.with(|hosts| {
+        hosts
+            .borrow()
+            .get(&id)
+            .is_some_and(|entry| entry.listeners.borrow().dialog_modal.contains(&arena))
+    });
     // w80fix: the forced no-op arms come BEFORE validity, like
     // production `Document::toggle_popover`: open-ness is
     // well-defined without the attribute (not in the shim set
@@ -30624,6 +31760,11 @@ fn parse_popover_apply(
             )));
         }
         if is_open {
+            return Err(err_type(format!(
+                "{op}: InvalidStateError: popover is already showing"
+            )));
+        }
+        if op == "showPopover" && is_dialog_modal {
             return Err(err_type(format!(
                 "{op}: InvalidStateError: popover is already showing"
             )));
@@ -30716,6 +31857,443 @@ fn n_parse_el_toggle_popover(
     Ok(Value::Bool(open))
 }
 
+// -- dialog -----------------------------------------------------------------
+
+/// The shim-side dialog test (same shape as production
+/// [`Document::is_dialog_element`](bowser_dom::Document::is_dialog_element)):
+/// the parser's tag name, ASCII case-insensitive, AND the HTML
+/// namespace. The parser lowercases HTML tag names, but the
+/// compare stays insensitive so a foreign-cased record cannot
+/// slip through — and a foreign-namespace element named
+/// `dialog` (SVG, MathML, or custom) is not a dialog at all.
+/// The namespace resolves through the slot's all-element
+/// enumeration (cached per mutation epoch, like the identity
+/// refresh): an element with no enumeration record (detached,
+/// template contents, never wrapped) keeps the tag-only answer,
+/// since no tree API exposes its namespace — such an element
+/// fails the connected check in `show` / `close` anyway.
+fn parse_dialog_is_dialog(
+    id: u64,
+    host: &ScriptHost<'static, 'static, 'static>,
+    el: ScriptElement,
+) -> bool {
+    if !host
+        .tag_name(el)
+        .is_some_and(|t| t.eq_ignore_ascii_case("dialog"))
+    {
+        return false;
+    }
+    let ns = PARSE_HOSTS.with(|hosts| {
+        let entry = hosts.borrow().get(&id).map(|e| (e.host, e.enum_cache.clone()))?;
+        let (host_ptr, cache) = entry;
+        if host_ptr.is_null() {
+            return None;
+        }
+        // SAFETY: same `ParseShimGuard` contract as
+        // `parse_element_identity`; a read-only enumeration.
+        let map = all_element_enum(deref_parse_host(host_ptr), &cache);
+        map.get(&el.arena_index()).map(|(_, ns)| ns.clone())
+    });
+    ns.is_none_or(|ns| ns == Namespace::Html)
+}
+
+/// Whether `el` carries an `open` attribute in the parser's tree
+/// (markup `<dialog open>`, a prior shim `show`/`showModal`, or a
+/// direct `setAttribute('open', …)`).
+fn parse_dialog_has_open_attr(
+    host: &ScriptHost<'static, 'static, 'static>,
+    el: ScriptElement,
+) -> bool {
+    host.get_attributes(el)
+        .into_iter()
+        .any(|(name, _)| name.eq_ignore_ascii_case("open"))
+}
+
+/// The shim-side dialog open predicate: an `open` attribute OR a
+/// method-open record. The attribute arm is what makes
+/// `show()` on a `<dialog open>` throw and `close()` on a
+/// markup-open dialog work mid-parse, where the method record
+/// alone would miss both.
+fn parse_dialog_is_open(
+    id: u64,
+    host: &ScriptHost<'static, 'static, 'static>,
+    el: ScriptElement,
+) -> bool {
+    if parse_dialog_has_open_attr(host, el) {
+        return true;
+    }
+    PARSE_HOSTS.with(|hosts| {
+        hosts.borrow().get(&id).is_some_and(|entry| {
+            entry
+                .listeners
+                .borrow()
+                .dialog_open
+                .contains(&el.arena_index())
+        })
+    })
+}
+
+/// Shared show/showModal core for the shim dialog natives: the
+/// production [`Document::show_dialog`] /
+/// [`Document::show_dialog_modal`] state machine, replayed
+/// against the parser's tree and the shared roots' dialog sets.
+/// The `open` attribute is written into the parser's tree (not
+/// just the roots), so the snapshot the production install
+/// builds from already carries it — without that, an adopted
+/// dialog would arrive closed. After any state change the
+/// installation's computed-style and layout caches are dropped,
+/// like [`parse_popover_apply`] (a show changes `dialog[open]`
+/// display and `:open` / `:modal` matching).
+fn parse_dialog_show(
+    id: u64,
+    host: *mut ScriptHost<'static, 'static, 'static>,
+    el: ScriptElement,
+    modal: bool,
+) -> Result<(), NativeError> {
+    let host_ref = deref_parse_host(host);
+    let op = if modal { "showModal" } else { "show" };
+    if !parse_dialog_is_dialog(id, host_ref, el) {
+        return Err(err_type(format!(
+            "{op}: NotSupportedError: element is not a dialog element"
+        )));
+    }
+    if !host_element_connected(host_ref, el) {
+        return Err(err_type(format!(
+            "{op}: InvalidStateError: dialog is not connected"
+        )));
+    }
+    if parse_dialog_is_open(id, host_ref, el) {
+        return Err(err_type(format!(
+            "{op}: InvalidStateError: dialog is already open"
+        )));
+    }
+    host_ref.set_attribute(el, "open", "");
+    PARSE_HOSTS.with(|hosts| {
+        let mut hosts = hosts.borrow_mut();
+        let entry = hosts
+            .get_mut(&id)
+            .ok_or_else(|| err_type("document is not available outside the parser"))?;
+        entry
+            .listeners
+            .borrow_mut()
+            .dialog_open_insert(el.arena_index(), modal);
+        entry.layout_hook.style_cache.clear();
+        entry.layout_hook.entries.clear();
+        Ok::<(), NativeError>(())
+    })?;
+    Ok(())
+}
+
+/// Shared close core for the shim dialog native: returns `true`
+/// when the dialog was open and is now closed (the caller fires
+/// the `close` event exactly then), `false` for a closed dialog
+/// (no-op, no event). A given `return_value` replaces the stored
+/// one before closing; `None` keeps it. Closing removes the
+/// `open` attribute from the parser's tree and drops the
+/// method-open / modal records (the stored `returnValue`
+/// survives, as in production).
+fn parse_dialog_close(
+    id: u64,
+    host: *mut ScriptHost<'static, 'static, 'static>,
+    el: ScriptElement,
+    return_value: Option<String>,
+) -> Result<bool, NativeError> {
+    let host_ref = deref_parse_host(host);
+    if !parse_dialog_is_dialog(id, host_ref, el) {
+        return Err(err_type(
+            "close: NotSupportedError: element is not a dialog element",
+        ));
+    }
+    if !parse_dialog_is_open(id, host_ref, el) {
+        return Ok(false);
+    }
+    host_ref.remove_attribute(el, "open");
+    PARSE_HOSTS.with(|hosts| {
+        let mut hosts = hosts.borrow_mut();
+        let entry = hosts
+            .get_mut(&id)
+            .ok_or_else(|| err_type("document is not available outside the parser"))?;
+        let mut roots = entry.listeners.borrow_mut();
+        if let Some(v) = return_value {
+            roots.dialog_return.insert(el.arena_index(), v);
+        }
+        roots.dialog_open_remove(el.arena_index());
+        entry.layout_hook.style_cache.clear();
+        entry.layout_hook.entries.clear();
+        Ok::<(), NativeError>(())
+    })?;
+    Ok(true)
+}
+
+/// Fire the shim `close` event at `el`'s wrapper: invoke the
+/// record's `close` listeners and `onclose` handlers in
+/// registration (`seq`) order, swallowing listener exceptions
+/// (DOM report-and-continue, like
+/// [`n_parse_dispatch_event`]). `once` listeners are removed
+/// before they run, so a synchronous re-close from inside one
+/// cannot re-enter it. Every entry is also re-checked against
+/// the live record before it runs, so a listener removed
+/// mid-dispatch by an earlier listener never runs. The event argument is a plain object
+/// carrying `type`/`bubbles`/`cancelable` — the shim has no
+/// `Event` constructor, and its listeners read exactly those
+/// fields in practice.
+fn parse_dialog_fire_close(heap: &mut Heap, this: Value, id: u64, el: ScriptElement) {
+    let Value::Object(obj) = this else { return };
+    // Snapshot entries: (callback, seq, once, capture, is_handler).
+    // `seq` / `capture` / `is_handler` are what the
+    // pre-invocation re-check below matches against: `seq`
+    // distinguishes a re-added registration from the snapshot
+    // entry it replaced (w81fix R3 L3), and `removeEventListener`
+    // removes by (type, callback, capture), dropping a handler
+    // record only for non-capture removals, so the re-check must
+    // tell the registrations apart.
+    let cbs: Vec<(Value, u64, bool, bool, bool)> = PARSE_HOSTS.with(|hosts| {
+        let Some(entry) = hosts.borrow().get(&id).map(|e| e.listeners.clone()) else {
+            return Vec::new();
+        };
+        let g = entry.borrow();
+        let Some(pos) = find_shim_record(&g, el, obj) else {
+            return Vec::new();
+        };
+        let rec = &g.element_wrappers[pos];
+        let mut all: Vec<(Value, u64, bool, bool, bool)> = rec
+            .listeners
+            .iter()
+            .filter(|l| l.etype == "close")
+            .map(|l| (l.callback, l.seq, l.once, l.capture, false))
+            .collect();
+        all.extend(
+            rec.handlers
+                .iter()
+                .filter(|h| h.etype == "close")
+                .map(|h| (h.callback, h.seq, false, false, true)),
+        );
+        all.sort_by_key(|(_, seq, _, _, _)| *seq);
+        all
+    });
+    if cbs.is_empty() {
+        return;
+    }
+    let event_val = match heap.alloc_object(Object::new(ObjectKind::Ordinary)) {
+        Ok(o) => Value::Object(o),
+        Err(_) => return,
+    };
+    let temp_base = heap.protect(Value::Undefined);
+    heap.protect(event_val);
+    for &(cb, _, _, _, _) in &cbs {
+        heap.protect(cb);
+    }
+    if let Value::Object(o) = event_val {
+        if let Ok(t) = heap.alloc_str("close") {
+            let _ = def(heap, o, "type", Value::Str(t));
+        }
+        let _ = def(heap, o, "bubbles", Value::Bool(false));
+        let _ = def(heap, o, "cancelable", Value::Bool(false));
+    }
+    for (cb, seq, once, capture, is_handler) in cbs {
+        // DOM-dispatch semantics: a listener removed mid-dispatch
+        // (by an earlier close listener, or by a `once` removal
+        // above) must not run. The snapshot alone ran every
+        // entry regardless, so re-check the live record before
+        // each invocation; listeners added mid-dispatch are not
+        // in the snapshot and still never run.
+        // w81fix R3 L3: the re-check keys on the snapshot `seq`
+        // too, not just (callback, capture): a listener removed
+        // and re-added with identical callback+capture
+        // mid-dispatch gets a fresh `seq`, so the snapshot entry
+        // is gone and the re-added registration must not run in
+        // this dispatch (snapshot semantics). The same applies
+        // to an `onclose` handler re-assigned mid-dispatch.
+        let still_registered = PARSE_HOSTS.with(|hosts| {
+            let entry = hosts.borrow().get(&id).map(|e| e.listeners.clone())?;
+            let g = entry.borrow();
+            let pos = find_shim_record(&g, el, obj)?;
+            let rec = &g.element_wrappers[pos];
+            if is_handler {
+                Some(
+                    rec.handlers
+                        .iter()
+                        .any(|h| h.etype == "close" && h.callback == cb && h.seq == seq),
+                )
+            } else {
+                Some(rec.listeners.iter().any(|l| {
+                    l.etype == "close"
+                        && l.callback == cb
+                        && l.capture == capture
+                        && l.seq == seq
+                }))
+            }
+        });
+        if still_registered != Some(true) {
+            continue;
+        }
+        if once {
+            PARSE_HOSTS.with(|hosts| {
+                if let Some(entry) = hosts.borrow().get(&id).map(|e| e.listeners.clone()) {
+                    let mut g = entry.borrow_mut();
+                    if let Some(pos) = find_shim_record(&g, el, obj) {
+                        g.element_wrappers[pos]
+                            .listeners
+                            .retain(|l| !(l.callback == cb && l.seq == seq && l.etype == "close"));
+                    }
+                }
+            });
+        }
+        let _ = invoke_parse_listener(heap, cb, this, &[event_val]);
+    }
+    heap.release_temp(temp_base);
+}
+
+/// `el.show()` on the parse shim.
+fn n_parse_el_show_dialog(
+    heap: &mut Heap,
+    this: Value,
+    _args: &[Value],
+) -> Result<Value, NativeError> {
+    let (id, host, el) = parse_el_host(heap, this, "show")?;
+    parse_dialog_show(id, host, el, false)?;
+    Ok(Value::Undefined)
+}
+
+/// `el.showModal()` on the parse shim.
+fn n_parse_el_show_dialog_modal(
+    heap: &mut Heap,
+    this: Value,
+    _args: &[Value],
+) -> Result<Value, NativeError> {
+    let (id, host, el) = parse_el_host(heap, this, "showModal")?;
+    parse_dialog_show(id, host, el, true)?;
+    Ok(Value::Undefined)
+}
+
+/// `el.close(returnValue)` on the parse shim: state first, then
+/// the `close` event at the wrapper exactly when the dialog was
+/// open (a listener that re-opens the dialog sees the closed
+/// state, like production).
+fn n_parse_el_close_dialog(
+    heap: &mut Heap,
+    this: Value,
+    args: &[Value],
+) -> Result<Value, NativeError> {
+    let (id, host, el) = parse_el_host(heap, this, "close")?;
+    let return_value = match args.first().copied().unwrap_or(Value::Undefined) {
+        Value::Undefined => None,
+        v => Some(arg_to_string(&mut *heap, v)?),
+    };
+    if parse_dialog_close(id, host, el, return_value)? {
+        parse_dialog_fire_close(heap, this, id, el);
+    }
+    Ok(Value::Undefined)
+}
+
+/// `el.open` getter on the parse shim: the dialog's open state
+/// (attribute or method record); `false` for non-dialogs.
+fn n_parse_el_dialog_open_get(
+    heap: &mut Heap,
+    this: Value,
+    _args: &[Value],
+) -> Result<Value, NativeError> {
+    let (id, host, el) = parse_el_host(heap, this, "open")?;
+    Ok(Value::Bool(parse_dialog_is_open(
+        id,
+        deref_parse_host(host),
+        el,
+    )))
+}
+
+/// `el.open` setter on the parse shim: direct attribute
+/// reflection, mirroring production [`n_dialog_open_set`]
+/// (setting `true` opens non-modally via the attribute only;
+/// setting `false` removes it and demotes, without a `close`
+/// event). Throws on a non-dialog receiver.
+fn n_parse_el_dialog_open_set(
+    heap: &mut Heap,
+    this: Value,
+    args: &[Value],
+) -> Result<Value, NativeError> {
+    let (id, host, el) = parse_el_host(heap, this, "open")?;
+    let host_ref = deref_parse_host(host);
+    if !parse_dialog_is_dialog(id, host_ref, el) {
+        return Err(err_type(
+            "open: NotSupportedError: element is not a dialog element",
+        ));
+    }
+    let value = match args.first().copied().unwrap_or(Value::Undefined) {
+        Value::Undefined => false,
+        v => parse_truthy(v),
+    };
+    if value {
+        host_ref.set_attribute(el, "open", "");
+    } else {
+        host_ref.remove_attribute(el, "open");
+        drop_shim_dialog_arena(id, el.arena_index());
+    }
+    PARSE_HOSTS.with(|hosts| {
+        if let Some(entry) = hosts.borrow_mut().get_mut(&id) {
+            entry.layout_hook.style_cache.clear();
+            entry.layout_hook.entries.clear();
+        }
+    });
+    Ok(Value::Undefined)
+}
+
+/// `el.returnValue` getter on the parse shim: the stored value,
+/// `""` when none was set (or for a non-dialog receiver).
+fn n_parse_el_dialog_return_value_get(
+    heap: &mut Heap,
+    this: Value,
+    _args: &[Value],
+) -> Result<Value, NativeError> {
+    let (id, _host, el) = parse_el_host(heap, this, "returnValue")?;
+    let val = PARSE_HOSTS.with(|hosts| {
+        hosts
+            .borrow()
+            .get(&id)
+            .and_then(|entry| {
+                entry
+                    .listeners
+                    .borrow()
+                    .dialog_return
+                    .get(&el.arena_index())
+                    .cloned()
+            })
+            .unwrap_or_default()
+    });
+    heap.alloc_str(&val)
+        .map(Value::Str)
+        .map_err(|_| NativeError::OutOfMemory)
+}
+
+/// `el.returnValue` setter on the parse shim: stores the value
+/// without opening, closing, or firing anything. Throws on a
+/// non-dialog receiver.
+fn n_parse_el_dialog_return_value_set(
+    heap: &mut Heap,
+    this: Value,
+    args: &[Value],
+) -> Result<Value, NativeError> {
+    let (id, host, el) = parse_el_host(heap, this, "returnValue")?;
+    if !parse_dialog_is_dialog(id, deref_parse_host(host), el) {
+        return Err(err_type(
+            "returnValue: NotSupportedError: element is not a dialog element",
+        ));
+    }
+    let value = arg_to_string(
+        &mut *heap,
+        args.first().copied().unwrap_or(Value::Undefined),
+    )?;
+    PARSE_HOSTS.with(|hosts| {
+        if let Some(entry) = hosts.borrow_mut().get_mut(&id) {
+            entry
+                .listeners
+                .borrow_mut()
+                .dialog_return
+                .insert(el.arena_index(), value);
+        }
+    });
+    Ok(Value::Undefined)
+}
+
 /// `el.matches(selectors)` on the parse shim: the full selector
 /// engine, run against the same whole-tree rebuild the shim's
 /// `getComputedStyle` cascades against (so `:popover-open` reads
@@ -30734,9 +32312,12 @@ fn n_parse_el_matches(heap: &mut Heap, this: Value, args: &[Value]) -> Result<Va
     let hit = PARSE_HOSTS.with(|hosts| {
         let mut hosts = hosts.borrow_mut();
         let entry = hosts.get_mut(&id)?;
-        let top = entry.listeners.borrow().top_layer_ordered();
+        let top = entry.listeners.borrow().top_layer_show_ordered();
+        let dialog_modal = entry.listeners.borrow().dialog_modal.clone();
         let host_ref = deref_parse_host(entry.host);
-        let data = entry.layout_hook.style_data(host_ref, &top)?;
+        let data = entry
+            .layout_hook
+            .style_data(host_ref, &top, &dialog_modal)?;
         let node = *data.arena_node.get(&el.arena_index())?;
         Some(data.doc.matches(node, &sel))
     });
@@ -31431,6 +33012,16 @@ fn n_parse_get_computed_style(
     let (id, host) = parse_host_from_global(heap, this)?;
     let el_val = args.first().copied().unwrap_or(Value::Undefined);
     let (_eid, el) = parse_el_handle(heap, el_val, "getComputedStyle")?;
+    // Pseudo-element argument (w81 backdrop, W4): `"::backdrop"`
+    // routes to the backdrop projection below instead of the
+    // element's computed props — the shim half of production
+    // `n_get_computed_style`'s pseudo branch (parser-inserted
+    // scripts run here, so WPT pages hit this path, not the
+    // production one). Any other pseudo falls back to the
+    // element's props, as before.
+    let is_backdrop = matches!(args.get(1), Some(Value::Str(s)) if {
+        is_backdrop_pseudo_arg(&s.as_wtf8().to_string())
+    });
     // The cascade path: the layout hook's whole-tree rebuild styled
     // by the real cascade (see `ParseLayoutHook::computed_props`).
     let cascaded = PARSE_HOSTS.with(|hosts| {
@@ -31443,11 +33034,30 @@ fn n_parse_get_computed_style(
         // JS, so nothing re-enters `PARSE_HOSTS` while the entry
         // borrow is held.
         let host_ref = deref_parse_host(host);
-        let top = entry.listeners.borrow().top_layer_ordered();
-        entry.layout_hook.computed_props(host_ref, el, &top)
+        let top = entry.listeners.borrow().top_layer_show_ordered();
+        let dialog_modal = entry.listeners.borrow().dialog_modal.clone();
+        if is_backdrop {
+            entry
+                .layout_hook
+                .backdrop_computed_props(host_ref, el, &top, &dialog_modal)
+        } else {
+            entry
+                .layout_hook
+                .computed_props(host_ref, el, &top, &dialog_modal)
+        }
     });
     let mut values = match cascaded {
         Some(v) => v,
+        // A missing backdrop style answers an empty declaration,
+        // matching production's fallback shape (whole L9): never
+        // the element style. The empties are explicit, not a bare
+        // empty map — the object build below fills any absent key
+        // with its initial value, which would turn a bare map into
+        // an initial-valued (but uncomputed) backdrop style.
+        None if is_backdrop => PARSE_COMPUTED_PROPS
+            .iter()
+            .map(|(prop, _, _)| (prop.to_string(), String::new()))
+            .collect(),
         None => {
             let viewport = PARSE_HOSTS
                 .with(|hosts| {
@@ -31473,9 +33083,21 @@ fn n_parse_get_computed_style(
     // `computed_props` itself: other callers must not drive
     // transitions. The production surface hooks the same engine in
     // `n_get_computed_style` (w80fix), under its own `prod:` keys.
-    {
+    // Backdrop pseudo styles skip this, like production: the
+    // originator's keyed values must not leak into them.
+    if !is_backdrop {
         let key = format!("parse:{id}:{}", el.arena_index());
         crate::transition::apply_transitions(&key, &mut values);
+        // w81: same hook as production (see `crate::animation`):
+        // discrete keyframed properties step and numeric ones
+        // interpolate at the current time, overwriting the
+        // cascaded value for each keyframed property.
+        crate::animation::apply_animations(&key, &mut values);
+        // w81fix (F-E): same re-synthesis as production
+        // `n_get_computed_style` — an animated longhand must be
+        // reflected in its shorthand, and for unanimated
+        // properties this reproduces the pre-animation synthesis.
+        synthesize_computed_shorthands(&mut values);
     }
     let obj = heap
         .alloc_object(Object::new(ObjectKind::Ordinary))
@@ -39132,6 +40754,171 @@ mod tests {
     }
 
     #[test]
+    fn get_computed_style_backdrop_pseudo_argument() {
+        // w81 backdrop (W4): the second argument is honored for
+        // `::backdrop` — previously it was ignored, so the call
+        // below returned the dialog's own style. The backdrop
+        // answers the UA fixed/inset-0 style plus the author
+        // `dialog::backdrop` background, while the no-pseudo call
+        // still answers the element's own style (here: the
+        // dialog's own `background-color` is untouched by the
+        // backdrop rule, and its `position` is the UA dialog
+        // fixed rule — so the discriminator is the background).
+        // The `0px` insets are the WPT `backdrop-ua-style`
+        // assertions verbatim (the UA rule spells `0px`, not
+        // bare `0`, so serialization matches).
+        let mut fx = setup("<html><body><dialog id=\"d\">x</dialog></body></html>");
+        let sheet = parse_stylesheet("dialog::backdrop { background-color: red; }");
+        fx.apis.borrow_mut().set_author_stylesheets(vec![sheet]);
+        let el = call_get_element_by_id(&mut fx, "d");
+        let global = Value::Object(fx.global);
+        let pseudo = str_val(&mut fx, "::backdrop");
+        let decl = n_get_computed_style(&mut fx.heap, global, &[el, pseudo]).unwrap();
+        let prop = |fx: &mut Fixture, decl: Value, name: &str| -> String {
+            let name_val = str_val(fx, name);
+            match n_style_get_property_value(&mut fx.heap, decl, &[name_val]).unwrap() {
+                Value::Str(s) => s.as_wtf8().to_string(),
+                _ => panic!("not a string"),
+            }
+        };
+        assert_eq!(prop(&mut fx, decl, "position"), "fixed");
+        assert_eq!(prop(&mut fx, decl, "top"), "0px");
+        assert_eq!(prop(&mut fx, decl, "right"), "0px");
+        assert_eq!(prop(&mut fx, decl, "bottom"), "0px");
+        assert_eq!(prop(&mut fx, decl, "left"), "0px");
+        assert_eq!(prop(&mut fx, decl, "background-color"), "rgb(255, 0, 0)");
+        // No pseudo argument: the element's own style, not the
+        // backdrop's — the author backdrop rule must not leak.
+        assert_eq!(
+            computed_prop(&mut fx, el, "background-color"),
+            "rgba(0, 0, 0, 0)"
+        );
+        // A single-colon spelling and different case are accepted
+        // the same way browsers accept `:backdrop`.
+        let pseudo = str_val(&mut fx, ":Backdrop");
+        let decl = n_get_computed_style(&mut fx.heap, global, &[el, pseudo]).unwrap();
+        assert_eq!(prop(&mut fx, decl, "position"), "fixed");
+        assert_eq!(prop(&mut fx, decl, "background-color"), "rgb(255, 0, 0)");
+    }
+
+    // w81fix (JS L1): a bare `backdrop` or `:::backdrop`
+    // pseudo argument is not a backdrop query at all — the old
+    // strip-all-colons shape accepted both. Both fall back to
+    // the element's style (a plain div, whose `position` reads
+    // `static`, while a real backdrop query reads the UA
+    // `fixed`), while `:Backdrop` stays accepted, per the
+    // existing test above.
+    #[test]
+    fn get_computed_style_backdrop_pseudo_argument_rejects_bare_and_triple_colon() {
+        let mut fx = setup("<html><body><div id=\"d\">x</div></body></html>");
+        let el = call_get_element_by_id(&mut fx, "d");
+        let global = Value::Object(fx.global);
+        let prop = |fx: &mut Fixture, decl: Value, name: &str| -> String {
+            let name_val = str_val(fx, name);
+            match n_style_get_property_value(&mut fx.heap, decl, &[name_val]).unwrap() {
+                Value::Str(s) => s.as_wtf8().to_string(),
+                _ => panic!("not a string"),
+            }
+        };
+        for arg in ["backdrop", ":::backdrop", "  backdrop  ", ":: :backdrop"] {
+            let pseudo = str_val(&mut fx, arg);
+            let decl = n_get_computed_style(&mut fx.heap, global, &[el, pseudo]).unwrap();
+            assert_eq!(
+                prop(&mut fx, decl, "position"),
+                "static",
+                "{arg:?} must fall back to the element style, not the backdrop"
+            );
+        }
+        let pseudo = str_val(&mut fx, "::backdrop");
+        let decl = n_get_computed_style(&mut fx.heap, global, &[el, pseudo]).unwrap();
+        assert_eq!(prop(&mut fx, decl, "position"), "fixed");
+    }
+
+    // w81fix (whole L9): when the backdrop pseudo query returns
+    // `None` — forced here with an empty UA stylesheet, so no
+    // `::backdrop` rule exists — the answer must be an empty
+    // declaration, never the element's style. The element's own
+    // inline background stays red on the no-pseudo call, while
+    // the backdrop call reads `""` for it.
+    #[test]
+    fn get_computed_style_backdrop_missing_style_is_empty_not_element_style() {
+        let mut fx =
+            setup("<html><body><div id=\"d\" style=\"background-color: red;\">x</div></body></html>");
+        fx.apis.borrow_mut().ua_stylesheet = parse_stylesheet("");
+        let el = call_get_element_by_id(&mut fx, "d");
+        let global = Value::Object(fx.global);
+        let prop = |fx: &mut Fixture, decl: Value, name: &str| -> String {
+            let name_val = str_val(fx, name);
+            match n_style_get_property_value(&mut fx.heap, decl, &[name_val]).unwrap() {
+                Value::Str(s) => s.as_wtf8().to_string(),
+                _ => panic!("not a string"),
+            }
+        };
+        let pseudo = str_val(&mut fx, "::backdrop");
+        let decl = n_get_computed_style(&mut fx.heap, global, &[el, pseudo]).unwrap();
+        assert_eq!(prop(&mut fx, decl, "background-color"), "");
+        assert_eq!(computed_prop(&mut fx, el, "background-color"), "rgb(255, 0, 0)");
+    }
+
+    #[test]
+    fn parse_shim_get_computed_style_backdrop_pseudo_argument() {
+        // w81 backdrop (W4), shim half: parser-inserted scripts —
+        // including every testharness page's inline scripts — run
+        // through `n_parse_get_computed_style`, not the production
+        // function, so the WPT `backdrop-ua-style` page exercises
+        // this path. The query is ungated (a plain div answers
+        // the UA backdrop style), and the author `::backdrop`
+        // rule applies to it while the element's own style is
+        // untouched by that rule.
+        let r = shim_result(
+            b"<html><head><style>div::backdrop { background-color: red; }</style></head><body>\
+              <div id=\"elm\">x</div>\
+              <script>var el = document.getElementById('elm');\
+              var cs = getComputedStyle(el, '::backdrop');\
+              var own = getComputedStyle(el);\
+              globalThis.__result = [cs.position, cs.top, cs.right, cs.bottom, cs.left, cs.backgroundColor, own.backgroundColor].join('|');</script>\
+              </body></html>",
+        );
+        assert_eq!(r, "fixed|0px|0px|0px|0px|rgb(255, 0, 0)|rgba(0, 0, 0, 0)");
+    }
+
+    // w81fix (JS L1, shim half): bare `backdrop` and
+    // `:::backdrop` are not backdrop queries on the parse shim
+    // either — they answer the element's style (`static`, the
+    // shim's initial for `position`), while `::backdrop` and
+    // `:Backdrop` answer the UA backdrop (`fixed`).
+    #[test]
+    fn parse_shim_get_computed_style_backdrop_rejects_bare_and_triple_colon() {
+        let r = shim_result(
+            b"<html><body>\
+              <div id=\"elm\">x</div>\
+              <script>var el = document.getElementById('elm');\
+              globalThis.__result = [getComputedStyle(el, 'backdrop').position, getComputedStyle(el, ':::backdrop').position, getComputedStyle(el, '::backdrop').position, getComputedStyle(el, ':Backdrop').position].join('|');</script>\
+              </body></html>",
+        );
+        assert_eq!(r, "static|static|fixed|fixed");
+    }
+
+    // w81fix (JS L2): a backdrop query whose pseudo style cannot
+    // be computed — here a detached element, outside the rebuilt
+    // document — answers an empty declaration, never the element
+    // style: the inline red background reads `""` on the backdrop
+    // call, while the element's own call still reads it.
+    #[test]
+    fn parse_shim_get_computed_style_backdrop_missing_style_is_empty() {
+        let r = shim_result(
+            b"<html><body><script>\
+              var el = document.createElement('div');\
+              el.setAttribute('style', 'background-color: red');\
+              var cs = getComputedStyle(el, '::backdrop');\
+              var own = getComputedStyle(el);\
+              globalThis.__result = [cs.backgroundColor, cs.position, own.backgroundColor].join('|');</script>\
+              </body></html>",
+        );
+        assert_eq!(r, "||rgb(255, 0, 0)");
+    }
+
+    #[test]
     fn get_computed_style_resolves_auto_height_to_used_value() {
         // Production gCS: computed `height: auto` resolves to the used
         // content-box height from the published layout tree (mirroring
@@ -39437,6 +41224,67 @@ mod tests {
             node_list_str(&mut vm, &format!("{gcs}.textDecorationColor;")),
             "rgb(0, 255, 255)"
         );
+    }
+
+    #[test]
+    fn get_computed_style_flex_shorthand_keyword_cases() {
+        // w81fix F-FLX (round-3 item closing the SCOPE LIMIT in
+        // `flex_shorthand_computed_serialization_cases` in
+        // bowser_css::cascade): that test pins only the longhands
+        // the computed `flex` string serializes from, because the
+        // string itself is built by `synthesize_flex_shorthand`
+        // here in bowser_js. This test reads the actual
+        // synthesized string through the production
+        // `getComputedStyle` surface for stylesheet-authored
+        // single-keyword / single-number `flex` values. Per CSS
+        // Flexbox 1 §7.1, `none` computes to `0 0 auto` (never
+        // back to `none`: collapsing would misreport a
+        // longhand-authored `0 0 auto` set, which carries
+        // identical longhands), `1` to `1 1 0%`, `auto` to
+        // `1 1 auto`, and `initial` to `0 1 auto`. The longhand
+        // asserts pin the expansion each string serializes from,
+        // and `none` / `1` / `auto` all differ from the initial
+        // `0 1 auto`, so a sheet that failed to apply could not
+        // pass this test vacuously.
+        for (authored, flex, grow, shrink, basis) in [
+            ("none", "0 0 auto", "0", "0", "auto"),
+            ("1", "1 1 0%", "1", "1", "0%"),
+            ("auto", "1 1 auto", "1", "1", "auto"),
+            ("initial", "0 1 auto", "0", "1", "auto"),
+        ] {
+            let mut vm = Vm::new();
+            let (doc, _) = Document::parse_html(b"<html><body><div id=\"d\">x</div></body></html>");
+            let doc = Rc::new(RefCell::new(doc));
+            let base = bowser_url::parse("http://example.com/", None).unwrap();
+            let ctx = vm
+                .install_page_web_apis(doc.clone(), base, "BowserTest/1.0")
+                .expect("production install");
+            vm.set_author_stylesheets(
+                ctx,
+                vec![parse_stylesheet(&format!("#d {{ flex: {authored}; }}"))],
+            );
+            let gcs = "getComputedStyle(document.getElementById(\"d\"))";
+            assert_eq!(
+                node_list_str(&mut vm, &format!("{gcs}.flex;")),
+                flex,
+                "stylesheet-authored flex: {authored}"
+            );
+            assert_eq!(
+                node_list_str(&mut vm, &format!("{gcs}.flexGrow;")),
+                grow,
+                "flex: {authored} grow"
+            );
+            assert_eq!(
+                node_list_str(&mut vm, &format!("{gcs}.flexShrink;")),
+                shrink,
+                "flex: {authored} shrink"
+            );
+            assert_eq!(
+                node_list_str(&mut vm, &format!("{gcs}.flexBasis;")),
+                basis,
+                "flex: {authored} basis"
+            );
+        }
     }
 
     #[test]
@@ -42647,7 +44495,8 @@ mod tests {
     fn element_constructor_global_supports_feature_detection() {
         // Production: `Element` exists with the shared element
         // prototype, so WAAPI-style feature detection (`'animate' in
-        // Element.prototype`) degrades to `false` instead of throwing
+        // Element.prototype`) is `true` since w81 (the `animate`
+        // native lives on that prototype) instead of throwing
         // `ReferenceError`. The constructor itself throws per WebIDL.
         let mut fx = setup("<html><body><p>hi</p></body></html>");
         let el_ctor = obj_of(global_prop(&fx, "Element"));
@@ -42660,7 +44509,7 @@ mod tests {
         assert!(
             fx.heap
                 .get_property(proto, Wtf8::from_str("animate"))
-                .is_none()
+                .is_some()
         );
         assert!(matches!(
             n_element_ctor(&mut fx.heap, Value::Undefined, &[]),
@@ -42702,7 +44551,8 @@ mod tests {
 
     #[test]
     fn parse_shim_element_constructor_global_supports_feature_detection() {
-        // Parse shim: same degradation mid-parse.
+        // Parse shim: same surface mid-parse, with `animate`
+        // present since w81.
         let mut probe = ShimEval { vm: Vm::new() };
         bowser_html::parse_with_scripting_and_executor(
             b"<html><body><script>\
@@ -42716,9 +44566,294 @@ mod tests {
             &mut probe,
         );
         assert_eq!(node_list_str(&mut probe.vm, "globalThis.__el;"), "function");
-        assert_eq!(node_list_str(&mut probe.vm, "globalThis.__feat;"), "false");
+        assert_eq!(node_list_str(&mut probe.vm, "globalThis.__feat;"), "true");
         assert_eq!(node_list_str(&mut probe.vm, "globalThis.__ctor;"), "true");
         assert_eq!(node_list_str(&mut probe.vm, "globalThis.__new;"), "threw");
+    }
+
+    #[test]
+    fn production_element_animate_testcommon_shape() {
+        // w81: the exact `interpolation-testcommon.js` WAAPI shape
+        // on the production surface — keyframes with `offset` /
+        // `composite` / camelCase properties, `{fill, duration,
+        // easing}` options — must not throw, and `pause()` plus a
+        // `currentTime` set must read back exactly.
+        let mut vm = Vm::new();
+        let (doc, _) =
+            Document::parse_html(b"<html><head></head><body><div id=\"a\">hi</div></body></html>");
+        let doc = Rc::new(RefCell::new(doc));
+        let base = bowser_url::parse("http://example.com/", None).unwrap();
+        let ctx = ContextId(
+            vm.install_page_web_apis(doc.clone(), base, "BowserTest/1.0")
+                .expect("production install"),
+        );
+        vm.eval(
+            "var el = document.getElementById(\"a\"); \
+             globalThis.__feat = String('animate' in Element.prototype); \
+             globalThis.__typeof = typeof el.animate; \
+             var anim = el.animate( \
+               [{offset: 0, composite: 'replace', overlay: 'auto'}, \
+                {offset: 1, composite: 'replace', overlay: 'none'}], \
+               {fill: 'forwards', duration: 100000, easing: 'linear'}); \
+             globalThis.__ps0 = anim.playState; \
+             anim.pause(); \
+             globalThis.__ps1 = anim.playState; \
+             anim.currentTime = 50000; \
+             globalThis.__ct = String(anim.currentTime); \
+             anim.play(); \
+             globalThis.__ps2 = anim.playState; \
+             anim.cancel(); \
+             globalThis.__ctNull = String(anim.currentTime); \
+             globalThis.__ps3 = anim.playState; \
+             var anim2 = el.animate(); \
+             globalThis.__ps4 = anim2.playState;",
+        )
+        .expect("animate script must not throw");
+        assert_eq!(node_list_str(&mut vm, "globalThis.__feat;"), "true");
+        assert_eq!(node_list_str(&mut vm, "globalThis.__typeof;"), "function");
+        assert_eq!(node_list_str(&mut vm, "globalThis.__ps0;"), "running");
+        assert_eq!(node_list_str(&mut vm, "globalThis.__ps1;"), "paused");
+        assert_eq!(node_list_str(&mut vm, "globalThis.__ct;"), "50000");
+        assert_eq!(node_list_str(&mut vm, "globalThis.__ps2;"), "running");
+        assert_eq!(node_list_str(&mut vm, "globalThis.__ctNull;"), "null");
+        assert_eq!(node_list_str(&mut vm, "globalThis.__ps3;"), "idle");
+        assert_eq!(node_list_str(&mut vm, "globalThis.__ps4;"), "running");
+        remove_context(ctx);
+    }
+
+    // w81fix (F-B2 finish follow-up): `finish()` on an
+    // infinite-iterations animation must surface
+    // `InvalidStateError` (WAAPI §4.5.13 step 1), not the
+    // generic stale-animation error the old `finish()` mapping
+    // produced for both the unknown-id and the spec-throw
+    // cases. Control: a finite animation finishes cleanly.
+    #[test]
+    fn animation_finish_infinite_iterations_throws_invalid_state() {
+        let mut vm = Vm::new();
+        let (doc, _) =
+            Document::parse_html(b"<html><head></head><body><div id=\"a\">hi</div></body></html>");
+        let doc = Rc::new(RefCell::new(doc));
+        let base = bowser_url::parse("http://example.com/", None).unwrap();
+        let ctx = ContextId(
+            vm.install_page_web_apis(doc.clone(), base, "BowserTest/1.0")
+                .expect("production install"),
+        );
+        vm.eval(
+            "var el = document.getElementById(\"a\"); \
+             var inf = el.animate([{opacity: '0'}, {opacity: '1'}], {duration: 100000, iterations: Infinity}); \
+             try { inf.finish(); globalThis.__inf = 'no-throw'; } \
+             catch (e) { globalThis.__inf = String(e); } \
+             var fin = el.animate([{opacity: '0'}, {opacity: '1'}], {duration: 100000}); \
+             try { fin.finish(); globalThis.__fin = 'finished:' + fin.playState; } \
+             catch (e) { globalThis.__fin = 'threw:' + String(e); }",
+        )
+        .expect("finish script must not throw at the eval level");
+        let inf = node_list_str(&mut vm, "globalThis.__inf;");
+        assert!(
+            inf.contains("InvalidStateError"),
+            "infinite finish must throw InvalidStateError, got {inf:?}"
+        );
+        assert!(
+            !inf.contains("stale"),
+            "infinite finish must not surface the stale-animation error, got {inf:?}"
+        );
+        assert_eq!(
+            node_list_str(&mut vm, "globalThis.__fin;"),
+            "finished:finished"
+        );
+        remove_context(ctx);
+    }
+
+    // w81fix (F-E): an animated longhand must be reflected in
+    // its computed shorthand on the production surface. The
+    // pre-animation synthesis ran on the cascaded longhands,
+    // so without the post-animation re-synthesis `margin`
+    // kept `0px` while `margin-top` read `50px`, and
+    // `background` kept its unanimated color while
+    // `background-color` read the interpolated one. Fail-before:
+    // both shorthand assertions below fail (stale `0px` /
+    // pre-animation background). The unanimated `padding`
+    // shorthand must be untouched, proving re-synthesis is a
+    // no-op for properties no animation touched.
+    #[test]
+    fn animated_longhand_resynthesizes_computed_shorthand() {
+        let (mut vm, _doc) = computed_style_vm(
+            b"<html><body><div id=\"d\">x</div><div id=\"b\">y</div></body></html>",
+        );
+        let el = "document.getElementById(\"d\")";
+        vm.eval(&format!(
+            "var anim = {el}.animate([{{marginTop: '0px'}}, {{marginTop: '100px'}}], \
+             {{duration: 100000, easing: 'linear'}}); \
+             anim.pause(); anim.currentTime = 50000;"
+        ))
+        .unwrap();
+        assert_eq!(
+            node_list_str(&mut vm, &format!("getComputedStyle({el}).marginTop;")),
+            "50px"
+        );
+        assert_eq!(
+            node_list_str(&mut vm, &format!("getComputedStyle({el}).margin;")),
+            "50px 0px 0px"
+        );
+        assert_eq!(
+            node_list_str(&mut vm, &format!("getComputedStyle({el}).padding;")),
+            "0px"
+        );
+        let bel = "document.getElementById(\"b\")";
+        vm.eval(&format!(
+            "var banim = {bel}.animate(\
+             [{{backgroundColor: 'rgb(0, 0, 0)'}}, {{backgroundColor: 'rgb(255, 0, 0)'}}], \
+             {{duration: 100000, easing: 'linear'}}); \
+             banim.pause(); banim.currentTime = 50000;"
+        ))
+        .unwrap();
+        assert_eq!(
+            node_list_str(
+                &mut vm,
+                &format!("getComputedStyle({bel}).backgroundColor;")
+            ),
+            "rgb(128, 0, 0)"
+        );
+        let bg = node_list_str(&mut vm, &format!("getComputedStyle({bel}).background;"));
+        assert!(
+            bg.contains("rgb(128, 0, 0)"),
+            "computed background must carry the animated color, got {bg:?}"
+        );
+    }
+
+    // w81fix (F-E): the same re-synthesis on the parse shim
+    // surface, where the WPT driver reads computed style
+    // mid-parse. Fail-before: `margin` stays `0px` while
+    // `margin-top` reads `50px`.
+    #[test]
+    fn parse_shim_animated_longhand_resynthesizes_computed_shorthand() {
+        let r = shim_result(
+            b"<html><body><div id=t>x</div> \
+              <script>var el = document.getElementById('t'); \
+              var anim = el.animate([{marginTop: '0px'}, {marginTop: '100px'}], \
+                {duration: 100000, easing: 'linear'}); \
+              anim.pause(); anim.currentTime = 50000; \
+              var cs = getComputedStyle(el); \
+              globalThis.__result = [cs.marginTop, cs.margin, cs.padding].join('|');</script> \
+              </body></html>",
+        );
+        assert_eq!(r, "50px|50px 0px 0px|0px");
+    }
+
+    #[test]
+    fn parse_shim_element_animate_testcommon_shape() {
+        // w81: the same testcommon shape mid-parse, where the WPT
+        // driver runs: the shim wrapper's own `animate`, pause,
+        // and a `currentTime` set must read back exactly.
+        let mut probe = ShimEval { vm: Vm::new() };
+        bowser_html::parse_with_scripting_and_executor(
+            b"<html><body><script> \
+              var el = document.createElement('div'); \
+              globalThis.__typeof = typeof el.animate; \
+              var anim = el.animate( \
+                [{offset: 0, composite: 'replace', overlay: 'auto'}, \
+                 {offset: 1, composite: 'replace', overlay: 'none'}], \
+                {fill: 'forwards', duration: 100 * 1000, easing: 'cubic-bezier(0, 1, 1, 1)'}); \
+              anim.pause(); \
+              anim.currentTime = 50 * 1000; \
+              globalThis.__ct = String(anim.currentTime); \
+              globalThis.__ps = anim.playState; \
+              </script></body></html>",
+            true,
+            &mut probe,
+        );
+        assert_eq!(
+            node_list_str(&mut probe.vm, "globalThis.__typeof;"),
+            "function"
+        );
+        assert_eq!(node_list_str(&mut probe.vm, "globalThis.__ct;"), "50000");
+        assert_eq!(node_list_str(&mut probe.vm, "globalThis.__ps;"), "paused");
+    }
+
+    #[test]
+    fn animate_options_and_keyframes_parsing() {
+        // Rust-level parsing: duration as a number (milliseconds),
+        // a `<time>` string duration, fill / direction / easing /
+        // iterations members, and a keyframe sequence whose
+        // camelCase property becomes a dashed property pair.
+        use crate::animation::{Composite, Fill};
+        let mut fx = setup("<html><body></body></html>");
+        let delay_val = str_val(&mut fx, "2s");
+        let fill_val = str_val(&mut fx, "forwards");
+        let easing_val = str_val(&mut fx, "linear");
+        let opts_obj = fx
+            .heap
+            .alloc_object(Object::new(ObjectKind::Ordinary))
+            .unwrap();
+        def(&mut fx.heap, opts_obj, "duration", Value::Int(100000)).unwrap();
+        def(&mut fx.heap, opts_obj, "delay", delay_val).unwrap();
+        def(&mut fx.heap, opts_obj, "fill", fill_val).unwrap();
+        def(&mut fx.heap, opts_obj, "easing", easing_val).unwrap();
+        def(&mut fx.heap, opts_obj, "iterations", Value::Float(2.0)).unwrap();
+        let opts = parse_animation_options(&mut fx.heap, Value::Object(opts_obj)).unwrap();
+        assert_eq!(opts.duration_ms, 100000.0);
+        assert_eq!(opts.delay_ms, 2000.0);
+        assert_eq!(opts.fill, Fill::Forwards);
+        assert_eq!(opts.iterations, 2.0);
+        // A bare number is a millisecond duration; a string
+        // duration parses as a serialized `<time>`.
+        let num_opts = parse_animation_options(&mut fx.heap, Value::Int(500)).unwrap();
+        assert_eq!(num_opts.duration_ms, 500.0);
+        // w81fix (JS L4): the doc promised a string form, but the
+        // match had no `Str` arm and errored. Serialized times,
+        // `auto`, and invalid strings (default duration) all work.
+        let str_arg = str_val(&mut fx, "1.5s");
+        let str_opts = parse_animation_options(&mut fx.heap, str_arg).unwrap();
+        assert_eq!(str_opts.duration_ms, 1500.0);
+        let auto_arg = str_val(&mut fx, "auto");
+        let auto_opts = parse_animation_options(&mut fx.heap, auto_arg).unwrap();
+        assert_eq!(auto_opts.duration_ms, 0.0);
+        let bad_arg = str_val(&mut fx, "banana");
+        let bad_opts = parse_animation_options(&mut fx.heap, bad_arg).unwrap();
+        assert_eq!(bad_opts.duration_ms, 0.0);
+        // w81fix (JS L9): the numeric leniency the module note now
+        // documents — negative iterations clamp to 0, negative
+        // iterationStart and negative durations pass through.
+        let neg_obj = fx
+            .heap
+            .alloc_object(Object::new(ObjectKind::Ordinary))
+            .unwrap();
+        def(&mut fx.heap, neg_obj, "duration", Value::Int(-250)).unwrap();
+        def(&mut fx.heap, neg_obj, "iterations", Value::Float(-3.0)).unwrap();
+        def(
+            &mut fx.heap,
+            neg_obj,
+            "iterationStart",
+            Value::Float(-0.5),
+        )
+        .unwrap();
+        let neg_opts = parse_animation_options(&mut fx.heap, Value::Object(neg_obj)).unwrap();
+        assert_eq!(neg_opts.duration_ms, -250.0);
+        assert_eq!(neg_opts.iterations, 0.0);
+        assert_eq!(neg_opts.iteration_start, -0.5);
+        let composite_val = str_val(&mut fx, "replace");
+        let color_val = str_val(&mut fx, "red");
+        let overlay_val = str_val(&mut fx, "auto");
+        let kf0 = fx
+            .heap
+            .alloc_object(Object::new(ObjectKind::Ordinary))
+            .unwrap();
+        def(&mut fx.heap, kf0, "offset", Value::Float(0.0)).unwrap();
+        def(&mut fx.heap, kf0, "composite", composite_val).unwrap();
+        def(&mut fx.heap, kf0, "backgroundColor", color_val).unwrap();
+        def(&mut fx.heap, kf0, "overlay", overlay_val).unwrap();
+        let arr = fx
+            .heap
+            .alloc_object(Object::new(ObjectKind::Array))
+            .unwrap();
+        def(&mut fx.heap, arr, "length", Value::Int(1)).unwrap();
+        def(&mut fx.heap, arr, "0", Value::Object(kf0)).unwrap();
+        let kfs = parse_keyframes(&mut fx.heap, Value::Object(arr)).unwrap();
+        assert_eq!(kfs.len(), 1);
+        assert_eq!(kfs[0].offset, Some(0.0));
+        assert_eq!(kfs[0].composite, Composite::Replace);
+        assert_eq!(kfs[0].value("background-color"), Some("red"));
+        assert_eq!(kfs[0].value("overlay"), Some("auto"));
     }
 
     #[test]
@@ -45949,6 +48084,247 @@ mod tests {
         remove_context(ContextId(ctx));
     }
 
+    // w81 phase 2: dialog on the parse shim — mid-parse
+    // showModal / show / close with a `close` listener, error
+    // names, `:modal` matching, and adoption: a dialog left
+    // modal at install stays modal in production (top layer +
+    // modal flag + stored `returnValue`), and its mid-parse
+    // `close` listener survives adoption to fire on a
+    // post-install production `close()`.
+    #[test]
+    fn parse_shim_dialog_show_modal_close_and_adoption() {
+        let (mut probe, doc, ctx) = captured_install(
+            b"<html><body><dialog id=\"d\">hi</dialog><div id=\"x\"></div><script>\
+              globalThis.__seen = [];\
+              globalThis.__d = document.getElementById('d');\
+              globalThis.__x = document.getElementById('x');\
+              __d.addEventListener('close', function(e) { __seen.push('close:' + __d.returnValue); });\
+              __d.showModal();\
+              globalThis.__midModal = String(__d.matches(':modal'));\
+              globalThis.__midOpen = String(__d.open);\
+              __d.close('yes');\
+              globalThis.__afterClose = String(__d.open);\
+              globalThis.__rv = __d.returnValue;\
+              try { __x.showModal(); globalThis.__plainErr = 'no-throw'; }\
+              catch (e) { globalThis.__plainErr = String(e); }\
+              __d.show();\
+              try { __d.show(); globalThis.__dbl = 'no-throw'; }\
+              catch (e) { globalThis.__dbl = String(e); }\
+              __d.close();\
+              __d.showModal();\
+              </script></body></html>",
+        );
+        assert_eq!(
+            node_list_str(&mut probe.vm, "globalThis.__midModal;"),
+            "true"
+        );
+        assert_eq!(
+            node_list_str(&mut probe.vm, "globalThis.__midOpen;"),
+            "true"
+        );
+        assert_eq!(
+            node_list_str(&mut probe.vm, "globalThis.__afterClose;"),
+            "false"
+        );
+        assert_eq!(node_list_str(&mut probe.vm, "globalThis.__rv;"), "yes");
+        assert!(
+            node_list_str(&mut probe.vm, "globalThis.__plainErr;").contains("NotSupportedError"),
+            "div showModal must throw NotSupportedError"
+        );
+        assert!(
+            node_list_str(&mut probe.vm, "globalThis.__dbl;").contains("InvalidStateError"),
+            "double show must throw InvalidStateError"
+        );
+        // Adoption: still modal in production, with the stored
+        // returnValue, and the mid-parse listener still attached.
+        let d_node = doc.borrow().get_element_by_id("d").expect("dialog#d");
+        assert!(doc.borrow().is_dialog_modal(d_node));
+        assert!(doc.borrow().is_in_top_layer(d_node));
+        assert_eq!(doc.borrow().dialog_return_value(d_node), "yes");
+        assert_eq!(
+            node_list_str(&mut probe.vm, "String(__d.matches(':modal'));"),
+            "true"
+        );
+        probe.vm.eval("__d.close('post');").unwrap();
+        assert_eq!(
+            node_list_str(&mut probe.vm, "__seen.join(';');"),
+            "close:yes;close:yes;close:post"
+        );
+        // A post-install double showModal still throws.
+        probe
+            .vm
+            .eval(
+                "try { __d.showModal(); __d.showModal(); globalThis.__postDbl = 'no-throw'; } \
+                 catch (e) { globalThis.__postDbl = String(e); }",
+            )
+            .unwrap();
+        assert!(
+            node_list_str(&mut probe.vm, "globalThis.__postDbl;").contains("InvalidStateError"),
+            "post-install double showModal must throw InvalidStateError"
+        );
+        remove_context(ContextId(ctx));
+    }
+
+    // w81fix (JS L5 / whole L7): a foreign-namespace element
+    // named `dialog` is not a dialog on the shim either — the
+    // old tag-only check let an SVG `dialog` through `showModal`
+    // / `close` / the `returnValue` setter. All three reject
+    // with `NotSupportedError`, and the element never adopts as
+    // modal in production.
+    #[test]
+    fn parse_shim_dialog_foreign_namespace_rejected() {
+        let (mut probe, doc, ctx) = captured_install(
+            b"<html><body><script>\
+              globalThis.__fo = document.createElementNS('http://www.w3.org/2000/svg', 'dialog');\
+              __fo.id = 'fo';\
+              document.body.appendChild(__fo);\
+              try { __fo.showModal(); globalThis.__show = 'no-throw'; }\
+              catch (e) { globalThis.__show = String(e); }\
+              try { __fo.close(); globalThis.__close = 'no-throw'; }\
+              catch (e) { globalThis.__close = String(e); }\
+              try { __fo.returnValue = 'x'; globalThis.__rv = 'no-throw'; }\
+              catch (e) { globalThis.__rv = String(e); }\
+              </script></body></html>",
+        );
+        for name in ["__show", "__close", "__rv"] {
+            assert!(
+                node_list_str(&mut probe.vm, &format!("globalThis.{name};"))
+                    .contains("NotSupportedError"),
+                "{name} must throw NotSupportedError for a foreign dialog"
+            );
+        }
+        let fo_node = doc.borrow().get_element_by_id("fo").expect("svg dialog#fo");
+        assert!(!doc.borrow().is_dialog_modal(fo_node));
+        assert!(!doc.borrow().is_in_top_layer(fo_node));
+        remove_context(ContextId(ctx));
+    }
+
+    // w81fix (JS L12): a close listener removed mid-dispatch by
+    // an earlier close listener must not run. The old snapshot
+    // ran every entry regardless of removal.
+    #[test]
+    fn parse_shim_dialog_close_listener_removed_mid_dispatch_does_not_run() {
+        let (mut probe, _doc, ctx) = captured_install(
+            b"<html><body><dialog id=\"d\">hi</dialog><script>\
+              globalThis.__d = document.getElementById('d');\
+              globalThis.__seen = [];\
+              function second() { __seen.push('second'); }\
+              function first() { __seen.push('first'); __d.removeEventListener('close', second); }\
+              __d.addEventListener('close', first);\
+              __d.addEventListener('close', second);\
+              __d.showModal();\
+              __d.close();\
+              </script></body></html>",
+        );
+        assert_eq!(
+            node_list_str(&mut probe.vm, "__seen.join(';');"),
+            "first"
+        );
+        remove_context(ContextId(ctx));
+    }
+
+    // w81fix R3 L3: a close listener removed and re-added with
+    // identical callback+capture mid-dispatch must NOT run in
+    // that dispatch (snapshot semantics: the re-add carries a
+    // fresh `seq`, so the snapshot entry is gone). The re-added
+    // registration does survive: with `first` removed, a second
+    // close runs `second`.
+    #[test]
+    fn parse_shim_dialog_close_listener_readded_mid_dispatch_does_not_run() {
+        let (mut probe, _doc, ctx) = captured_install(
+            b"<html><body><dialog id=\"d\">hi</dialog><script>\
+              globalThis.__d = document.getElementById('d');\
+              globalThis.__seen = [];\
+              function second() { __seen.push('second'); }\
+              function first() { __seen.push('first'); __d.removeEventListener('close', second); __d.addEventListener('close', second); }\
+              __d.addEventListener('close', first);\
+              __d.addEventListener('close', second);\
+              __d.showModal();\
+              __d.close();\
+              __d.removeEventListener('close', first);\
+              __d.showModal();\
+              __d.close();\
+              </script></body></html>",
+        );
+        assert_eq!(
+            node_list_str(&mut probe.vm, "__seen.join(';');"),
+            "first;second"
+        );
+        remove_context(ContextId(ctx));
+    }
+
+    // w81fix R3 M2: a dual `<dialog popover>` shown modal, then
+    // popover, must adopt as modal. `showPopover()` after
+    // `showModal()` now throws `InvalidStateError` (mirroring
+    // production `Document::show_popover`, which rejects any
+    // node already in the top layer), so the dual state in this
+    // test is reached through `togglePopover()`, which flips
+    // the unified entry to `Popover` while `dialog_modal` still
+    // contains the arena — exactly the loss window the
+    // kind-independent mark closes, in both the mid-parse style
+    // rebuild (`:modal` matching) and production adoption
+    // (top layer + modal flag + `:modal`). The reverse order
+    // (popover then modal) stays correct.
+    #[test]
+    fn parse_shim_dual_dialog_popover_modal_then_popover_adopts_modal() {
+        let (mut probe, doc, ctx) = captured_install(
+            b"<html><body><dialog id=\"d\" popover=\"manual\">hi</dialog><dialog id=\"e\" popover=\"manual\">hi</dialog><script>\
+              globalThis.__d = document.getElementById('d');\
+              globalThis.__e = document.getElementById('e');\
+              __d.showModal();\
+              try { __d.showPopover(); globalThis.__popErr = 'no-throw'; }\
+              catch (e) { globalThis.__popErr = String(e); }\
+              globalThis.__midModalAfterShow = String(__d.matches(':modal'));\
+              __d.togglePopover();\
+              globalThis.__midModal = String(__d.matches(':modal'));\
+              globalThis.__midPop = String(__d.matches(':popover-open'));\
+              __e.showPopover();\
+              __e.showModal();\
+              globalThis.__eMidModal = String(__e.matches(':modal'));\
+              globalThis.__eMidPop = String(__e.matches(':popover-open'));\
+              </script></body></html>",
+        );
+        assert!(
+            node_list_str(&mut probe.vm, "globalThis.__popErr;").contains("InvalidStateError"),
+            "showPopover after showModal must throw InvalidStateError, got: {}",
+            node_list_str(&mut probe.vm, "globalThis.__popErr;")
+        );
+        assert_eq!(
+            node_list_str(&mut probe.vm, "globalThis.__midModalAfterShow;"),
+            "true"
+        );
+        assert_eq!(
+            node_list_str(&mut probe.vm, "globalThis.__midModal;"),
+            "true"
+        );
+        assert_eq!(node_list_str(&mut probe.vm, "globalThis.__midPop;"), "true");
+        assert_eq!(
+            node_list_str(&mut probe.vm, "globalThis.__eMidModal;"),
+            "true"
+        );
+        assert_eq!(
+            node_list_str(&mut probe.vm, "globalThis.__eMidPop;"),
+            "true"
+        );
+        let d_node = doc.borrow().get_element_by_id("d").expect("dialog#d");
+        assert!(doc.borrow().is_dialog_modal(d_node));
+        assert!(doc.borrow().is_in_top_layer(d_node));
+        assert!(doc.borrow().is_popover_open(d_node));
+        let e_node = doc.borrow().get_element_by_id("e").expect("dialog#e");
+        assert!(doc.borrow().is_dialog_modal(e_node));
+        assert!(doc.borrow().is_in_top_layer(e_node));
+        assert!(doc.borrow().is_popover_open(e_node));
+        assert_eq!(
+            node_list_str(&mut probe.vm, "String(__d.matches(':modal'));"),
+            "true"
+        );
+        assert_eq!(
+            node_list_str(&mut probe.vm, "String(__e.matches(':modal'));"),
+            "true"
+        );
+        remove_context(ContextId(ctx));
+    }
+
     // w80fix (F-SHIM-TOPLAYER): show -> removeAttribute('popover')
     // -> setAttribute('popover', '') must NOT resurrect the open
     // state: removing the attribute hides the popover (production
@@ -46236,10 +48612,13 @@ mod tests {
         remove_context(ContextId(ctx));
     }
 
-    // w80fix (F-SHIM-TOPLAYER): coexisting manual popovers adopt
-    // in show order, not hash order. The shim set is unordered,
-    // so a single install can pass by chance; repeat installs and
-    // require show order every time.
+    // w80fix (F-SHIM-TOPLAYER): what this pins, and only this —
+    // two coexisting manual popovers adopt in show order (m1
+    // before m2) on each of 12 fresh installs. The shim set itself
+    // is unordered, so the repeats are what give the pin its
+    // weight; they bound, not eliminate, a false pass, and the test
+    // says nothing about the shim's internal ordering mechanism
+    // or about ordering for three or more popovers.
     #[test]
     fn parse_shim_popover_adoption_preserves_show_order() {
         for _ in 0..12 {
@@ -46266,6 +48645,50 @@ mod tests {
             remove_context(ContextId(ctx));
             drop(probe);
         }
+    }
+
+    // w81fix (JS M5): an interleaved dialog/popover show sequence
+    // must adopt in show order, not kind order. The old shape
+    // promoted all popovers first, then all modal dialogs, so
+    // dialog -> popover -> dialog -> popover rebuilt as
+    // popover, popover, dialog, dialog — inverting the middle
+    // pairs and picking the wrong topmost element for Escape /
+    // focus / paint. The unified show sequence preserves it.
+    #[test]
+    fn parse_shim_top_layer_adoption_preserves_interleaved_show_order() {
+        let (_probe, doc, ctx) = captured_install(
+            b"<html><body><dialog id=\"d1\">a</dialog><div id=\"p1\" popover=\"manual\"></div><dialog id=\"d2\">b</dialog><div id=\"p2\" popover=\"manual\"></div><script>\
+              globalThis.__d1 = document.getElementById('d1');\
+              globalThis.__p1 = document.getElementById('p1');\
+              globalThis.__d2 = document.getElementById('d2');\
+              globalThis.__p2 = document.getElementById('p2');\
+              __d1.showModal();\
+              __p1.showPopover();\
+              __d2.showModal();\
+              __p2.showPopover();\
+              </script></body></html>",
+        );
+        let order: Vec<String> = doc
+            .borrow()
+            .top_layer()
+            .iter()
+            .map(|&n| {
+                doc.borrow()
+                    .get_attribute(n, "id")
+                    .unwrap_or_default()
+                    .to_string()
+            })
+            .collect();
+        assert_eq!(
+            order,
+            vec![
+                "d1".to_string(),
+                "p1".to_string(),
+                "d2".to_string(),
+                "p2".to_string(),
+            ]
+        );
+        remove_context(ContextId(ctx));
     }
 
     #[test]
@@ -46454,6 +48877,132 @@ mod tests {
             Value::Bool(false)
         );
         assert_eq!(computed_prop(&mut fx, p2, "overlay"), "none");
+    }
+
+    // w81 phase 2: dialog production natives — show / showModal /
+    // close, `open` / `returnValue` accessors, UA display and
+    // position rules, and `:open` / `:modal` matching, mirroring
+    // the popover production test above.
+    fn rv_str(v: Value) -> String {
+        match v {
+            Value::Str(s) => s.as_wtf8().to_string(),
+            other => panic!("expected a string value, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn production_dialog_show_show_modal_close() {
+        let mut fx =
+            setup("<html><body><dialog id=\"d\">hi</dialog><div id=\"q\"></div></body></html>");
+        // Author `overlay: auto`, like the popover production
+        // test: it loses to the UA `!important` `none` rule for
+        // non-top-layer dialogs and wins for a modal dialog via
+        // the top-layer exemption.
+        let sheet = parse_stylesheet("dialog { overlay: auto; }");
+        fx.apis.borrow_mut().set_author_stylesheets(vec![sheet]);
+        let d = call_get_element_by_id(&mut fx, "d");
+        let q = call_get_element_by_id(&mut fx, "q");
+        let open_sel = str_val(&mut fx, ":open");
+        let modal_sel = str_val(&mut fx, ":modal");
+        // Closed: UA hidden rule; neither pseudo matches.
+        assert_eq!(computed_prop(&mut fx, d, "display"), "none");
+        assert_eq!(
+            n_matches(&mut fx.heap, d, &[open_sel]).unwrap(),
+            Value::Bool(false)
+        );
+        assert_eq!(
+            n_matches(&mut fx.heap, d, &[modal_sel]).unwrap(),
+            Value::Bool(false)
+        );
+        assert_eq!(
+            n_dialog_open_get(&mut fx.heap, d, &[]).unwrap(),
+            Value::Bool(false)
+        );
+        // Non-dialog receiver: NotSupportedError on every method.
+        match n_show_dialog(&mut fx.heap, q, &[]) {
+            Err(NativeError::TypeError(m)) => {
+                assert!(m.contains("NotSupportedError"), "div show message: {m}")
+            }
+            other => panic!("div show must throw NotSupportedError, got {other:?}"),
+        }
+        match n_show_dialog_modal(&mut fx.heap, q, &[]) {
+            Err(NativeError::TypeError(m)) => {
+                assert!(
+                    m.contains("NotSupportedError"),
+                    "div showModal message: {m}"
+                )
+            }
+            other => panic!("div showModal must throw NotSupportedError, got {other:?}"),
+        }
+        // show(): open, non-modal, not top-layer (overlay none),
+        // absolute and block via the UA `dialog[open]` rule: the
+        // rescoped UA rules give non-modal dialogs absolute
+        // positioning, with fixed reserved for modal dialogs.
+        n_show_dialog(&mut fx.heap, d, &[]).unwrap();
+        assert_eq!(
+            n_dialog_open_get(&mut fx.heap, d, &[]).unwrap(),
+            Value::Bool(true)
+        );
+        assert_eq!(computed_prop(&mut fx, d, "display"), "block");
+        assert_eq!(computed_prop(&mut fx, d, "position"), "absolute");
+        assert_eq!(computed_prop(&mut fx, d, "overlay"), "none");
+        assert_eq!(
+            n_matches(&mut fx.heap, d, &[open_sel]).unwrap(),
+            Value::Bool(true)
+        );
+        assert_eq!(
+            n_matches(&mut fx.heap, d, &[modal_sel]).unwrap(),
+            Value::Bool(false)
+        );
+        // Double-show throws InvalidStateError.
+        match n_show_dialog(&mut fx.heap, d, &[]) {
+            Err(NativeError::TypeError(m)) => {
+                assert!(m.contains("InvalidStateError"), "double-show message: {m}")
+            }
+            other => panic!("double-show must throw InvalidStateError, got {other:?}"),
+        }
+        // close('ok'): closed again, returnValue stored, `open`
+        // false, and closing again is a no-op that keeps it.
+        let ok_arg = str_val(&mut fx, "ok");
+        n_close_dialog(&mut fx.heap, d, &[ok_arg]).unwrap();
+        assert_eq!(
+            n_dialog_open_get(&mut fx.heap, d, &[]).unwrap(),
+            Value::Bool(false)
+        );
+        assert_eq!(computed_prop(&mut fx, d, "display"), "none");
+        let rv = n_dialog_return_value_get(&mut fx.heap, d, &[]).unwrap();
+        assert_eq!(rv_str(rv), "ok");
+        n_close_dialog(&mut fx.heap, d, &[]).unwrap();
+        let rv = n_dialog_return_value_get(&mut fx.heap, d, &[]).unwrap();
+        assert_eq!(rv_str(rv), "ok");
+        // showModal(): open, modal, top-layer (overlay auto).
+        n_show_dialog_modal(&mut fx.heap, d, &[]).unwrap();
+        assert_eq!(
+            n_matches(&mut fx.heap, d, &[modal_sel]).unwrap(),
+            Value::Bool(true)
+        );
+        assert_eq!(computed_prop(&mut fx, d, "overlay"), "auto");
+        // `open = false` closes without an event (no listener is
+        // registered here, so this only pins the state change);
+        // `returnValue =` stores without opening.
+        n_dialog_open_set(&mut fx.heap, d, &[Value::Bool(false)]).unwrap();
+        assert_eq!(
+            n_dialog_open_get(&mut fx.heap, d, &[]).unwrap(),
+            Value::Bool(false)
+        );
+        assert_eq!(
+            n_matches(&mut fx.heap, d, &[modal_sel]).unwrap(),
+            Value::Bool(false)
+        );
+        let preset_arg = str_val(&mut fx, "preset");
+        n_dialog_return_value_set(&mut fx.heap, d, &[preset_arg]).unwrap();
+        let rv = n_dialog_return_value_get(&mut fx.heap, d, &[]).unwrap();
+        assert_eq!(rv_str(rv), "preset");
+        assert_eq!(
+            n_dialog_open_get(&mut fx.heap, d, &[]).unwrap(),
+            Value::Bool(false)
+        );
+        remove_context(fx.ctx);
     }
 
     #[test]

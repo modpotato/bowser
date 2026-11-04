@@ -12634,6 +12634,275 @@ fn w80fix_multicol_unpromoted_block_parent_laid_out() {
     );
 }
 
+// w81f matrix: the laid-out multicol inline-block shape (120x50, second
+// child in column 2 at item x + 50 + 20 gap) pinned under each unpinned
+// parent shape. The w80 test covered the flex parent (promoted) and the
+// w80fix test the plain block parent (unpromoted); these tests close the
+// gap the w80 comment claimed to probe. Every shape below passes at
+// introduction with no layout change: the w79 joint gate plus the
+// intrinsic multicol arms already cover them, so these are pins, not
+// fixes. The finder is used because table/multicol parents insert
+// anonymous wrappers between the parent and the item, so direct child
+// indexing is not stable across shapes; the item is the only box with
+// exactly two 50-wide children, which identifies it in both the correct
+// layout and the stacked/kids-max failure modes.
+
+/// First box (preorder) with exactly two 50-wide children: the multicol
+/// item in the w81f fixtures, whatever wrapper boxes sit above it.
+fn w81f_find_item(b: &LayoutBox) -> Option<&LayoutBox> {
+    if b.children.len() == 2 && b.children.iter().all(|c| approx(c.rect.w, 50.0)) {
+        return Some(b);
+    }
+    b.children.iter().find_map(w81f_find_item)
+}
+
+const W81F_ITEM_CSS: &str = ".i { display: inline-block; column-count: 2; column-gap: 20px; } .a { width: 50px; height: 50px; } .b { width: 50px; height: 50px; }";
+const W81F_ITEM_HTML: &str = r#"<div class="i"><div class="a"></div><div class="b"></div></div>"#;
+
+/// The canonical laid-out shape: 120 wide (50 + 20 gap + 50), 50 tall,
+/// second child in column 2. A stacked fallback reads 50x100 with the
+/// second child at item x; a kids-max intrinsic failure reads 50 wide.
+fn w81f_assert_laid_out(item: &LayoutBox, label: &str) {
+    assert!(
+        approx(item.rect.w, 120.0),
+        "{label}: item w={} != 120",
+        item.rect.w
+    );
+    assert!(
+        approx(item.rect.h, 50.0),
+        "{label}: item h={} != 50 (stacked children would be 100)",
+        item.rect.h
+    );
+    assert!(
+        approx(item.children[0].rect.x, item.rect.x),
+        "{label}: first child x={} != item x={}",
+        item.children[0].rect.x,
+        item.rect.x
+    );
+    assert!(
+        approx(item.children[1].rect.x, item.rect.x + 70.0),
+        "{label}: second child x={} != item x + 70 (item x={})",
+        item.children[1].rect.x,
+        item.rect.x
+    );
+    assert!(
+        approx(item.children[1].rect.y, item.children[0].rect.y),
+        "{label}: second child y={} != first child y={} (must share the column row)",
+        item.children[1].rect.y,
+        item.children[0].rect.y
+    );
+}
+
+#[test]
+fn w81f_multicol_grid_parent_laid_out() {
+    // Grid parent, two subcases. (a) Stretched: a bare `display: grid`
+    // container is 800 wide with one auto track, so the item is
+    // blockified to `Block` and stretched to the full 800 grid area —
+    // 120x50 is NOT the correct expectation here, and asserting it
+    // would pin a grid bug, not a multicol one. Multicol still has
+    // to fire: with content width 800 the columns are 390 wide, so
+    // the second child sits at item x + 410; a gate failure would
+    // stack to 800x100 with the second child at item x. (b)
+    // `width: min-content`: the track sizes from the item's
+    // max-content intrinsic, which must go through the multicol
+    // arms (120, not the 50 kids-max), giving the canonical shape.
+    let l = layout_html(
+        &format!(r#"<div class="p">{W81F_ITEM_HTML}</div>"#),
+        &format!("body {{ margin: 0; }} .p {{ display: grid; }} {W81F_ITEM_CSS}"),
+    );
+    let item = w81f_find_item(&l).expect("grid-stretch: item not found");
+    assert_eq!(
+        item.box_type,
+        BoxType::Block,
+        "grid-stretch: item must be blockified as a grid item"
+    );
+    assert!(
+        approx(item.rect.w, 800.0),
+        "grid-stretch: item w={} != 800 (grid area)",
+        item.rect.w
+    );
+    assert!(
+        approx(item.rect.h, 50.0),
+        "grid-stretch: item h={} != 50 (stacked would be 100)",
+        item.rect.h
+    );
+    assert!(
+        approx(item.children[1].rect.x, item.rect.x + 410.0),
+        "grid-stretch: second child x={} != item x + 410 (390 column + 20 gap)",
+        item.children[1].rect.x
+    );
+    let l = layout_html(
+        &format!(r#"<div class="p">{W81F_ITEM_HTML}</div>"#),
+        &format!(
+            "body {{ margin: 0; }} .p {{ display: grid; width: min-content; }} {W81F_ITEM_CSS}"
+        ),
+    );
+    assert!(
+        approx(body(&l).children[0].rect.w, 120.0),
+        "grid-min-content: container w={} != 120",
+        body(&l).children[0].rect.w
+    );
+    let item = w81f_find_item(&l).expect("grid-min-content: item not found");
+    assert_eq!(
+        item.box_type,
+        BoxType::Block,
+        "grid-min-content: item must be blockified as a grid item"
+    );
+    w81f_assert_laid_out(item, "grid-min-content");
+}
+
+#[test]
+fn w81f_multicol_multicol_parent_laid_out() {
+    // Multicol parent: the item sits inline in the parent's first
+    // column (390 wide) and shrink-to-fits to its own multicol
+    // max-content (120). Unpromoted: no flex/grid promotion fires
+    // for an inline-block inside a multicol column, so this pins
+    // the gate's `InlineBlock` branch inside a multicol parent,
+    // distinct from the plain block parent of w80fix.
+    let l = layout_html(
+        &format!(r#"<div class="p">{W81F_ITEM_HTML}</div>"#),
+        &format!(
+            "body {{ margin: 0; }} .p {{ column-count: 2; column-gap: 20px; }} {W81F_ITEM_CSS}"
+        ),
+    );
+    let item = w81f_find_item(&l).expect("multicol-parent: item not found");
+    assert_eq!(
+        item.box_type,
+        BoxType::InlineBlock,
+        "multicol-parent: item must stay unpromoted"
+    );
+    w81f_assert_laid_out(item, "multicol-parent");
+}
+
+#[test]
+fn w81f_multicol_table_cell_parent_laid_out() {
+    // Table-cell parent: the cell sizes from the item's intrinsics
+    // (the multicol max-content arm, 120) and the item stays an
+    // unpromoted `InlineBlock` inside the cell.
+    let l = layout_html(
+        &format!(r#"<div class="t"><div class="p">{W81F_ITEM_HTML}</div></div>"#),
+        &format!(
+            "body {{ margin: 0; }} .t {{ display: table; }} .p {{ display: table-cell; }} {W81F_ITEM_CSS}"
+        ),
+    );
+    let item = w81f_find_item(&l).expect("table-cell: item not found");
+    assert_eq!(
+        item.box_type,
+        BoxType::InlineBlock,
+        "table-cell: item must stay unpromoted"
+    );
+    w81f_assert_laid_out(item, "table-cell");
+}
+
+#[test]
+fn w81f_multicol_float_parent_laid_out() {
+    // Float parent: the floated block shrink-to-fits around the
+    // item, so the float's intrinsic measurement must reach the
+    // multicol arms (120, not 50); the item itself stays unpromoted.
+    let l = layout_html(
+        &format!(r#"<div class="p">{W81F_ITEM_HTML}</div>"#),
+        &format!("body {{ margin: 0; }} .p {{ float: left; }} {W81F_ITEM_CSS}"),
+    );
+    assert!(
+        approx(body(&l).children[0].rect.w, 120.0),
+        "float: parent w={} != 120",
+        body(&l).children[0].rect.w
+    );
+    let item = w81f_find_item(&l).expect("float: item not found");
+    assert_eq!(
+        item.box_type,
+        BoxType::InlineBlock,
+        "float: item must stay unpromoted"
+    );
+    w81f_assert_laid_out(item, "float");
+}
+
+#[test]
+fn w81f_multicol_abspos_fixed_parent_laid_out() {
+    // Abspos/fixed parent: with auto width the out-of-flow parent
+    // shrink-to-fits (multicol intrinsic arms again), positioned
+    // at the given offsets; the item stays unpromoted in both.
+    for pos in ["absolute", "fixed"] {
+        let l = layout_html(
+            &format!(r#"<div class="p">{W81F_ITEM_HTML}</div>"#),
+            &format!(
+                "body {{ margin: 0; }} .p {{ position: {pos}; top: 0; left: 0; }} {W81F_ITEM_CSS}"
+            ),
+        );
+        assert!(
+            approx(body(&l).children[0].rect.w, 120.0),
+            "{pos}: parent w={} != 120",
+            body(&l).children[0].rect.w
+        );
+        let item = w81f_find_item(&l).unwrap_or_else(|| panic!("{pos}: item not found"));
+        assert_eq!(
+            item.box_type,
+            BoxType::InlineBlock,
+            "{pos}: item must stay unpromoted"
+        );
+        w81f_assert_laid_out(item, pos);
+    }
+}
+
+#[test]
+fn w81f_multicol_column_flex_parent_laid_out() {
+    // Column-flex parent: the item is a flex item, so it IS promoted
+    // to `Block` (already covered by the `Block` branch), but the
+    // cross-axis (width) sizing of a column flex container is the
+    // unpinned path: with `width: min-content`/`max-content` the
+    // container sizes from the item's flex-basis multicol size
+    // (`flex_basis_multicol_size`), not from a generic read-back.
+    // A failure there would size the container/item at 50 wide.
+    for kw in ["min-content", "max-content"] {
+        let l = layout_html(
+            &format!(r#"<div class="p">{W81F_ITEM_HTML}</div>"#),
+            &format!(
+                "body {{ margin: 0; }} .p {{ display: flex; flex-direction: column; width: {kw}; }} {W81F_ITEM_CSS}"
+            ),
+        );
+        assert!(
+            approx(body(&l).children[0].rect.w, 120.0),
+            "column-flex-{kw}: container w={} != 120",
+            body(&l).children[0].rect.w
+        );
+        let item = w81f_find_item(&l).unwrap_or_else(|| panic!("column-flex-{kw}: item not found"));
+        assert_eq!(
+            item.box_type,
+            BoxType::Block,
+            "column-flex-{kw}: item must be promoted as a flex item"
+        );
+        w81f_assert_laid_out(item, &format!("column-flex-{kw}"));
+    }
+}
+
+#[test]
+fn w81f_multicol_column2_after_split_laid_out() {
+    // Column-2-after-split placement: the parent multicol has
+    // height 100 and a 100px filler fills column 1, so the item
+    // fragments to column 2 at x = 390 + 20 = 410. Its own internal
+    // columns must still be 50 + 20 + 50 (second child at 480):
+    // this pins that the split placement hands the item its own
+    // multicol layout rather than a stacked fallback in column 2.
+    let l = layout_html(
+        &format!(r#"<div class="p"><div class="f"></div>{W81F_ITEM_HTML}</div>"#),
+        &format!(
+            "body {{ margin: 0; }} .p {{ column-count: 2; column-gap: 20px; height: 100px; }} .f {{ height: 100px; }} {W81F_ITEM_CSS}"
+        ),
+    );
+    let item = w81f_find_item(&l).expect("col2: item not found");
+    assert_eq!(
+        item.box_type,
+        BoxType::InlineBlock,
+        "col2: item must stay unpromoted"
+    );
+    assert!(
+        approx(item.rect.x, 410.0),
+        "col2: item x={} != 410 (column 2)",
+        item.rect.x
+    );
+    w81f_assert_laid_out(item, "col2");
+}
+
 #[test]
 fn w80fix_blockification_probe_replaced_table_cell_float_abspos() {
     // w80fix R2-F6, probe only (no code change): CSS 2.1 §9.7
@@ -12872,4 +13141,45 @@ fn replaced_table_caption_inputs_share_a_line_when_sized() {
         a.rect.y,
         b.rect.y
     );
+}
+
+#[test]
+fn replaced_table_inputs_stack_on_default_height() {
+    // w81fix: same geometry as `replaced_table_caption_inputs_share_a_
+    // line_when_sized`, but WITHOUT the explicit height — the WPT
+    // `table-model-fixup-2` `table` cases (input=text/button/file)
+    // set only a width and assert unequal tops. Before the fix the
+    // pair was two zero-height blocks sharing a top, so the unequal
+    // assertion failed; the intrinsic content height is now the
+    // computed line-height (FixedFontMetrics: 1.2 * 16px = 19.2px),
+    // so the second block's top is exactly one control height below
+    // the first's. No explicit height anywhere in this test.
+    for ty in ["text", "button", "file"] {
+        let html = format!(r#"<div class="wrap"><input type="{ty}"><input type="{ty}"></div>"#);
+        let l = layout_html(
+            &html,
+            ".wrap input { width: 100px; margin: 0; display: table; }",
+        );
+        let wrap = &body(&l).children[0];
+        assert_eq!(wrap.children.len(), 2, "two table {ty} inputs");
+        let (a, b) = (&wrap.children[0], &wrap.children[1]);
+        assert_eq!(a.box_type, BoxType::Block);
+        assert!(
+            a.rect.h > 0.0,
+            "{ty} input height must be nonzero, got {}",
+            a.rect.h
+        );
+        assert!(
+            approx(a.rect.h, 19.2),
+            "{ty} input height is its line-height: h={}",
+            a.rect.h
+        );
+        assert!(
+            approx(b.rect.y, a.rect.y + a.rect.h),
+            "{ty} table pair must stack: a.y={} b.y={} a.h={}",
+            a.rect.y,
+            b.rect.y,
+            a.rect.h
+        );
+    }
 }

@@ -13,18 +13,22 @@
 //!   pipeline, builds its display list, and prints the list's debug
 //!   representation to stdout.
 
+use std::collections::HashMap;
 use std::io::Write;
 use std::process::ExitCode;
+use std::rc::Rc;
 use std::sync::Mutex;
 use std::sync::mpsc::RecvTimeoutError;
 use std::time::{Duration, Instant};
 
 use bowser_app::{Browser, BrowserConfig, Tab};
 use bowser_css::ComputedStyle;
-use bowser_dom::Document;
+use bowser_dom::{Document, NodeId};
 use bowser_layout::{LayoutBox, Size};
 use bowser_paint::WgpuBackend;
-use bowser_paint::display_list::build_display_list;
+use bowser_paint::display_list::{
+    build_display_list_with_backdrop_styles, collect_backdrop_styles,
+};
 use bowser_paint::fonts::{FontCache, FontKey};
 
 /// Parsed command line.
@@ -373,6 +377,13 @@ fn render_headless_pixels(
     // scrolled (e.g. via `scrollIntoView`) screenshots at its live
     // scroll position, not the top of the document.
     let scroll = tab.scroll().offset();
+    // Author `::backdrop` styles for the production paint path,
+    // collected from the tab's author sheets over the top layer
+    // (see `bowser_paint::display_list::collect_backdrop_styles`):
+    // without them paint falls back to the UA modal dim and
+    // author backdrop rules never render.
+    let author_refs: Vec<&bowser_css::Stylesheet> = tab.render.author.iter().collect();
+    let backdrop_styles = collect_backdrop_styles(&document, &author_refs, viewport);
     Ok(render_layout_to_rgba_with_fonts(
         root,
         &document,
@@ -380,6 +391,7 @@ fn render_headless_pixels(
         &mut resolve_images,
         &mut fonts,
         scroll,
+        backdrop_styles,
     ))
 }
 
@@ -458,6 +470,7 @@ fn render_layout_to_rgba_with_fonts(
     )>,
     fonts: &mut FontCache,
     scroll: (f32, f32),
+    backdrop_styles: HashMap<NodeId, Rc<ComputedStyle>>,
 ) -> Vec<u8> {
     let Some((w, h)) = viewport_whole(viewport) else {
         return Vec::new();
@@ -466,12 +479,15 @@ fn render_layout_to_rgba_with_fonts(
         let display_list = {
             let mut resolve_fonts =
                 |style: &ComputedStyle| -> FontKey { bowser_app::font_key_for_style(fonts, style) };
-            build_display_list(
+            // Cloned, not moved: the adapter-vanished fallback below
+            // still needs the map.
+            build_display_list_with_backdrop_styles(
                 root,
                 doc,
                 &mut resolve_fonts,
                 &mut *image_resolver,
                 viewport,
+                backdrop_styles.clone(),
             )
         };
         if let Some(mut pixels) =
@@ -483,12 +499,13 @@ fn render_layout_to_rgba_with_fonts(
         // Adapter vanished between probe and render; fall through to the
         // CPU path below.
     }
-    bowser_paint::render::render_layout_to_rgba_with_scroll(
+    bowser_paint::render::render_layout_to_rgba_with_scroll_and_backdrop_styles(
         root,
         doc,
         viewport,
         image_resolver,
         scroll,
+        backdrop_styles,
     )
 }
 

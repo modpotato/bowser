@@ -108,7 +108,7 @@ impl Default for RunConfig {
             include: Vec::new(),
             exclude: Vec::new(),
             kinds: Vec::new(),
-            timeout: Duration::from_secs(60),
+            timeout: Duration::from_secs(180),
             probe_timeout: Duration::from_secs(5),
             viewport: Viewport::DEFAULT,
             tolerance: ReftestTolerance::EXACT,

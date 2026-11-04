@@ -1,4 +1,4 @@
-//! Image decoding: PNG, JPEG, and GIF to RGBA8.
+//! Image decoding: PNG, JPEG, GIF, and ICO to RGBA8.
 //!
 //! [`decode_image`] dispatches on magic bytes and always returns pixels as
 //! RGBA8, row-major, top-to-bottom.
@@ -18,6 +18,15 @@
 //!   Graphic Control Extension transparency, GIF-variant LZW, and 4-pass
 //!   deinterlacing. Only the first frame is decoded; animation support is
 //!   a future subsystem. Frames are clipped to the logical screen.
+//! - ICO: an ICO file (reserved 0, type 1) holding one or more image
+//!   entries. Each entry is either an embedded PNG (delegated to the
+//!   PNG decoder) or a BMP/DIB image (40-byte `BITMAPINFOHEADER`,
+//!   `BI_RGB` only): a palette for 1/4/8bpp, bottom-up XOR rows padded
+//!   to 4 bytes, and a 1bpp AND mask row set (bit 1 = transparent)
+//!   whose height is folded into the DIB height (so the DIB height is
+//!   twice the image height). The largest entry (by area, then bpp)
+//!   is decoded; a `.cur` file (type 2) is not an ICO and stays
+//!   [`ImageError::UnknownFormat`].
 //! - WebP: NOT supported ([`ImageError::UnknownFormat`]). Rationale:
 //!   lossless WebP (VP8L) needs Huffman + LZ77 + color-cache + spatial
 //!   transforms, and lossy WebP needs a full VP8 bitstream decoder (DCT,
@@ -125,9 +134,279 @@ pub fn decode_image(bytes: &[u8]) -> Result<DecodedImage, ImageError> {
         && (bytes[..6] == GIF_MAGIC_87A || bytes[..6] == GIF_MAGIC_89A)
     {
         decode_gif(bytes)
+    } else if is_ico(bytes) {
+        decode_ico(bytes)
     } else {
         Err(ImageError::UnknownFormat)
     }
+}
+
+/// An ICO header is reserved 0 plus type 1 (`.cur` is type 2 and is
+/// deliberately not matched: cursor hotspots are out of scope).
+fn is_ico(bytes: &[u8]) -> bool {
+    bytes.len() >= 6 && u16le(bytes, 0) == 0 && u16le(bytes, 2) == 1
+}
+
+fn u16le(bytes: &[u8], off: usize) -> u16 {
+    u16::from_le_bytes([bytes[off], bytes[off + 1]])
+}
+
+fn u32le(bytes: &[u8], off: usize) -> u32 {
+    u32::from_le_bytes([bytes[off], bytes[off + 1], bytes[off + 2], bytes[off + 3]])
+}
+
+fn i32le(bytes: &[u8], off: usize) -> i32 {
+    i32::from_le_bytes([bytes[off], bytes[off + 1], bytes[off + 2], bytes[off + 3]])
+}
+
+/// One ICO directory entry: dimensions (0 means 256), palette size
+/// hint, and the payload's location in the file.
+struct IcoEntry {
+    width: u32,
+    height: u32,
+    colors: u8,
+    bpp: u16,
+    size: usize,
+    offset: usize,
+}
+
+/// Decode an ICO file: try entries largest-first (by area, then bit
+/// depth, first on ties) and fall back to the next-best entry when
+/// the best entry is out of range or fails to decode, so one corrupt
+/// entry cannot hide a smaller valid one. Embedded PNG entries go to
+/// the PNG decoder; anything else must be a BMP/DIB image (see
+/// [`decode_ico_dib`]). Malformed headers, out-of-range entries, and
+/// unsupported DIB shapes are [`ImageError::DecodeFailed`], never a
+/// panic: every slice is bounds-checked before it is read.
+fn decode_ico(bytes: &[u8]) -> Result<DecodedImage, ImageError> {
+    let fail = |msg: &str| ImageError::DecodeFailed(msg.into());
+    if bytes.len() < 6 {
+        return Err(fail("ICO header truncated"));
+    }
+    let count = u16le(bytes, 4) as usize;
+    if count == 0
+        || 6usize
+            .checked_add(count.checked_mul(16).ok_or(fail("ICO count overflow"))?)
+            .filter(|&end| end <= bytes.len())
+            .is_none()
+    {
+        return Err(fail("ICO directory truncated"));
+    }
+    let mut entries: Vec<IcoEntry> = Vec::with_capacity(count);
+    for i in 0..count {
+        let off = 6 + i * 16;
+        let width = if bytes[off] == 0 {
+            256
+        } else {
+            bytes[off] as u32
+        };
+        let height = if bytes[off + 1] == 0 {
+            256
+        } else {
+            bytes[off + 1] as u32
+        };
+        // ICONDIRENTRY: width +0, height +1, colors +2, reserved +3,
+        // planes +4-5, bit count +6-7, size +8-11, offset +12-15.
+        // (Reading bit count from +10 — the high half of the size
+        // field — yields 0 for every entry under 64 KiB.)
+        entries.push(IcoEntry {
+            width,
+            height,
+            colors: bytes[off + 2],
+            bpp: u16le(bytes, off + 6),
+            size: u32le(bytes, off + 8) as usize,
+            offset: u32le(bytes, off + 12) as usize,
+        });
+    }
+    // Largest-first; the sort is stable, so ties keep directory
+    // order (first on ties, as before).
+    entries.sort_by(|a, b| {
+        (b.width as u64 * b.height as u64, b.bpp).cmp(&(a.width as u64 * a.height as u64, a.bpp))
+    });
+    let mut first_err: Option<ImageError> = None;
+    for entry in &entries {
+        let payload = match entry
+            .offset
+            .checked_add(entry.size)
+            .filter(|&end| end <= bytes.len())
+            .and_then(|end| bytes.get(entry.offset..end))
+        {
+            Some(payload) => payload,
+            None => {
+                if first_err.is_none() {
+                    first_err = Some(fail("ICO entry out of range"));
+                }
+                continue;
+            }
+        };
+        let result = if payload.len() >= PNG_SIGNATURE.len() && payload[..8] == PNG_SIGNATURE {
+            decode_png(payload)
+        } else {
+            decode_ico_dib(payload, entry)
+        };
+        match result {
+            Ok(img) => return Ok(img),
+            Err(err) => {
+                if first_err.is_none() {
+                    first_err = Some(err);
+                }
+            }
+        }
+    }
+    Err(first_err.unwrap_or_else(|| fail("ICO has no entries")))
+}
+
+/// Decode one BMP/DIB ICO payload to RGBA8. The DIB height is twice
+/// the image height (XOR bitmap plus AND mask); a negative DIB height
+/// means top-down XOR rows instead of the usual bottom-up order.
+/// Palette entries are BGRA (the reserved byte is ignored); 24bpp
+/// pixels are BGR, 32bpp pixels BGRA. The AND mask is 1bpp, MSB
+/// first, rows padded to 4 bytes, bit 1 forcing full transparency.
+/// A 32bpp image whose alpha channel is entirely zero is treated as
+/// opaque (mask bits excepted): that is how alpha-less 32bpp ICOs
+/// are written, and trusting the zero bytes would paint nothing.
+fn decode_ico_dib(payload: &[u8], entry: &IcoEntry) -> Result<DecodedImage, ImageError> {
+    let fail = |msg: &str| ImageError::DecodeFailed(msg.into());
+    if payload.len() < 40 || u32le(payload, 0) != 40 {
+        return Err(fail("ICO DIB header is not BITMAPINFOHEADER"));
+    }
+    let dib_width = i32le(payload, 4);
+    let dib_height_raw = i32le(payload, 8);
+    let bpp = u16le(payload, 14);
+    let compression = u32le(payload, 16);
+    if compression != 0 {
+        return Err(fail("ICO DIB compression is not BI_RGB"));
+    }
+    if !matches!(bpp, 1 | 4 | 8 | 24 | 32) {
+        return Err(fail("ICO DIB bit depth unsupported"));
+    }
+    let (width, height) = (entry.width, entry.height);
+    if dib_width != width as i32 || dib_height_raw.unsigned_abs() != 2 * height {
+        return Err(fail("ICO DIB dimensions disagree with the directory entry"));
+    }
+    if width > MAX_IMAGE_DIMENSION || height > MAX_IMAGE_DIMENSION {
+        return Err(ImageError::TooLarge);
+    }
+    let rgba_len = (width as usize)
+        .checked_mul(height as usize)
+        .and_then(|n| n.checked_mul(4))
+        .filter(|&n| n <= PNG_MAX_OUTPUT_BYTES)
+        .ok_or(ImageError::TooLarge)?;
+    // Palette: the DIB's explicit color count wins, else the
+    // directory entry's count, else 2^bpp for paletted depths.
+    let palette_count = if bpp <= 8 {
+        let declared = u32le(payload, 32);
+        let count = if declared != 0 {
+            declared as usize
+        } else if entry.colors != 0 {
+            entry.colors as usize
+        } else {
+            1usize << bpp
+        };
+        count.min(payload.len().saturating_sub(40) / 4)
+    } else {
+        0
+    };
+    if bpp <= 8 && palette_count == 0 {
+        return Err(fail("ICO DIB palette is empty"));
+    }
+    let palette = &payload[40..40 + palette_count * 4];
+    let row_bytes = |bits: usize| -> Option<usize> {
+        ((width as usize).checked_mul(bits)?.checked_add(31)? / 32).checked_mul(4)
+    };
+    let xor_row = row_bytes(bpp as usize).ok_or(fail("ICO XOR row size overflow"))?;
+    let xor_len = xor_row
+        .checked_mul(height as usize)
+        .ok_or(fail("ICO XOR size overflow"))?;
+    let mask_row = row_bytes(1).ok_or(fail("ICO mask row size overflow"))?;
+    let mask_len = mask_row
+        .checked_mul(height as usize)
+        .ok_or(fail("ICO mask size overflow"))?;
+    let xor_start = 40 + palette_count * 4;
+    let xor = payload
+        .get(
+            xor_start
+                ..xor_start
+                    .checked_add(xor_len)
+                    .ok_or(fail("ICO XOR overflow"))?,
+        )
+        .ok_or(fail("ICO XOR data truncated"))?;
+    let mask_start = xor_start + xor_len;
+    let mask = payload
+        .get(
+            mask_start
+                ..mask_start
+                    .checked_add(mask_len)
+                    .ok_or(fail("ICO mask overflow"))?,
+        )
+        .ok_or(fail("ICO mask data truncated"))?;
+    let top_down = dib_height_raw < 0;
+    let mut rgba = vec![0u8; rgba_len];
+    let mut has_alpha = false;
+    // Checked palette lookup: a short palette with an out-of-range
+    // index is corrupt input, not a panic (see `decode_image`).
+    let pal = |idx: usize| -> Result<(u8, u8, u8), ImageError> {
+        let p = palette
+            .get(idx * 4..idx * 4 + 4)
+            .ok_or(fail("ICO DIB palette index out of range"))?;
+        Ok((p[2], p[1], p[0]))
+    };
+    for y in 0..height as usize {
+        let src_row = if top_down { y } else { height as usize - 1 - y };
+        let xor_row_bytes = &xor[src_row * xor_row..(src_row + 1) * xor_row];
+        let mask_row_bytes = &mask[src_row * mask_row..(src_row + 1) * mask_row];
+        for x in 0..width as usize {
+            let (r, g, b, a) = match bpp {
+                1 => {
+                    let idx = (xor_row_bytes[x / 8] >> (7 - (x % 8))) & 1;
+                    let (r, g, b) = pal(idx as usize)?;
+                    (r, g, b, 255)
+                }
+                4 => {
+                    let byte = xor_row_bytes[x / 2];
+                    let idx = if x % 2 == 0 { byte >> 4 } else { byte & 0x0F };
+                    let (r, g, b) = pal(idx as usize)?;
+                    (r, g, b, 255)
+                }
+                8 => {
+                    let (r, g, b) = pal(xor_row_bytes[x] as usize)?;
+                    (r, g, b, 255)
+                }
+                24 => {
+                    let p = &xor_row_bytes[x * 3..x * 3 + 3];
+                    (p[2], p[1], p[0], 255)
+                }
+                _ => {
+                    let p = &xor_row_bytes[x * 4..x * 4 + 4];
+                    if p[3] != 0 {
+                        has_alpha = true;
+                    }
+                    (p[2], p[1], p[0], p[3])
+                }
+            };
+            let transparent = (mask_row_bytes[x / 8] >> (7 - (x % 8))) & 1 == 1;
+            let out = &mut rgba[(y * width as usize + x) * 4..][..4];
+            out[0] = r;
+            out[1] = g;
+            out[2] = b;
+            out[3] = if transparent { 0 } else { a };
+        }
+    }
+    if bpp == 32 && !has_alpha {
+        // Alpha-less 32bpp: every alpha byte was zero, so opaque
+        // pixels were decoded as transparent. Restore opacity
+        // wherever the AND mask did not already force transparency.
+        for y in 0..height as usize {
+            let src_row = if top_down { y } else { height as usize - 1 - y };
+            let mask_row_bytes = &mask[src_row * mask_row..(src_row + 1) * mask_row];
+            for x in 0..width as usize {
+                if (mask_row_bytes[x / 8] >> (7 - (x % 8))) & 1 == 0 {
+                    rgba[(y * width as usize + x) * 4 + 3] = 255;
+                }
+            }
+        }
+    }
+    Ok(DecodedImage::from_rgba(width, height, rgba))
 }
 
 fn decode_failed<E: std::fmt::Display>(e: E) -> ImageError {
@@ -1468,6 +1747,213 @@ mod tests {
                 255, 255, 255, 255, 0, 0, 255, 255, 0, 255, 0, 255, 255, 0, 0, 255,
             ]
         );
+    }
+
+    // ICO decoding against the real WPT support fixture
+    // (`css/support/blue32x32.ico`, copied to `tests/fixtures/`):
+    // a 32x32, 2-color, 1bpp BMP/DIB entry whose XOR bits are all
+    // palette index 0 (BGRA `FF 00 00 00` = blue) and whose AND mask
+    // is all zero (opaque). Every pixel must come out blue and
+    // opaque — intrinsics alone would pass layout and leave paint
+    // blank, so the pixels themselves are pinned.
+    #[test]
+    fn ico_bmp_dib_fixture_decodes_exact_pixels() {
+        let img = decode_image(include_bytes!("../tests/fixtures/blue32x32.ico"));
+        let img = img.expect("decode blue32x32.ico");
+        assert_eq!((img.width, img.height), (32, 32));
+        assert_eq!(img.rgba.len(), 32 * 32 * 4);
+        let (pixels, remainder) = img.rgba.as_chunks::<4>();
+        assert!(remainder.is_empty(), "RGBA length must be a multiple of 4");
+        assert!(
+            pixels.iter().all(|p| *p == [0, 0, 255, 255]),
+            "expected all-blue opaque pixels"
+        );
+    }
+
+    #[test]
+    fn ico_png_entry_delegates_to_png_decoder() {
+        let png = make_png(
+            2,
+            1,
+            png::ColorType::Rgba,
+            png::BitDepth::Eight,
+            &[255, 0, 0, 255, 0, 255, 0, 255],
+            false,
+        );
+        let mut ico = Vec::new();
+        ico.extend_from_slice(&0u16.to_le_bytes()); // reserved
+        ico.extend_from_slice(&1u16.to_le_bytes()); // type: ICO
+        ico.extend_from_slice(&1u16.to_le_bytes()); // count
+        ico.push(2); // width
+        ico.push(1); // height
+        ico.push(0); // colors
+        ico.push(0); // reserved
+        ico.extend_from_slice(&1u16.to_le_bytes()); // planes
+        ico.extend_from_slice(&32u16.to_le_bytes()); // bpp
+        ico.extend_from_slice(&(png.len() as u32).to_le_bytes());
+        ico.extend_from_slice(&22u32.to_le_bytes()); // payload offset
+        ico.extend_from_slice(&png);
+        let img = decode_image(&ico).expect("decode PNG-entry ICO");
+        assert_eq!((img.width, img.height), (2, 1));
+        assert_eq!(img.rgba, vec![255, 0, 0, 255, 0, 255, 0, 255]);
+    }
+
+    /// Same-dimension entries must resolve by directory bit depth:
+    /// the 32bpp entry wins over the 8bpp entry even though it is
+    /// listed second. This pins the ICONDIRENTRY bit-count offset
+    /// (+6): reading it from +10 (the high half of the size field)
+    /// yields 0 for both entries under 64 KiB, so the first entry
+    /// would win on the tie instead.
+    #[test]
+    fn ico_same_dimensions_higher_bpp_entry_wins() {
+        let blue = make_png(
+            2,
+            1,
+            png::ColorType::Rgba,
+            png::BitDepth::Eight,
+            &[0, 0, 255, 255, 0, 0, 255, 255],
+            false,
+        );
+        let red = make_png(
+            2,
+            1,
+            png::ColorType::Rgba,
+            png::BitDepth::Eight,
+            &[255, 0, 0, 255, 255, 0, 0, 255],
+            false,
+        );
+        let mut ico = Vec::new();
+        ico.extend_from_slice(&0u16.to_le_bytes()); // reserved
+        ico.extend_from_slice(&1u16.to_le_bytes()); // type: ICO
+        ico.extend_from_slice(&2u16.to_le_bytes()); // count
+        let push_entry = |ico: &mut Vec<u8>, bpp: u16, size: usize, offset: usize| {
+            ico.push(2); // width
+            ico.push(1); // height
+            ico.push(0); // colors
+            ico.push(0); // reserved
+            ico.extend_from_slice(&1u16.to_le_bytes()); // planes
+            ico.extend_from_slice(&bpp.to_le_bytes()); // bit count (+6)
+            ico.extend_from_slice(&(size as u32).to_le_bytes());
+            ico.extend_from_slice(&(offset as u32).to_le_bytes());
+        };
+        let first_offset = 6 + 2 * 16;
+        push_entry(&mut ico, 8, blue.len(), first_offset);
+        push_entry(&mut ico, 32, red.len(), first_offset + blue.len());
+        ico.extend_from_slice(&blue);
+        ico.extend_from_slice(&red);
+        let img = decode_image(&ico).expect("decode multi-entry ICO");
+        assert_eq!((img.width, img.height), (2, 1));
+        assert_eq!(
+            img.rgba,
+            vec![255, 0, 0, 255, 255, 0, 0, 255],
+            "the 32bpp entry must win over the same-size 8bpp entry"
+        );
+    }
+
+    /// A corrupt or out-of-range largest entry must not hide a
+    /// smaller valid entry: decoding falls back to the next-best
+    /// entry, and only fails when every entry fails.
+    #[test]
+    fn ico_corrupt_largest_entry_falls_back_to_smaller_valid_entry() {
+        let blue = make_png(
+            2,
+            1,
+            png::ColorType::Rgba,
+            png::BitDepth::Eight,
+            &[0, 0, 255, 255, 0, 0, 255, 255],
+            false,
+        );
+        // Build a 2-entry ICO: first the (larger, corrupt) entry,
+        // then the (smaller, valid) PNG entry.
+        let build = |largest: &[u8], largest_size: usize, largest_offset: usize| -> Vec<u8> {
+            let mut ico = Vec::new();
+            ico.extend_from_slice(&0u16.to_le_bytes());
+            ico.extend_from_slice(&1u16.to_le_bytes());
+            ico.extend_from_slice(&2u16.to_le_bytes());
+            let first_offset = 6 + 2 * 16;
+            let push_entry =
+                |ico: &mut Vec<u8>, w: u8, h: u8, bpp: u16, size: usize, offset: usize| {
+                    ico.push(w);
+                    ico.push(h);
+                    ico.push(0);
+                    ico.push(0);
+                    ico.extend_from_slice(&1u16.to_le_bytes());
+                    ico.extend_from_slice(&bpp.to_le_bytes());
+                    ico.extend_from_slice(&(size as u32).to_le_bytes());
+                    ico.extend_from_slice(&(offset as u32).to_le_bytes());
+                };
+            push_entry(&mut ico, 4, 4, 32, largest_size, largest_offset);
+            push_entry(&mut ico, 2, 1, 32, blue.len(), first_offset + largest.len());
+            ico.extend_from_slice(largest);
+            ico.extend_from_slice(&blue);
+            ico
+        };
+        // Case 1: largest payload is garbage (not PNG, not a DIB).
+        let garbage = b"garbage!!".to_vec();
+        let ico = build(&garbage, garbage.len(), 6 + 2 * 16);
+        let img = decode_image(&ico).expect("fallback must decode the smaller valid entry");
+        assert_eq!((img.width, img.height), (2, 1));
+        assert_eq!(img.rgba, vec![0, 0, 255, 255, 0, 0, 255, 255]);
+        // Case 2: largest entry's range lies past the end of the file.
+        let ico = build(&[], 100, 6 + 2 * 16);
+        let img = decode_image(&ico).expect("out-of-range largest must fall back");
+        assert_eq!((img.width, img.height), (2, 1));
+        // Case 3: every entry corrupt still fails (no silent success).
+        let mut only_garbage = Vec::new();
+        only_garbage.extend_from_slice(&0u16.to_le_bytes());
+        only_garbage.extend_from_slice(&1u16.to_le_bytes());
+        only_garbage.extend_from_slice(&1u16.to_le_bytes());
+        only_garbage.push(4);
+        only_garbage.push(4);
+        only_garbage.push(0);
+        only_garbage.push(0);
+        only_garbage.extend_from_slice(&1u16.to_le_bytes());
+        only_garbage.extend_from_slice(&32u16.to_le_bytes());
+        only_garbage.extend_from_slice(&(garbage.len() as u32).to_le_bytes());
+        only_garbage.extend_from_slice(&22u32.to_le_bytes());
+        only_garbage.extend_from_slice(&garbage);
+        assert!(
+            matches!(
+                decode_image(&only_garbage),
+                Err(ImageError::DecodeFailed(_))
+            ),
+            "all-corrupt ICO must still fail"
+        );
+    }
+
+    #[test]
+    fn ico_malformed_inputs_fail_cleanly() {
+        // A `.cur` header (type 2) is not an ICO at all.
+        match decode_image(&[0, 0, 2, 0, 1, 0]) {
+            Err(ImageError::UnknownFormat) => {}
+            other => panic!("expected UnknownFormat for CUR, got {other:?}"),
+        }
+        // Truncated payload: the directory promises 304 bytes that
+        // are not there.
+        let full = include_bytes!("../tests/fixtures/blue32x32.ico");
+        match decode_image(&full[..100]) {
+            Err(ImageError::DecodeFailed(_)) => {}
+            other => panic!("expected DecodeFailed for truncated ICO, got {other:?}"),
+        }
+        // A palette index past the end of a short palette: with the
+        // entry's color count cut to 1, the XOR data starts at file
+        // offset 22 (payload) + 40 (header) + 4 (one palette entry)
+        // = 66, and setting its top bit selects palette index 1,
+        // which no longer exists.
+        let mut short = full.to_vec();
+        short[6 + 2] = 1; // directory entry: 1 color
+        short[66] = 0x80; // first XOR byte: pixel (0, 0) -> index 1
+        match decode_image(&short) {
+            Err(ImageError::DecodeFailed(_)) => {}
+            other => panic!("expected DecodeFailed for short palette, got {other:?}"),
+        }
+        // A DIB width disagreeing with the directory entry.
+        let mut wide = full.to_vec();
+        wide[22 + 4..22 + 8].copy_from_slice(&16i32.to_le_bytes());
+        match decode_image(&wide) {
+            Err(ImageError::DecodeFailed(_)) => {}
+            other => panic!("expected DecodeFailed for mismatched DIB, got {other:?}"),
+        }
     }
 
     #[test]
