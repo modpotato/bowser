@@ -131,30 +131,27 @@
 //! animation of `rotate` or `animation-duration`. Wiring either
 //! property into those lists is a separate bindings change.
 //!
-//! Proof caveat (w81-B, read before citing any harness score):
+//! `!important` precedence (w84, CSS Cascade 5): animations sit
+//! below all `!important` origins, so [`apply_animations`] never
+//! overwrites a property whose cascade winner is `!important` —
+//! the caller passes those names in `blocked`, taken from the
+//! cascade before transitions run (transitions legitimately
+//! outrank `!important` and are unaffected). The plain-`<div>`
+//! case is the UA rule itself: `* { overlay: none !important }`
+//! wins the cascade, so a WAAPI-animated plain `<div>` reads
+//! `none` at every progress, and
 //! `css/css-position/overlay/animation/overlay-interpolation.html`
-//! compares each actual target against an *expected* target whose
-//! inline `overlay` is also collapsed to `none` by the UA
-//! `* { overlay: none !important }` rule for plain `<div>`s, so
-//! the expected value the harness reads is `none` no matter what
-//! the test's expectation string says. Before this change both
-//! sides read `none` and the whole file passed vacuously
-//! (including its CSS Animations method, where `@keyframes` rules
-//! are parse-and-skipped and no CSS animation engine exists at
-//! all — see `parse.rs`). After this change a WAAPI-animated
-//! plain `<div>` genuinely reads its animated value (e.g.
-//! `none -> auto` at eased progress `> 0` reads `auto`), which
-//! *diverges* from the harness's UA-collapsed expected `none`
-//! on the auto-expecting subtests. That divergence is the proof
-//! the values are real, not a regression in the engine: the
-//! harness's expected-value derivation is itself broken for
-//! `overlay` on non-top-layer elements. A distinguishable proof
-//! must therefore assert the animated value directly (animated
-//! `auto` against an unanimated control reading `none`), not
-//! the harness's expected-target comparison.
+//! passes 88/88 because its expected targets read the same
+//! UA-collapsed `none`. (Its CSS Animations method still passes
+//! vacuously: `@keyframes` rules are parse-and-skipped and no CSS
+//! animation engine exists at all — see `parse.rs`.) A top-layer
+//! element is the mirror case: the UA `none` rule is exempted
+//! there, so an author-normal `overlay` winner is unblocked and
+//! animates, while a top-layer popover's UA `auto !important`
+//! winner stays blocked at `auto`.
 
 use std::cell::{Cell, RefCell};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::time::{Duration, Instant};
 
 use crate::transition::{Timing, eval_timing, parse_timing};
@@ -1711,6 +1708,155 @@ const ANIMATED_SHORTHAND_PROPS: &[&str] = &[
     "transition",
 ];
 
+/// w84fix: expand a `!important`-blocked set across the
+/// logical-to-physical fold, in both directions. `cascade`'s
+/// `important_properties` reports the winning longhand's own name
+/// and does not apply the fold, so a `margin-inline-start: 0
+/// !important` winner leaves `blocked = {margin-inline-start}`
+/// while the computed-props map carries the folded value under
+/// `margin-left`: a keyframe on `margin-left` would read that
+/// folded value as its base and overwrite it, defeating the
+/// `!important` winner through its physical alias (CSS Cascade 5:
+/// animations sit below all `!important` origins). The reverse
+/// holds too: a physical `!important` winner governs the side the
+/// logical longhand folds into, so a keyframe on the logical name
+/// is blocked as well. The mapping mirrors
+/// `cascade::apply_logical_mapping`'s side table (same
+/// writing-mode/direction resolution, read from the props map
+/// itself — production maps carry every computed property, so
+/// `writing-mode`/`direction` are present; absent keys default to
+/// horizontal-tb/ltr). Size pairs (`inline-size`/`block-size` vs
+/// `width`/`height`) and flow-relative overflow pairs
+/// (`overflow-inline`/`overflow-block` vs `overflow-x`/`overflow-y`)
+/// fold the same way and expand too.
+fn expand_blocked_across_logical_fold(
+    blocked: &HashSet<String>,
+    props: &HashMap<String, String>,
+) -> HashSet<String> {
+    let mut out: HashSet<String> = blocked.clone();
+    if blocked.is_empty() {
+        return out;
+    }
+    let wm = props
+        .get("writing-mode")
+        .map(|s| s.as_str())
+        .unwrap_or("horizontal-tb");
+    let vertical_rl = wm.eq_ignore_ascii_case("vertical-rl");
+    let vertical = vertical_rl || wm.eq_ignore_ascii_case("vertical-lr");
+    let rtl = props
+        .get("direction")
+        .map(|s| s.eq_ignore_ascii_case("rtl"))
+        .unwrap_or(false);
+    // Physical side index for (inline axis?, start?) — the same
+    // table as `cascade::logical_side_idx`: 0=top, 1=right,
+    // 2=bottom, 3=left.
+    let side_idx = |inline_axis: bool, start: bool| -> usize {
+        match (vertical, vertical_rl, rtl, inline_axis, start) {
+            (false, _, false, true, true) => 3,
+            (false, _, false, true, false) => 1,
+            (false, _, true, true, true) => 1,
+            (false, _, true, true, false) => 3,
+            (false, _, _, false, true) => 0,
+            (false, _, _, false, false) => 2,
+            (true, _, false, true, true) => 0,
+            (true, _, false, true, false) => 2,
+            (true, _, true, true, true) => 2,
+            (true, _, true, true, false) => 0,
+            (true, true, _, false, true) => 1,
+            (true, true, _, false, false) => 3,
+            (true, false, _, false, true) => 3,
+            (true, false, _, false, false) => 1,
+        }
+    };
+    const SIDES: [&str; 4] = ["top", "right", "bottom", "left"];
+    // (logical name, physical name) pairs for every side group.
+    let mut pairs: Vec<(String, String)> = Vec::new();
+    let side_groups: &[(&str, [&str; 4])] = &[
+        (
+            "margin",
+            ["margin-top", "margin-right", "margin-bottom", "margin-left"],
+        ),
+        (
+            "padding",
+            [
+                "padding-top",
+                "padding-right",
+                "padding-bottom",
+                "padding-left",
+            ],
+        ),
+        (
+            "scroll-margin",
+            [
+                "scroll-margin-top",
+                "scroll-margin-right",
+                "scroll-margin-bottom",
+                "scroll-margin-left",
+            ],
+        ),
+        (
+            "scroll-padding",
+            [
+                "scroll-padding-top",
+                "scroll-padding-right",
+                "scroll-padding-bottom",
+                "scroll-padding-left",
+            ],
+        ),
+        ("inset", ["top", "right", "bottom", "left"]),
+    ];
+    for (prefix, physical) in side_groups {
+        for (axis, inline_axis) in [("inline", true), ("block", false)] {
+            for (end, start) in [("start", true), ("end", false)] {
+                pairs.push((
+                    format!("{prefix}-{axis}-{end}"),
+                    physical[side_idx(inline_axis, start)].to_string(),
+                ));
+            }
+        }
+    }
+    for part in ["width", "style", "color"] {
+        for (axis, inline_axis) in [("inline", true), ("block", false)] {
+            for (end, start) in [("start", true), ("end", false)] {
+                pairs.push((
+                    format!("border-{axis}-{end}-{part}"),
+                    format!("border-{}-{part}", SIDES[side_idx(inline_axis, start)]),
+                ));
+            }
+        }
+    }
+    // Size and overflow pairs fold by axis, not by side.
+    let (inline_size_phys, block_size_phys) = if vertical {
+        ("height", "width")
+    } else {
+        ("width", "height")
+    };
+    pairs.push(("inline-size".to_string(), inline_size_phys.to_string()));
+    pairs.push(("block-size".to_string(), block_size_phys.to_string()));
+    let (inline_overflow_phys, block_overflow_phys) = if vertical {
+        ("overflow-y", "overflow-x")
+    } else {
+        ("overflow-x", "overflow-y")
+    };
+    pairs.push((
+        "overflow-inline".to_string(),
+        inline_overflow_phys.to_string(),
+    ));
+    pairs.push((
+        "overflow-block".to_string(),
+        block_overflow_phys.to_string(),
+    ));
+    for (logical, physical) in &pairs {
+        if blocked.contains(logical) {
+            out.insert(physical.clone());
+        }
+        if blocked.contains(physical) {
+            out.insert(logical.clone());
+        }
+    }
+    out
+}
+
 /// Apply animated values over a computed-props map, in place.
 ///
 /// W81-B: fills in the worker-A placeholder. For each animation
@@ -1730,13 +1876,24 @@ const ANIMATED_SHORTHAND_PROPS: &[&str] = &[
 /// already present in `props` are written: the production surface
 /// exposes every map entry as a named property on the computed
 /// style object, so inventing a slot for an unknown keyframe name
-/// would leak it there. The write happens on the props map after
-/// the cascade, so it overrides even a UA `!important` cascaded
-/// value — which is exactly why a plain `<div>` animated
-/// `none -> auto` reads `auto` here while the same div with
-/// inline `overlay: auto` and no animation still reads `none`
-/// (see the module header's proof note).
-pub fn apply_animations(key: &str, props: &mut HashMap<String, String>) {
+/// would leak it there. `blocked` is the set of property names
+/// whose cascade winner is `!important` (CSS Cascade 5: animations
+/// sit below all `!important` origins), captured by the caller
+/// from the cascade BEFORE `apply_transitions` runs; a blocked
+/// keyframed property keeps its cascaded value at every progress.
+/// The set is expanded across the logical-to-physical fold on entry
+/// (see `expand_blocked_across_logical_fold`), so blocking a logical
+/// longhand also blocks its physical alias and vice versa.
+/// A plain `<div>` animated `none -> auto` therefore still reads
+/// `none` (the UA `* { overlay: none !important }` winner blocks
+/// it), while the same div with inline `overlay: auto` and no
+/// animation also reads `none` (see the module header's note).
+pub fn apply_animations(key: &str, props: &mut HashMap<String, String>, blocked: &HashSet<String>) {
+    // w84fix: a blocked logical longhand also blocks its physical
+    // alias (and vice versa) — see
+    // `expand_blocked_across_logical_fold`.
+    let blocked = expand_blocked_across_logical_fold(blocked, props);
+    let blocked = &blocked;
     let now = Instant::now();
     for state in animations_for_target(key) {
         if !state.applies_at(now) {
@@ -1760,6 +1917,13 @@ pub fn apply_animations(key: &str, props: &mut HashMap<String, String>) {
             }
         }
         for prop in keyframed {
+            // w84: a `!important` cascade winner outranks the
+            // animation origin entirely — skip before reading the
+            // base value, so no segment (discrete or numeric) can
+            // overwrite it at any progress.
+            if blocked.contains(prop) {
+                continue;
+            }
             // Shorthands are skipped, not expanded (see
             // `ANIMATED_SHORTHAND_PROPS`); the underlying value
             // below is read BEFORE this animation's overwrite,
@@ -1967,6 +2131,9 @@ mod tests {
 
     /// Drive one animation to a paused hold time and read back
     /// the overlay `apply_animations` writes over `cascaded`.
+    /// Passes an empty blocked set: pure segment coverage, no
+    /// `!important` winner in play (see the w84 blocked tests
+    /// below for the blocked half).
     fn animated_overlay(
         key: &str,
         keyframes: Vec<Keyframe>,
@@ -1977,7 +2144,7 @@ mod tests {
         assert!(pause(id));
         assert!(set_current_time(id, Some(hold_ms)));
         let mut props = HashMap::from([("overlay".to_string(), "none".to_string())]);
-        apply_animations(key, &mut props);
+        apply_animations(key, &mut props, &HashSet::new());
         props["overlay"].clone()
     }
 
@@ -2147,7 +2314,7 @@ mod tests {
         );
         assert!(cancel(id));
         let mut props = HashMap::from([("overlay".to_string(), "none".to_string())]);
-        apply_animations(key, &mut props);
+        apply_animations(key, &mut props, &HashSet::new());
         assert_eq!(props["overlay"], "none");
     }
 
@@ -2185,7 +2352,7 @@ mod tests {
         assert!(pause(second));
         assert!(set_current_time(second, Some(50_000.0)));
         let mut props = HashMap::from([("overlay".to_string(), "none".to_string())]);
-        apply_animations(key, &mut props);
+        apply_animations(key, &mut props, &HashSet::new());
         assert_eq!(props["overlay"], "auto");
         // Omitted offsets distribute: no-offset keyframes are
         // 0 and 1, so the same flip applies.
@@ -2207,6 +2374,367 @@ mod tests {
             animated_overlay(key, vec![kf(None, "auto")], waapi_opts("linear"), 50_000.0),
             "auto"
         );
+    }
+
+    /// Blocked variant of `animated_overlay`: `blocked` names the
+    /// `!important`-won properties, `cascaded` is the pre-animation
+    /// value (the UA-collapsed `none` for a plain `<div>`, `auto`
+    /// for a top-layer element).
+    fn animated_overlay_blocked(
+        key: &str,
+        keyframes: Vec<Keyframe>,
+        options: AnimationOptions,
+        hold_ms: f64,
+        blocked: &[&str],
+        cascaded: &str,
+    ) -> String {
+        let id = create_animation(key.to_string(), keyframes, options);
+        assert!(pause(id));
+        assert!(set_current_time(id, Some(hold_ms)));
+        let mut props = HashMap::from([("overlay".to_string(), cascaded.to_string())]);
+        let blocked: HashSet<String> = blocked.iter().map(|p| p.to_string()).collect();
+        apply_animations(key, &mut props, &blocked);
+        props["overlay"].clone()
+    }
+
+    /// Blocked variant of `animated_value` (defined below): same
+    /// drive, with an explicit blocked set.
+    fn animated_value_blocked(
+        key: &str,
+        keyframes: Vec<Keyframe>,
+        options: AnimationOptions,
+        hold_ms: f64,
+        prop: &str,
+        cascaded: &str,
+        blocked: &[&str],
+    ) -> String {
+        animated_value_blocked_with(
+            key,
+            keyframes,
+            options,
+            hold_ms,
+            prop,
+            cascaded,
+            blocked,
+            &[],
+        )
+    }
+
+    /// `animated_value_blocked` plus extra props entries (e.g.
+    /// `writing-mode` / `direction`, which the fold expansion
+    /// reads to resolve logical longhands). Test-only mirror of
+    /// the 7-arg helper above, plus the extra-entries slice.
+    #[allow(clippy::too_many_arguments)]
+    fn animated_value_blocked_with(
+        key: &str,
+        keyframes: Vec<Keyframe>,
+        options: AnimationOptions,
+        hold_ms: f64,
+        prop: &str,
+        cascaded: &str,
+        blocked: &[&str],
+        extra: &[(&str, &str)],
+    ) -> String {
+        let id = create_animation(key.to_string(), keyframes, options);
+        assert!(pause(id));
+        assert!(set_current_time(id, Some(hold_ms)));
+        let mut props = HashMap::from([(prop.to_string(), cascaded.to_string())]);
+        for (k, v) in extra {
+            props.insert(k.to_string(), v.to_string());
+        }
+        let blocked: HashSet<String> = blocked.iter().map(|p| p.to_string()).collect();
+        apply_animations(key, &mut props, &blocked);
+        props[prop].clone()
+    }
+
+    #[test]
+    fn blocked_important_overlay_stays_none_at_all_wpt_progress_points() {
+        // w84: mirrors the 13 failing subtests of
+        // overlay-interpolation.html (see the css-position.ini
+        // block): a plain `<div>` whose `overlay` winner is the UA
+        // `none !important` rule must read `none` at every
+        // progress, whichever direction the keyframes run.
+        // Progress is hold_ms / 100_000 with `waapi_opts`
+        // (linear, fill forwards).
+        let cases: &[(&str, &str, &str, f64)] = &[
+            // (from, to, key suffix, progress)
+            ("auto", "none", "an-neg", -1.0),
+            ("auto", "none", "an-0", 0.0),
+            ("auto", "none", "an-01", 0.1),
+            ("auto", "none", "an-09", 0.9),
+            ("none", "auto", "na-01", 0.1),
+            ("none", "auto", "na-09", 0.9),
+            ("none", "auto", "na-1", 1.0),
+            ("none", "auto", "na-15", 1.5),
+            ("auto", "auto", "aa-neg", -1.0),
+            ("auto", "auto", "aa-0", 0.0),
+            ("auto", "auto", "aa-05", 0.5),
+            ("auto", "auto", "aa-1", 1.0),
+            ("auto", "auto", "aa-15", 1.5),
+        ];
+        assert_eq!(cases.len(), 13);
+        for (from, to, suffix, progress) in cases {
+            let key = format!("w84:blocked-{suffix}");
+            let got = animated_overlay_blocked(
+                &key,
+                vec![kf(Some(0.0), from), kf(Some(1.0), to)],
+                waapi_opts("linear"),
+                progress * 100_000.0,
+                &["overlay"],
+                "none",
+            );
+            assert_eq!(
+                got, "none",
+                "blocked overlay at progress {progress} ({from}->{to})"
+            );
+        }
+    }
+
+    #[test]
+    fn unblocked_author_normal_overlay_still_animates() {
+        // The mirror of the blocked case: no `!important` winner
+        // (e.g. a top-layer element whose UA `none` rule is
+        // exempted, author-normal `auto` winning) animates freely.
+        // auto->none flips only at t >= 1 (asymmetric discrete
+        // rule, kept untouched), so drive to the end of the
+        // interval; none->auto flips at t > 0, so mid-interval
+        // suffices there.
+        let key = "w84:unblocked-an";
+        assert_eq!(
+            animated_overlay_blocked(
+                key,
+                vec![kf(Some(0.0), "auto"), kf(Some(1.0), "none")],
+                waapi_opts("linear"),
+                100_000.0,
+                &[],
+                "auto",
+            ),
+            "none"
+        );
+        let key = "w84:unblocked-na";
+        assert_eq!(
+            animated_overlay_blocked(
+                key,
+                vec![kf(Some(0.0), "none"), kf(Some(1.0), "auto")],
+                waapi_opts("linear"),
+                50_000.0,
+                &[],
+                "auto",
+            ),
+            "auto"
+        );
+        // w84fix: controls for the out-of-range progress points
+        // the blocked test covers (-1.0, 1.5) and for auto->auto.
+        // The blocked test's block is unconditional, so on its own
+        // it cannot distinguish "blocked at every progress" from
+        // "the engine never applies there"; these unblocked cases
+        // prove the engine does evaluate there, and differ from the
+        // blocked `none` at every one of them: auto->none still
+        // reads its from-value before the interval, none->auto
+        // holds its end value past it (fill forwards), and
+        // auto->auto reads `auto` at both ends.
+        let cases: &[(&str, &str, &str, f64, &str)] = &[
+            ("auto", "none", "an-neg", -1.0, "auto"),
+            ("none", "auto", "na-15", 1.5, "auto"),
+            ("auto", "auto", "aa-neg", -1.0, "auto"),
+            ("auto", "auto", "aa-15", 1.5, "auto"),
+        ];
+        for (from, to, suffix, progress, expected) in cases {
+            let key = format!("w84fix:unblocked-{suffix}");
+            assert_eq!(
+                animated_overlay_blocked(
+                    &key,
+                    vec![kf(Some(0.0), from), kf(Some(1.0), to)],
+                    waapi_opts("linear"),
+                    progress * 100_000.0,
+                    &[],
+                    "auto",
+                ),
+                *expected,
+                "unblocked overlay at progress {progress} ({from}->{to})"
+            );
+        }
+    }
+
+    #[test]
+    fn blocked_logical_longhand_blocks_physical_keyframe_and_reverse() {
+        // w84fix: the logical-to-physical fold bypass. A
+        // `margin-inline-start !important` winner blocks a keyframe
+        // on the physical alias it folds into (horizontal-tb, ltr:
+        // `margin-left`), and a physical winner blocks a keyframe on
+        // the logical name — in both cases the animated value must
+        // not overwrite the folded cascaded value (CSS Cascade 5).
+        // Each blocked case has an unblocked control proving the
+        // engine would otherwise move the value.
+        let kfs = |prop: &str| {
+            vec![
+                kf_prop(Some(0.0), prop, "0px"),
+                kf_prop(Some(1.0), prop, "100px"),
+            ]
+        };
+        // Logical blocked, physical keyframed (ltr default).
+        let key = "w84fix:blocked-logical-physical";
+        assert_eq!(
+            animated_value_blocked(
+                key,
+                kfs("margin-left"),
+                waapi_opts("linear"),
+                50_000.0,
+                "margin-left",
+                "0px",
+                &["margin-inline-start"],
+            ),
+            "0px"
+        );
+        let key = "w84fix:unblocked-logical-physical";
+        assert_eq!(
+            animated_value_blocked(
+                key,
+                kfs("margin-left"),
+                waapi_opts("linear"),
+                50_000.0,
+                "margin-left",
+                "0px",
+                &[],
+            ),
+            "50px"
+        );
+        // Reverse: physical blocked, logical keyframed.
+        let key = "w84fix:blocked-physical-logical";
+        assert_eq!(
+            animated_value_blocked(
+                key,
+                kfs("margin-inline-start"),
+                waapi_opts("linear"),
+                50_000.0,
+                "margin-inline-start",
+                "0px",
+                &["margin-left"],
+            ),
+            "0px"
+        );
+        // Direction-sensitive, not blanket: under rtl the
+        // inline-start alias is `margin-right`, so `margin-left`
+        // still animates while `margin-right` stays blocked.
+        let key = "w84fix:blocked-logical-rtl-right";
+        assert_eq!(
+            animated_value_blocked_with(
+                key,
+                kfs("margin-right"),
+                waapi_opts("linear"),
+                50_000.0,
+                "margin-right",
+                "0px",
+                &["margin-inline-start"],
+                &[("direction", "rtl")],
+            ),
+            "0px"
+        );
+        let key = "w84fix:unblocked-logical-rtl-left";
+        assert_eq!(
+            animated_value_blocked_with(
+                key,
+                kfs("margin-left"),
+                waapi_opts("linear"),
+                50_000.0,
+                "margin-left",
+                "0px",
+                &["margin-inline-start"],
+                &[("direction", "rtl")],
+            ),
+            "50px"
+        );
+        // Size fold: `inline-size` blocks `width` in horizontal
+        // modes and `height` in vertical ones.
+        let key = "w84fix:blocked-inline-size-width";
+        assert_eq!(
+            animated_value_blocked(
+                key,
+                kfs("width"),
+                waapi_opts("linear"),
+                50_000.0,
+                "width",
+                "0px",
+                &["inline-size"],
+            ),
+            "0px"
+        );
+        let key = "w84fix:blocked-inline-size-height-vertical";
+        assert_eq!(
+            animated_value_blocked_with(
+                key,
+                kfs("height"),
+                waapi_opts("linear"),
+                50_000.0,
+                "height",
+                "0px",
+                &["inline-size"],
+                &[("writing-mode", "vertical-rl")],
+            ),
+            "0px"
+        );
+    }
+
+    #[test]
+    fn blocked_important_numeric_property_stays_cascaded() {
+        // The block is general, not overlay-only: an author
+        // `width: 50px !important` winner is not interpolated.
+        let key = "w84:blocked-width";
+        assert_eq!(
+            animated_value_blocked(
+                key,
+                vec![
+                    kf_prop(Some(0.0), "width", "0px"),
+                    kf_prop(Some(1.0), "width", "200px"),
+                ],
+                waapi_opts("linear"),
+                50_000.0,
+                "width",
+                "50px",
+                &["width"],
+            ),
+            "50px"
+        );
+        // Control: the same animation unblocked interpolates.
+        let key = "w84:unblocked-width";
+        assert_eq!(
+            animated_value_blocked(
+                key,
+                vec![
+                    kf_prop(Some(0.0), "width", "0px"),
+                    kf_prop(Some(1.0), "width", "200px"),
+                ],
+                waapi_opts("linear"),
+                50_000.0,
+                "width",
+                "50px",
+                &[],
+            ),
+            "100px"
+        );
+    }
+
+    #[test]
+    fn top_layer_ua_auto_overlay_stays_auto_under_animation() {
+        // Popover (`:popover-open` UA `auto !important`) and modal
+        // dialog (`dialog:modal` UA `auto !important`) winners are
+        // `!important` too, so an animation towards `none` cannot
+        // pull a shown top-layer element out of the top layer.
+        for suffix in ["popover", "modal"] {
+            let key = format!("w84:top-layer-{suffix}");
+            assert_eq!(
+                animated_overlay_blocked(
+                    &key,
+                    vec![kf(Some(0.0), "auto"), kf(Some(1.0), "none")],
+                    waapi_opts("linear"),
+                    50_000.0,
+                    &["overlay"],
+                    "auto",
+                ),
+                "auto",
+                "top-layer {suffix} overlay must stay auto"
+            );
+        }
     }
 
     fn kf_prop(offset: Option<f64>, prop: &str, value: &str) -> Keyframe {
@@ -2233,7 +2761,7 @@ mod tests {
         assert!(pause(id));
         assert!(set_current_time(id, Some(hold_ms)));
         let mut props = HashMap::from([(prop.to_string(), cascaded.to_string())]);
-        apply_animations(key, &mut props);
+        apply_animations(key, &mut props, &HashSet::new());
         props[prop].clone()
     }
 
@@ -2994,7 +3522,7 @@ mod tests {
             ("background".to_string(), "yellow".to_string()),
             ("background-color".to_string(), "rgb(0, 0, 0)".to_string()),
         ]);
-        apply_animations(key, &mut props);
+        apply_animations(key, &mut props, &HashSet::new());
         assert_eq!(props["background"], "yellow");
         assert_eq!(props["background-color"], "rgb(128, 128, 128)");
     }

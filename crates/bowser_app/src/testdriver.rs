@@ -4298,6 +4298,613 @@ mod tests {
         );
     }
     #[test]
+    fn w84_request_close_modal_cancel_close_prevented_and_non_modal() {
+        // C3, through real JS: `requestClose(rv)` fires a trusted
+        // cancel then a trusted close and applies `rv`; a
+        // prevented cancel keeps the dialog open with `rv`
+        // untouched; an omitted argument keeps the stored value;
+        // a closed dialog is a no-op with no events; a
+        // non-dialog receiver throws NotSupportedError; and a
+        // non-modal dialog (show(), not showModal()) fires
+        // cancel and closes too (WHATWG HTML §4.11.4: show()
+        // sets a close watcher, requestClose() enables it).
+        let (mut tab, out, dlg, _a) = dialog_tab();
+        let mut driver = TestDriver::new();
+        driver.set_focus(&mut tab, Some(out));
+        eval(
+            &mut tab,
+            "var d = document.getElementById('dlg'); \
+             window.__log = []; window.__prevent = false; \
+             d.addEventListener('cancel', function(e) { \
+               __log.push('cancel:' + e.isTrusted + ':' + e.cancelable); \
+               if (__prevent) e.preventDefault(); }); \
+             d.addEventListener('close', function(e) { \
+               __log.push('close:' + e.isTrusted + ':' + e.cancelable); }); \
+             d.showModal(); d.requestClose('ok');",
+        );
+        assert!(
+            !tab.document_ref().expect("document").is_dialog_open(dlg),
+            "unprevented requestClose must close the modal dialog"
+        );
+        assert!(
+            js_true(
+                &mut tab,
+                "__log.join(';') === 'cancel:true:true;close:true:false'"
+            ),
+            "cancel (cancelable, trusted) must precede close (non-cancelable, trusted)"
+        );
+        assert!(
+            js_true(&mut tab, "d.returnValue === 'ok'"),
+            "requestClose('ok') must apply its argument"
+        );
+        // Prevented cancel: stays open, returnValue untouched,
+        // no close event.
+        eval(
+            &mut tab,
+            "d.showModal(); __prevent = true; d.requestClose('nope');",
+        );
+        assert!(
+            tab.document_ref().expect("document").is_dialog_open(dlg),
+            "prevented requestClose must keep the dialog open"
+        );
+        assert!(
+            js_true(
+                &mut tab,
+                "__log.length === 3 && __log[2] === 'cancel:true:true'"
+            ),
+            "prevented requestClose fires cancel only"
+        );
+        assert!(
+            js_true(&mut tab, "d.returnValue === 'ok'"),
+            "prevented requestClose must leave returnValue untouched"
+        );
+        // Unprevented, omitted argument: closes, stored value kept.
+        eval(&mut tab, "__prevent = false; d.requestClose();");
+        assert!(
+            !tab.document_ref().expect("document").is_dialog_open(dlg),
+            "second requestClose must close"
+        );
+        assert!(
+            js_true(&mut tab, "d.returnValue === 'ok'"),
+            "omitted requestClose argument must keep the stored value"
+        );
+        // Closed dialog: no-op, no events.
+        eval(&mut tab, "d.requestClose('late');");
+        assert!(
+            js_true(&mut tab, "__log.length === 5"),
+            "requestClose on a closed dialog must fire nothing"
+        );
+        assert!(
+            js_true(&mut tab, "d.returnValue === 'ok'"),
+            "closed-dialog requestClose must not apply its argument"
+        );
+        // Non-dialog receiver throws a `TypeError` naming
+        // `NotSupportedError` (engine idiom: no `DOMException`
+        // type) — asserted as error identity (`instanceof` +
+        // `name` + message), not a bare substring of the
+        // stringified error.
+        eval(
+            &mut tab,
+            "window.__nd = false; try { document.querySelector('button').requestClose(); } \
+             catch (e) { window.__nd = (e instanceof TypeError) && e.name === 'TypeError' && \
+               String(e.message).indexOf('NotSupportedError') !== -1; }",
+        );
+        assert!(
+            js_true(&mut tab, "__nd === true"),
+            "requestClose on a non-dialog must throw a TypeError naming NotSupportedError"
+        );
+        // Non-modal dialog: cancel then close, value applied.
+        eval(&mut tab, "d.show(); d.requestClose('nm');");
+        assert!(
+            !tab.document_ref().expect("document").is_dialog_open(dlg),
+            "requestClose must close a non-modal dialog too"
+        );
+        assert!(
+            js_true(&mut tab, "d.returnValue === 'nm'"),
+            "non-modal requestClose must apply its argument"
+        );
+        assert!(
+            js_true(
+                &mut tab,
+                "__log.slice(-2).join(';') === 'cancel:true:true;close:true:false'"
+            ),
+            "non-modal requestClose must fire cancel then close"
+        );
+        // returnValue matrix (w84fix): `null` stringifies to
+        // `"null"`, `""` clears the stored value (DOMString
+        // conversion, like `close()`).
+        eval(&mut tab, "d.showModal(); d.requestClose(null);");
+        assert!(
+            !tab.document_ref().expect("document").is_dialog_open(dlg),
+            "requestClose(null) must close"
+        );
+        assert!(
+            js_true(&mut tab, "d.returnValue === 'null'"),
+            "requestClose(null) must apply the string \"null\""
+        );
+        eval(&mut tab, "d.showModal(); d.requestClose('');");
+        assert!(
+            !tab.document_ref().expect("document").is_dialog_open(dlg),
+            "requestClose('') must close"
+        );
+        assert!(
+            js_true(&mut tab, "d.returnValue === ''"),
+            "requestClose('') must clear the stored value"
+        );
+        // A `{passive:true}` cancel listener cannot prevent the
+        // close: its `preventDefault` is a no-op, like Escape's.
+        eval(
+            &mut tab,
+            "d.addEventListener('cancel', function(e) { e.preventDefault(); }, {passive:true}); \
+             d.showModal(); d.requestClose('pv');",
+        );
+        assert!(
+            !tab.document_ref().expect("document").is_dialog_open(dlg),
+            "a passive cancel listener must not prevent requestClose"
+        );
+        assert!(
+            js_true(&mut tab, "d.returnValue === 'pv'"),
+            "passive-cancel requestClose must apply its argument"
+        );
+        // A bare-`open` dialog (markup / attribute open, never
+        // shown via `show()` / `showModal()`) fires cancel then
+        // close: under the current spec the dialog setup steps
+        // (including close-watcher establishment) run when the
+        // `open` attribute is added for a connected dialog, so
+        // w84's stale "bare open has no close watcher" note is
+        // corrected, not carried forward.
+        eval(
+            &mut tab,
+            "d.setAttribute('open', ''); d.requestClose('bare');",
+        );
+        assert!(
+            !tab.document_ref().expect("document").is_dialog_open(dlg),
+            "bare-open requestClose must close"
+        );
+        assert!(
+            js_true(&mut tab, "d.returnValue === 'bare'"),
+            "bare-open requestClose must apply its argument"
+        );
+        assert!(
+            js_true(
+                &mut tab,
+                "__log.slice(-2).join(';') === 'cancel:true:true;close:true:false'"
+            ),
+            "bare-open requestClose must fire cancel then close"
+        );
+    }
+
+    #[test]
+    fn w84_request_close_cancel_listener_reentrancy_two_cases() {
+        // w84fix (dialog #2): the cancel listener's own close
+        // splits two ways, and the comment on
+        // `n_request_close_dialog` used to conflate them.
+        // (a) cancel closes without reopening: exactly one
+        // `close` event, with the listener's value, and the
+        // requestClose argument is discarded. (b) cancel closes
+        // AND re-opens: a second `close` event fires, with the
+        // requestClose argument applied — the open state is not
+        // snapshotted at cancel time.
+        let (mut tab, _out, dlg, _a) = dialog_tab();
+        eval(
+            &mut tab,
+            "var d = document.getElementById('dlg'); window.__closes = 0; window.__mode = 'close'; \
+             d.addEventListener('cancel', function() { \
+               if (__mode === 'close') { d.close('from-cancel'); } \
+               else if (__mode === 'reopen') { d.close('tmp'); d.showModal(); } }); \
+             d.addEventListener('close', function() { __closes += 1; }); \
+             d.showModal(); d.requestClose('arg');",
+        );
+        assert!(
+            !tab.document_ref().expect("document").is_dialog_open(dlg),
+            "cancel-close case must end closed"
+        );
+        assert!(
+            js_true(&mut tab, "__closes === 1"),
+            "cancel-close must fire exactly one close event"
+        );
+        assert!(
+            js_true(&mut tab, "d.returnValue === 'from-cancel'"),
+            "cancel-close must keep the listener's value, discarding the requestClose argument"
+        );
+        eval(
+            &mut tab,
+            "__mode = 'reopen'; d.showModal(); d.requestClose('arg2');",
+        );
+        assert!(
+            !tab.document_ref().expect("document").is_dialog_open(dlg),
+            "cancel close-then-reopen case must end closed"
+        );
+        assert!(
+            js_true(&mut tab, "__closes === 3"),
+            "cancel close-then-reopen must fire a second close event (listener close plus requestClose close)"
+        );
+        assert!(
+            js_true(&mut tab, "d.returnValue === 'arg2'"),
+            "cancel close-then-reopen must apply the requestClose argument on the second close"
+        );
+    }
+
+    #[test]
+    fn w84_request_close_disconnected_dialog_is_noop() {
+        // w84fix (whole-diff #2): per the spec's request-to-close
+        // step 2, a dialog removed while open (`open` survives
+        // removal) answers `requestClose` silently — no `cancel`,
+        // no `close`, argument untouched.
+        let (mut tab, _out, dlg, _a) = dialog_tab();
+        eval(
+            &mut tab,
+            "var d = document.getElementById('dlg'); window.__log = []; \
+             d.addEventListener('cancel', function() { __log.push('cancel'); }); \
+             d.addEventListener('close', function() { __log.push('close'); }); \
+             d.showModal(); document.body.removeChild(d); d.requestClose('late');",
+        );
+        assert!(
+            js_true(&mut tab, "__log.length === 0"),
+            "requestClose on a disconnected dialog must fire nothing"
+        );
+        assert!(
+            tab.document_ref().expect("document").is_dialog_open(dlg),
+            "disconnected requestClose must leave the open attribute in place"
+        );
+        assert!(
+            js_true(&mut tab, "d.returnValue === ''"),
+            "disconnected requestClose must not apply its argument"
+        );
+    }
+
+    #[test]
+    fn w84_request_close_inline_oncancel_is_not_served() {
+        // w84fix (dialog #3), KNOWN DIVERGENCE pinned, not
+        // hidden: JS `requestClose` dispatches `cancel` through
+        // the JS-native dispatch core, which serves only
+        // `addEventListener` listeners — an inline `oncancel`
+        // attribute (`return false`) does NOT gate the close,
+        // so the dialog closes. The windowed Escape path serves
+        // the same attribute through the host dispatch
+        // (`dispatch_cancel` in `script.rs`), so Escape on the
+        // same dialog keeps it open. Routing the JS cancel
+        // through the host dispatch would need a
+        // bindings-to-window channel that does not exist; until
+        // it does, this test pins the split.
+        let (mut tab, _out, dlg, _a) = dialog_tab();
+        let mut driver = TestDriver::new();
+        eval(
+            &mut tab,
+            "var d = document.getElementById('dlg'); \
+             d.setAttribute('oncancel', 'return false'); d.showModal(); d.requestClose('x');",
+        );
+        assert!(
+            !tab.document_ref().expect("document").is_dialog_open(dlg),
+            "JS requestClose must close despite inline oncancel returning false (pinned limitation)"
+        );
+        assert!(
+            js_true(&mut tab, "d.returnValue === 'x'"),
+            "JS requestClose must apply its argument despite inline oncancel"
+        );
+        eval(&mut tab, "d.showModal();");
+        assert!(
+            driver.execute_escape(&mut tab),
+            "Escape must find the modal dialog dismissible"
+        );
+        assert!(
+            tab.document_ref().expect("document").is_dialog_open(dlg),
+            "Escape must keep the dialog open when inline oncancel returns false"
+        );
+    }
+
+    #[test]
+    fn w84_reclose_inside_close_listener_is_noop_and_reshow_sees_closed() {
+        // C2: a `close` listener that calls `close()` again
+        // must not fire a second `close` event, and must observe
+        // the dialog already closed; re-showing afterwards works.
+        let (mut tab, _out, dlg, _a) = dialog_tab();
+        eval(
+            &mut tab,
+            "var d = document.getElementById('dlg'); \
+             window.__closes = 0; window.__openInClose = null; \
+             d.addEventListener('close', function() { \
+               __closes += 1; __openInClose = d.open; d.close(); }); \
+             d.showModal(); d.close();",
+        );
+        assert!(
+            js_true(&mut tab, "__closes === 1 && __openInClose === false"),
+            "re-close inside a close listener must be a no-op and see closed state"
+        );
+        assert!(
+            !tab.document_ref().expect("document").is_dialog_open(dlg),
+            "dialog must stay closed after the listener re-close"
+        );
+        eval(&mut tab, "d.showModal();");
+        assert!(
+            tab.document_ref().expect("document").is_dialog_open(dlg),
+            "re-show after a listener re-close must reopen"
+        );
+        eval(&mut tab, "d.close();");
+        assert!(
+            js_true(&mut tab, "__closes === 2"),
+            "a second real close must fire close again"
+        );
+    }
+
+    #[test]
+    fn w84_request_close_restores_focus_at_sync_and_prevented_keeps_it() {
+        // Focus parity with JS close(): an unprevented
+        // requestClose restores the previous focus at the next
+        // sync; a prevented one leaves focus inside the dialog.
+        let (mut tab, out, _dlg, a) = dialog_tab();
+        let mut driver = TestDriver::new();
+        driver.set_focus(&mut tab, Some(out));
+        eval(
+            &mut tab,
+            "var d = document.getElementById('dlg'); \
+             d.addEventListener('cancel', function(e) { if (window.__prevent) e.preventDefault(); }); \
+             window.__prevent = false; d.showModal();",
+        );
+        driver.sync_modal_focus(&mut tab);
+        assert_eq!(driver.actions.focused, Some(a));
+        eval(&mut tab, "d.requestClose();");
+        // w84fix pin, mirroring the window-level
+        // `js_close_listener_observes_pre_restore_focus_then_sync_restores`:
+        // the `close` listener ran synchronously inside the
+        // eval above, but focus has not moved yet — the
+        // executor mirror still points inside the dialog, i.e.
+        // pre-restore focus is what a close listener observes.
+        assert_eq!(
+            driver.actions.focused,
+            Some(a),
+            "focus must still be inside the dialog after the requestClose eval and before the sync"
+        );
+        driver.sync_modal_focus(&mut tab);
+        assert_eq!(
+            driver.actions.focused,
+            Some(out),
+            "unprevented requestClose must restore previous focus at the sync"
+        );
+        assert!(driver.actions.modal_focus_stack.is_empty());
+        eval(
+            &mut tab,
+            "d.showModal(); __prevent = true; d.requestClose();",
+        );
+        // w84fix: no sync ran between the second `showModal`
+        // and this prevented `requestClose`, so that show's
+        // move-in is still pending — pre-sync focus is unchanged
+        // (still the pre-show focus, `out`), and the prevented
+        // close itself moves nothing. The sync below replays the
+        // show and lands focus inside the dialog.
+        assert_eq!(
+            driver.actions.focused,
+            Some(out),
+            "prevented requestClose must move no focus before the sync"
+        );
+        driver.sync_modal_focus(&mut tab);
+        assert_eq!(
+            driver.actions.focused,
+            Some(a),
+            "prevented requestClose must leave focus inside the dialog"
+        );
+        assert_eq!(driver.actions.modal_focus_stack.len(), 1);
+    }
+
+    #[test]
+    fn w84_remove_attribute_open_fires_no_close_event() {
+        // C8 (JS level): removing `open` from a modal dialog
+        // closes it state-wise but fires no `close` event.
+        let (mut tab, _out, dlg, _a) = dialog_tab();
+        eval(
+            &mut tab,
+            "var d = document.getElementById('dlg'); window.__closes = 0; \
+             d.addEventListener('close', function() { __closes += 1; }); \
+             d.showModal(); d.returnValue = 'kept'; d.removeAttribute('open');",
+        );
+        assert!(
+            !tab.document_ref().expect("document").is_dialog_open(dlg),
+            "removeAttribute('open') must close the dialog state-wise"
+        );
+        assert!(
+            js_true(&mut tab, "__closes === 0"),
+            "removeAttribute('open') must fire no close event"
+        );
+        assert!(
+            js_true(&mut tab, "d.returnValue === 'kept'"),
+            "removeAttribute('open') must leave returnValue untouched"
+        );
+    }
+
+    /// A tab with a `<dialog>` containing a `<form
+    /// method="dialog">` with a valued submit button (`#sub`)
+    /// and an unvalued one (`#plain`). No layout boxes: the
+    /// click path only needs the document, like
+    /// `popover_click_tab`.
+    fn dialog_form_tab() -> (Tab, NodeId, NodeId, NodeId) {
+        use std::cell::RefCell;
+        use std::rc::Rc;
+        let doc = Rc::new(RefCell::new(
+            bowser_dom::Document::parse_html(
+                b"<html><body><button id=\"out\">o</button>\
+                  <dialog id=\"dlg\"><form method=\"dialog\">\
+                  <button id=\"sub\" type=\"submit\" value=\"confirm\">ok</button>\
+                  <button id=\"plain\" type=\"submit\">p</button>\
+                  </form></dialog></body></html>",
+            )
+            .0,
+        ));
+        let (dlg, sub, plain) = {
+            let d = doc.borrow();
+            (
+                d.get_element_by_id("dlg").expect("dlg"),
+                d.get_element_by_id("sub").expect("sub"),
+                d.get_element_by_id("plain").expect("plain"),
+            )
+        };
+        let base = bowser_url::parse("http://example.com/page.html", None).expect("test url");
+        let page =
+            crate::script::PageVm::new_for_document(doc.clone(), &base, "TestBrowser/9.9", &[])
+                .expect("install web apis");
+        let mut tab = crate::Tab::new(bowser_layout::Size { w: 800.0, h: 600.0 });
+        tab.install_document(doc, page);
+        tab.dirty.layout = true;
+        (tab, dlg, sub, plain)
+    }
+
+    #[test]
+    #[ignore = "w84-dialog C7 deferred: no submit-activation path exists, so clicking a method=dialog submit button closes nothing today; enable when submit activation lands"]
+    fn w84_dialog_form_method_dialog_submit_closes_with_submitter_value() {
+        // C7, expected per WHATWG HTML §4.11.4 / form
+        // submission: submitting a form with method="dialog"
+        // closes the dialog directly — no `cancel` event, one
+        // `close` event, `returnValue` = the submitter's value
+        // (`""` when the submitter has none). Today the click
+        // fires no submit activation at all, so this fails
+        // with the dialog still open and no `close` event.
+        // Deliberately NOT half-built here: it needs a real
+        // submit-activation path (constraint validation,
+        // `submit` event, formmethod override), not a click
+        // hook that closes dialogs.
+        let (mut tab, dlg, sub, plain) = dialog_form_tab();
+        eval(
+            &mut tab,
+            "var d = document.getElementById('dlg'); window.__ev = []; \
+             d.addEventListener('cancel', function() { __ev.push('cancel'); }); \
+             d.addEventListener('close', function() { __ev.push('close'); }); \
+             d.showModal();",
+        );
+        let mut driver = TestDriver::new();
+        driver.execute_click(&mut tab, sub).expect("click");
+        assert!(
+            !tab.document_ref().expect("document").is_dialog_open(dlg),
+            "method=dialog submit must close the dialog"
+        );
+        assert!(
+            js_true(&mut tab, "__ev.join(',') === 'close'"),
+            "method=dialog submit must fire close only, no cancel"
+        );
+        assert!(
+            js_true(&mut tab, "d.returnValue === 'confirm'"),
+            "returnValue must be the valued submitter's value"
+        );
+        eval(&mut tab, "d.showModal();");
+        driver.execute_click(&mut tab, plain).expect("click");
+        assert!(
+            !tab.document_ref().expect("document").is_dialog_open(dlg),
+            "unvalued submitter must close the dialog too"
+        );
+        assert!(
+            js_true(&mut tab, "d.returnValue === ''"),
+            "returnValue must be empty for an unvalued submitter"
+        );
+    }
+
+    /// A tab with a `<dialog popover="auto">` (`#dlg`) and a
+    /// plain auto popover (`#pop`), for the C10 capacity
+    /// decision. No layout boxes needed.
+    fn dialog_popover_tab() -> (Tab, NodeId, NodeId) {
+        use std::cell::RefCell;
+        use std::rc::Rc;
+        let doc = Rc::new(RefCell::new(
+            bowser_dom::Document::parse_html(
+                b"<html><body><dialog id=\"dlg\" popover=\"auto\">hi</dialog>\
+                  <div id=\"pop\" popover=\"auto\">hi</div></body></html>",
+            )
+            .0,
+        ));
+        let (dlg, pop) = {
+            let d = doc.borrow();
+            (
+                d.get_element_by_id("dlg").expect("dlg"),
+                d.get_element_by_id("pop").expect("pop"),
+            )
+        };
+        let base = bowser_url::parse("http://example.com/page.html", None).expect("test url");
+        let page =
+            crate::script::PageVm::new_for_document(doc.clone(), &base, "TestBrowser/9.9", &[])
+                .expect("install web apis");
+        let mut tab = crate::Tab::new(bowser_layout::Size { w: 800.0, h: 600.0 });
+        tab.install_document(doc, page);
+        tab.dirty.layout = true;
+        (tab, dlg, pop)
+    }
+
+    #[test]
+    fn w84_dual_dialog_popover_modal_survives_auto_popover_show() {
+        // C10, fixed w84fix (this was a decision test recording
+        // the corrupt behaviour — it must not stay the
+        // contract): a `<dialog popover="auto">` shown via
+        // `showModal` is NOT in the spec's showing auto popover
+        // list (HTML §6.12: that list holds only elements
+        // opened in popover mode `auto`, and a modal dialog was
+        // never opened in popover mode), so showing a second
+        // auto popover leaves it untouched — no `toggle`, no
+        // `close`, still open, still `:modal`, still in the top
+        // layer. Recovery paths included: the never-stranded
+        // dialog closes normally and re-shows via `showModal`
+        // afterwards. A dialog shown via `showPopover` (not
+        // modal) is still a legitimate victim; that direction
+        // is pinned at the DOM level.
+        let (mut tab, dlg, pop) = dialog_popover_tab();
+        eval(
+            &mut tab,
+            "var d = document.getElementById('dlg'); window.__ev = []; \
+             d.addEventListener('close', function() { __ev.push('close'); }); \
+             d.addEventListener('toggle', function(e) { __ev.push('toggle:' + e.oldState + '->' + e.newState); }); \
+             d.showModal();",
+        );
+        assert!(
+            tab.document_ref().expect("document").is_dialog_open(dlg),
+            "showModal must open the dual dialog"
+        );
+        assert!(
+            js_true(&mut tab, "d.matches(':modal')"),
+            "dual dialog must match :modal after showModal"
+        );
+        eval(&mut tab, "document.getElementById('pop').showPopover();");
+        assert!(
+            tab.document_ref().expect("document").is_popover_open(pop),
+            "the second auto popover must be open"
+        );
+        assert!(
+            js_true(&mut tab, "__ev.length === 0"),
+            "a modal dialog must receive no toggle and no close when another auto popover shows"
+        );
+        assert!(
+            tab.document_ref().expect("document").is_dialog_open(dlg),
+            "a modal dialog must stay open when another auto popover shows"
+        );
+        assert!(
+            tab.document_ref().expect("document").is_in_top_layer(dlg),
+            "a modal dialog must stay in the top layer when another auto popover shows"
+        );
+        assert!(
+            js_true(&mut tab, "d.matches(':modal')"),
+            "a modal dialog must keep matching :modal when another auto popover shows"
+        );
+        // Recovery: never stranded, so close() works and a
+        // fresh showModal() reopens it.
+        eval(&mut tab, "d.close();");
+        assert!(
+            !tab.document_ref().expect("document").is_dialog_open(dlg),
+            "close() must close the surviving dialog"
+        );
+        assert!(
+            js_true(&mut tab, "__ev.join(',') === 'close'"),
+            "close() must fire exactly one close event"
+        );
+        assert!(
+            !js_true(&mut tab, "d.matches(':modal')"),
+            "the closed dialog must no longer match :modal"
+        );
+        eval(&mut tab, "d.showModal();");
+        assert!(
+            tab.document_ref().expect("document").is_dialog_open(dlg),
+            "showModal() must reopen the dialog after close()"
+        );
+        assert!(
+            js_true(&mut tab, "d.matches(':modal')"),
+            "the reopened dialog must match :modal again"
+        );
+    }
+
+    #[test]
     fn testdriver_popover_scope_blocks_dialog_move_in() {
         // w82 fix regression (see
         // `actions_tab_traps_in_popover_above_modal_dialog`):

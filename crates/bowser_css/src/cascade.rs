@@ -380,6 +380,22 @@ pub fn compute_style(
     out.expect("node is always in its own ancestor chain")
 }
 
+/// One-shot [`Styler::important_properties`] for `node`, mirroring
+/// [`compute_style`]: builds a fresh styler and returns the
+/// `!important`-won property names as a set, for `getComputedStyle`
+/// surfaces that only have the one-shot cascade available.
+/// Returns an empty set when the node has no `!important` winners.
+pub fn compute_important_properties(
+    doc: &Document,
+    node: NodeId,
+    author: &[&Stylesheet],
+    ua: &Stylesheet,
+    viewport: &Viewport,
+) -> std::collections::HashSet<String> {
+    let styler = Styler::new(doc, author, ua, *viewport);
+    styler.important_properties(node).into_iter().collect()
+}
+
 /// One-shot wrapper around [`Styler::pseudo_style_for`]: builds a
 /// fresh styler, styles the node's ancestor chain root-first (as
 /// [`compute_style`] does), and returns the pseudo-element's
@@ -2306,19 +2322,24 @@ enum MemoVar {
 /// from the stylesheet's declarations for sheet rules; owned only for
 /// deferred `var()`-in-shorthand expansions (rare).
 /// Sorted cascade winners for one node: `(COMPUTED_PROPS index, value,
-/// cascade sequence)`. The sequence is the winner's position in the
+/// cascade sequence, cascade rank)`. The rank is the winning candidate's
+/// `rank()` (0..=5); `rank >= 3` means the winner is `!important`
+/// (author `!important` 3, inline `!important` 4, UA `!important` 5).
+/// Animations sit below all `!important` origins (CSS Cascade 5), so
+/// the WAAPI engine blocks keyframed properties whose winner is
+/// `!important` — see [`Styler::important_properties`]. The sequence is the winner's position in the
 /// cascade-sorted candidate list (higher wins later in the cascade); it
 /// lets the logical-to-physical fold (`apply_logical_mapping`) decide
 /// between a logical longhand and its physical counterpart by cascade
 /// order, the way browsers do.
-type NodeWinners<'a> = Rc<Vec<(u8, Cow<'a, CssValue>, u32)>>;
+type NodeWinners<'a> = Rc<Vec<(u8, Cow<'a, CssValue>, u32, u8)>>;
 
 /// Look up the winning specified value for a [`COMPUTED_PROPS`]
 /// position in a [`NodeWinners`] vec (binary search; the vec is sorted
 /// by index with unique indices).
-fn winner_at<'w>(winners: &'w [(u8, Cow<'_, CssValue>, u32)], idx: u8) -> Option<&'w CssValue> {
+fn winner_at<'w>(winners: &'w [(u8, Cow<'_, CssValue>, u32, u8)], idx: u8) -> Option<&'w CssValue> {
     winners
-        .binary_search_by_key(&idx, |(i, _, _)| *i)
+        .binary_search_by_key(&idx, |(i, _, _, _)| *i)
         .ok()
         .map(|pos| winners[pos].1.as_ref())
 }
@@ -2518,7 +2539,7 @@ fn logical_map() -> &'static LogicalMap {
 /// fully computed slot array (initial values filled in).
 fn apply_logical_mapping(
     props: &mut [Option<Arc<CssValue>>],
-    winners: &[(u8, Cow<'_, CssValue>, u32)],
+    winners: &[(u8, Cow<'_, CssValue>, u32, u8)],
     invalid: &[bool; 256],
 ) {
     // Cascade sequence per property index; `u32::MAX` = unspecified or
@@ -2527,7 +2548,7 @@ fn apply_logical_mapping(
     // as absent lets the valid counterpart declaration win, matching
     // the "invalid at computed-value time behaves as unset" rule.
     let mut seq = [u32::MAX; 256];
-    for (i, _, s) in winners {
+    for (i, _, s, _) in winners {
         seq[*i as usize] = if invalid[*i as usize] { u32::MAX } else { *s };
     }
     let map = logical_map();
@@ -3610,6 +3631,31 @@ impl<'a> Styler<'a> {
     /// reuses its ancestors' memoized cascade and inheritance results.
     /// The finished style is memoized per node per style-pass epoch: a
     /// repeat query is a slab probe plus a clone, not a recomputation.
+    /// Properties of `node` whose cascade winner is `!important`
+    /// (winner rank `>= 3`: author `!important`, inline `!important`,
+    /// or UA `!important`), as [`COMPUTED_PROPS`]
+    /// names in index order. Per CSS Cascade 5, animations sit
+    /// below all `!important` origins, so the WAAPI engine must not
+    /// overwrite these properties: a plain `<div>`'s `overlay` is
+    /// here because the UA `* { overlay: none !important }` rule
+    /// wins its cascade, while a top-layer popover's `overlay` is
+    /// here because the UA `:popover-open` `auto !important` rule
+    /// wins — either way the animated value must not replace the
+    /// cascaded one. Properties with no specified winner (initial
+    /// or inherited values) are absent: nothing `!important` on
+    /// this node blocks an animation of them. The logical-to-
+    /// physical fold is not applied here: a logical longhand's
+    /// `!important` winner blocks animation of that logical name,
+    /// not of the physical slot it folds into (an edge the WAAPI
+    /// surface does not currently animate through).
+    pub fn important_properties(&self, node: NodeId) -> Vec<String> {
+        self.cascade_expanded(node)
+            .iter()
+            .filter(|(_, _, _, rank)| *rank >= 3)
+            .map(|(idx, _, _, _)| COMPUTED_PROPS[*idx as usize].to_string())
+            .collect()
+    }
+
     pub fn style_for(&self, node: NodeId) -> ComputedStyle {
         (*self.style_for_shared(node)).clone()
     }
@@ -4711,7 +4757,7 @@ impl<'a> Styler<'a> {
         for (idx, prop) in COMPUTED_PROPS.iter().enumerate() {
             let idx = idx as u8;
             let specified = match witer.peek() {
-                Some((i, v, _)) if *i == idx => {
+                Some((i, v, _, _)) if *i == idx => {
                     let v = v.as_ref();
                     witer.next();
                     Some(v)
@@ -5070,14 +5116,15 @@ impl<'a> Styler<'a> {
         // `COMPUTED_PROPS`, so indexing the array below is always in
         // bounds.
         const _: () = assert!(COMPUTED_PROPS.len() <= MAX_COMPUTED_PROPS);
-        let mut slots: [Option<(Cow<'a, CssValue>, u32)>; MAX_COMPUTED_PROPS] =
+        let mut slots: [Option<(Cow<'a, CssValue>, u32, u8)>; MAX_COMPUTED_PROPS] =
             core::array::from_fn(|_| None);
         // Insert or replace the winner for `idx` (last-wins), recording
         // the candidate's cascade sequence so the logical-to-physical
         // fold can order a logical longhand against its physical
         // counterpart.
-        let mut set_winner =
-            |idx: u8, value: Cow<'a, CssValue>, seq: u32| slots[idx as usize] = Some((value, seq));
+        let mut set_winner = |idx: u8, value: Cow<'a, CssValue>, seq: u32, rank: u8| {
+            slots[idx as usize] = Some((value, seq, rank))
+        };
         for (seq, cand) in cands.iter().enumerate() {
             let seq = seq as u32;
             if is_shorthand_property(&cand.property) && value_contains_var(&cand.value) {
@@ -5117,7 +5164,7 @@ impl<'a> Styler<'a> {
                             // Expanded longhands share their shorthand's
                             // cascade position: one declaration, one
                             // sequence number.
-                            set_winner(atom.index(), Cow::Owned(value), seq);
+                            set_winner(atom.index(), Cow::Owned(value), seq, cand.rank);
                         }
                     }
                     // An unclassifiable substituted value expands to
@@ -5131,15 +5178,15 @@ impl<'a> Styler<'a> {
             if atom.is_computed() {
                 // `Cow::Borrowed` clones as a pointer copy: no heap clone
                 // of the declaration's value.
-                set_winner(atom.index(), cand.value.clone(), seq);
+                set_winner(atom.index(), cand.value.clone(), seq, cand.rank);
             }
         }
-        // Compact the slot array to `(idx, value, seq)` triples, already
+        // Compact the slot array to `(idx, value, seq, rank)` tuples, already
         // in index order; this is the only pass over the winners.
-        let mut winners: Vec<(u8, Cow<'a, CssValue>, u32)> = Vec::with_capacity(slots.len());
+        let mut winners: Vec<(u8, Cow<'a, CssValue>, u32, u8)> = Vec::with_capacity(slots.len());
         for (idx, slot) in slots.into_iter().enumerate() {
-            if let Some((value, seq)) = slot {
-                winners.push((idx as u8, value, seq));
+            if let Some((value, seq, rank)) = slot {
+                winners.push((idx as u8, value, seq, rank));
             }
         }
         let winners = Rc::new(winners);
@@ -10694,7 +10741,7 @@ impl<'a> Styler<'a> {
         node: NodeId,
         idx: u8,
         prop: &str,
-        winners: &[(u8, Cow<'a, CssValue>, u32)],
+        winners: &[(u8, Cow<'a, CssValue>, u32, u8)],
         env: &FxHashMap<String, CssValue>,
     ) -> (Option<Arc<CssValue>>, bool) {
         if idx == props::OVERFLOW_X || idx == props::OVERFLOW_Y {
@@ -10848,7 +10895,7 @@ impl<'a> Styler<'a> {
         node: NodeId,
         idx: u8,
         prop: &str,
-        winners: &[(u8, Cow<'a, CssValue>, u32)],
+        winners: &[(u8, Cow<'a, CssValue>, u32, u8)],
         env: &FxHashMap<String, CssValue>,
     ) -> (Option<Arc<CssValue>>, bool) {
         // Phase 1: walk up, collecting (node, explicit) frames until a
@@ -23184,6 +23231,65 @@ mod tests {
 
     // w80 phase 2: the top-layer exemption, `:popover-open`, and
     // the popover state machine, through the real cascade.
+    // w84: the `!important`-winner query the WAAPI engine blocks
+    // on (CSS Cascade 5: animations sit below all `!important`
+    // origins). Rank threshold is `>= 3` — author `!important`,
+    // inline `!important`, UA `!important` — not the UA normal
+    // or author normal ranks below it.
+    #[test]
+    fn important_properties_reports_important_winners_only() {
+        fn important(doc: &Document, node: NodeId, css: &str) -> Vec<String> {
+            let author = parse_stylesheet(css);
+            let ua_sheet = ua();
+            let refs = [&author];
+            let styler = Styler::new(doc, &refs, &ua_sheet, vp());
+            styler.important_properties(node)
+        }
+        let (doc, div, _) = sample();
+        // Plain `<div>`: the UA `* { overlay: none !important }`
+        // winner blocks `overlay`, but author-normal declarations
+        // do not block anything.
+        let imp = important(&doc, div, "div { overlay: auto; width: 10px; color: red; }");
+        assert!(imp.contains(&"overlay".to_string()), "{imp:?}");
+        assert!(!imp.contains(&"width".to_string()), "{imp:?}");
+        assert!(!imp.contains(&"color".to_string()), "{imp:?}");
+        // Author `!important` blocks its own property too.
+        let imp = important(&doc, div, "div { width: 10px !important; }");
+        assert!(imp.contains(&"width".to_string()), "{imp:?}");
+        assert!(imp.contains(&"overlay".to_string()), "{imp:?}");
+        // Inline `!important` blocks as well.
+        let mut doc2 = Document::new();
+        let root = doc2.root();
+        let el = doc2.create_element("div");
+        doc2.append_child(root, el);
+        doc2.set_attribute(el, "style", "width: 5px !important; height: 6px;");
+        let imp = important(&doc2, el, "div { color: red; }");
+        assert!(imp.contains(&"width".to_string()), "{imp:?}");
+        assert!(!imp.contains(&"height".to_string()), "{imp:?}");
+        // Top-layer promotion exempts the UA `none` rule, so an
+        // author-normal `overlay: auto` winner is NOT blocked —
+        // while a shown popover's UA `auto !important` winner IS.
+        let mut doc3 = Document::new();
+        let root = doc3.root();
+        let html = doc3.create_element("html");
+        doc3.append_child(root, html);
+        let body = doc3.create_element("body");
+        doc3.append_child(html, body);
+        let plain = doc3.create_element("div");
+        doc3.append_child(body, plain);
+        doc3.set_attribute(plain, "id", "q");
+        doc3.promote_to_top_layer(plain);
+        let imp = important(&doc3, plain, "#q { overlay: auto; }");
+        assert!(!imp.contains(&"overlay".to_string()), "{imp:?}");
+        let pop = doc3.create_element("div");
+        doc3.append_child(body, pop);
+        doc3.set_attribute(pop, "id", "p");
+        doc3.set_attribute(pop, "popover", "");
+        doc3.show_popover(pop).unwrap();
+        let imp = important(&doc3, pop, "#p { overlay: auto; }");
+        assert!(imp.contains(&"overlay".to_string()), "{imp:?}");
+    }
+
     #[test]
     fn overlay_top_layer_exemption_and_popover_open() {
         let mut doc = Document::new();

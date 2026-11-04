@@ -2507,6 +2507,21 @@ impl Document {
     /// popover ancestor" rule, simplified to the ancestor chain:
     /// `manual`/`hint` popovers are never auto-closed, and an
     /// `auto` popover nested inside another stays open).
+    /// Modal dialogs are NEVER auto-close victims, even when
+    /// they carry `popover=auto` (w84fix C10): the spec's
+    /// showing auto popover list contains only top-layer
+    /// elements whose opened-in-popover-mode is `auto`, and a
+    /// dialog shown via `showModal` was never opened in popover
+    /// mode (its opened-in-popover-mode is null) — so the
+    /// "hide all popovers until" step that closes victims
+    /// never touches it. The old filter (attribute state only)
+    /// victimised modal dialogs, demoting them out of the top
+    /// layer while leaving `dialog_modal` and the `open`
+    /// attribute in place: a stranded dialog that still
+    /// matched `:modal`, fired no `close`, and could never be
+    /// re-shown (`showModal` throws while `open` is set).
+    /// A dialog shown via `showPopover` (not modal) IS a
+    /// legitimate victim and is still closed here.
     /// Returns the auto-closed set, in live promotion order
     /// followed by retained victims in arena order: the caller
     /// fires a `toggle` event (`open` -> `closed`) for each,
@@ -2515,7 +2530,9 @@ impl Document {
     /// popover is also closed by the show (its retention
     /// ends, dirtied like any demotion), because a retained
     /// popover still renders as open and the new popover
-    /// must not stack above a closing one. A live victim
+    /// must not stack above a closing one. Modal dialogs are
+    /// excluded from both victim lists (w84fix C10, above).
+    /// A live victim
     /// with a stored exit duration is not demoted
     /// synchronously: it is retained for that duration
     /// (its `toggle` still fires now, at close time, like a
@@ -2546,6 +2563,12 @@ impl Document {
                     *n != node
                         && !ancestors.contains(n)
                         && self.popover_state(*n) == Some(PopoverState::Auto)
+                        // w84fix C10: a modal dialog is not in the
+                        // spec's showing auto popover list (it was
+                        // never opened in popover mode), so it is
+                        // never a victim — demoting it would strand
+                        // its modal flag and `open` attribute.
+                        && !self.is_dialog_modal(*n)
                 })
                 .collect();
             let mut retained: Vec<NodeId> = self
@@ -2556,6 +2579,13 @@ impl Document {
                     *n != node
                         && !ancestors.contains(n)
                         && self.popover_state(*n) == Some(PopoverState::Auto)
+                        // w84fix C10: same exclusion for retained
+                        // victims — a retained modal dialog is
+                        // already closed, and its retention record
+                        // (`was_modal`) keeps `is_dialog_modal`
+                        // true, so it must not be re-closed as a
+                        // popover victim either.
+                        && !self.is_dialog_modal(*n)
                 })
                 .collect();
             // HashMap order is arbitrary; arena order keeps
@@ -3024,13 +3054,20 @@ impl Document {
     }
 
     /// The topmost open `popover=auto` element, if any, regardless
-    /// of what sits above it in the top layer.
+    /// of what sits above it in the top layer. A modal dialog
+    /// carrying `popover=auto` is NOT a candidate (w84fix C10):
+    /// the spec's showing auto popover list holds only elements
+    /// opened in popover mode, so light-dismiss must not demote
+    /// a modal dialog and strand its modal flag / `open`
+    /// attribute the way the old victim filter did.
     pub fn topmost_auto_popover(&self) -> Option<NodeId> {
         self.top_layer
             .iter()
             .rev()
             .find(|n| {
-                self.is_popover_open(**n) && self.popover_state(**n) == Some(PopoverState::Auto)
+                self.is_popover_open(**n)
+                    && self.popover_state(**n) == Some(PopoverState::Auto)
+                    && !self.is_dialog_modal(**n)
             })
             .copied()
     }
@@ -4041,7 +4078,10 @@ impl Document {
     /// flag is maintained incrementally by `link_last` / `link_before` /
     /// `unlink`. Fail-closed on foreign ids (the linkless stand-in node
     /// is never attached), matching the old parent-chain walk.
-    fn is_attached(&self, node: NodeId) -> bool {
+    /// Public for the JS bindings' connectedness guards (e.g.
+    /// `requestClose`, whose spec steps return silently for a
+    /// disconnected dialog).
+    pub fn is_attached(&self, node: NodeId) -> bool {
         self.node(node).attached
     }
 
@@ -6228,6 +6268,69 @@ mod w81_light_dismiss_tests {
             Some(&dlg),
             "modal promotion must move the dialog to the end, not keep its popover position"
         );
+    }
+
+    #[test]
+    fn show_popover_never_victimises_a_modal_dialog() {
+        // w84fix C10: a `<dialog popover=auto>` shown via
+        // `showModal` is not in the spec's showing auto popover
+        // list (never opened in popover mode), so showing a
+        // second auto popover must leave it fully intact: still
+        // open, still modal, still in the top layer, and the
+        // show must report no victims. The old attribute-only
+        // filter demoted it and stranded `:modal` true outside
+        // the top layer with `open` still set.
+        let mut doc = Document::new();
+        let host = stage(&mut doc);
+        let dlg = attached(&mut doc, host, "dialog");
+        doc.set_attribute(dlg, "popover", "auto");
+        doc.show_dialog_modal(dlg).expect("showModal");
+        let pop = open_popover(&mut doc, host, "auto");
+        // Re-show path needs a fresh popover: hide the first,
+        // then show a second one while the dialog is modal.
+        doc.hide_popover(pop).expect("hide");
+        let pop2 = attached(&mut doc, host, "div");
+        doc.set_attribute(pop2, "popover", "auto");
+        let closed = doc.show_popover(pop2).expect("show second");
+        assert!(
+            closed.is_empty(),
+            "a modal dialog must never be an auto-close victim, got {closed:?}"
+        );
+        assert!(doc.is_dialog_open(dlg));
+        assert!(doc.is_dialog_modal(dlg));
+        assert!(doc.is_in_top_layer(dlg));
+        assert!(doc.is_popover_open(pop2));
+        // And the reverse direction still works: a dialog
+        // shown via `showPopover` (not modal) IS a victim.
+        let dlg2 = attached(&mut doc, host, "dialog");
+        doc.set_attribute(dlg2, "popover", "auto");
+        doc.hide_popover(pop2).expect("hide second");
+        doc.show_popover(dlg2).expect("show dialog as popover");
+        assert!(!doc.is_dialog_modal(dlg2));
+        let pop3 = attached(&mut doc, host, "div");
+        doc.set_attribute(pop3, "popover", "auto");
+        let closed = doc.show_popover(pop3).expect("show third");
+        assert_eq!(closed, vec![dlg2]);
+        assert!(!doc.is_popover_open(dlg2));
+    }
+
+    #[test]
+    fn light_dismiss_never_targets_a_modal_dialog() {
+        // w84fix C10, light-dismiss twin of the victim fix: a
+        // modal dialog with `popover=auto` on top is not the
+        // topmost auto popover, so an outside press dismisses
+        // nothing and leaves the dialog modal and open.
+        let mut doc = Document::new();
+        let host = stage(&mut doc);
+        let dlg = attached(&mut doc, host, "dialog");
+        doc.set_attribute(dlg, "popover", "auto");
+        doc.show_dialog_modal(dlg).expect("showModal");
+        assert_eq!(doc.topmost_auto_popover(), None);
+        assert_eq!(doc.light_dismiss_candidate(None), None);
+        assert_eq!(doc.light_dismiss_popover(None), None);
+        assert!(doc.is_dialog_modal(dlg));
+        assert!(doc.is_dialog_open(dlg));
+        assert!(doc.is_in_top_layer(dlg));
     }
 
     #[test]

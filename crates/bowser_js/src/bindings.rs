@@ -4969,8 +4969,9 @@ fn install_web_apis_inner(
             def_native(heap, element_proto, "showPopover", n_show_popover)?;
             def_native(heap, element_proto, "hidePopover", n_hide_popover)?;
             def_native(heap, element_proto, "togglePopover", n_toggle_popover)?;
-            // Dialog API (HTML §4.11.4, w81 phase 2): `show` /
-            // `showModal` / `close` plus the `open` and
+            // Dialog API (HTML §4.11.4, w81 phase 2, w84
+            // `requestClose`): `show` / `showModal` / `close` /
+            // `requestClose` plus the `open` and
             // `returnValue` IDL attributes, on the shared element
             // prototype like the popover methods above (there is
             // no separate `HTMLDialogElement.prototype` in this
@@ -4979,6 +4980,7 @@ fn install_web_apis_inner(
             def_native(heap, element_proto, "show", n_show_dialog)?;
             def_native(heap, element_proto, "showModal", n_show_dialog_modal)?;
             def_native(heap, element_proto, "close", n_close_dialog)?;
+            def_native(heap, element_proto, "requestClose", n_request_close_dialog)?;
             def_accessor(
                 heap,
                 element_proto,
@@ -13431,6 +13433,137 @@ fn n_close_dialog(heap: &mut Heap, this: Value, args: &[Value]) -> Result<Value,
     Ok(Value::Undefined)
 }
 
+/// `HTMLDialogElement.requestClose(returnValue)` (w84, WHATWG
+/// HTML §4.11.4): act as if a close request was sent targeting
+/// the dialog. A trusted, non-bubbling, cancelable `cancel`
+/// event fires first; if it is prevented, the dialog stays open
+/// and `returnValue` is untouched (the argument is applied only
+/// by the close that follows an unprevented cancel, per the
+/// spec's close-dialog steps: a null result leaves the stored
+/// value alone, so an omitted argument keeps it too). If it is
+/// not prevented, the dialog closes exactly like `close()` —
+/// same deferred-close path, same trusted non-bubbling `close`
+/// event — with the argument applied. A closed dialog is a
+/// no-op (no `cancel`, no `close`); a non-dialog receiver is
+/// a `TypeError` naming `NotSupportedError` (engine idiom: this
+/// engine has no `DOMException` type, so DOM names travel in
+/// the message). Per the request-to-close steps (step 2), a
+/// dialog that is not connected — or whose document is not
+/// fully active — returns silently; this engine has a single
+/// document that is always fully active, so the disconnected
+/// check below is the whole guard. Unlike Escape, this is NOT
+/// modal-only:
+/// `show()` sets a close watcher too (spec `show()` step 9),
+/// and `requestClose()` temporarily enables that watcher, so a
+/// non-modal dialog fires `cancel` and closes here, while
+/// Escape never targets it. A dialog open only via a bare
+/// `open` attribute is a legitimate target too: under the
+/// current spec the dialog setup steps (including close-watcher
+/// establishment) run when the `open` attribute is added for a
+/// connected dialog, so the old "bare open has no close
+/// watcher" reading is stale; this engine follows the same
+/// cancel-then-close path for it, pinned by test.
+/// Focus restore is at the embedder's next sync via the
+/// `Closed` journal event, exactly like `close()` — the
+/// bindings own no window focus, so a `close` listener that
+/// re-opens synchronously sees pre-restore focus here, unlike
+/// the windowed Escape path, which restores before firing
+/// `close`. Inline `oncancel`/`onclose` content attributes are
+/// served only by the host dispatch path (as for `close()`),
+/// not by this JS-native dispatch — a known divergence from
+/// Escape, pinned by test rather than hidden.
+fn n_request_close_dialog(
+    heap: &mut Heap,
+    this: Value,
+    args: &[Value],
+) -> Result<Value, NativeError> {
+    let rc = apis_rc(heap, this)?;
+    let node = {
+        let g = rc.borrow();
+        target_node(heap, this, &g)?
+    };
+    let return_value = match args.first().copied().unwrap_or(Value::Undefined) {
+        Value::Undefined => None,
+        v => Some(arg_to_string(&mut *heap, v)?),
+    };
+    let doc_rc = rc.borrow().live_document()?;
+    if !doc_rc.borrow().is_dialog_element(node) {
+        return Err(err_type(
+            "requestClose: NotSupportedError: element is not a dialog element",
+        ));
+    }
+    if !doc_rc.borrow().is_dialog_open(node) {
+        return Ok(Value::Undefined);
+    }
+    // WHATWG HTML §4.11.4 request-to-close step 2: a dialog
+    // that is not connected returns silently (no `cancel`, no
+    // `close`, argument untouched). The engine's single document
+    // is always fully active, so connectedness is the whole
+    // guard here. After the open check, so an open-but-detached
+    // dialog (removed while open: `open` survives removal) and
+    // a closed detached dialog both no-op.
+    if !doc_rc.borrow().is_attached(node) {
+        return Ok(Value::Undefined);
+    }
+    // Cancel first, trusted, through the same dispatch core
+    // `n_close_dialog` uses for `close` (the host
+    // `dispatch_cancel_event` path is the app-level twin: same
+    // event shape, same prevented semantics, including passive
+    // listeners not gating the close).
+    let (cancel_val, cancel_handle) = {
+        let mut g = rc.borrow_mut();
+        wrap_event(heap, &mut g, dom::Event::new("cancel", false, true), true)
+            .map_err(|_| NativeError::OutOfMemory)?
+    };
+    let base = heap.protect(cancel_val);
+    let prevented = run_event_dispatch(heap, &rc, node, cancel_val, cancel_handle);
+    heap.release_temp(base);
+    if prevented? {
+        return Ok(Value::Undefined);
+    }
+    // Two re-entrancy cases, with different outcomes (both
+    // pinned by test):
+    // (a) the cancel listener closed the dialog and did NOT
+    // re-open it: `close_dialog` below is then a no-op, no
+    // second `close` event fires, and the requestClose argument
+    // is discarded — the value the listener's own close applied
+    // stands.
+    // (b) the cancel listener closed AND re-opened the dialog
+    // (close-then-showModal): the dialog is open again, so
+    // `close_dialog` below closes it a second time, firing a
+    // second `close` event with the requestClose argument
+    // applied. The open state is NOT snapshotted at cancel time:
+    // the listener's re-open is a real open, and the unprevented
+    // cancel's close must still land on it.
+    // Otherwise this is `close()` from here on, verbatim.
+    let exit = production_exit_transition_duration(&rc, node);
+    let closed = match exit {
+        Some(d) => doc_rc.borrow_mut().close_dialog_deferred(
+            node,
+            return_value.as_deref(),
+            d + EXIT_RETENTION_GRACE_S,
+        ),
+        None => doc_rc
+            .borrow_mut()
+            .close_dialog(node, return_value.as_deref()),
+    }
+    .map_err(|e| err_type(format!("requestClose: {e}")))?;
+    if !closed {
+        return Ok(Value::Undefined);
+    }
+    doc_rc.borrow_mut().take_stored_exit_duration(node);
+    let (event_val, handle) = {
+        let mut g = rc.borrow_mut();
+        wrap_event(heap, &mut g, dom::Event::new("close", false, false), true)
+            .map_err(|_| NativeError::OutOfMemory)?
+    };
+    let base = heap.protect(event_val);
+    let r = run_event_dispatch(heap, &rc, node, event_val, handle);
+    heap.release_temp(base);
+    r?;
+    Ok(Value::Undefined)
+}
+
 /// `HTMLDialogElement.open` getter (w81 phase 2): reflects the
 /// `open` attribute on dialogs; `false` for any other receiver
 /// (a non-dialog has no open state to reflect).
@@ -21281,6 +21414,20 @@ fn n_get_computed_style(
         // transition/animation registry of their own: the
         // originator's keyed values must not leak into them.
         if !is_backdrop {
+            // w84: capture the `!important`-won properties from the
+            // cascade BEFORE transitions run (transitions outrank
+            // `!important` and are unaffected; animations sit below
+            // all `!important` origins, so they must not overwrite
+            // these — e.g. a plain `<div>`'s UA `overlay: none
+            // !important` winner, or a shown popover's UA `auto
+            // !important` winner).
+            let blocked = bowser_css::compute_important_properties(
+                &doc,
+                node,
+                &author,
+                &g.ua_stylesheet,
+                &g.viewport,
+            );
             let anim_key = format!("prod:{node:?}");
             // w82fix JS-M1: an exit-retained node must NOT run
             // the transition engine (its cascade still reports
@@ -21295,7 +21442,7 @@ fn n_get_computed_style(
             } else {
                 crate::transition::apply_transitions(&anim_key, &mut props);
             }
-            crate::animation::apply_animations(&anim_key, &mut props);
+            crate::animation::apply_animations(&anim_key, &mut props, &blocked);
             // w81fix (F-E): re-synthesize shorthands after
             // animation/transition application, so an animated
             // longhand (e.g. `margin-top`) is reflected in its
@@ -24784,6 +24931,8 @@ fn wrap_parse_element(
             def_native(heap, obj, "showModal", n_parse_el_show_dialog_modal)
                 .map_err(|_| NativeError::OutOfMemory)?;
             def_native(heap, obj, "close", n_parse_el_close_dialog)
+                .map_err(|_| NativeError::OutOfMemory)?;
+            def_native(heap, obj, "requestClose", n_parse_el_request_close_dialog)
                 .map_err(|_| NativeError::OutOfMemory)?;
             def_accessor(
                 heap,
@@ -30239,6 +30388,38 @@ impl ParseLayoutHook {
     /// them. `None` when the element is not in the rebuilt tree
     /// (detached, inside `<template>` contents, or no document
     /// element yet): the caller falls back to the inline-only path.
+    /// `!important`-won property names for `el` (w84, the parse
+    /// shim's half of the production blocked set above): mirrors
+    /// [`computed_props`](Self::computed_props)' style resolution
+    /// but returns only the blocked set, so
+    /// `n_parse_get_computed_style` can pass it to
+    /// `apply_animations`. `None` when the element is not in the
+    /// rebuilt tree: the caller falls back to an empty set (the
+    /// inline-only fallback has no cascade winners to block on).
+    pub(crate) fn important_properties(
+        &mut self,
+        host: &mut ScriptHost<'_, '_, '_>,
+        el: ScriptElement,
+        top_layer: &[(usize, TopLayerShowKind)],
+        dialog_modal: &HashSet<usize>,
+        exit_retained: &[(usize, TopLayerShowKind, f64)],
+    ) -> Option<std::collections::HashSet<String>> {
+        let data = self.style_data(host, top_layer, dialog_modal, exit_retained)?;
+        let node = *data.arena_node.get(&el.arena_index())?;
+        let sheet_refs: Vec<&Stylesheet> = data.sheets.iter().collect();
+        let viewport = Viewport {
+            w: self.viewport.0 as f32,
+            h: self.viewport.1 as f32,
+        };
+        Some(bowser_css::compute_important_properties(
+            &data.doc,
+            node,
+            &sheet_refs,
+            parse_ua_stylesheet(),
+            &viewport,
+        ))
+    }
+
     pub(crate) fn computed_props(
         &mut self,
         host: &mut ScriptHost<'_, '_, '_>,
@@ -33312,6 +33493,16 @@ fn parse_popover_apply(
                     if other == arena || ancestors.contains(&other) {
                         continue;
                     }
+                    // w84fix C10, shim twin of production
+                    // `Document::show_popover`: a modal dialog is
+                    // not in the spec's showing auto popover list
+                    // (never opened in popover mode), so it is
+                    // never an auto-close victim — demoting it
+                    // here would strand its modal flag and `open`
+                    // attribute exactly like the production bug.
+                    if roots.dialog_modal.contains(&other) {
+                        continue;
+                    }
                     let other_is_auto = roots
                         .element_wrappers
                         .iter()
@@ -33620,20 +33811,98 @@ fn parse_dialog_close(
     Ok(true)
 }
 
-/// Fire the shim `close` event at `el`'s wrapper: invoke the
-/// record's `close` listeners and `onclose` handlers in
-/// registration (`seq`) order, swallowing listener exceptions
-/// (DOM report-and-continue, like
+// Per-dispatch state for a shim dialog event (see
+// `parse_dialog_fire`): `(cancelable, prevented)`. Reset at
+// the start of every fire, so a `cancel` dispatch's prevention
+// never leaks into the `close` dispatch that follows it (or
+// into a later, unrelated dispatch on the same thread). The
+// shim has no `Event` constructor and no per-event handle table
+// like production's `event_states`, so this single thread-local
+// slot is the whole mechanism — and it is only ever read during
+// the dispatch it belongs to, by the `preventDefault` /
+// `defaultPrevented` natives below and by the fire's return
+// value. Plain `//` comments, not `///` docs: rustdoc generates
+// no documentation for macro invocations, so a doc comment on
+// `thread_local!` would warn as unused.
+thread_local! {
+    static SHIM_DIALOG_EVENT_STATE: Cell<(bool, bool)> = const { Cell::new((false, false)) };
+}
+
+/// `preventDefault` for a shim dialog event object: records
+/// prevention in the dispatch state when the in-flight event is
+/// cancelable, and is a no-op otherwise (DOM: calling it on a
+/// non-cancelable event leaves `defaultPrevented` false). The
+/// shim has no passive listeners, so there is no passive gate to
+/// apply here.
+fn n_parse_shim_event_prevent_default(
+    _heap: &mut Heap,
+    _this: Value,
+    _args: &[Value],
+) -> Result<Value, NativeError> {
+    SHIM_DIALOG_EVENT_STATE.with(|s| {
+        if s.get().0 {
+            s.set((true, true));
+        }
+    });
+    Ok(Value::Undefined)
+}
+
+/// `defaultPrevented` getter for a shim dialog event object:
+/// reads the dispatch state (see [`SHIM_DIALOG_EVENT_STATE`]).
+fn n_parse_shim_event_default_prevented_get(
+    _heap: &mut Heap,
+    _this: Value,
+    _args: &[Value],
+) -> Result<Value, NativeError> {
+    Ok(Value::Bool(SHIM_DIALOG_EVENT_STATE.with(|s| s.get().1)))
+}
+
+/// `defaultPrevented` setter for a shim dialog event object: a
+/// no-op, matching the read-only shape (a page assignment to it
+/// must not corrupt the dispatch state).
+fn n_parse_shim_event_default_prevented_set(
+    _heap: &mut Heap,
+    _this: Value,
+    _args: &[Value],
+) -> Result<Value, NativeError> {
+    Ok(Value::Undefined)
+}
+
+/// Fire a shim dialog event (`close` or `cancel`, w84
+/// generalised from the old close-only firer) at `el`'s
+/// wrapper: invoke the record's listeners and `on*` handlers
+/// for that type in registration (`seq`) order, swallowing
+/// listener exceptions (DOM report-and-continue, like
 /// [`n_parse_dispatch_event`]). `once` listeners are removed
 /// before they run, so a synchronous re-close from inside one
 /// cannot re-enter it. Every entry is also re-checked against
 /// the live record before it runs, so a listener removed
-/// mid-dispatch by an earlier listener never runs. The event argument is a plain object
-/// carrying `type`/`bubbles`/`cancelable` — the shim has no
-/// `Event` constructor, and its listeners read exactly those
-/// fields in practice.
-fn parse_dialog_fire_close(heap: &mut Heap, this: Value, id: u64, el: ScriptElement) {
-    let Value::Object(obj) = this else { return };
+/// mid-dispatch by an earlier listener never runs. The event
+/// argument is a plain object — the shim has no `Event`
+/// constructor — carrying `type`/`bubbles`/`cancelable` plus,
+/// since w84 (G4), `isTrusted: true` and `target` (the wrapper
+/// itself), and since w84fix a `preventDefault` native and a
+/// `defaultPrevented` accessor backed by
+/// [`SHIM_DIALOG_EVENT_STATE`]: a shim `cancel` listener can
+/// now prevent the close that follows, like production.
+/// Returns whether the event was prevented (always false for a
+/// non-cancelable event, and for a dispatch with no listeners).
+fn parse_dialog_fire(
+    heap: &mut Heap,
+    this: Value,
+    id: u64,
+    el: ScriptElement,
+    etype: &str,
+    bubbles: bool,
+    cancelable: bool,
+) -> bool {
+    let Value::Object(obj) = this else {
+        return false;
+    };
+    // Fresh dispatch state before anything else, including the
+    // no-listener early return below: a previous dispatch's
+    // prevention must never be re-read as this one's.
+    SHIM_DIALOG_EVENT_STATE.with(|s| s.set((cancelable, false)));
     // Snapshot entries: (callback, seq, once, capture, is_handler).
     // `seq` / `capture` / `is_handler` are what the
     // pre-invocation re-check below matches against: `seq`
@@ -33654,24 +33923,24 @@ fn parse_dialog_fire_close(heap: &mut Heap, this: Value, id: u64, el: ScriptElem
         let mut all: Vec<(Value, u64, bool, bool, bool)> = rec
             .listeners
             .iter()
-            .filter(|l| l.etype == "close")
+            .filter(|l| l.etype == etype)
             .map(|l| (l.callback, l.seq, l.once, l.capture, false))
             .collect();
         all.extend(
             rec.handlers
                 .iter()
-                .filter(|h| h.etype == "close")
+                .filter(|h| h.etype == etype)
                 .map(|h| (h.callback, h.seq, false, false, true)),
         );
         all.sort_by_key(|(_, seq, _, _, _)| *seq);
         all
     });
     if cbs.is_empty() {
-        return;
+        return false;
     }
     let event_val = match heap.alloc_object(Object::new(ObjectKind::Ordinary)) {
         Ok(o) => Value::Object(o),
-        Err(_) => return,
+        Err(_) => return false,
     };
     let temp_base = heap.protect(Value::Undefined);
     heap.protect(event_val);
@@ -33679,15 +33948,37 @@ fn parse_dialog_fire_close(heap: &mut Heap, this: Value, id: u64, el: ScriptElem
         heap.protect(cb);
     }
     if let Value::Object(o) = event_val {
-        if let Ok(t) = heap.alloc_str("close") {
+        if let Ok(t) = heap.alloc_str(etype) {
             let _ = def(heap, o, "type", Value::Str(t));
         }
-        let _ = def(heap, o, "bubbles", Value::Bool(false));
-        let _ = def(heap, o, "cancelable", Value::Bool(false));
+        let _ = def(heap, o, "bubbles", Value::Bool(bubbles));
+        let _ = def(heap, o, "cancelable", Value::Bool(cancelable));
+        // w84 (G4): the shim event now carries the two fields
+        // the C11 pin asserts, matching the production `close`
+        // event's observable shape for these fields.
+        let _ = def(heap, o, "isTrusted", Value::Bool(true));
+        let _ = def(heap, o, "target", this);
+        // w84fix: the prevention natives (see
+        // `SHIM_DIALOG_EVENT_STATE`). On a non-cancelable
+        // event `preventDefault` is a defined no-op and
+        // `defaultPrevented` stays false, like production.
+        let _ = def_native(
+            heap,
+            o,
+            "preventDefault",
+            n_parse_shim_event_prevent_default,
+        );
+        let _ = def_accessor(
+            heap,
+            o,
+            "defaultPrevented",
+            n_parse_shim_event_default_prevented_get,
+            n_parse_shim_event_default_prevented_set,
+        );
     }
     for (cb, seq, once, capture, is_handler) in cbs {
         // DOM-dispatch semantics: a listener removed mid-dispatch
-        // (by an earlier close listener, or by a `once` removal
+        // (by an earlier listener, or by a `once` removal
         // above) must not run. The snapshot alone ran every
         // entry regardless, so re-check the live record before
         // each invocation; listeners added mid-dispatch are not
@@ -33698,7 +33989,7 @@ fn parse_dialog_fire_close(heap: &mut Heap, this: Value, id: u64, el: ScriptElem
         // mid-dispatch gets a fresh `seq`, so the snapshot entry
         // is gone and the re-added registration must not run in
         // this dispatch (snapshot semantics). The same applies
-        // to an `onclose` handler re-assigned mid-dispatch.
+        // to an `on*` handler re-assigned mid-dispatch.
         let still_registered = PARSE_HOSTS.with(|hosts| {
             let entry = hosts.borrow().get(&id).map(|e| e.listeners.clone())?;
             let g = entry.borrow();
@@ -33708,11 +33999,11 @@ fn parse_dialog_fire_close(heap: &mut Heap, this: Value, id: u64, el: ScriptElem
                 Some(
                     rec.handlers
                         .iter()
-                        .any(|h| h.etype == "close" && h.callback == cb && h.seq == seq),
+                        .any(|h| h.etype == etype && h.callback == cb && h.seq == seq),
                 )
             } else {
                 Some(rec.listeners.iter().any(|l| {
-                    l.etype == "close" && l.callback == cb && l.capture == capture && l.seq == seq
+                    l.etype == etype && l.callback == cb && l.capture == capture && l.seq == seq
                 }))
             }
         });
@@ -33726,7 +34017,7 @@ fn parse_dialog_fire_close(heap: &mut Heap, this: Value, id: u64, el: ScriptElem
                     if let Some(pos) = find_shim_record(&g, el, obj) {
                         g.element_wrappers[pos]
                             .listeners
-                            .retain(|l| !(l.callback == cb && l.seq == seq && l.etype == "close"));
+                            .retain(|l| !(l.callback == cb && l.seq == seq && l.etype == etype));
                     }
                 }
             });
@@ -33734,6 +34025,22 @@ fn parse_dialog_fire_close(heap: &mut Heap, this: Value, id: u64, el: ScriptElem
         let _ = invoke_parse_listener(heap, cb, this, &[event_val]);
     }
     heap.release_temp(temp_base);
+    SHIM_DIALOG_EVENT_STATE.with(|s| s.get().1)
+}
+
+/// Fire the shim `close` event at `el`'s wrapper (see
+/// [`parse_dialog_fire`]): trusted, non-bubbling,
+/// non-cancelable.
+fn parse_dialog_fire_close(heap: &mut Heap, this: Value, id: u64, el: ScriptElement) {
+    parse_dialog_fire(heap, this, id, el, "close", false, false);
+}
+
+/// Fire the shim `cancel` event at `el`'s wrapper (see
+/// [`parse_dialog_fire`]): trusted, non-bubbling, cancelable,
+/// and now preventable — returns whether a listener prevented
+/// it, which `requestClose` honours like production.
+fn parse_dialog_fire_cancel(heap: &mut Heap, this: Value, id: u64, el: ScriptElement) -> bool {
+    parse_dialog_fire(heap, this, id, el, "cancel", false, true)
 }
 
 /// `el.show()` on the parse shim.
@@ -33772,6 +34079,49 @@ fn n_parse_el_close_dialog(
         Value::Undefined => None,
         v => Some(arg_to_string(&mut *heap, v)?),
     };
+    if parse_dialog_close(id, host, el, return_value)? {
+        parse_dialog_fire_close(heap, this, id, el);
+    }
+    Ok(Value::Undefined)
+}
+
+/// `el.requestClose(returnValue)` on the parse shim (w84, gates
+/// fixed w84fix): the checks run in this order — (1) a
+/// non-dialog receiver throws a `TypeError` naming
+/// `NotSupportedError` (engine idiom: no `DOMException` type),
+/// before any event fires; (2) a closed dialog is a no-op (no
+/// `cancel`, no `close`); (3) a disconnected dialog is a no-op
+/// too, per the spec's request-to-close step 2 (same guard as
+/// production, via [`host_element_connected`]); (4) the shim
+/// fires, and a listener that calls its `preventDefault` keeps
+/// the dialog open with `returnValue` untouched, like
+/// production; (5) only an unprevented cancel closes like
+/// `close()` (state first, then the `close` event).
+fn n_parse_el_request_close_dialog(
+    heap: &mut Heap,
+    this: Value,
+    args: &[Value],
+) -> Result<Value, NativeError> {
+    let (id, host, el) = parse_el_host(heap, this, "requestClose")?;
+    let return_value = match args.first().copied().unwrap_or(Value::Undefined) {
+        Value::Undefined => None,
+        v => Some(arg_to_string(&mut *heap, v)?),
+    };
+    let host_ref = deref_parse_host(host);
+    if !parse_dialog_is_dialog(id, host_ref, el) {
+        return Err(err_type(
+            "requestClose: NotSupportedError: element is not a dialog element",
+        ));
+    }
+    if !parse_dialog_is_open(id, host_ref, el) {
+        return Ok(Value::Undefined);
+    }
+    if !host_element_connected(host_ref, el) {
+        return Ok(Value::Undefined);
+    }
+    if parse_dialog_fire_cancel(heap, this, id, el) {
+        return Ok(Value::Undefined);
+    }
     if parse_dialog_close(id, host, el, return_value)? {
         parse_dialog_fire_close(heap, this, id, el);
     }
@@ -34680,6 +35030,21 @@ fn n_parse_get_computed_style(
     // Backdrop pseudo styles skip this, like production: the
     // originator's keyed values must not leak into them.
     if !is_backdrop {
+        // w84: same blocked-set capture as production, from the
+        // shim's rebuilt-tree cascade, before transitions run.
+        let blocked = PARSE_HOSTS
+            .with(|hosts| {
+                let mut hosts = hosts.borrow_mut();
+                let entry = hosts.get_mut(&id)?;
+                let host_ref = deref_parse_host(host);
+                let top = entry.listeners.borrow().top_layer_show_ordered();
+                let dialog_modal = entry.listeners.borrow().dialog_modal.clone();
+                let retained = entry.listeners.borrow().exit_retained_live();
+                entry
+                    .layout_hook
+                    .important_properties(host_ref, el, &top, &dialog_modal, &retained)
+            })
+            .unwrap_or_default();
         let key = format!("parse:{id}:{}", el.arena_index());
         // w82fix JS-M1, shim half of the production branch
         // above: an exit-retained arena pins the transition
@@ -34704,7 +35069,7 @@ fn n_parse_get_computed_style(
         // discrete keyframed properties step and numeric ones
         // interpolate at the current time, overwriting the
         // cascaded value for each keyframed property.
-        crate::animation::apply_animations(&key, &mut values);
+        crate::animation::apply_animations(&key, &mut values, &blocked);
         // w81fix (F-E): same re-synthesis as production
         // `n_get_computed_style` — an animated longhand must be
         // reflected in its shorthand, and for unanimated
@@ -50509,6 +50874,176 @@ mod tests {
     // (top layer + modal flag + `:modal`). The reverse order
     // (popover then modal) stays correct.
     #[test]
+    fn w84_parse_shim_dialog_close_event_shape_is_trusted_and_targeted() {
+        // C11 + G4: the shim `close` event is a plain object
+        // (no `Event` constructor mid-parse), but since w84 it
+        // carries the production shape for the fields a
+        // listener can observe here: trusted, targeted at the
+        // dialog wrapper, non-bubbling, non-cancelable.
+        let (mut probe, _doc, ctx) = captured_install(
+            b"<html><body><dialog id=\"d\">hi</dialog><script>\
+              globalThis.__d = document.getElementById('d');\
+              globalThis.__seen = [];\
+              __d.addEventListener('close', function(e) {\
+                __seen.push('trusted:' + e.isTrusted + ';target:' + (e.target === __d) + \
+                  ';type:' + e.type + ';bubbles:' + e.bubbles + ';cancelable:' + e.cancelable); });\
+              __d.showModal();\
+              __d.close();\
+              </script></body></html>",
+        );
+        assert_eq!(
+            node_list_str(&mut probe.vm, "__seen.join(';');"),
+            "trusted:true;target:true;type:close;bubbles:false;cancelable:false"
+        );
+        remove_context(ContextId(ctx));
+    }
+
+    #[test]
+    fn w84_parse_shim_dialog_request_close_fires_cancel_then_close() {
+        // C4 + C11: shim `requestClose(rv)` fires `cancel`
+        // (trusted, targeted at the dialog wrapper, typed,
+        // non-bubbling, cancelable — the same fields the C11
+        // `close` assertion pins, field-for-field) then closes
+        // with `rv` applied and a `close` event; a closed dialog
+        // is a no-op; an omitted argument keeps the stored
+        // value. Prevention itself is pinned by
+        // `w84_parse_shim_dialog_request_close_prevented_cancel_keeps_open`,
+        // not here.
+        let (mut probe, _doc, ctx) = captured_install(
+            b"<html><body><dialog id=\"d\">hi</dialog><script>\
+              globalThis.__d = document.getElementById('d');\
+              globalThis.__seen = [];\
+              __d.addEventListener('cancel', function(e) {\
+                __seen.push('cancel:trusted:' + e.isTrusted + ';target:' + (e.target === __d) + \
+                  ';type:' + e.type + ';bubbles:' + e.bubbles + ';cancelable:' + e.cancelable); });\
+              __d.addEventListener('close', function() {\
+                __seen.push('close:' + __d.returnValue); });\
+              __d.showModal();\
+              __d.requestClose('rv');\
+              __d.requestClose('late');\
+              __d.show();\
+              __d.requestClose();\
+              </script></body></html>",
+        );
+        assert_eq!(
+            node_list_str(&mut probe.vm, "__seen.join(';');"),
+            "cancel:trusted:true;target:true;type:cancel;bubbles:false;cancelable:true;close:rv;cancel:trusted:true;target:true;type:cancel;bubbles:false;cancelable:true;close:rv"
+        );
+        assert_eq!(node_list_str(&mut probe.vm, "String(__d.open);"), "false");
+        remove_context(ContextId(ctx));
+    }
+
+    #[test]
+    fn w84_parse_shim_dialog_request_close_prevented_cancel_keeps_open() {
+        // w84fix: the shim `cancel` event now carries a real
+        // `preventDefault` (see `parse_dialog_fire`), so a
+        // prevented shim `requestClose` keeps the dialog open
+        // with `returnValue` untouched and fires no `close`;
+        // an unprevented one then closes, applying its argument.
+        // A `preventDefault` on the non-cancelable `close`
+        // event is a no-op: `defaultPrevented` stays false.
+        let (mut probe, _doc, ctx) = captured_install(
+            b"<html><body><dialog id=\"d\">hi</dialog><script>\
+              globalThis.__d = document.getElementById('d');\
+              globalThis.__seen = [];\
+              globalThis.__prevent = true;\
+              __d.addEventListener('cancel', function(e) {\
+                __seen.push('cancel:prevented-before:' + e.defaultPrevented);\
+                if (__prevent) { e.preventDefault(); }\
+                __seen.push('cancel:prevented-after:' + e.defaultPrevented); });\
+              __d.addEventListener('close', function(e) {\
+                e.preventDefault();\
+                __seen.push('close:prevented:' + e.defaultPrevented); });\
+              __d.showModal();\
+              __d.requestClose('nope');\
+              __seen.push('open-after-prevented:' + __d.open + ';rv:' + __d.returnValue);\
+              __prevent = false;\
+              __d.requestClose('yes');\
+              </script></body></html>",
+        );
+        assert_eq!(
+            node_list_str(&mut probe.vm, "__seen.join(';');"),
+            "cancel:prevented-before:false;cancel:prevented-after:true;open-after-prevented:true;rv:;cancel:prevented-before:false;cancel:prevented-after:false;close:prevented:false"
+        );
+        assert_eq!(node_list_str(&mut probe.vm, "String(__d.open);"), "false");
+        assert_eq!(node_list_str(&mut probe.vm, "__d.returnValue;"), "yes");
+        remove_context(ContextId(ctx));
+    }
+
+    #[test]
+    fn w84_parse_shim_dialog_request_close_return_value_matrix() {
+        // w84fix, shim twin of the production C3 rv pins:
+        // `requestClose(null)` stringifies to `"null"` and
+        // `requestClose("")` clears the stored value, like
+        // `close()` (DOMString conversion, argument omitted
+        // keeps the stored value).
+        let (mut probe, _doc, ctx) = captured_install(
+            b"<html><body><dialog id=\"d\">hi</dialog><script>\
+              globalThis.__d = document.getElementById('d');\
+              globalThis.__seen = [];\
+              __d.addEventListener('close', function() {\
+                __seen.push(__d.returnValue); });\
+              __d.showModal();\
+              __d.requestClose(null);\
+              __d.showModal();\
+              __d.requestClose('');\
+              __d.showModal();\
+              __d.requestClose();\
+              </script></body></html>",
+        );
+        assert_eq!(node_list_str(&mut probe.vm, "__seen.join(';');"), "null;;");
+        remove_context(ContextId(ctx));
+    }
+
+    #[test]
+    fn w84_parse_shim_dialog_request_close_non_dialog_throws_named_type_error() {
+        // w84fix, shim twin of the production C3 non-dialog pin:
+        // `requestClose` on a non-dialog throws a `TypeError`
+        // whose message names `NotSupportedError` (engine idiom:
+        // no `DOMException` type) — asserted as error identity
+        // (`instanceof` + `name` + message), not a bare
+        // substring of the stringified error.
+        let (mut probe, _doc, ctx) = captured_install(
+            b"<html><body><button id=\"b\">b</button><script>\
+              globalThis.__b = document.getElementById('b');\
+              globalThis.__nd = false;\
+              try { __b.requestClose(); }\
+              catch (e) { __nd = (e instanceof TypeError) && e.name === 'TypeError' && \
+                String(e.message).indexOf('NotSupportedError') !== -1; }\
+              </script></body></html>",
+        );
+        assert_eq!(node_list_str(&mut probe.vm, "String(__nd);"), "true");
+        remove_context(ContextId(ctx));
+    }
+
+    #[test]
+    fn w84_parse_shim_dialog_request_close_disconnected_is_noop() {
+        // w84fix, shim twin of the production connectedness pin:
+        // a dialog removed while open (`open` survives removal)
+        // answers `requestClose` silently — no `cancel`, no
+        // `close`, argument untouched — per the spec's
+        // request-to-close step 2.
+        let (mut probe, _doc, ctx) = captured_install(
+            b"<html><body><dialog id=\"d\">hi</dialog><script>\
+              globalThis.__d = document.getElementById('d');\
+              globalThis.__seen = [];\
+              __d.addEventListener('cancel', function() { __seen.push('cancel'); });\
+              __d.addEventListener('close', function() { __seen.push('close'); });\
+              __d.showModal();\
+              __d.remove();\
+              __seen.push('open-after-remove:' + __d.open);\
+              __d.requestClose('late');\
+              __seen.push('open-after-request:' + __d.open + ';rv:' + __d.returnValue);\
+              </script></body></html>",
+        );
+        assert_eq!(
+            node_list_str(&mut probe.vm, "__seen.join(';');"),
+            "open-after-remove:true;open-after-request:true;rv:"
+        );
+        remove_context(ContextId(ctx));
+    }
+
+    #[test]
     fn parse_shim_dual_dialog_popover_modal_then_popover_adopts_modal() {
         let (mut probe, doc, ctx) = captured_install(
             b"<html><body><dialog id=\"d\" popover=\"manual\">hi</dialog><dialog id=\"e\" popover=\"manual\">hi</dialog><script>\
@@ -51382,6 +51917,46 @@ mod tests {
             n_dialog_open_get(&mut fx.heap, d, &[]).unwrap(),
             Value::Bool(false)
         );
+        remove_context(fx.ctx);
+    }
+
+    #[test]
+    fn w84_dialog_close_return_value_matrix() {
+        // C1: `close(rv)` applies the argument; an omitted
+        // argument keeps the stored value; `null` stringifies
+        // to `"null"` (DOMString conversion, like every other
+        // string argument here); `""` clears it. A close on an
+        // already-closed dialog is a no-op that keeps the value.
+        let mut fx = setup("<html><body><dialog id=\"d\">hi</dialog></body></html>");
+        let d = call_get_element_by_id(&mut fx, "d");
+        let rv =
+            |fx: &mut Fixture| rv_str(n_dialog_return_value_get(&mut fx.heap, d, &[]).unwrap());
+        let is_open = |fx: &mut Fixture| {
+            n_dialog_open_get(&mut fx.heap, d, &[]).unwrap() == Value::Bool(true)
+        };
+        assert_eq!(rv(&mut fx), "");
+        let yes = str_val(&mut fx, "yes");
+        n_show_dialog_modal(&mut fx.heap, d, &[]).unwrap();
+        n_close_dialog(&mut fx.heap, d, &[yes]).unwrap();
+        assert!(!is_open(&mut fx));
+        assert_eq!(rv(&mut fx), "yes");
+        // Omitted argument keeps the stored value.
+        n_show_dialog_modal(&mut fx.heap, d, &[]).unwrap();
+        n_close_dialog(&mut fx.heap, d, &[]).unwrap();
+        assert_eq!(rv(&mut fx), "yes");
+        // `null` -> `"null"`, `""` clears.
+        n_show_dialog_modal(&mut fx.heap, d, &[]).unwrap();
+        n_close_dialog(&mut fx.heap, d, &[Value::Null]).unwrap();
+        assert_eq!(rv(&mut fx), "null");
+        let empty = str_val(&mut fx, "");
+        n_show_dialog_modal(&mut fx.heap, d, &[]).unwrap();
+        n_close_dialog(&mut fx.heap, d, &[empty]).unwrap();
+        assert_eq!(rv(&mut fx), "");
+        // Re-close is a no-op: still closed, value untouched.
+        let nope = str_val(&mut fx, "nope");
+        n_close_dialog(&mut fx.heap, d, &[nope]).unwrap();
+        assert!(!is_open(&mut fx));
+        assert_eq!(rv(&mut fx), "");
         remove_context(fx.ctx);
     }
 

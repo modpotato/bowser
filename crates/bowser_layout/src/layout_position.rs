@@ -2297,12 +2297,16 @@ mod tests {
         assert!(approx(r2.rect.x, 30.0), "x={}", r2.rect.x);
     }
 
-    // `height: stretch` support for abspos boxes is landing separately;
-    // these WPT css-position/position-relative-016 shapes (t3/t18) are
-    // ignored until the tree builds green with it. They pin the expected
-    // values for that work.
+    // WPT css-position/position-relative-016 shapes (t3/t18):
+    // `height: stretch` on an abspos box fills its definite containing
+    // block, so a relative child's percentage offset resolves against
+    // that filled height. The fill itself comes from `specified_height`
+    // (CSS Sizing 3 §5: stretch fills the containing-block height when
+    // definite, behaves as `auto` when indefinite), which the abspos
+    // path already threads a definite `cb_h` into; the tests below pin
+    // that the abspos path actually carries it through, including the
+    // definiteness flag the relative child reads.
     #[test]
-    #[ignore]
     fn abspos_stretch_height_fills_definite_cb() {
         let html = r#"<div class="cb"><div class="a"><div class="r"></div></div></div>"#;
         let css = "body { margin: 0; } \
@@ -2321,7 +2325,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore]
     fn abspos_stretch_height_child_bottom() {
         let html = r#"<div class="cb"><div class="a"><div class="r"></div></div></div>"#;
         let css = "body { margin: 0; } \
@@ -2336,6 +2339,95 @@ mod tests {
             "dy={}",
             r.rect.y - a.rect.y
         );
+    }
+
+    #[test]
+    fn abspos_stretch_height_indefinite_cb_behaves_as_auto() {
+        // CSS Sizing 3 §5: against an indefinite containing-block
+        // height there is nothing to fill, so `stretch` behaves as
+        // `auto` — the box keeps its content height (10px) and stays
+        // indefinite, so the relative child's `top: 50%` computes to
+        // `auto` (no shift), mirroring the t13/t15 negatives.
+        let html = r#"<div class="cb"><div class="h"></div><div class="a"><div class="r"></div></div></div>"#;
+        let css = "body { margin: 0; } \
+             .cb { position: relative; } .h { height: 20px; } \
+             .a { position: absolute; height: stretch; } \
+             .r { position: relative; top: 50%; height: 10px; }";
+        let l = layout_plain(html, css);
+        let a = &body(&l).children[0].children[1];
+        let r = &a.children[0];
+        assert!(approx(a.rect.h, 10.0), "a.h={}", a.rect.h);
+        assert!(
+            approx(r.rect.y - a.rect.y, 0.0),
+            "dy={}",
+            r.rect.y - a.rect.y
+        );
+    }
+
+    #[test]
+    fn abspos_stretch_height_min_height_clamps() {
+        // A stretched height is still a specified height for
+        // min/max clamping: `min-height: 250px` wins over the 200px fill.
+        let html = r#"<div class="cb"><div class="a"><div class="r"></div></div></div>"#;
+        let css = "body { margin: 0; } \
+             .cb { position: relative; height: 200px; } \
+             .a { position: absolute; height: stretch; min-height: 250px; } \
+             .r { position: relative; top: 50%; height: 10px; }";
+        let l = layout_plain(html, css);
+        let a = &body(&l).children[0].children[0];
+        let r = &a.children[0];
+        assert!(approx(a.rect.h, 250.0), "a.h={}", a.rect.h);
+        assert!(
+            approx(r.rect.y - a.rect.y, 125.0),
+            "dy={}",
+            r.rect.y - a.rect.y
+        );
+    }
+
+    #[test]
+    fn abspos_stretch_height_fixed_fills_viewport() {
+        // `position: fixed` with `height: stretch` fills the initial
+        // containing block (the 800x600 test viewport), not its
+        // in-flow parent.
+        let html = r#"<div class="a"><div class="r"></div></div>"#;
+        let css = "body { margin: 0; } \
+             .a { position: fixed; height: stretch; } \
+             .r { position: relative; top: 50%; height: 10px; }";
+        let l = layout_plain(html, css);
+        let a = &body(&l).children[0];
+        let r = &a.children[0];
+        assert!(approx(a.rect.h, 600.0), "a.h={}", a.rect.h);
+        assert!(
+            approx(r.rect.y - a.rect.y, 300.0),
+            "dy={}",
+            r.rect.y - a.rect.y
+        );
+    }
+
+    #[test]
+    fn abspos_stretch_height_with_opposing_insets_is_definite() {
+        // `stretch` resolves to the full containing-block height, so
+        // with both `top` and `bottom` specified the equation is
+        // over-constrained and `bottom` is dropped (CSS 2.1 §10.6.4):
+        // the box sits at `top` with the full 200px height. The
+        // full-CB resolution happens BEFORE inset constraint
+        // solving, not as "fill the space between the insets"
+        // (which would give 170): CSS Sizing 4 §3.2/§7.1 defines
+        // `stretch` as stretch-fit sizing, matching the box's
+        // margin box to its containing block (margins zero here),
+        // and CSS Sizing 3's definite-size rule makes an
+        // absolutely positioned element's containing block always
+        // definite for it — so `stretch` is a definite 200px height
+        // entering the §10.6.4 equation, and `bottom` is the value
+        // dropped as over-constrained.
+        let html = r#"<div class="cb"><div class="a"></div></div>"#;
+        let css = "body { margin: 0; } \
+             .cb { position: relative; height: 200px; } \
+             .a { position: absolute; top: 10px; bottom: 20px; height: stretch; }";
+        let l = layout_plain(html, css);
+        let a = &body(&l).children[0].children[0];
+        assert!(approx(a.rect.y, 10.0), "a.y={}", a.rect.y);
+        assert!(approx(a.rect.h, 200.0), "a.h={}", a.rect.h);
     }
 
     // --- `position: fixed` static-position frame (fix 1) ---
@@ -3571,6 +3663,58 @@ mod tests {
         let l = layout_scrolled(html, css, (0.0, 500.0));
         let sticky = &body(&l).children[0].children[0];
         assert!(approx(sticky.rect.y, 120.0), "y={}", sticky.rect.y);
+    }
+
+    // --- WPT position-sticky-overflow-padding (pin) ---
+    //
+    // Stylesheet mirror of `setupStickyTest` with `padding: 20px 0` on
+    // the scroller and `top: 0`: scroller content origin 20, container
+    // at 120, sticky laid out at 220. At scroll 200 the box sticks at
+    // the padded scrollport origin (220); at scroll 315 the
+    // scrollport alone would put it at 335, but the
+    // containing-block bound (container 120..420, sticky 100 tall)
+    // pins it at 320. Pins the layout half of the WPT file: the
+    // remaining WPT failure in that file's third subtest (expected
+    // 320, got 300 through the driver) is not this arithmetic — it
+    // reproduces exactly here.
+
+    #[test]
+    fn sticky_padded_scroller_cb_bound_matches_wpt() {
+        let html = r#"<div id="sc"><div id="contents"><div id="pre"></div><div id="container"><div id="filler"></div><div id="sticky"></div></div></div></div>"#;
+        let css = "body { margin: 0; } \
+             #sc { position: relative; width: 100px; height: 200px; overflow: hidden; padding: 20px 0; } \
+             #contents { height: 500px; } \
+             #pre { height: 100px; } \
+             #container { height: 300px; } \
+             #filler { height: 100px; } \
+             #sticky { position: sticky; top: 0; height: 100px; }";
+        for (scroll, expect) in [(150.0, 220.0), (200.0, 220.0), (315.0, 320.0)] {
+            let (doc, _) = bowser_dom::Document::parse_html(html.as_bytes());
+            let ss = bowser_css::parse_stylesheet(css);
+            let mut offsets = HashMap::new();
+            offsets.insert(doc.get_element_by_id("sc").expect("sc"), (0.0, scroll));
+            let l = layout_with_scroll_and_offsets(
+                &doc,
+                &[&ss],
+                VP,
+                &FixedFontMetrics,
+                (0.0, 0.0),
+                &offsets,
+            );
+            let sc = &body(&l).children[0];
+            let contents = &sc.children[0];
+            let container = &contents.children[1];
+            let sticky = &container.children[1];
+            assert!(
+                approx(sticky.rect.y, expect),
+                "scroll {scroll}: sticky y={} (sc y={}, contents y={}, container y={}, container h={}), expected {expect}",
+                sticky.rect.y,
+                sc.rect.y,
+                contents.rect.y,
+                container.rect.y,
+                container.rect.h
+            );
+        }
     }
 
     #[test]

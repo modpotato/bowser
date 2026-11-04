@@ -16475,6 +16475,205 @@ mod tests {
     }
 
     #[test]
+    fn w84_escape_ignores_non_modal_dialog_and_manual_popover_on_top() {
+        // C5/C6: Escape never targets a non-modal dialog
+        // (show() promotes nothing to the top layer), and a
+        // manual popover sitting above a modal dialog makes the
+        // top-layer member non-dismissible, so Escape is a
+        // no-op for both (unlike an auto popover above a modal
+        // dialog, which Escape dismisses first — covered by
+        // escape_closes_auto_popover_but_not_manual...).
+        let mut doc = dismiss_doc();
+        let dlg = doc.get_element_by_id("dlg").expect("dlg");
+        doc.show_dialog(dlg).expect("show");
+        let (tab, _, _, _, _, _) = dismiss_tab(doc);
+        let mut tabs = TabArena::default();
+        let tab_id = tabs.insert(tab);
+        let jar = Arc::new(Mutex::new(CookieJar::new()));
+        let (mut app, log) = dismiss_app(
+            &mut tabs,
+            &jar,
+            tab_id,
+            StubDispatch {
+                prevent: false,
+                ..Default::default()
+            },
+        );
+        app.on_key(&Key::Named(NamedKey::Escape), true);
+        assert!(
+            check(&app, tab_id, |d| d.is_dialog_open(dlg)),
+            "Escape must not close a non-modal dialog"
+        );
+        assert!(log.borrow().cancels.is_empty());
+        assert!(log.borrow().closes.is_empty());
+
+        // Manual popover above a modal dialog: Escape no-op.
+        let mut doc = dismiss_doc();
+        let pop = doc.get_element_by_id("pop").expect("pop");
+        let dlg = doc.get_element_by_id("dlg").expect("dlg");
+        doc.set_attribute(pop, "popover", "manual");
+        doc.show_dialog_modal(dlg).expect("showModal");
+        doc.show_popover(pop).expect("show manual");
+        let (tab, _, _, _, _, _) = dismiss_tab(doc);
+        let mut tabs = TabArena::default();
+        let tab_id = tabs.insert(tab);
+        let jar = Arc::new(Mutex::new(CookieJar::new()));
+        let (mut app, log) = dismiss_app(
+            &mut tabs,
+            &jar,
+            tab_id,
+            StubDispatch {
+                prevent: false,
+                ..Default::default()
+            },
+        );
+        app.on_key(&Key::Named(NamedKey::Escape), true);
+        assert!(
+            check(&app, tab_id, |d| d.is_dialog_open(dlg)),
+            "Escape topped by a manual popover must not close the dialog below"
+        );
+        assert!(
+            check(&app, tab_id, |d| d.is_popover_open(pop)),
+            "Escape must not dismiss the manual popover on top"
+        );
+        assert!(log.borrow().cancels.is_empty());
+        assert!(log.borrow().closes.is_empty());
+        assert!(log.borrow().toggles.is_empty());
+    }
+
+    #[test]
+    fn w84_remove_attribute_open_restores_focus_at_sync() {
+        // C8 (window level): removing `open` from a modal
+        // dialog demotes it without any `close` dispatch, and
+        // the next focus sync restores the previous focus via
+        // the final-state diff (no `Closed` journal event is
+        // pushed by an attribute removal).
+        let (doc, _) = Document::parse_html(
+            b"<html><body><button id=\"out\">o</button>\
+              <dialog id=\"dlg\"><button id=\"a\">a</button>\
+              <button id=\"b\">b</button></dialog></body></html>",
+        );
+        let id = |name: &str| doc.get_element_by_id(name).expect(name);
+        let (out, dlg, a, _b) = (id("out"), id("dlg"), id("a"), id("b"));
+        let tab = focus_tab(doc, &[out, dlg, a, _b]);
+        let mut tabs = TabArena::default();
+        let tab_id = tabs.insert(tab);
+        let jar = Arc::new(Mutex::new(CookieJar::new()));
+        let (mut app, log) = dismiss_app(
+            &mut tabs,
+            &jar,
+            tab_id,
+            StubDispatch {
+                prevent: false,
+                ..Default::default()
+            },
+        );
+        app.input.focused = Some(out);
+        with_installed_doc(&mut app, tab_id, |d| {
+            d.show_dialog_modal(dlg).expect("showModal");
+        });
+        app.sync_modal_focus();
+        assert_eq!(app.input.focused, Some(a));
+        with_installed_doc(&mut app, tab_id, |d| {
+            d.set_dialog_return_value(dlg, "kept");
+            d.remove_attribute(dlg, "open");
+        });
+        assert!(!check(&app, tab_id, |d| d.is_dialog_open(dlg)));
+        assert!(!check(&app, tab_id, |d| d.is_dialog_modal(dlg)));
+        assert!(
+            check(&app, tab_id, |d| d.dialog_return_value(dlg) == "kept"),
+            "removeAttribute('open') must leave returnValue untouched"
+        );
+        app.sync_modal_focus();
+        assert_eq!(
+            app.input.focused,
+            Some(out),
+            "removeAttribute('open') must restore previous focus at the next sync"
+        );
+        assert!(stack_len(&app, tab_id) == 0);
+        assert!(log.borrow().closes.is_empty());
+    }
+
+    #[test]
+    fn w84_removed_modal_dialog_reinserts_open_but_non_modal() {
+        // C9: removing an open modal dialog demotes it and
+        // restores previous focus at the next sync; the `open`
+        // attribute survives removal, so a reinserted dialog
+        // comes back open but non-modal (never re-promoted to
+        // the top layer), with no `close` event at any point.
+        let (doc, _) = Document::parse_html(
+            b"<html><body><button id=\"out\">o</button>\
+              <dialog id=\"dlg\"><button id=\"a\">a</button></dialog></body></html>",
+        );
+        let id = |name: &str| doc.get_element_by_id(name).expect(name);
+        let (out, dlg, a) = (id("out"), id("dlg"), id("a"));
+        let tab = focus_tab(doc, &[out, dlg, a]);
+        let mut tabs = TabArena::default();
+        let tab_id = tabs.insert(tab);
+        let jar = Arc::new(Mutex::new(CookieJar::new()));
+        let (mut app, log) = dismiss_app(
+            &mut tabs,
+            &jar,
+            tab_id,
+            StubDispatch {
+                prevent: false,
+                ..Default::default()
+            },
+        );
+        app.input.focused = Some(out);
+        with_installed_doc(&mut app, tab_id, |d| {
+            d.show_dialog_modal(dlg).expect("showModal");
+        });
+        app.sync_modal_focus();
+        assert_eq!(app.input.focused, Some(a));
+        with_installed_doc(&mut app, tab_id, |d| {
+            d.remove(dlg);
+        });
+        app.sync_modal_focus();
+        assert_eq!(
+            app.input.focused,
+            Some(out),
+            "removal must restore previous focus"
+        );
+        assert!(stack_len(&app, tab_id) == 0);
+        // The `open` attribute survives removal; modal flag and
+        // top-layer membership do not.
+        assert!(check(&app, tab_id, |d| d.is_dialog_open(dlg)));
+        assert!(!check(&app, tab_id, |d| d.is_dialog_modal(dlg)));
+        assert!(!check(&app, tab_id, |d| d.is_in_top_layer(dlg)));
+        with_installed_doc(&mut app, tab_id, |d| {
+            let body = d.get_elements_by_tag_name("body").item(0).expect("body");
+            d.append_child(body, dlg);
+        });
+        assert!(
+            check(&app, tab_id, |d| d.is_dialog_open(dlg)),
+            "reinserted dialog keeps its open attribute"
+        );
+        assert!(
+            !check(&app, tab_id, |d| d.is_dialog_modal(dlg)),
+            "reinserted dialog comes back non-modal"
+        );
+        assert!(!check(&app, tab_id, |d| d.is_in_top_layer(dlg)));
+        app.sync_modal_focus();
+        assert_eq!(
+            app.input.focused,
+            Some(out),
+            "reinsert must not re-stack or re-move focus"
+        );
+        assert!(stack_len(&app, tab_id) == 0);
+        assert!(log.borrow().closes.is_empty());
+        assert!(log.borrow().cancels.is_empty());
+        // w84fix: close() recovers the reinserted dialog — it
+        // is still open (the attribute survived removal), so a
+        // plain close() returns true and clears the open state.
+        with_installed_doc(&mut app, tab_id, |d| {
+            assert!(d.close_dialog(dlg, None).expect("close"));
+        });
+        assert!(!check(&app, tab_id, |d| d.is_dialog_open(dlg)));
+        assert!(log.borrow().closes.is_empty());
+    }
+
+    #[test]
     fn light_dismiss_press_outside_closes_auto_only_and_inside_keeps_open() {
         // Outside press (empty area, no hit) dismisses the auto popover.
         let mut doc = dismiss_doc();

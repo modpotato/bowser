@@ -15816,6 +15816,155 @@ mod tests {
         }
     }
 
+    /// w84: multicol paint follows laid-out geometry. The canonical
+    /// w81f shape (inline-block, 2 columns, 20px gap, 50px children)
+    /// must paint the second child's background in column 2 (item x +
+    /// 70), not stacked under the first child at item x, and the
+    /// `column-rule` must land centered on the gap (item x + 60, so
+    /// a 2px rule spans item x + 59 .. + 61). This is the first test
+    /// tying multicol paint output to laid-out rects: layout pins
+    /// alone cannot catch a paint walk that ignores column shifts.
+    #[test]
+    fn w84_multicol_paint_canonical_columns_and_rule() {
+        let (doc, root) = layout_html(
+            b"<!DOCTYPE html><html><body><div id=\"i\"><div id=\"a\"></div><div id=\"b\"></div></div></body></html>",
+            "body { margin: 0; } #i { display: inline-block; column-count: 2; column-gap: 20px; column-rule: 2px solid black; } #a { width: 50px; height: 50px; background: red; } #b { width: 50px; height: 50px; background: blue; }",
+        );
+        let (_, _, tree) = build_tree(&doc, &root);
+        let paint = tree.bake_paint_tree(&root).into_owned();
+        let item = find_box(&paint, doc.get_element_by_id("i").expect("i")).expect("item box");
+        let a_box = find_box(&paint, doc.get_element_by_id("a").expect("a")).expect("a box");
+        let b_box = find_box(&paint, doc.get_element_by_id("b").expect("b")).expect("b box");
+        // Layout shape first, so a paint failure cannot masquerade
+        // as a layout failure (and vice versa).
+        assert!(approx_eq(item.rect.w, 120.0), "item w={}", item.rect.w);
+        assert!(approx_eq(item.rect.h, 50.0), "item h={}", item.rect.h);
+        assert!(approx_eq(b_box.rect.x, item.rect.x + 70.0));
+        assert!(approx_eq(b_box.rect.y, a_box.rect.y));
+        let list = display_list_of(&paint, &doc);
+        // Second child's blue fill paints at the column-2 rect, and
+        // no blue fill paints at the stacked (item x) position.
+        let blue = list
+            .items
+            .iter()
+            .filter(|it| matches!(it, DisplayItem::FillRect { color, .. } if *color == Color::rgba8(0, 0, 255, 255)))
+            .collect::<Vec<_>>();
+        assert_eq!(blue.len(), 1, "exactly one blue fill, got {blue:?}");
+        match blue[0] {
+            DisplayItem::FillRect { rect, .. } => assert_eq!(*rect, b_box.rect),
+            _ => unreachable!(),
+        }
+        // Column rule: one border item, 2px wide, 50px tall, left
+        // edge bar centered on the gap center (item x + 60).
+        let rules = list
+            .items
+            .iter()
+            .filter_map(|it| match it {
+                DisplayItem::Border { rect, widths, .. } => Some((rect, widths)),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(rules.len(), 1, "exactly one rule item, got {rules:?}");
+        let (rect, widths) = rules[0];
+        assert!(approx_eq(rect.x, item.rect.x + 59.0), "rule x={}", rect.x);
+        assert!(approx_eq(rect.w, 2.0), "rule w={}", rect.w);
+        assert!(approx_eq(rect.h, 50.0), "rule h={}", rect.h);
+        assert!(approx_eq(widths[3], 2.0), "rule left width={}", widths[3]);
+    }
+
+    /// w84: a split block child paints per fragment, not per element.
+    /// The 200px-tall text child (10 lines at 20px) in a definite
+    /// 100px-high 2-column container fragments 100px / 100px, so its
+    /// red background must paint twice (once per fragment rect) and
+    /// never as one 200px rect; all 10 line runs must paint, 5 per
+    /// column, so the continuation is neither dropped nor doubled.
+    #[test]
+    fn w84_multicol_paint_split_fragments() {
+        let lines = (1..=10)
+            .map(|k| format!("l{k}"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let html = format!(
+            "<!DOCTYPE html><html><body><div id=\"mc\"><div id=\"t\">{lines}</div></div></body></html>"
+        );
+        let (doc, root) = layout_html(
+            html.as_bytes(),
+            "body { margin: 0; } #mc { width: 420px; column-count: 2; column-gap: 20px; height: 100px; } #t { white-space: pre; line-height: 20px; background: red; }",
+        );
+        let (_, _, tree) = build_tree(&doc, &root);
+        let paint = tree.bake_paint_tree(&root).into_owned();
+        // Both fragments of #t exist in the paint tree, same node.
+        let t_node = doc.get_element_by_id("t").expect("t");
+        let mut frags = Vec::new();
+        let mut stack = vec![&paint];
+        while let Some(b) = stack.pop() {
+            if b.node == Some(t_node) {
+                frags.push(b.rect);
+            }
+            stack.extend(b.children.iter());
+        }
+        assert_eq!(frags.len(), 2, "two paint-tree fragments, got {frags:?}");
+        let list = display_list_of(&paint, &doc);
+        let reds = list
+            .items
+            .iter()
+            .filter_map(|it| match it {
+                DisplayItem::FillRect { rect, color } if *color == Color::rgba8(255, 0, 0, 255) => {
+                    Some(*rect)
+                }
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        // The block fragments themselves paint once each. (The text
+        // child re-emits the same solid color over its own narrower
+        // rect too: generic paint behavior, idempotent for a solid
+        // color per the gradient comment in `paint_box` — not a
+        // multicol double-paint — so the fragment assertion filters
+        // to the 200px-wide block rects.)
+        let frag_fills = reds
+            .iter()
+            .filter(|r| approx_eq(r.w, 200.0))
+            .collect::<Vec<_>>();
+        assert_eq!(
+            frag_fills.len(),
+            2,
+            "background paints once per fragment, got {reds:?}"
+        );
+        assert!(
+            frag_fills.iter().all(|r| approx_eq(r.h, 100.0)),
+            "no double-painted full 200px rect, got {reds:?}"
+        );
+        assert!(
+            reds.iter().all(|r| !approx_eq(r.h, 200.0)),
+            "no unsliced 200px fill, got {reds:?}"
+        );
+        assert!(
+            frag_fills.iter().any(|r| approx_eq(r.x, 0.0))
+                && frag_fills.iter().any(|r| approx_eq(r.x, 220.0)),
+            "one fragment fill per column, got {reds:?}"
+        );
+        // Text runs: 10 lines total, 5 in each column.
+        let runs = list
+            .items
+            .iter()
+            .filter_map(|it| match it {
+                DisplayItem::TextRun { rect, .. } => Some(*rect),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(runs.len(), 10, "all lines paint, got {}", runs.len());
+        assert_eq!(
+            runs.iter().filter(|r| approx_eq(r.x, 0.0)).count(),
+            5,
+            "5 runs in column 1"
+        );
+        assert_eq!(
+            runs.iter().filter(|r| approx_eq(r.x, 220.0)).count(),
+            5,
+            "5 runs in column 2"
+        );
+    }
+
     /// A scroll container with an absolutely-positioned child (a
     /// dropdown) stays on the transform fast path: the child shifts
     /// with the scroll but drains inside the container's clip range,

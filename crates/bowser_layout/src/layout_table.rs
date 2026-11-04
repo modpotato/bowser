@@ -6464,7 +6464,13 @@ fn share_proportional(row_h: &mut [f32], cands: &[usize], extra: f32) {
 /// specified height itself, or a cell originating in it does (a cell's
 /// specified height constrains its row, per WPT
 /// `table-height-redistribution` table 31).
-fn row_is_sized(forest: &Forest, fr: &TableResume, r: usize, spec: HeightSpec) -> bool {
+fn row_is_sized(
+    forest: &Forest,
+    fr: &TableResume,
+    r: usize,
+    spec: HeightSpec,
+    pct_enabled: bool,
+) -> bool {
     if !spec.is_auto() {
         return true;
     }
@@ -6472,6 +6478,7 @@ fn row_is_sized(forest: &Forest, fr: &TableResume, r: usize, spec: HeightSpec) -
         c.row == r
             && cell_laid_out(&fr.collapsed_rows, &fr.collapsed_cols, c)
             && !matches!(forest.nodes[c.node].data.height, SpecLen::Auto)
+            && (pct_enabled || pct_fraction(forest.nodes[c.node].data.height).is_none())
     })
 }
 
@@ -6766,6 +6773,333 @@ fn recompute_baseline_shifts(forest: &Forest, fr: &TableResume) -> Vec<f32> {
     bshift
 }
 
+/// Pre-table-height row pipeline (css-tables-3 §3.10.1/§3.10.4):
+/// content heights, specified minima, `rowspan` distribution, baseline
+/// growth, and row-group distribution — everything before the table's
+/// own specified height is distributed. `resume_table` runs it twice
+/// when the table has a specified height: once with percentages
+/// resolved as 0px (the first-pass *base* sizes) and once with them
+/// resolved (the second-pass *reference* sizes). When the table height
+/// falls between the two totals, the table-height pass sizes rows
+/// intermediately between base and reference instead of distributing
+/// excess over the reference sizes. `cell_h0` is the pre-detach
+/// snapshot of every cell's border-box height (parallel to
+/// `fr.cells`); the caller detaches measured-only cells before either
+/// pass, so the passes must not read the forest rects for heights.
+struct PreTableHeights {
+    row_h: Vec<f32>,
+    group_target: Vec<f32>,
+    bshift: Vec<f32>,
+    group_spec: Vec<Option<f32>>,
+    row_sized: Vec<bool>,
+}
+
+fn compute_pre_table_row_heights(
+    forest: &Forest,
+    fr: &TableResume,
+    vertical: bool,
+    cell_h0: &[f32],
+    pct_enabled: bool,
+) -> PreTableHeights {
+    // Row heights from the tallest cell in each row (border-box heights,
+    // now that cell contents laid out). Cells measured for height
+    // ([`cell_measured_for_height`]) contribute too: a collapsed row's
+    // content height feeds the specified-table-height distribution
+    // below (zeroed before placement), and a cell in fully-collapsed
+    // columns still sizes its visible row. A laid-out cell spanning a
+    // collapsed row never grows its visible rows (see
+    // [`cell_height_contributes`]).
+    let mut row_h = vec![0.0f32; fr.nrows];
+    for (ci, cell) in fr.cells.iter().enumerate().filter(|(_, c)| c.rowspan == 1) {
+        let measured = cell_measured_for_height(&fr.collapsed_rows, &fr.collapsed_cols, cell);
+        if !measured {
+            if !cell_laid_out(&fr.collapsed_rows, &fr.collapsed_cols, cell) {
+                continue;
+            }
+            if !cell_height_contributes(&fr.collapsed_rows, &fr.collapsed_cols, cell) {
+                continue;
+            }
+        }
+        // `cell_h0` is the pre-detach snapshot (the caller detaches
+        // measured-only cells before either pass runs); reading the
+        // forest here would see the detached zero instead.
+        let h = cell_h0[ci];
+        if h > row_h[cell.row] {
+            row_h[cell.row] = h;
+        }
+    }
+    // Specified heights on row groups and rows, resolved once: they
+    // feed the row minimums below, the `rowspan` distribution's
+    // constrained / percentage classification, and the row-group and
+    // table excess passes (CSS 2.1 §17.5.3). A row's percentages
+    // resolve against its group's specified height first, then the
+    // table's.
+    let group_spec: Vec<Option<f32>> = fr
+        .group_nodes
+        .iter()
+        .map(|&g| {
+            let v = group_height_spec(forest, g, fr.hspec);
+            // First pass (css-tables-3 §3.10.1): percentage group
+            // heights resolve as 0px, like percentage row heights.
+            if !pct_enabled && pct_fraction(forest.nodes[g].data.height).is_some() {
+                None
+            } else {
+                v
+            }
+        })
+        .collect();
+    let row_spec: Vec<HeightSpec> = (0..fr.nrows)
+        .map(|r| match fr.row_nodes.get(r).copied().flatten() {
+            Some(rn) => {
+                let base = fr
+                    .row_group
+                    .get(r)
+                    .copied()
+                    .flatten()
+                    .and_then(|gg| group_index(fr, gg))
+                    .and_then(|gi| group_spec[gi])
+                    .or(fr.hspec);
+                let spec = row_height_spec(forest, rn, base, fr.hspec);
+                // First pass: percentage row heights are 0px.
+                if !pct_enabled && matches!(spec, HeightSpec::Pct(_)) {
+                    HeightSpec::Auto
+                } else {
+                    spec
+                }
+            }
+            None => HeightSpec::Auto,
+        })
+        .collect();
+    // A specified `height` on a row is a minimum for that row's height
+    // (CSS 2.1 §17.5.3). The minimums land before the `rowspan`
+    // distribution, so spanning cells spread over the constrained
+    // sizes rather than the raw content sizes.
+    for (r, spec) in row_spec.iter().enumerate() {
+        if let Some(v) = spec.value() {
+            row_h[r] = row_h[r].max(v);
+        }
+    }
+
+    // `rowspan` cells grow the rows they span (see
+    // [`distribute_rowspan_excess`] for the algorithm). Cells are
+    // distributed in priority order: of two cells spanning the same
+    // rows the taller goes first; a span fully enclosed by another is
+    // distributed before it; otherwise the higher cell goes first.
+    // Collapsed rows take no part (CSS 2.1 §17.5): a cell intersecting
+    // a collapsed row never grows the visible rows it spans (see
+    // [`cell_height_contributes`]).
+    let mut span_origins = vec![0usize; fr.nrows];
+    for cell in fr.cells.iter().filter(|c| c.rowspan > 1) {
+        if cell_laid_out(&fr.collapsed_rows, &fr.collapsed_cols, cell)
+            && cell_height_contributes(&fr.collapsed_rows, &fr.collapsed_cols, cell)
+        {
+            span_origins[cell.row] += 1;
+        }
+    }
+    let mut spans: Vec<usize> = fr
+        .cells
+        .iter()
+        .enumerate()
+        .filter(|(_, c)| {
+            c.rowspan > 1
+                && cell_laid_out(&fr.collapsed_rows, &fr.collapsed_cols, c)
+                && cell_height_contributes(&fr.collapsed_rows, &fr.collapsed_cols, c)
+        })
+        .map(|(i, _)| i)
+        .collect();
+    spans.sort_by(|&ai, &bi| {
+        use std::cmp::Ordering;
+        let (a, b) = (&fr.cells[ai], &fr.cells[bi]);
+        let (sa, ea) = (a.row, span_end(fr, a));
+        let (sb, eb) = (b.row, span_end(fr, b));
+        let (ha, hb) = (cell_h0[ai], cell_h0[bi]);
+        if sa == sb && ea == eb {
+            hb.partial_cmp(&ha).unwrap_or(Ordering::Equal)
+        } else if sa >= sb && ea <= eb {
+            Ordering::Less // `a` is enclosed by `b`: the inner cell goes first.
+        } else if sb >= sa && eb <= ea {
+            Ordering::Greater
+        } else {
+            sa.cmp(&sb)
+                .then_with(|| hb.partial_cmp(&ha).unwrap_or(Ordering::Equal))
+        }
+    });
+    for ci in spans {
+        let cell = &fr.cells[ci];
+        let end = span_end(fr, cell);
+        let vis: Vec<usize> = (cell.row..end)
+            .filter(|&r| !fr.collapsed_rows.get(r).copied().unwrap_or(false))
+            .collect();
+        if vis.is_empty() {
+            continue;
+        }
+        let h = cell_h0[ci];
+        distribute_rowspan_excess(fr, &mut row_h, &row_spec, &span_origins, cell, &vis, h);
+    }
+
+    // Cell `vertical-align`: baseline alignment first. Each row's
+    // baseline is the greatest baseline among the
+    // `vertical-align: baseline` cells *originating in it with
+    // `rowspan == 1`* (baselines are measured from the cell's
+    // content-box top and every cell starts at its row's top, so they
+    // are comparable). A spanning cell's baseline belongs to the rows
+    // it spans as a whole: it must not shift — and grow — its first
+    // row (WPT `rowspan-height-redistribution`: a tall spanning cell
+    // would otherwise dump its whole height into its originating row).
+    // Each baseline cell's content shifts down by the difference,
+    // growing the row when the shifted cell needs more room (like the
+    // `rowspan` growth above). `top`/`middle`/`bottom` need no pre-pass:
+    // they only distribute the slack left after the row height is
+    // known. `sub`/`super` are meaningless on table cells and align as
+    // `baseline`.
+    // Vertical carve-out (w75f3, item 8), mirroring
+    // [`recompute_baseline_shifts`]: vertical tables keep the node's
+    // own baseline instead of the horizontal first-baseline walk.
+    let row_bl = |node: usize| -> f32 {
+        if vertical {
+            forest.nodes[node].baseline
+        } else {
+            cell_row_baseline(forest, node)
+        }
+    };
+    let mut bshift = vec![0.0f32; fr.cells.len()];
+    for r in 0..fr.nrows {
+        let mut bl_max = 0.0f32;
+        for cell in fr.cells.iter().filter(|c| c.row == r && c.rowspan == 1) {
+            // Never laid out: no baseline to contribute.
+            if !cell_laid_out(&fr.collapsed_rows, &fr.collapsed_cols, cell) {
+                continue;
+            }
+            if is_baseline_valign(forest, cell.node) {
+                bl_max = bl_max.max(row_bl(cell.node));
+            }
+        }
+        for (i, cell) in fr.cells.iter().enumerate().filter(|(_, c)| c.row == r) {
+            if !cell_laid_out(&fr.collapsed_rows, &fr.collapsed_cols, cell) {
+                continue;
+            }
+            if !is_baseline_valign(forest, cell.node) {
+                continue;
+            }
+            let dy = (bl_max - row_bl(cell.node)).max(0.0);
+            bshift[i] = dy;
+            // The shift moves the cell's content down *within* the cell:
+            // the row only grows when the shifted content overflows the
+            // cell's border box. A specified `height` absorbs the shift
+            // (CSS 2.1 §17.5.3: it is a minimum, and the baseline shift
+            // is content positioning, not extra height) — WPT
+            // css-tables/tentative/baseline-td.html "Baseline and td
+            // height" expects 202px, not 200px + shift. The natural
+            // content height (pre-minimum) sizes the shifted content;
+            // paths that did not record it fall back to `content_h`.
+            let need = {
+                let n = &forest.nodes[cell.node];
+                let m = &n.metrics;
+                let natural = if n.natural_content_h.is_nan() {
+                    n.content_h
+                } else {
+                    n.natural_content_h
+                };
+                let shifted_bottom = dy + natural + m.bt + m.pt + m.pb + m.bb;
+                n.rect.h.max(shifted_bottom)
+            };
+            if cell.rowspan == 1 {
+                if need > row_h[r] {
+                    row_h[r] = need;
+                }
+            } else {
+                // A cell intersecting a collapsed row never grows rows
+                // (see [`cell_height_contributes`]).
+                if !cell_height_contributes(&fr.collapsed_rows, &fr.collapsed_cols, cell) {
+                    continue;
+                }
+                // Collapsed rows take no part in the spread (see the
+                // `rowspan` growth above): the excess divides over the
+                // visible spanned rows only.
+                let end = span_end(fr, cell);
+                let vis: Vec<usize> = (cell.row..end)
+                    .filter(|&r| !fr.collapsed_rows.get(r).copied().unwrap_or(false))
+                    .collect();
+                if vis.is_empty() {
+                    continue;
+                }
+                distribute_rowspan_excess(
+                    fr,
+                    &mut row_h,
+                    &row_spec,
+                    &span_origins,
+                    cell,
+                    &vis,
+                    need,
+                );
+            }
+        }
+    }
+
+    // A specified `height` on a row group is a minimum for the sum of
+    // its rows' heights (CSS 2.1 §17.5.3). The group's excess over its
+    // rows' natural heights distributes over the group's unconstrained
+    // rows proportionally to their heights (evenly when all are
+    // zero-height); when every row is constrained, the constrained rows
+    // grow proportionally instead. Collapsed rows take no share, and a
+    // fully-collapsed group's specified height is discarded with it.
+    // `group_target` is each group's final height contribution to the
+    // table's natural height; rowless groups (no rows at all) keep
+    // theirs as a direct rect height.
+    let vis_row = |r: usize| !fr.collapsed_rows.get(r).copied().unwrap_or(false);
+    // B5: `row_is_sized` scans every cell per call and the distribution
+    // passes below call it O(rows x units) times (~O(U*R*C) overall).
+    // It depends only on `row_spec` and the cells' specified heights,
+    // neither of which changes during distribution, so resolve it once
+    // per row here and thread the flags through both passes.
+    let row_sized: Vec<bool> = (0..fr.nrows)
+        .map(|r| row_is_sized(forest, fr, r, row_spec[r], pct_enabled))
+        .collect();
+    let mut group_target = vec![0.0f32; fr.group_nodes.len()];
+    for (gi, &g) in fr.group_nodes.iter().enumerate() {
+        let rows: Vec<usize> = fr
+            .row_group
+            .iter()
+            .enumerate()
+            .filter(|(r, grp)| *r < fr.nrows && **grp == Some(g))
+            .map(|(r, _)| r)
+            .collect();
+        let vis: Vec<usize> = rows.iter().copied().filter(|&r| vis_row(r)).collect();
+        let natural: f32 = vis.iter().map(|&r| row_h[r]).sum();
+        if rows.is_empty() {
+            group_target[gi] = group_spec[gi].unwrap_or(0.0);
+            continue;
+        }
+        if vis.is_empty() {
+            // Fully collapsed: the group's specified height never
+            // applies (see the zeroing pass below).
+            group_target[gi] = 0.0;
+            continue;
+        }
+        let target = group_spec[gi].unwrap_or(0.0).max(natural);
+        group_target[gi] = target;
+        let excess = target - natural;
+        if excess > 0.0 {
+            let free: Vec<usize> = vis.iter().copied().filter(|&r| !row_sized[r]).collect();
+            if free.is_empty() {
+                share_proportional(&mut row_h, &vis, excess);
+            } else {
+                share_proportional(&mut row_h, &free, excess);
+            }
+            // The rows now sum to the target.
+            group_target[gi] = vis.iter().map(|&r| row_h[r]).sum::<f32>().max(target);
+        }
+    }
+
+    PreTableHeights {
+        row_h,
+        group_target,
+        bshift,
+        group_spec,
+        row_sized,
+    }
+}
+
 pub(crate) fn resume_table(forest: &mut Forest, tasks: &mut Vec<Task>, fr: TableResume) {
     // Final caption-placement resume (w77-d task 1): the table is
     // already placed and transposed to physical space, so this resume
@@ -6887,33 +7221,16 @@ pub(crate) fn resume_table(forest: &mut Forest, tasks: &mut Vec<Task>, fr: Table
         }
     }
 
-    // Row heights from the tallest cell in each row (border-box heights,
-    // now that cell contents laid out). Cells measured for height
-    // ([`cell_measured_for_height`]) contribute too: a collapsed row's
-    // content height feeds the specified-table-height distribution
-    // below (zeroed before placement), and a cell in fully-collapsed
-    // columns still sizes its visible row. A laid-out cell spanning a
-    // collapsed row never grows its visible rows (see
-    // [`cell_height_contributes`]).
-    let mut row_h = vec![0.0f32; fr.nrows];
+    // Snapshot every cell's border-box height, then detach
+    // measured-only cells once: both passes below read heights from
+    // the snapshot (see `compute_pre_table_row_heights`).
+    let cell_h0: Vec<f32> = fr
+        .cells
+        .iter()
+        .map(|c| forest.nodes[c.node].rect.h)
+        .collect();
     for cell in fr.cells.iter().filter(|c| c.rowspan == 1) {
-        let measured = cell_measured_for_height(&fr.collapsed_rows, &fr.collapsed_cols, cell);
-        if !measured {
-            if !cell_laid_out(&fr.collapsed_rows, &fr.collapsed_cols, cell) {
-                continue;
-            }
-            if !cell_height_contributes(&fr.collapsed_rows, &fr.collapsed_cols, cell) {
-                continue;
-            }
-        }
-        let h = forest.nodes[cell.node].rect.h;
-        if h > row_h[cell.row] {
-            row_h[cell.row] = h;
-        }
-        // Measured-only cells never paint or place: detach them now
-        // that their height is captured — zero rect, drop children and
-        // fragments so paint sees the same empty box as a skipped cell.
-        if measured {
+        if cell_measured_for_height(&fr.collapsed_rows, &fr.collapsed_cols, cell) {
             let n = &mut forest.nodes[cell.node];
             n.rect = crate::Rect {
                 x: 0.0,
@@ -6925,250 +7242,25 @@ pub(crate) fn resume_table(forest: &mut Forest, tasks: &mut Vec<Task>, fr: Table
             n.fragments.clear();
         }
     }
-    // Specified heights on row groups and rows, resolved once: they
-    // feed the row minimums below, the `rowspan` distribution's
-    // constrained / percentage classification, and the row-group and
-    // table excess passes (CSS 2.1 §17.5.3). A row's percentages
-    // resolve against its group's specified height first, then the
-    // table's.
-    let group_spec: Vec<Option<f32>> = fr
-        .group_nodes
-        .iter()
-        .map(|&g| group_height_spec(forest, g, fr.hspec))
-        .collect();
-    let row_spec: Vec<HeightSpec> = (0..fr.nrows)
-        .map(|r| match fr.row_nodes.get(r).copied().flatten() {
-            Some(rn) => {
-                let base = fr
-                    .row_group
-                    .get(r)
-                    .copied()
-                    .flatten()
-                    .and_then(|gg| group_index(&fr, gg))
-                    .and_then(|gi| group_spec[gi])
-                    .or(fr.hspec);
-                row_height_spec(forest, rn, base, fr.hspec)
-            }
-            None => HeightSpec::Auto,
-        })
-        .collect();
-    // A specified `height` on a row is a minimum for that row's height
-    // (CSS 2.1 §17.5.3). The minimums land before the `rowspan`
-    // distribution, so spanning cells spread over the constrained
-    // sizes rather than the raw content sizes.
-    for (r, spec) in row_spec.iter().enumerate() {
-        if let Some(v) = spec.value() {
-            row_h[r] = row_h[r].max(v);
-        }
-    }
+    // Second-pass (reference) heights drive placement; the first-pass
+    // (base) heights feed only the §3.10.4 intermediate sizing in the
+    // table-height pass below. The base pass runs only for specified
+    // table heights, the one case where the two can differ.
+    let base_heights = fr
+        .hspec
+        .map(|_| compute_pre_table_row_heights(forest, &fr, vertical, &cell_h0, false));
+    let PreTableHeights {
+        mut row_h,
+        mut group_target,
+        mut bshift,
+        group_spec,
+        row_sized,
+    } = compute_pre_table_row_heights(forest, &fr, vertical, &cell_h0, true);
 
-    // `rowspan` cells grow the rows they span (see
-    // [`distribute_rowspan_excess`] for the algorithm). Cells are
-    // distributed in priority order: of two cells spanning the same
-    // rows the taller goes first; a span fully enclosed by another is
-    // distributed before it; otherwise the higher cell goes first.
-    // Collapsed rows take no part (CSS 2.1 §17.5): a cell intersecting
-    // a collapsed row never grows the visible rows it spans (see
-    // [`cell_height_contributes`]).
-    let mut span_origins = vec![0usize; fr.nrows];
-    for cell in fr.cells.iter().filter(|c| c.rowspan > 1) {
-        if cell_laid_out(&fr.collapsed_rows, &fr.collapsed_cols, cell)
-            && cell_height_contributes(&fr.collapsed_rows, &fr.collapsed_cols, cell)
-        {
-            span_origins[cell.row] += 1;
-        }
-    }
-    let mut spans: Vec<&GridCell> = fr
-        .cells
-        .iter()
-        .filter(|c| {
-            c.rowspan > 1
-                && cell_laid_out(&fr.collapsed_rows, &fr.collapsed_cols, c)
-                && cell_height_contributes(&fr.collapsed_rows, &fr.collapsed_cols, c)
-        })
-        .collect();
-    spans.sort_by(|a, b| {
-        use std::cmp::Ordering;
-        let (sa, ea) = (a.row, span_end(&fr, a));
-        let (sb, eb) = (b.row, span_end(&fr, b));
-        let (ha, hb) = (forest.nodes[a.node].rect.h, forest.nodes[b.node].rect.h);
-        if sa == sb && ea == eb {
-            hb.partial_cmp(&ha).unwrap_or(Ordering::Equal)
-        } else if sa >= sb && ea <= eb {
-            Ordering::Less // `a` is enclosed by `b`: the inner cell goes first.
-        } else if sb >= sa && eb <= ea {
-            Ordering::Greater
-        } else {
-            sa.cmp(&sb)
-                .then_with(|| hb.partial_cmp(&ha).unwrap_or(Ordering::Equal))
-        }
-    });
-    for cell in spans {
-        let end = span_end(&fr, cell);
-        let vis: Vec<usize> = (cell.row..end)
-            .filter(|&r| !fr.collapsed_rows.get(r).copied().unwrap_or(false))
-            .collect();
-        if vis.is_empty() {
-            continue;
-        }
-        let h = forest.nodes[cell.node].rect.h;
-        distribute_rowspan_excess(&fr, &mut row_h, &row_spec, &span_origins, cell, &vis, h);
-    }
-
-    // Cell `vertical-align`: baseline alignment first. Each row's
-    // baseline is the greatest baseline among the
-    // `vertical-align: baseline` cells *originating in it with
-    // `rowspan == 1`* (baselines are measured from the cell's
-    // content-box top and every cell starts at its row's top, so they
-    // are comparable). A spanning cell's baseline belongs to the rows
-    // it spans as a whole: it must not shift — and grow — its first
-    // row (WPT `rowspan-height-redistribution`: a tall spanning cell
-    // would otherwise dump its whole height into its originating row).
-    // Each baseline cell's content shifts down by the difference,
-    // growing the row when the shifted cell needs more room (like the
-    // `rowspan` growth above). `top`/`middle`/`bottom` need no pre-pass:
-    // they only distribute the slack left after the row height is
-    // known. `sub`/`super` are meaningless on table cells and align as
-    // `baseline`.
-    // Vertical carve-out (w75f3, item 8), mirroring
-    // [`recompute_baseline_shifts`]: vertical tables keep the node's
-    // own baseline instead of the horizontal first-baseline walk.
-    let row_bl = |node: usize| -> f32 {
-        if vertical {
-            forest.nodes[node].baseline
-        } else {
-            cell_row_baseline(forest, node)
-        }
-    };
-    let mut bshift = vec![0.0f32; fr.cells.len()];
-    for r in 0..fr.nrows {
-        let mut bl_max = 0.0f32;
-        for cell in fr.cells.iter().filter(|c| c.row == r && c.rowspan == 1) {
-            // Never laid out: no baseline to contribute.
-            if !cell_laid_out(&fr.collapsed_rows, &fr.collapsed_cols, cell) {
-                continue;
-            }
-            if is_baseline_valign(forest, cell.node) {
-                bl_max = bl_max.max(row_bl(cell.node));
-            }
-        }
-        for (i, cell) in fr.cells.iter().enumerate().filter(|(_, c)| c.row == r) {
-            if !cell_laid_out(&fr.collapsed_rows, &fr.collapsed_cols, cell) {
-                continue;
-            }
-            if !is_baseline_valign(forest, cell.node) {
-                continue;
-            }
-            let dy = (bl_max - row_bl(cell.node)).max(0.0);
-            bshift[i] = dy;
-            // The shift moves the cell's content down *within* the cell:
-            // the row only grows when the shifted content overflows the
-            // cell's border box. A specified `height` absorbs the shift
-            // (CSS 2.1 §17.5.3: it is a minimum, and the baseline shift
-            // is content positioning, not extra height) — WPT
-            // css-tables/tentative/baseline-td.html "Baseline and td
-            // height" expects 202px, not 200px + shift. The natural
-            // content height (pre-minimum) sizes the shifted content;
-            // paths that did not record it fall back to `content_h`.
-            let need = {
-                let n = &forest.nodes[cell.node];
-                let m = &n.metrics;
-                let natural = if n.natural_content_h.is_nan() {
-                    n.content_h
-                } else {
-                    n.natural_content_h
-                };
-                let shifted_bottom = dy + natural + m.bt + m.pt + m.pb + m.bb;
-                n.rect.h.max(shifted_bottom)
-            };
-            if cell.rowspan == 1 {
-                if need > row_h[r] {
-                    row_h[r] = need;
-                }
-            } else {
-                // A cell intersecting a collapsed row never grows rows
-                // (see [`cell_height_contributes`]).
-                if !cell_height_contributes(&fr.collapsed_rows, &fr.collapsed_cols, cell) {
-                    continue;
-                }
-                // Collapsed rows take no part in the spread (see the
-                // `rowspan` growth above): the excess divides over the
-                // visible spanned rows only.
-                let end = span_end(&fr, cell);
-                let vis: Vec<usize> = (cell.row..end)
-                    .filter(|&r| !fr.collapsed_rows.get(r).copied().unwrap_or(false))
-                    .collect();
-                if vis.is_empty() {
-                    continue;
-                }
-                distribute_rowspan_excess(
-                    &fr,
-                    &mut row_h,
-                    &row_spec,
-                    &span_origins,
-                    cell,
-                    &vis,
-                    need,
-                );
-            }
-        }
-    }
-
-    // A specified `height` on a row group is a minimum for the sum of
-    // its rows' heights (CSS 2.1 §17.5.3). The group's excess over its
-    // rows' natural heights distributes over the group's unconstrained
-    // rows proportionally to their heights (evenly when all are
-    // zero-height); when every row is constrained, the constrained rows
-    // grow proportionally instead. Collapsed rows take no share, and a
-    // fully-collapsed group's specified height is discarded with it.
-    // `group_target` is each group's final height contribution to the
-    // table's natural height; rowless groups (no rows at all) keep
-    // theirs as a direct rect height.
+    // `vis_row` lived in the pre-table pipeline before it was extracted
+    // (see `compute_pre_table_row_heights`); the table pass below uses
+    // it too, so it is defined here as well.
     let vis_row = |r: usize| !fr.collapsed_rows.get(r).copied().unwrap_or(false);
-    // B5: `row_is_sized` scans every cell per call and the distribution
-    // passes below call it O(rows x units) times (~O(U*R*C) overall).
-    // It depends only on `row_spec` and the cells' specified heights,
-    // neither of which changes during distribution, so resolve it once
-    // per row here and thread the flags through both passes.
-    let row_sized: Vec<bool> = (0..fr.nrows)
-        .map(|r| row_is_sized(forest, &fr, r, row_spec[r]))
-        .collect();
-    let mut group_target = vec![0.0f32; fr.group_nodes.len()];
-    for (gi, &g) in fr.group_nodes.iter().enumerate() {
-        let rows: Vec<usize> = fr
-            .row_group
-            .iter()
-            .enumerate()
-            .filter(|(r, grp)| *r < fr.nrows && **grp == Some(g))
-            .map(|(r, _)| r)
-            .collect();
-        let vis: Vec<usize> = rows.iter().copied().filter(|&r| vis_row(r)).collect();
-        let natural: f32 = vis.iter().map(|&r| row_h[r]).sum();
-        if rows.is_empty() {
-            group_target[gi] = group_spec[gi].unwrap_or(0.0);
-            continue;
-        }
-        if vis.is_empty() {
-            // Fully collapsed: the group's specified height never
-            // applies (see the zeroing pass below).
-            group_target[gi] = 0.0;
-            continue;
-        }
-        let target = group_spec[gi].unwrap_or(0.0).max(natural);
-        group_target[gi] = target;
-        let excess = target - natural;
-        if excess > 0.0 {
-            let free: Vec<usize> = vis.iter().copied().filter(|&r| !row_sized[r]).collect();
-            if free.is_empty() {
-                share_proportional(&mut row_h, &vis, excess);
-            } else {
-                share_proportional(&mut row_h, &free, excess);
-            }
-            // The rows now sum to the target.
-            group_target[gi] = vis.iter().map(|&r| row_h[r]).sum::<f32>().max(target);
-        }
-    }
-
     // A specified table height distributes its excess over the natural
     // content height (CSS 2.1 §17.5.3): row groups without a specified
     // height and with at least one unsized row absorb it, sharing
@@ -7235,7 +7327,109 @@ pub(crate) fn resume_table(forest: &mut Forest, tasks: &mut Vec<Task>, fr: Table
             .filter(|&r| fr.collapsed_rows.get(r).copied().unwrap_or(false))
             .map(|r| row_h[r])
             .sum::<f32>();
-        let excess = hspec - natural;
+        let mut excess = hspec - natural;
+        // w84-table: css-tables-3 §3.10.4 intermediate sizing. When
+        // the table height falls between the first-pass total (percent
+        // rows/groups at 0px) and the second-pass total (percentages
+        // resolved), rows size intermediately between their base and
+        // reference heights. The reference height of a row is the
+        // largest of its base height and its second-pass height: a
+        // percentage row growing in the second pass shrinks the
+        // spanning deficit, so second-pass origin rows can fall below
+        // their base heights (table 23: 51 vs the base 110) — the
+        // reference keeps the base. WPT `rowspan-height-redistribution`
+        // table 23: base 360, reference 478, table 460 → the 30% row
+        // lands at 20 + (100/118) * 118 = 120, and the origin rows keep
+        // their base 110. Collapsed rows and rowed groups whose group
+        // target exceeds their row sum (a binding group spec) are
+        // excluded — their heights vanish or slacken in ways the
+        // intermediate total cannot reconcile; those tables keep the
+        // old behaviour.
+        if let Some(base) = &base_heights
+            && !fr.collapsed_rows.iter().any(|&c| c)
+        {
+            let spacing_term = if !fr.collapse {
+                let nvis = fr.collapsed_rows.iter().filter(|&&c| !c).count();
+                fr.spacing_v * (nvis + 1) as f32
+            } else {
+                0.0
+            };
+            // Rowless groups are pure targets and interpolate; a rowed
+            // group whose target exceeds its row sum (binding group
+            // spec) breaks the row-sum accounting, so skip then.
+            let mut slack = false;
+            let mut base_total = 0.0f32;
+            let mut ref_total = 0.0f32;
+            for (gi, &g) in fr.group_nodes.iter().enumerate() {
+                if !fr.row_group.contains(&Some(g)) {
+                    base_total += base.group_target[gi];
+                    ref_total += base.group_target[gi].max(group_target[gi]);
+                }
+            }
+            for (gi, &g) in fr.group_nodes.iter().enumerate() {
+                if fr.row_group.contains(&Some(g)) {
+                    let brows: f32 = fr
+                        .row_group
+                        .iter()
+                        .enumerate()
+                        .filter(|(r, grp)| *r < fr.nrows && **grp == Some(g))
+                        .map(|(r, _)| base.row_h[r])
+                        .sum();
+                    let srows: f32 = fr
+                        .row_group
+                        .iter()
+                        .enumerate()
+                        .filter(|(r, grp)| *r < fr.nrows && **grp == Some(g))
+                        .map(|(r, _)| row_h[r])
+                        .sum();
+                    if (base.group_target[gi] - brows).abs() > 0.01
+                        || (group_target[gi] - srows).abs() > 0.01
+                    {
+                        slack = true;
+                    }
+                }
+            }
+            base_total += base.row_h.iter().sum::<f32>();
+            ref_total += row_h
+                .iter()
+                .zip(base.row_h.iter())
+                .map(|(s, b)| s.max(*b))
+                .sum::<f32>();
+            let base_natural = caps + spacing_term + base_total;
+            let ref_natural = caps + spacing_term + ref_total;
+            if !slack && base_natural < hspec && hspec < ref_natural {
+                let t = (hspec - base_natural) / (ref_natural - base_natural);
+                for (r, rh) in row_h.iter_mut().enumerate() {
+                    let reference = (*rh).max(base.row_h[r]);
+                    *rh = base.row_h[r] + t * (reference - base.row_h[r]);
+                }
+                // w84fix: placement below uses `bshift` for the
+                // baseline-aligned cells, so it interpolates with
+                // the same `t` instead of staying at the
+                // second-pass value. (Today the two passes share
+                // the cell baselines — both read the same forest
+                // snapshots — so base and reference shifts are
+                // identical and this is behaviour-preserving; it
+                // pins the pairing so a future per-pass baseline
+                // change cannot silently leave intermediately-sized
+                // rows placing with second-pass offsets. css-tables-3
+                // §3.10.1 likewise states distribution has no impact
+                // on row baselines, which is what the test below
+                // pins: the placed baselines coincide at the
+                // interpolated row height.)
+                for (i, bs) in bshift.iter_mut().enumerate() {
+                    *bs = base.bshift[i] + t * (*bs - base.bshift[i]);
+                }
+                for (gi, &g) in fr.group_nodes.iter().enumerate() {
+                    if !fr.row_group.contains(&Some(g)) {
+                        let reference = base.group_target[gi].max(group_target[gi]);
+                        group_target[gi] =
+                            base.group_target[gi] + t * (reference - base.group_target[gi]);
+                    }
+                }
+                excess = 0.0;
+            }
+        }
         if excess > 0.0 {
             // Row-group units in grid order; bare rows form one trailing
             // unit; rowless groups participate through their target.
@@ -7314,7 +7508,27 @@ pub(crate) fn resume_table(forest: &mut Forest, tasks: &mut Vec<Task>, fr: Table
                 }
                 all_unit_rows[u].iter().any(|&r| !row_sized[r])
             };
-            let absorbers: Vec<usize> = (0..targets.len()).filter(|&u| unit_absorbs(u)).collect();
+            // w84-table: a header/footer section never absorbs table
+            // excess while a body section (or bare rows) can absorb:
+            // WPT `table-height-redistribution` table 17 (empty thead
+            // + empty tbody under a 100px table) expects thead 0 and
+            // tbody 100, not the 50/50 split the old rule gave. A
+            // header/footer absorbs only when no body unit can (a
+            // thead-only table still grows to the table height, via
+            // this phase or the last-rowed-unit fallback below).
+            let is_body_unit = |u: usize| -> bool {
+                if u >= fr.group_nodes.len() {
+                    return true;
+                }
+                !matches!(
+                    row_group_section_kind(forest, fr.group_nodes[u]),
+                    Some(SectionKind::Header) | Some(SectionKind::Footer)
+                )
+            };
+            let body_can_absorb = (0..targets.len()).any(|u| is_body_unit(u) && unit_absorbs(u));
+            let absorbers: Vec<usize> = (0..targets.len())
+                .filter(|&u| unit_absorbs(u) && (is_body_unit(u) || !body_can_absorb))
+                .collect();
             let mut share = vec![0.0f32; targets.len()];
             if !absorbers.is_empty() {
                 let total: f32 = absorbers.iter().map(|&u| targets[u]).sum();
@@ -15103,6 +15317,272 @@ mod table_tests {
         let table = &l.children[0].children[0];
         assert!(approx(table.rect.h, 100.0), "table={}", table.rect.h);
         assert!(approx(row_at(&l, 0).rect.h, 100.0));
+    }
+
+    // ---- w84-table: reproductions for the 4 targeted WPT files ----
+    // These pin the current behaviour before any fix; the w84-table
+    // worker updates them as each diagnosis lands.
+
+    #[test]
+    fn w84_table_rowspan_pct_row_with_table_height() {
+        // WPT `rowspan-height-redistribution` table 23: table height
+        // 460, td padding 10, a 280px cell spanning 6 rows, a 30% row,
+        // and rowspan-origin rows. Chrome expects the 30% row at 120
+        // and the origin rows at 110/110.
+        let l = layout_table_html(
+            "<table style=\"height:460px;border-collapse:collapse\">\
+             <tr><td rowspan=\"6\"><div style=\"width:50px;height:280px\"></div></td><td></td><td></td></tr>\
+             <tr><td></td></tr>\
+             <tr style=\"height:30%\"><td></td></tr>\
+             <tr><td rowspan=\"7\"></td></tr>\
+             <tr><td rowspan=\"17\"><div style=\"width:50px;height:40px\"></div></td></tr>\
+             <tr><td></td></tr><tr><td></td></tr><tr><td></td></tr><tr><td></td></tr>\
+             </table>",
+            "table { border-collapse: collapse; } td { padding: 10px; }",
+        );
+        assert!(
+            approx(row_at(&l, 2).rect.h, 120.0),
+            "r2={}",
+            row_at(&l, 2).rect.h
+        );
+        assert!(
+            approx(row_at(&l, 3).rect.h, 110.0),
+            "r3={}",
+            row_at(&l, 3).rect.h
+        );
+        assert!(
+            approx(row_at(&l, 4).rect.h, 110.0),
+            "r4={}",
+            row_at(&l, 4).rect.h
+        );
+    }
+
+    #[test]
+    fn w84_table_empty_thead_empty_tbody() {
+        // WPT `table-height-redistribution` table 17: an empty thead
+        // and an empty tbody under a 100px table. Chrome gives the
+        // whole excess to the tbody (thead 0, tbody 100).
+        let l = layout_table_html(
+            "<table style=\"height:100px\"><thead><tr></tr></thead><tbody><tr></tr></tbody></table>",
+            NO_PAD,
+        );
+        assert!(
+            approx(group_at(&l, 0).rect.h, 0.0),
+            "thead={}",
+            group_at(&l, 0).rect.h
+        );
+        assert!(
+            approx(group_at(&l, 1).rect.h, 100.0),
+            "tbody={}",
+            group_at(&l, 1).rect.h
+        );
+    }
+
+    #[test]
+    fn w84_table_rowspan_pct_row_intermediate_midpoint() {
+        // §3.10.4 midpoint: same structure as
+        // `w84_table_rowspan_pct_row_with_table_height`, but table
+        // height 400 (base 360, reference 478) → t = 40/118, so the
+        // 30% row lands at 20 + 40 = 60 and the origin rows keep 110.
+        let l = layout_table_html(
+            "<table style=\"height:400px;border-collapse:collapse\">\
+             <tr><td rowspan=\"6\"><div style=\"width:50px;height:280px\"></div></td><td></td><td></td></tr>\
+             <tr><td></td></tr>\
+             <tr style=\"height:30%\"><td></td></tr>\
+             <tr><td rowspan=\"7\"></td></tr>\
+             <tr><td rowspan=\"17\"><div style=\"width:50px;height:40px\"></div></td></tr>\
+             <tr><td></td></tr><tr><td></td></tr><tr><td></td></tr><tr><td></td></tr>\
+             </table>",
+            "table { border-collapse: collapse; } td { padding: 10px; }",
+        );
+        assert!(
+            approx(row_at(&l, 2).rect.h, 60.0),
+            "r2={}",
+            row_at(&l, 2).rect.h
+        );
+        assert!(
+            approx(row_at(&l, 3).rect.h, 110.0),
+            "r3={}",
+            row_at(&l, 3).rect.h
+        );
+        assert!(
+            approx(row_at(&l, 4).rect.h, 110.0),
+            "r4={}",
+            row_at(&l, 4).rect.h
+        );
+    }
+
+    #[test]
+    fn w84fix_table_empty_tfoot_empty_tbody() {
+        // w84fix: tfoot counterpart of
+        // `w84_table_empty_thead_empty_tbody` (WPT
+        // `table-height-redistribution` table 17 covers the thead
+        // half; the spec's §3.10.5 distribution gives no priority
+        // to header/footer sections over body sections, and
+        // TablesNG gives the whole excess to the body section in
+        // the thead case, so the footer mirrors it). A footer
+        // section never absorbs while a body section can: the
+        // empty tfoot stays 0 and the empty tbody takes all 100.
+        let l = layout_table_html(
+            "<table style=\"height:100px\"><tbody><tr></tr></tbody><tfoot><tr></tr></tfoot></table>",
+            NO_PAD,
+        );
+        assert!(
+            approx(group_at(&l, 0).rect.h, 100.0),
+            "tbody={}",
+            group_at(&l, 0).rect.h
+        );
+        assert!(
+            approx(group_at(&l, 1).rect.h, 0.0),
+            "tfoot={}",
+            group_at(&l, 1).rect.h
+        );
+    }
+
+    #[test]
+    fn w84fix_table_thead_with_content_empty_tbody() {
+        // w84fix: the absorber priority is not an empty-section
+        // quirk — a thead with real (unsized) content still does
+        // not absorb while the tbody can. Mirrors WPT
+        // `table-height-redistribution` "thead with td" (thead 20,
+        // tbody 80): the thead keeps its content height (one 16px
+        // text line at 1.2 = 19.2 under unit-test metrics) and the
+        // tbody takes the rest of the 100px table.
+        let l = layout_table_html(
+            "<table style=\"height:100px\"><thead><tr><td>thead</td></tr></thead><tbody><tr></tr></tbody></table>",
+            NO_PAD,
+        );
+        assert!(
+            approx(group_at(&l, 0).rect.h, 19.2),
+            "thead={}",
+            group_at(&l, 0).rect.h
+        );
+        assert!(
+            approx(group_at(&l, 1).rect.h, 80.8),
+            "tbody={}",
+            group_at(&l, 1).rect.h
+        );
+    }
+
+    #[test]
+    fn w84fix_table_intermediate_sizing_keeps_baselines_aligned() {
+        // w84fix: baseline alignment under §3.10.4 intermediate
+        // sizing. Row 0 is a 50% row (base 50 from its 50px text,
+        // reference 75 at a 150px table) over an 80px row 1: base
+        // total 130, reference total 155, table 150, so t = 0.8
+        // and row 0 lands at 70. The small cell's content must
+        // still drop by the baseline difference and the two cells'
+        // baselines must coincide at the interpolated row height —
+        // not at a second-pass offset. Baselines under unit-test
+        // metrics (ascent 0.96 * font size, half-leading centred):
+        // the 50px line-height-1 text sits at -5 + 48 = 43, the
+        // 10px default-line-height text at 9.6, so the drop is
+        // 43 - 9.6 = 33.4.
+        let l = layout_table_html(
+            "<table style=\"height:150px\"><tr style=\"height:50%\"><td style=\"font-size:50px;line-height:1\">y</td><td style=\"font-size:10px\">x</td></tr><tr><td><div style=\"width:50px;height:80px\"></div></td></tr></table>",
+            "table { border-collapse: collapse; } td { padding: 0; vertical-align: baseline; }",
+        );
+        assert!(
+            approx(row_at(&l, 0).rect.h, 70.0),
+            "r0={}",
+            row_at(&l, 0).rect.h
+        );
+        assert!(
+            approx(row_at(&l, 1).rect.h, 80.0),
+            "r1={}",
+            row_at(&l, 1).rect.h
+        );
+        let a = cell_at(&l, 0, 0);
+        let b = cell_at(&l, 0, 1);
+        assert!(approx(a.rect.h, 70.0), "a={}", a.rect.h);
+        assert!(approx(b.rect.h, 70.0), "b={}", b.rect.h);
+        let inner_a = &a.children[0];
+        let inner_b = &b.children[0];
+        assert!(
+            approx(inner_b.rect.y - b.rect.y, 33.4),
+            "small cell content must drop by the baseline difference: {}",
+            inner_b.rect.y - b.rect.y
+        );
+        assert!(
+            approx(inner_a.rect.y + 43.0, inner_b.rect.y + 9.6),
+            "baselines must coincide: big={} small={}",
+            inner_a.rect.y + 43.0,
+            inner_b.rect.y + 9.6
+        );
+    }
+
+    #[test]
+    fn w84fix_table_group_residual_shrinks_when_sibling_grows() {
+        // w84fix: mechanism behind WPT `tbody-height-redistribution`
+        // table 9 (`eightplus`): a 100px group with a 20px fixed row
+        // holding text, a 30px fixed row, and an empty unconstrained
+        // row. When the text row's content outgrows its fixed height
+        // (under the WPT driver font a 20px text row measures 22),
+        // the unconstrained row's residual shrinks by exactly that
+        // growth (50 -> 48) — it is downstream of the font artifact
+        // on the sibling row, not a separate border/spacing bug.
+        // Unit-test metrics reproduce the mechanism with a 20px
+        // font (line 24) in the 20px row: 100 - 24 - 30 = 46.
+        let l = layout_table_html(
+            "<table><tbody style=\"height:100px\"><tr><td></td></tr><tr style=\"height:20px\"><td style=\"font-size:20px\">0,1</td></tr><tr style=\"height:30px\"><td>0,2</td></tr></tbody></table>",
+            NO_PAD,
+        );
+        assert!(
+            approx(row_at(&l, 0).rect.h, 46.0),
+            "r0={}",
+            row_at(&l, 0).rect.h
+        );
+        assert!(
+            approx(row_at(&l, 1).rect.h, 24.0),
+            "r1={}",
+            row_at(&l, 1).rect.h
+        );
+        assert!(
+            approx(row_at(&l, 2).rect.h, 30.0),
+            "r2={}",
+            row_at(&l, 2).rect.h
+        );
+    }
+
+    #[test]
+    fn w84_table_thead_only_absorbs_table_height() {
+        // Counterpart to `w84_table_empty_thead_empty_tbody`: with no
+        // tbody at all, the thead is the only absorber and still
+        // grows to the full table height (the header/footer exclusion
+        // applies only while a body unit can absorb).
+        let l = layout_table_html(
+            "<table style=\"height:100px\"><thead><tr></tr></thead></table>",
+            NO_PAD,
+        );
+        assert!(
+            approx(group_at(&l, 0).rect.h, 100.0),
+            "thead={}",
+            group_at(&l, 0).rect.h
+        );
+    }
+
+    #[test]
+    fn w84_table_fixed20_text_row_control() {
+        // Control for the WPT 20->22 cluster (`table-height` tables
+        // 18-22, 29-31; `tbody` tables 7-9; `rowspan` table 7): a 20px
+        // fixed row holding text. Under unit-test metrics (line
+        // height 1.2 * 16 = 19.2) the row stays 20, so a WPT failure
+        // there is font-metric dependent, not height distribution.
+        let l = layout_table_html(
+            "<table style=\"height:100px\"><thead><tr><td style=\"height:20px\">thead</td></tr></thead>\
+             <tbody><tr></tr></tbody></table>",
+            NO_PAD,
+        );
+        assert!(
+            approx(group_at(&l, 0).rect.h, 20.0),
+            "thead={}",
+            group_at(&l, 0).rect.h
+        );
+        assert!(
+            approx(group_at(&l, 1).rect.h, 80.0),
+            "tbody={}",
+            group_at(&l, 1).rect.h
+        );
     }
 
     #[test]

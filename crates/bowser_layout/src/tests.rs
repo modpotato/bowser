@@ -13435,3 +13435,81 @@ fn replaced_table_inputs_stack_on_default_height() {
         );
     }
 }
+
+/// w84: a tall block child split across two columns yields TWO
+/// `LayoutBox`es sharing ONE `NodeId` (the continuation is a
+/// `clone_node` copy, which copies `dom`). The layout pins below are
+/// the identity probe; the consumer audit is recorded here, not fixed
+/// (no fragment-id model exists yet):
+///
+/// * Preorder recursive finders return FRAGMENT 1 silently: this
+///   file's `find_box`, `bowser_app::script` geometry (`find`), and
+///   `window::find_box_path` (siblings checked in order). So
+///   `getBoundingClientRect` on a split element reports fragment 1's
+///   rect, not the union of both fragments.
+/// * `bowser_app::scroll::find_box` is the exception: it walks a
+///   stack and pushes children in order without reversing, so it
+///   visits in REVERSE document order and returns FRAGMENT 2 (the
+///   continuation) for a duplicated node. It is only used for scroll
+///   -container geometry (`initial_target_for`,
+///   `snap_areas_for_engine`), so a split *scroller* would get its
+///   container rect from the continuation; a split non-scroller is
+///   unaffected there.
+/// * `ScrollTree::index` is keyed by `NodeId` with a
+///   `debug_assert!(prev.is_none())`: `discover` emits one entry per
+///   box, so a split scroller would insert twice and last-win,
+///   silently dropping the first container's shift (see the comment
+///   at the insert site). Not exercised here: the fixture's split
+///   child is not a scroller.
+/// * Hit-testing is geometry-based (display-list rects), not
+///   node-based, so both fragments hit-test correctly; paint is the
+///   only consumer that sees the full fragment set.
+#[test]
+fn w84_multicol_split_fragments_share_node_id() {
+    // 10 lines at 20px = 200px tall, in a definite-height (100px)
+    // 2-column container: lines 1-5 stay in column 1, lines 6-10
+    // move to a continuation in column 2. A bare tall div with no
+    // lines cannot split (see `try_split_child`: no line boundary),
+    // so the fixture must carry text lines.
+    let text = (1..=10)
+        .map(|k| format!("l{k}"))
+        .collect::<Vec<_>>()
+        .join("\n");
+    let l = layout_html(
+        &format!(r#"<div class="mc"><div class="t">{text}</div><div class="after"></div></div>"#),
+        "body { margin: 0; } .mc { width: 420px; column-count: 2; column-gap: 20px; height: 100px; } .t { white-space: pre; line-height: 20px; background: red; } .after { height: 30px; }",
+    );
+    let mc = &body(&l).children[0];
+    assert_eq!(mc.children.len(), 3, "t fragments + .after {mc:?}");
+    let (frag1, frag2, after) = (&mc.children[0], &mc.children[1], &mc.children[2]);
+    // Identity: two boxes, one DOM node.
+    assert!(frag1.node.is_some(), "fragment 1 must carry the node");
+    assert_eq!(
+        frag1.node, frag2.node,
+        "split fragments must share one NodeId"
+    );
+    // Geometry: each fragment is one column tall, in its own column;
+    // neither is the unsliced 200px rect.
+    assert!(approx(frag1.rect.x, 0.0) && approx(frag1.rect.w, 200.0));
+    assert!(approx(frag1.rect.h, 100.0), "frag1 h={}", frag1.rect.h);
+    assert!(approx(frag2.rect.x, 220.0) && approx(frag2.rect.w, 200.0));
+    assert!(approx(frag2.rect.h, 100.0), "frag2 h={}", frag2.rect.h);
+    // Lines: 5 survive in each fragment, none dropped, none doubled.
+    assert_eq!(frag1.children[0].fragments.len(), 5);
+    assert_eq!(frag2.children[0].fragments.len(), 5);
+    assert_eq!(
+        frag1.children[0].fragments.len() + frag2.children[0].fragments.len(),
+        10
+    );
+    // The follower stacks below the continuation in column 2.
+    assert!(approx(after.rect.x, 220.0) && approx(after.rect.y, 100.0));
+    // The preorder finder silently resolves the shared node to
+    // fragment 1 (see the audit above): pin the behavior, do not
+    // "fix" it by inventing fragment ids here.
+    let found = find_box(&l, frag1.node.unwrap()).expect("t must be found");
+    assert!(
+        approx(found.rect.x, 0.0),
+        "preorder find_box resolves a split node to fragment 1 (x={})",
+        found.rect.x
+    );
+}
