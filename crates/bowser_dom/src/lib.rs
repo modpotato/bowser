@@ -539,6 +539,14 @@ pub enum PopoverError {
     NotSupported,
     /// Not connected, or already in the target state for `show`.
     InvalidState,
+    /// The element is a dialog showing modally: `hidePopover`
+    /// / a hide-direction `togglePopover` cannot close it
+    /// (HTML §6.12 check-popover-validity). Kept distinct
+    /// from [`PopoverError::InvalidState`] so the JS error
+    /// message is truthful: the old shared text ("not
+    /// connected or already showing") described neither the
+    /// modal state nor the remedy (`close()`).
+    ModalDialog,
 }
 
 impl fmt::Display for PopoverError {
@@ -550,19 +558,52 @@ impl fmt::Display for PopoverError {
             PopoverError::InvalidState => {
                 f.write_str("InvalidStateError: popover is not connected or already showing")
             }
+            PopoverError::ModalDialog => f.write_str(
+                "InvalidStateError: dialog is showing modally; \
+                 hidePopover cannot close a modal dialog, use close()",
+            ),
         }
     }
 }
 
+/// A dialog's computed closed-by state (WHATWG HTML §4.11.4;
+/// see [`Document::computed_closed_by`]): which user actions
+/// may close the dialog. `Any` admits close requests and
+/// clicks outside; `CloseRequest` admits close requests
+/// (Escape) but not clicks outside; `None` admits neither —
+/// only developer closes (`close()`, `requestClose()`, form
+/// submission) work.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ClosedBy {
+    /// `closedby=any`.
+    Any,
+    /// `closedby=closerequest`, or Auto on a modal dialog.
+    CloseRequest,
+    /// `closedby=none`, or Auto on a non-modal dialog.
+    None,
+}
+
 /// What pressing Escape dismisses: the single top-layer member
-/// that is dismissible by Escape. A `manual` (or `hint`) popover
-/// on top dismisses nothing, even when a dismissible element sits
-/// below it — the topmost member owns the key.
+/// that is dismissible by Escape, or — when the top layer is
+/// empty, or its top member is watcher-less — a non-modal
+/// dialog whose computed closed-by state opts it into close
+/// requests (w85, see [`Document::topmost_escape_target`]).
+/// A `manual` (or `hint`) popover on top still blocks a modal
+/// dialog below it, but not a non-modal dialog's watcher
+/// (Chrome probe 2 Q2, w85fix).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum EscapeTarget {
     /// A modal dialog: close it with its `returnValue` unchanged
     /// (the caller fires `cancel` first and `close` after).
+    /// A modal dialog with computed closed-by None is never
+    /// returned here (w85 `closedby=none` gate).
     ModalDialog(NodeId),
+    /// A non-modal dialog with explicit `closedby` of
+    /// `closerequest` or `any`: closed through the same
+    /// cancel-then-close path as a modal dialog. A non-modal
+    /// dialog with missing/invalid `closedby` (Auto -> None)
+    /// is never returned here.
+    NonModalDialog(NodeId),
     /// An `auto` popover: hide it (the caller fires `toggle`).
     AutoPopover(NodeId),
 }
@@ -2522,16 +2563,19 @@ impl Document {
     /// re-shown (`showModal` throws while `open` is set).
     /// A dialog shown via `showPopover` (not modal) IS a
     /// legitimate victim and is still closed here.
-    /// Returns the auto-closed set, in live promotion order
-    /// followed by retained victims in arena order: the caller
-    /// fires a `toggle` event (`open` -> `closed`) for each,
-    /// since this method itself fires nothing. Victims are
-    /// not only the live members — an exit-retained `auto`
-    /// popover is also closed by the show (its retention
-    /// ends, dirtied like any demotion), because a retained
-    /// popover still renders as open and the new popover
-    /// must not stack above a closing one. Modal dialogs are
-    /// excluded from both victim lists (w84fix C10, above).
+    /// Returns the auto-closed set, in live promotion order:
+    /// the caller fires a `toggle` event (`open` -> `closed`)
+    /// for each, since this method itself fires nothing. An
+    /// exit-retained `auto` popover is also demoted by the
+    /// show (its retention ends, dirtied like any demotion),
+    /// because a retained popover still renders as open and
+    /// the new popover must not stack above a closing one —
+    /// but it is NOT returned here (w85fix): its `toggle`
+    /// already fired at hide time (retention delays rendering
+    /// only), so returning it would fire a second
+    /// `open` -> `closed` toggle and silently end retention
+    /// twice. Modal dialogs are excluded from both victim
+    /// lists (w84fix C10, above).
     /// A live victim
     /// with a stored exit duration is not demoted
     /// synchronously: it is retained for that duration
@@ -2603,7 +2647,9 @@ impl Document {
                 }
             }
             for n in retained {
-                closed.push(n);
+                // w85fix: end the retention, but do NOT
+                // return the victim — its toggle fired at
+                // hide time (see the method docs above).
                 self.remove_from_top_layer(n);
             }
         }
@@ -2625,10 +2671,26 @@ impl Document {
     /// Only a live top-layer member is demoted here; ending a
     /// retention is a show's job (re-show cancels it), a
     /// removal's job, or expiry's job.
+    /// Modal guard (w85): a LIVE modal dialog throws
+    /// [`PopoverError::ModalDialog`] instead of demoting —
+    /// demoting it would strand `dialog_modal` and `open`
+    /// outside the top layer with no `close` event (the w84fix
+    /// C10 strand, via a different entry point). The guard
+    /// sits AFTER the retention no-op on purpose: a retained
+    /// modal dialog is already closed for API purposes, so
+    /// hiding it is the retention no-op, not a throw. A modal
+    /// dialog that is not a live member is likewise the
+    /// not-showing no-op, not a throw. Nothing is cleared on
+    /// the error path: `dialog_modal`, `open`, and top-layer
+    /// membership all survive, so `close()` and a later
+    /// `showModal()` still work.
     pub fn hide_popover(&mut self, node: NodeId) -> Result<(), PopoverError> {
         self.popover_state(node).ok_or(PopoverError::NotSupported)?;
         if self.is_exit_retained(node) {
             return Ok(());
+        }
+        if self.top_layer.contains(&node) && self.is_dialog_modal(node) {
+            return Err(PopoverError::ModalDialog);
         }
         self.remove_from_top_layer(node);
         Ok(())
@@ -2658,6 +2720,14 @@ impl Document {
         if !self.top_layer.contains(&node) {
             return Ok(());
         }
+        // w85 modal guard, same ordering as `hide_popover`:
+        // the not-live no-op above already covers a retained
+        // modal dialog (retained members are not live), so a
+        // live member reaching here that is modal throws
+        // instead of being retained as a closing popover.
+        if self.is_dialog_modal(node) {
+            return Err(PopoverError::ModalDialog);
+        }
         if exit_duration_s <= 0.0 {
             self.remove_from_top_layer(node);
             return Ok(());
@@ -2683,7 +2753,15 @@ impl Document {
     /// `togglePopover(false)` on a hidden non-popover returns
     /// `false`); otherwise this delegates to
     /// [`Document::show_popover`] / [`Document::hide_popover`] and
-    /// propagates their errors. Reconciled retention rule (w82
+    /// propagates their errors — including the w85 modal guard:
+    /// a forced-false or bare toggle on a live modal dialog
+    /// delegates to `hide_popover` and therefore throws
+    /// [`PopoverError::ModalDialog`] with the dialog intact,
+    /// and the caller fires no `toggle` event on that error
+    /// path (the bindings return before dispatch). A
+    /// forced-true toggle on a live member is a no-op that
+    /// returns `true` and never reaches the hide branch, so it
+    /// does not throw. Reconciled retention rule (w82
     /// fixpaths, same as [`Document::hide_popover`]): an
     /// exit-retained popover is hidden for API purposes, so
     /// `togglePopover(false)` on it and a bare toggle on it
@@ -2735,7 +2813,8 @@ impl Document {
     /// applies: a bare or forced-false toggle on a retained
     /// popover leaves the retention alone; a forced-true
     /// toggle re-shows it (live-membership key, like the sync
-    /// path).
+    /// path). The w85 modal guard is inherited the same way:
+    /// live hide branches throw [`PopoverError::ModalDialog`].
     pub fn toggle_popover_deferred(
         &mut self,
         node: NodeId,
@@ -2848,6 +2927,43 @@ impl Document {
                 && self.exit_retained.get(&node).is_some_and(|r| r.was_modal))
     }
 
+    /// The dialog's computed closed-by state (WHATWG HTML
+    /// §4.11.4, w85): the `closedby` attribute lowercased —
+    /// `any` / `closerequest` / `none` — with the Auto state
+    /// (missing or invalid value, including the
+    /// near-miss spelling `closedrequest`) resolving to
+    /// Close Request for a modal dialog and None otherwise.
+    /// Non-dialogs report None (no close watcher to gate).
+    /// `close()` and `requestClose()` IGNORE this value (the
+    /// spec says so explicitly for `requestClose`, and
+    /// `close()` is a developer close in all states); it
+    /// gates only user-initiated closes — Escape (close
+    /// requests) and light-dismiss (Any only).
+    pub fn computed_closed_by(&self, node: NodeId) -> ClosedBy {
+        if !self.is_dialog_element(node) {
+            return ClosedBy::None;
+        }
+        let explicit = match self.get_attribute(node, "closedby") {
+            Some(v) => match v.to_ascii_lowercase().as_str() {
+                "any" => Some(ClosedBy::Any),
+                "closerequest" => Some(ClosedBy::CloseRequest),
+                "none" => Some(ClosedBy::None),
+                _ => None,
+            },
+            None => None,
+        };
+        match explicit {
+            Some(state) => state,
+            None => {
+                if self.is_dialog_modal(node) {
+                    ClosedBy::CloseRequest
+                } else {
+                    ClosedBy::None
+                }
+            }
+        }
+    }
+
     /// True when `node` is in an open state for `:open` matching:
     /// an open dialog, a shown popover, or an open `details`
     /// element (Selectors 4 `:open` covers all three; the popover
@@ -2911,7 +3027,23 @@ impl Document {
     /// `InvalidState` when it is not connected or already open
     /// (an `open` attribute from markup counts as open here, so
     /// `show()` on a `<dialog open>` throws, per spec).
-    pub fn show_dialog(&mut self, node: NodeId) -> Result<(), DialogError> {
+    /// Returns the open `auto` popovers this show hid (w85
+    /// show-time rule, Chrome 155 probe RESULTS.md §2a:
+    /// showing a dialog — modal or not — closes open auto
+    /// popovers before any click, so a modal-above-auto state
+    /// never arises at click time): the caller fires a
+    /// `toggle` event (`open` -> `closed`) for each, in the
+    /// returned order. The order is top-layer (promotion)
+    /// order, matching [`Document::show_popover`]'s victim
+    /// order; exit-retained victims are demoted silently
+    /// and never returned (w85fix, their toggle already
+    /// fired at hide time), and ancestors of the dialog
+    /// are never victims (w85fix, Chrome probe 2 Q3).
+    /// The dialog itself is never a victim (a dialog shown
+    /// via `showPopover` then `showModal` keeps its own
+    /// popover membership until the modal promotion moves
+    /// it), and modal dialogs are never victims (w84fix C10).
+    pub fn show_dialog(&mut self, node: NodeId) -> Result<Vec<NodeId>, DialogError> {
         if !self.is_dialog_element(node) {
             return Err(DialogError::NotSupported);
         }
@@ -2920,10 +3052,86 @@ impl Document {
         }
         // Re-showing during an exit transition cancels it.
         self.cancel_exit_retention(node);
+        let closed = self.hide_open_auto_popovers_except(node);
         self.set_attribute(node, "open", "");
         self.dialog_focus_events
             .push(DialogFocusEvent::Shown { node, modal: false });
-        Ok(())
+        Ok(closed)
+    }
+
+    /// Hide every open `auto` popover except `except` (the
+    /// dialog being shown), except ancestors of `except`
+    /// (w85fix, mirroring [`Document::show_popover`]: a
+    /// dialog nested inside an open auto coexists with it —
+    /// Chrome probe 2 Q3 leaves the ancestor auto open for
+    /// both `show()` and `showModal()`), and except modal
+    /// dialogs (C10), in the same shape as
+    /// [`Document::show_popover`]'s victim handling: live
+    /// victims in top-layer order, returned so the caller
+    /// fires their `toggle` now; a live victim with a stored
+    /// exit duration is retained for that duration (its
+    /// `toggle` still fires now, at close time), the rest
+    /// demote at once. An exit-retained victim's retention
+    /// ends here (a show re-opens the layer, it does not
+    /// stack above a closing popover) but it is NOT
+    /// returned (w85fix): its `toggle` already fired at hide
+    /// time, and returning it would fire a second
+    /// `open` -> `closed` toggle. Retained-dual corner,
+    /// decided explicitly (w85fix): a dialog dual closed
+    /// via `close()` (not via a popover hide) retains with
+    /// `was_modal=false` and never fired a popover `toggle`
+    /// at hide time — so the blanket exclusion would drop
+    /// its toggle entirely. The fix is at close time, not
+    /// at retention end: the bindings fire the dual's
+    /// popover `toggle` when `close()` / `requestClose()`
+    /// closes a live popover member, matching the codebase
+    /// rule that the event fires now and retention delays
+    /// rendering only. A retention-end toggle would fire
+    /// late (or never, if the retention simply expires),
+    /// so it is not used.
+    fn hide_open_auto_popovers_except(&mut self, except: NodeId) -> Vec<NodeId> {
+        self.prune_expired_exit_retentions();
+        let ancestors = self.ancestors(except);
+        let live: Vec<NodeId> = self
+            .top_layer
+            .iter()
+            .copied()
+            .filter(|n| {
+                *n != except
+                    && !ancestors.contains(n)
+                    && self.popover_state(*n) == Some(PopoverState::Auto)
+                    && !self.is_dialog_modal(*n)
+            })
+            .collect();
+        let mut retained: Vec<NodeId> = self
+            .exit_retained
+            .keys()
+            .copied()
+            .filter(|n| {
+                *n != except
+                    && !ancestors.contains(n)
+                    && self.popover_state(*n) == Some(PopoverState::Auto)
+                    && !self.is_dialog_modal(*n)
+            })
+            .collect();
+        retained.sort_by_key(|n| n.index());
+        let mut closed: Vec<NodeId> = Vec::new();
+        for n in live {
+            closed.push(n);
+            match self.take_stored_exit_duration(n) {
+                Some(d) if d > 0.0 => {
+                    let was_modal = self.dialog_modal.contains(&n);
+                    self.retain_top_layer_for_exit(n, d, was_modal);
+                }
+                _ => self.remove_from_top_layer(n),
+            }
+        }
+        for n in retained {
+            // w85fix: end the retention, but do NOT return
+            // the victim — its toggle fired at hide time.
+            self.remove_from_top_layer(n);
+        }
+        closed
     }
 
     /// `HTMLDialogElement.showModal()`: open modally. Sets the
@@ -2936,7 +3144,9 @@ impl Document {
     /// stack once per script pump (w82, see
     /// `bowser_app::window`'s focus sync), and the Tab trap
     /// there confines sequential navigation while modal.
-    pub fn show_dialog_modal(&mut self, node: NodeId) -> Result<(), DialogError> {
+    /// Returns the open `auto` popovers this show hid, like
+    /// [`Document::show_dialog`] (same w85 show-time rule).
+    pub fn show_dialog_modal(&mut self, node: NodeId) -> Result<Vec<NodeId>, DialogError> {
         if !self.is_dialog_element(node) {
             return Err(DialogError::NotSupported);
         }
@@ -2945,6 +3155,7 @@ impl Document {
         }
         // Re-showing during an exit transition cancels it.
         self.cancel_exit_retention(node);
+        let closed = self.hide_open_auto_popovers_except(node);
         self.set_attribute(node, "open", "");
         self.dialog_modal.insert(node);
         // Move to the end, not just promote: a dialog already in
@@ -2956,7 +3167,7 @@ impl Document {
         self.promote_to_top_layer(node);
         self.dialog_focus_events
             .push(DialogFocusEvent::Shown { node, modal: true });
-        Ok(())
+        Ok(closed)
     }
 
     /// `HTMLDialogElement.close(returnValue)`: close the dialog.
@@ -3072,38 +3283,158 @@ impl Document {
             .copied()
     }
 
-    /// What Escape dismisses, if anything: the top-layer member
-    /// itself, not the topmost dismissible member below it. When
-    /// the top member is a modal dialog it wins over any popover
-    /// below; when it is an `auto` popover it wins over any dialog
-    /// below; when it is anything else (a `manual` popover, or a
-    /// member this engine does not dismiss) Escape does nothing.
-    /// This is a pure query: the caller runs the `cancel` check
-    /// (dialogs) and fires the event before closing/hiding.
+    /// What Escape dismisses, if anything. With a live
+    /// top-layer member, the member itself owns the key, as
+    /// before: a modal dialog wins over any popover below
+    /// (unless its computed closed-by state is None, w85
+    /// `closedby=none`, in which case Escape does nothing
+    /// even for a modal dialog); an `auto` popover wins over
+    /// any dialog below; a watcher-less top member (a
+    /// `manual`/`hint` popover) does NOT block a non-modal
+    /// dialog's watcher below it — Chrome probe 2 Q2 closes
+    /// the escapable non-modal dialog and leaves the manual
+    /// popover open in both top-layer orders — so that case
+    /// falls through to the non-modal fallback below
+    /// (w85fix). It still blocks a *modal* dialog below it,
+    /// exactly as the w84 pin says: the fallback searches
+    /// non-modal dialogs only, never a modal one.
+    /// With NO live top-layer member, a non-modal dialog
+    /// with explicit `closedby` of `closerequest` or `any`
+    /// gains Escape (w85 decision, pinned by test): the
+    /// spec establishes a close watcher for every open
+    /// dialog (dialog setup steps run for `show()` as well
+    /// as `showModal()`), and the computed-state rule makes
+    /// explicit values modal-independent — only the Auto
+    /// state distinguishes modal (Close Request) from
+    /// non-modal (None). If explicit values were also
+    /// modal-only, `closerequest` on a non-modal dialog
+    /// would be a dead state (Escape never reaching it and
+    /// `requestClose()` ignoring closed-by), which the
+    /// spec's Auto/modal distinction exists to avoid. The
+    /// fallback picks the last open escapable dialog in
+    /// document order: Bowser keeps no open-dialogs list
+    /// (spec order is setup order), so document order is
+    /// the approximation, documented here rather than
+    /// hidden. This is a pure query: the caller runs the
+    /// `cancel` check (dialogs) and fires the event before
+    /// closing/hiding.
     pub fn topmost_escape_target(&self) -> Option<EscapeTarget> {
-        let top = *self.top_layer.last()?;
-        if self.is_dialog_modal(top) {
-            Some(EscapeTarget::ModalDialog(top))
-        } else if self.is_popover_open(top) && self.popover_state(top) == Some(PopoverState::Auto) {
-            Some(EscapeTarget::AutoPopover(top))
-        } else {
-            None
+        match self.top_layer.last() {
+            Some(&top) => {
+                if self.is_dialog_modal(top) {
+                    match self.computed_closed_by(top) {
+                        ClosedBy::None => None,
+                        _ => Some(EscapeTarget::ModalDialog(top)),
+                    }
+                } else if self.is_popover_open(top)
+                    && self.popover_state(top) == Some(PopoverState::Auto)
+                {
+                    Some(EscapeTarget::AutoPopover(top))
+                } else {
+                    // w85fix (Chrome probe 2 Q2): a
+                    // watcher-less top member does not swallow
+                    // the key for a non-modal dialog's watcher.
+                    // The fallback is non-modal only, so a
+                    // modal dialog below a manual popover is
+                    // still blocked (w84 pin, kept).
+                    // w85fix re-review: the fallback runs
+                    // ONLY when no live auto popover remains
+                    // below the top member. With a live auto
+                    // below (manual over auto over an
+                    // escapable dialog), falling through would
+                    // let the dialog skip the auto whose
+                    // watcher should compete — and with no
+                    // dialog it already returns None
+                    // (manual blocks auto), so the dialog
+                    // must not change that answer. Return
+                    // None instead, preserving the
+                    // manual-blocks-auto behavior.
+                    // Probe 3 (Chrome 155, w85-chrome-probes3
+                    // RESULTS.md) shows this stopgap is a
+                    // safe UNDER-approximation, not the
+                    // Chrome rule: with manual M + auto A +
+                    // non-modal closedby="any" dialog D all
+                    // open, one Escape closes BOTH D and A
+                    // together — D's `cancel` then `close`,
+                    // then A's `toggle` to closed — leaving
+                    // M open, in both show orders where all
+                    // three coexist. API-closing D leaves A
+                    // open, so the double-close is
+                    // Escape-specific, not a side effect.
+                    // The full rule (multi-target Escape) is
+                    // a NEXT-WAVE item, deliberately not
+                    // built here: the current Escape
+                    // machinery assumes a single target
+                    // (`topmost_escape_target`,
+                    // `handle_escape`, `execute_escape`,
+                    // focus restore), and the modal+auto
+                    // and multi-auto/dialog matrix is still
+                    // unprobed — a half-probed multi-close
+                    // rule risks breaking pinned modal
+                    // single-target Escape. Until then,
+                    // None for the 3-stack closes nothing
+                    // rather than closing the wrong subset.
+                    let live_auto_below = self.top_layer[..self.top_layer.len().saturating_sub(1)]
+                        .iter()
+                        .any(|&n| {
+                            self.is_popover_open(n)
+                                && self.popover_state(n) == Some(PopoverState::Auto)
+                        });
+                    if live_auto_below {
+                        None
+                    } else {
+                        self.nonmodal_escape_target()
+                    }
+                }
+            }
+            None => self.nonmodal_escape_target(),
         }
     }
 
+    /// The non-modal fallback for
+    /// [`Document::topmost_escape_target`]: the last open
+    /// escapable non-modal dialog in document order (see the
+    /// method docs for the approximation note). Markup-open
+    /// dialogs count identically to API-shown ones (Chrome
+    /// probe 2 Q1): open-ness here is the `open` attribute,
+    /// however it got set.
+    fn nonmodal_escape_target(&self) -> Option<EscapeTarget> {
+        self.get_elements_by_tag_name("dialog")
+            .into_iter()
+            .rev()
+            .find(|&n| {
+                self.is_dialog_open(n)
+                    && !self.is_dialog_modal(n)
+                    && matches!(
+                        self.computed_closed_by(n),
+                        ClosedBy::Any | ClosedBy::CloseRequest
+                    )
+            })
+            .map(EscapeTarget::NonModalDialog)
+    }
+
     /// The popover a press/release at `clicked` would light-dismiss,
-    /// without dismissing it: the topmost `auto` popover, when it is
-    /// itself the top-layer member and `clicked` is outside it.
-    /// `None` (no hit: backdrop, empty area) counts as outside.
-    /// Callers that track pointerdown/pointerup pairs (HTML §6.12.2)
-    /// compare this candidate at press and at release and dismiss
-    /// only when both resolve to the same popover; see
+    /// without dismissing it: the topmost `auto` popover when
+    /// `clicked` is outside it. `None` (no hit: backdrop, empty
+    /// area) counts as outside. w85 Chrome-backed change: the
+    /// old rule additionally required the popover to be the
+    /// top-layer member, so an auto below a manual popover or
+    /// below a modal dialog never dismissed. Headless Chrome
+    /// 155 (probe RESULTS.md §2b/§2c) dismisses the auto below
+    /// a manual popover on an outside click, and dismisses an
+    /// auto above a modal dialog on a click inside the dialog:
+    /// light-dismiss keys off the auto-popover list and
+    /// whether the click is inside the popover, not off
+    /// top-layer position. The top-layer gate is therefore
+    /// gone; the multi-popover form is
+    /// [`Document::light_dismiss_popovers_until`]. Callers
+    /// that track pointerdown/pointerup pairs (HTML §6.12.2)
+    /// compare the press/release ancestors (see
+    /// [`Document::popover_light_dismiss_ancestor`]) and
+    /// dismiss the until-set only when they match; see
     /// [`Document::light_dismiss_popover`] for the one-shot form.
     pub fn light_dismiss_candidate(&self, clicked: Option<NodeId>) -> Option<NodeId> {
         let top = self.topmost_auto_popover()?;
-        if self.top_layer.last() != Some(&top) {
-            return None;
-        }
         if let Some(c) = clicked
             && (c == top || self.ancestors(c).contains(&top))
         {
@@ -3112,15 +3443,189 @@ impl Document {
         Some(top)
     }
 
-    /// Light-dismiss (HTML §6.12): hide the popover
-    /// [`Document::light_dismiss_candidate`] names for `clicked`,
-    /// if any. Returns the hidden node, or `None` when nothing was
-    /// dismissed. The caller fires the `toggle` event and clears
-    /// focus inside the popover when this returns `Some`.
-    pub fn light_dismiss_popover(&mut self, clicked: Option<NodeId>) -> Option<NodeId> {
-        let top = self.light_dismiss_candidate(clicked)?;
-        self.hide_popover(top).ok()?;
+    /// The nearest open-popover ancestor-or-self of `clicked`,
+    /// or `None` for a click outside every open popover — the
+    /// press/release ancestor the hide-all-until algorithm
+    /// compares (HTML §6.12: the popover pointerdown target).
+    /// Only *showing* popovers count: a click inside a hidden
+    /// popover element nested in an open auto resolves to
+    /// that auto, and a click inside a hidden popover with no
+    /// open ancestor resolves to outside. An exit-retained
+    /// (closing) popover deliberately still counts here:
+    /// [`Document::light_dismiss_popovers_until`] stops at
+    /// its original position, so a click inside it shields
+    /// the live autos below it (w85fix); dropping retained
+    /// ancestors here would turn such a click into an
+    /// outside click and hide everything instead.
+    pub fn popover_light_dismiss_ancestor(&self, clicked: Option<NodeId>) -> Option<NodeId> {
+        let mut current = clicked?;
+        loop {
+            if self.is_popover_open(current) {
+                return Some(current);
+            }
+            current = self.parent(current)?;
+        }
+    }
+
+    /// Hide-all-until for popovers (w85, HTML §6.12): every
+    /// open `auto` popover above `ancestor` in top-layer
+    /// order, returned topmost-first — the order their
+    /// `toggle` events fire in. `ancestor` is the release
+    /// ancestor from
+    /// [`Document::popover_light_dismiss_ancestor`]: the
+    /// set stops *before* it (an auto popover clicked inside
+    /// survives, the autos above it hide; a manual popover
+    /// clicked inside likewise stops the set, so the autos
+    /// below it survive). `None` (outside every popover,
+    /// or inside a non-popover element such as a dialog)
+    /// hides every open auto popover. Modal dialogs are
+    /// never in the set (w84fix C10): a modal dialog
+    /// carrying `popover=auto` was never opened in popover
+    /// mode, so hiding it as a popover would strand its
+    /// modal flag / `open` attribute. This is a pure query:
+    /// the caller hides each member (deferred, through its
+    /// stored exit duration) and fires its `toggle`.
+    /// w85fix: the walk runs over paint order (live members
+    /// interleaved with exit-retained members at their
+    /// original positions), not over the live slice alone —
+    /// and only live members are ever returned. A retained
+    /// ancestor therefore still stops the set at its original
+    /// position: a press/release pair entirely inside a
+    /// closing (retained) popover must shield the live autos
+    /// below it, exactly as a click inside its live
+    /// equivalent would. Excluding retained ancestors from
+    /// [`Document::popover_light_dismiss_ancestor`] instead
+    /// would NOT fix this: the pair would record `None` on
+    /// both ends, match as an outside click, and
+    /// `until(None)` would hide every live auto anyway.
+    pub fn light_dismiss_popovers_until(&self, ancestor: Option<NodeId>) -> Vec<NodeId> {
+        let mut out = Vec::new();
+        for member in self.top_layer_with_retained().iter().rev().copied() {
+            if Some(member) == ancestor {
+                break;
+            }
+            if self.top_layer.contains(&member)
+                && self.popover_state(member) == Some(PopoverState::Auto)
+                && !self.is_dialog_modal(member)
+            {
+                out.push(member);
+            }
+        }
+        out
+    }
+
+    /// The topmost open dialog (WHATWG §4.11.5's last element
+    /// of the open dialogs list, approximated): the last
+    /// open dialog in top-layer order when any open dialog
+    /// is in the top layer, else the last open dialog in
+    /// document order. Bowser keeps no open-dialogs list
+    /// (spec order is setup order), so the non-top-layer
+    /// arm is a document-order approximation, documented
+    /// here rather than hidden. A dialog shown via
+    /// `showPopover` alone is not open (no `open`
+    /// attribute) and never counts here.
+    pub fn topmost_open_dialog(&self) -> Option<NodeId> {
+        if let Some(&dialog) = self
+            .top_layer
+            .iter()
+            .rev()
+            .find(|n| self.is_dialog_open(**n))
+        {
+            return Some(dialog);
+        }
+        self.get_elements_by_tag_name("dialog")
+            .into_iter()
+            .rev()
+            .find(|&n| self.is_dialog_open(n))
+    }
+
+    /// The nearest open-dialog ancestor-or-self of `clicked`,
+    /// or `None` for a click outside every open dialog — the
+    /// press/release ancestor the dialog light-dismiss
+    /// algorithm compares (HTML §4.11.5: the dialog
+    /// pointerdown target). The caller maps a backdrop hit
+    /// (the modal dialog node itself, coordinates outside
+    /// its box) to `None` before calling, per the spec's
+    /// nearest-clicked-dialog rule; this method itself is
+    /// purely tree-based.
+    pub fn dialog_light_dismiss_ancestor(&self, clicked: Option<NodeId>) -> Option<NodeId> {
+        let mut current = clicked?;
+        loop {
+            if self.is_dialog_open(current) {
+                return Some(current);
+            }
+            current = self.parent(current)?;
+        }
+    }
+
+    /// The dialog a press/release at `clicked` would
+    /// light-dismiss, without dismissing it: the topmost open
+    /// dialog, when its computed closed-by state is Any and
+    /// `clicked` is not inside it. Only the topmost dialog
+    /// counts — a click inside a *different* open dialog does
+    /// not shield the topmost one (spec §4.11.5 step 5
+    /// returns early only when the ancestor IS the topmost
+    /// dialog); a click inside the topmost dialog itself, or
+    /// on a dialog whose state is not Any, dismisses nothing.
+    /// The caller dismisses through the dialog's close
+    /// watcher (`cancel`, preventable, then close with
+    /// `returnValue` preserved) — never through the popover
+    /// toggle path.
+    pub fn light_dismiss_dialog_candidate(&self, clicked: Option<NodeId>) -> Option<NodeId> {
+        let top = self.topmost_open_dialog()?;
+        if self.computed_closed_by(top) != ClosedBy::Any {
+            return None;
+        }
+        if self.dialog_light_dismiss_ancestor(clicked) == Some(top) {
+            return None;
+        }
         Some(top)
+    }
+
+    /// Light-dismiss (HTML §6.12) for a single click:
+    /// hide the whole
+    /// [`Document::light_dismiss_popovers_until`] set for
+    /// `clicked`, in topmost-first order, and return every
+    /// node hidden, topmost-first (empty when the set is
+    /// empty). w85fix S1: the old shape returned only the
+    /// topmost node, which made the return a trap for any
+    /// caller that drove one `toggle` / focus clear from it
+    /// — the other hidden members got neither. Callers
+    /// that need a toggle per member iterate this vec.
+    /// w85: this used to hide only the single popover
+    /// [`Document::light_dismiss_candidate`] names, which
+    /// diverged from production in three cases — a click
+    /// inside a manual popover above an auto hid the auto
+    /// below it (the until-set stops before the manual
+    /// ancestor, so the auto survives), an outside
+    /// click with nested autos hid only the inner one
+    /// (the until-set hides every auto), and a click
+    /// inside a retained auto above a live auto hid the
+    /// live auto (the until-set stops at the retained
+    /// ancestor's original position, so the live auto
+    /// survives — the retained case only arises nested,
+    /// since sibling autos victimise each other at show
+    /// time). Delegating to `until()` removes all three
+    /// divergences; the cases are pinned by tests below.
+    /// Production window code still calls `until()`
+    /// directly, not this helper: it tracks a
+    /// press/release ancestor pair (HTML §6.12.2), while
+    /// this helper takes a single click, so it is a test /
+    /// single-click convenience, not a production path.
+    /// A hide error stops the walk: the vec then holds
+    /// only the prefix hidden before the error, never a
+    /// member the caller must not toggle for.
+    pub fn light_dismiss_popover(&mut self, clicked: Option<NodeId>) -> Vec<NodeId> {
+        let ancestor = self.popover_light_dismiss_ancestor(clicked);
+        let targets = self.light_dismiss_popovers_until(ancestor);
+        let mut hidden = Vec::new();
+        for node in targets {
+            match self.hide_popover(node) {
+                Ok(()) => hidden.push(node),
+                Err(_) => break,
+            }
+        }
+        hidden
     }
 
     /// True when the element has an attribute with the given name. Name
@@ -6228,23 +6733,23 @@ mod w81_light_dismiss_tests {
         let auto = open_popover(&mut doc, host, "auto");
         // No hit (backdrop / empty area) is outside: only the auto
         // popover closes, the manual one stays.
-        assert_eq!(doc.light_dismiss_popover(None), Some(auto));
+        assert_eq!(doc.light_dismiss_popover(None), vec![auto]);
         assert!(!doc.is_popover_open(auto));
         assert!(doc.is_popover_open(manual));
         // Nothing dismissible left: a further outside press is a no-op.
-        assert_eq!(doc.light_dismiss_popover(None), None);
+        assert_eq!(doc.light_dismiss_popover(None), Vec::<NodeId>::new());
 
         // Inside presses never dismiss, neither on the popover
         // itself nor on a descendant.
         let auto2 = open_popover(&mut doc, host, "auto");
         let inner = doc.create_element("span");
         doc.append_child(auto2, inner);
-        assert_eq!(doc.light_dismiss_popover(Some(auto2)), None);
-        assert_eq!(doc.light_dismiss_popover(Some(inner)), None);
+        assert_eq!(doc.light_dismiss_popover(Some(auto2)), Vec::<NodeId>::new());
+        assert_eq!(doc.light_dismiss_popover(Some(inner)), Vec::<NodeId>::new());
         assert!(doc.is_popover_open(auto2));
         // An unrelated element is outside: it dismisses.
         let other = attached(&mut doc, host, "div");
-        assert_eq!(doc.light_dismiss_popover(Some(other)), Some(auto2));
+        assert_eq!(doc.light_dismiss_popover(Some(other)), vec![auto2]);
         assert!(!doc.is_popover_open(auto2));
     }
 
@@ -6327,7 +6832,7 @@ mod w81_light_dismiss_tests {
         doc.show_dialog_modal(dlg).expect("showModal");
         assert_eq!(doc.topmost_auto_popover(), None);
         assert_eq!(doc.light_dismiss_candidate(None), None);
-        assert_eq!(doc.light_dismiss_popover(None), None);
+        assert_eq!(doc.light_dismiss_popover(None), Vec::<NodeId>::new());
         assert!(doc.is_dialog_modal(dlg));
         assert!(doc.is_dialog_open(dlg));
         assert!(doc.is_in_top_layer(dlg));
@@ -6352,20 +6857,915 @@ mod w81_light_dismiss_tests {
     }
 
     #[test]
-    fn light_dismiss_never_closes_manual_and_never_reaches_past_modal() {
+    fn light_dismiss_never_closes_manual_and_show_hides_auto_below_modal() {
         let mut doc = Document::new();
         let host = stage(&mut doc);
         let manual = open_popover(&mut doc, host, "manual");
-        assert_eq!(doc.light_dismiss_popover(None), None);
+        assert_eq!(doc.light_dismiss_popover(None), Vec::<NodeId>::new());
         assert!(doc.is_popover_open(manual));
 
-        // A modal dialog above an auto popover blocks the press:
-        // the popover below survives an outside press.
+        // w85 revision (Chrome 155 probe RESULTS.md §2a/§2b):
+        // the old second half pinned "a modal dialog above an
+        // auto popover blocks the press, the popover below
+        // survives". That state no longer arises: showing the
+        // modal hides the auto at show time (the Chrome
+        // datum: auto-then-showModal leaves the auto closed
+        // before any click), and an auto below a *manual*
+        // popover DOES dismiss on an outside click (pinned by
+        // light_dismiss_hides_auto_below_manual below). So
+        // this half now pins the show-time rule itself: after
+        // showModal the auto is already closed, the dialog is
+        // modal, and a further outside press dismisses
+        // nothing.
         let mut doc = Document::new();
         let host = stage(&mut doc);
         let auto = open_popover(&mut doc, host, "auto");
-        let _dlg = open_modal(&mut doc, host);
-        assert_eq!(doc.light_dismiss_popover(None), None);
+        let dlg = open_modal(&mut doc, host);
+        assert!(
+            !doc.is_popover_open(auto),
+            "showModal must hide the open auto popover at show time"
+        );
+        assert!(doc.is_dialog_modal(dlg));
+        assert_eq!(doc.light_dismiss_popover(None), Vec::<NodeId>::new());
+    }
+
+    #[test]
+    fn light_dismiss_hides_auto_below_manual_and_above_modal() {
+        // w85, Chrome 155 probe §2b: a manual popover above
+        // an auto does NOT shield it — an outside click
+        // dismisses the auto below, the manual stays open.
+        let mut doc = Document::new();
+        let host = stage(&mut doc);
+        let auto = open_popover(&mut doc, host, "auto");
+        let manual = open_popover(&mut doc, host, "manual");
+        assert_eq!(doc.light_dismiss_popovers_until(None), vec![auto]);
+        assert_eq!(doc.light_dismiss_popover(None), vec![auto]);
+        assert!(!doc.is_popover_open(auto));
+        assert!(doc.is_popover_open(manual));
+
+        // w85, Chrome 155 probe §2c: an auto above a modal
+        // dialog dismisses on a click inside the dialog but
+        // outside the popover (the click's popover ancestor
+        // is `None`, so hide-all-until hides every auto).
+        let mut doc = Document::new();
+        let host = stage(&mut doc);
+        let dlg = open_modal(&mut doc, host);
+        let auto = open_popover(&mut doc, host, "auto");
+        let sibling = attached(&mut doc, host, "div");
+        assert_eq!(doc.popover_light_dismiss_ancestor(Some(sibling)), None);
+        assert_eq!(doc.light_dismiss_popovers_until(None), vec![auto]);
+        assert_eq!(doc.light_dismiss_popover(Some(sibling)), vec![auto]);
+        assert!(!doc.is_popover_open(auto));
+        assert!(doc.is_dialog_modal(dlg));
+        assert!(doc.is_dialog_open(dlg));
+    }
+
+    #[test]
+    fn light_dismiss_popover_matches_until_inside_manual_above_auto() {
+        // w85: the pre-delegation one-shot hid the auto
+        // below a manual popover on a click inside the
+        // manual (the candidate keys only on the auto,
+        // not on what sits above it). The production
+        // until-set stops before the manual ancestor, so
+        // the auto survives; the delegated one-shot must
+        // agree with it.
+        let mut doc = Document::new();
+        let host = stage(&mut doc);
+        let auto = open_popover(&mut doc, host, "auto");
+        let manual = open_popover(&mut doc, host, "manual");
+        let inner = doc.create_element("span");
+        doc.append_child(manual, inner);
+        assert_eq!(
+            doc.popover_light_dismiss_ancestor(Some(inner)),
+            Some(manual)
+        );
+        assert_eq!(
+            doc.light_dismiss_popovers_until(Some(manual)),
+            Vec::<NodeId>::new()
+        );
+        assert_eq!(doc.light_dismiss_popover(Some(inner)), Vec::<NodeId>::new());
         assert!(doc.is_popover_open(auto));
+        assert!(doc.is_popover_open(manual));
+        // Control: an outside click still hides the auto.
+        assert_eq!(doc.light_dismiss_popovers_until(None), vec![auto]);
+        assert_eq!(doc.light_dismiss_popover(None), vec![auto]);
+        assert!(!doc.is_popover_open(auto));
+        assert!(doc.is_popover_open(manual));
+    }
+
+    #[test]
+    fn light_dismiss_popover_hides_all_nested_autos_on_outside_click() {
+        // w85: sibling autos victimise each other at show
+        // time, so the multi-auto case is nested autos.
+        // The pre-delegation one-shot hid only the inner
+        // auto; the until-set (and now the delegated
+        // one-shot) hides every auto, topmost first,
+        // returning the whole set, topmost first.
+        let mut doc = Document::new();
+        let host = stage(&mut doc);
+        let outer = open_popover(&mut doc, host, "auto");
+        let inner = attached(&mut doc, outer, "div");
+        doc.set_attribute(inner, "popover", "auto");
+        doc.show_popover(inner).expect("show nested auto");
+        assert_eq!(doc.light_dismiss_popovers_until(None), vec![inner, outer]);
+        assert_eq!(doc.light_dismiss_popover(None), vec![inner, outer]);
+        assert!(!doc.is_popover_open(inner));
+        assert!(
+            !doc.is_popover_open(outer),
+            "an outside click hides every auto, not just the topmost"
+        );
+    }
+
+    #[test]
+    fn light_dismiss_popover_click_inside_retained_auto_shields_live_auto_below() {
+        // w85fix S5, third one-shot divergence: a live
+        // auto below a retained auto, with a click inside
+        // the retained popover, must survive. The old
+        // one-shot keyed only on the live topmost auto
+        // and hid it (the click was not inside the live
+        // auto); the delegated one-shot stops at the
+        // retained ancestor's original position and
+        // returns empty. Nesting is what lets both
+        // coexist: sibling autos victimise each other at
+        // show time, so a retained-above-live pair only
+        // arises nested (cf.
+        // `light_dismiss_until_stops_at_retained_ancestor_position`).
+        let mut doc = Document::new();
+        let host = stage(&mut doc);
+        let outer = open_popover(&mut doc, host, "auto");
+        let inner = attached(&mut doc, outer, "div");
+        doc.set_attribute(inner, "popover", "auto");
+        doc.show_popover(inner).expect("show nested auto");
+        let clicked = attached(&mut doc, inner, "span");
+        doc.hide_popover_deferred(inner, 60.0)
+            .expect("hide inner");
+        assert!(doc.is_exit_retained(inner));
+        assert_eq!(
+            doc.light_dismiss_popover(Some(clicked)),
+            Vec::<NodeId>::new(),
+            "a click inside the retained auto must shield the live auto below it"
+        );
+        assert!(doc.is_popover_open(outer));
+        assert!(doc.is_exit_retained(inner));
+        // Control: an outside click still hides the live auto.
+        assert_eq!(
+            doc.light_dismiss_popover(None),
+            vec![outer]
+        );
+        assert!(!doc.is_popover_open(outer));
+    }
+
+    #[test]
+    fn escape_none_modal_on_top_returns_none_without_fallthrough() {
+        // w85 pin, no behavior change: a modal dialog
+        // with closedby=none on top returns None, and
+        // does NOT fall through to an escapable non-modal
+        // dialog below it. Whether Chrome falls through
+        // below a none-modal is UNPROBED (no Chrome datum
+        // covers a none-modal above an escapable dialog);
+        // the None here is Bowser's current answer,
+        // pinned, not a Chrome-verified rule.
+        let mut doc = Document::new();
+        let host = stage(&mut doc);
+        let below = attached(&mut doc, host, "dialog");
+        doc.set_attribute(below, "closedby", "any");
+        doc.show_dialog(below).expect("show non-modal");
+        assert_eq!(
+            doc.topmost_escape_target(),
+            Some(EscapeTarget::NonModalDialog(below))
+        );
+        let modal = attached(&mut doc, host, "dialog");
+        doc.set_attribute(modal, "closedby", "none");
+        doc.show_dialog_modal(modal).expect("showModal");
+        assert_eq!(doc.top_layer().last(), Some(&modal));
+        assert_eq!(
+            doc.topmost_escape_target(),
+            None,
+            "closedby=none modal blocks Escape with no fallthrough to the escapable dialog below"
+        );
+        assert!(doc.is_dialog_open(below));
+    }
+
+    #[test]
+    fn nonmodal_escape_and_topmost_dialog_use_document_order_not_show_order() {
+        // w85 pin, no behavior change: Bowser keeps no
+        // open-dialogs (setup-order) list, so both the
+        // non-modal Escape fallback and topmost_open_dialog
+        // fall back to document order. When show order
+        // disagrees with document order, the
+        // document-last escapable dialog wins in both
+        // show orders.
+        for second_shown_first in [false, true] {
+            let mut doc = Document::new();
+            let host = stage(&mut doc);
+            let first = attached(&mut doc, host, "dialog");
+            doc.set_attribute(first, "closedby", "any");
+            let second = attached(&mut doc, host, "dialog");
+            doc.set_attribute(second, "closedby", "any");
+            if second_shown_first {
+                doc.show_dialog(second).expect("show second");
+                doc.show_dialog(first).expect("show first");
+            } else {
+                doc.show_dialog(first).expect("show first");
+                doc.show_dialog(second).expect("show second");
+            }
+            assert!(
+                doc.top_layer().is_empty(),
+                "non-modal dialogs are not top-layered"
+            );
+            assert_eq!(
+                doc.topmost_escape_target(),
+                Some(EscapeTarget::NonModalDialog(second)),
+                "second_shown_first={second_shown_first}: document-last wins, not last-shown"
+            );
+            assert_eq!(
+                doc.topmost_open_dialog(),
+                Some(second),
+                "second_shown_first={second_shown_first}"
+            );
+        }
+    }
+
+    #[test]
+    fn computed_closed_by_whitespace_padded_any_falls_back_to_auto() {
+        // w85 pin, no behavior change: the value is
+        // lowercased but NOT trimmed, so " any " matches
+        // no explicit state and falls back to Auto — None
+        // for a non-modal dialog, CloseRequest for a modal
+        // one. Contrast: unpadded "ANY" is explicit Any.
+        let mut doc = Document::new();
+        let host = stage(&mut doc);
+        let dlg = attached(&mut doc, host, "dialog");
+        doc.show_dialog(dlg).expect("show");
+        doc.set_attribute(dlg, "closedby", " any ");
+        assert_eq!(doc.computed_closed_by(dlg), ClosedBy::None);
+        assert_eq!(doc.topmost_escape_target(), None);
+        doc.set_attribute(dlg, "closedby", "ANY");
+        assert_eq!(doc.computed_closed_by(dlg), ClosedBy::Any);
+        assert_eq!(
+            doc.topmost_escape_target(),
+            Some(EscapeTarget::NonModalDialog(dlg))
+        );
+
+        let mut doc = Document::new();
+        let host = stage(&mut doc);
+        let modal = open_modal(&mut doc, host);
+        doc.set_attribute(modal, "closedby", " any ");
+        assert_eq!(
+            doc.computed_closed_by(modal),
+            ClosedBy::CloseRequest,
+            "padded value falls back to Auto, which is CloseRequest for a modal"
+        );
+        assert_eq!(
+            doc.topmost_escape_target(),
+            Some(EscapeTarget::ModalDialog(modal))
+        );
+    }
+
+    #[test]
+    fn light_dismiss_until_stops_at_clicked_popover_ancestor() {
+        // Nested autos (an auto inside another auto survives
+        // the inner's show): a click inside the outer auto
+        // but outside the inner dismisses only the inner.
+        let mut doc = Document::new();
+        let host = stage(&mut doc);
+        let outer = open_popover(&mut doc, host, "auto");
+        let inner = attached(&mut doc, outer, "div");
+        doc.set_attribute(inner, "popover", "auto");
+        doc.show_popover(inner).expect("show nested auto");
+        let other = attached(&mut doc, outer, "span");
+        assert_eq!(doc.popover_light_dismiss_ancestor(Some(other)), Some(outer));
+        assert_eq!(doc.light_dismiss_popovers_until(Some(outer)), vec![inner]);
+        // And a click inside the inner dismisses nothing.
+        assert_eq!(doc.light_dismiss_popovers_until(Some(inner)), vec![]);
+        assert_eq!(doc.light_dismiss_candidate(Some(inner)), None);
+    }
+
+    #[test]
+    fn show_dialog_and_show_modal_hide_open_auto_popovers() {
+        // w85 show-time rule, both show paths, with the
+        // victim list in top-layer order and the dialog
+        // itself never a victim.
+        let mut doc = Document::new();
+        let host = stage(&mut doc);
+        let auto = open_popover(&mut doc, host, "auto");
+        let dlg = attached(&mut doc, host, "dialog");
+        let closed = doc.show_dialog(dlg).expect("show");
+        assert_eq!(closed, vec![auto]);
+        assert!(!doc.is_popover_open(auto));
+        assert!(doc.is_dialog_open(dlg));
+        assert!(!doc.is_dialog_modal(dlg));
+
+        let mut doc = Document::new();
+        let host = stage(&mut doc);
+        let auto = open_popover(&mut doc, host, "auto");
+        let dlg = attached(&mut doc, host, "dialog");
+        let closed = doc.show_dialog_modal(dlg).expect("showModal");
+        assert_eq!(closed, vec![auto]);
+        assert!(!doc.is_popover_open(auto));
+        assert!(doc.is_dialog_modal(dlg));
+
+        // A modal dialog is never a show victim (C10), and a
+        // dialog shown via showPopover then showModal does
+        // not victimise itself.
+        let mut doc = Document::new();
+        let host = stage(&mut doc);
+        let dlg = attached(&mut doc, host, "dialog");
+        doc.set_attribute(dlg, "popover", "auto");
+        doc.show_popover(dlg).expect("show as popover");
+        let closed = doc.show_dialog_modal(dlg).expect("showModal dual");
+        assert!(closed.is_empty(), "self must never be a victim");
+        assert!(doc.is_dialog_modal(dlg));
+    }
+
+    #[test]
+    fn show_dialog_and_show_popover_never_return_retained_victims() {
+        // w85fix issue 1: a retained auto's toggle already
+        // fired at hide time, so a later show ends its
+        // retention silently and must NOT return it — the
+        // bindings would otherwise fire a second
+        // open -> closed toggle.
+        let mut doc = Document::new();
+        let host = stage(&mut doc);
+        let auto = open_popover(&mut doc, host, "auto");
+        doc.hide_popover_deferred(auto, 60.0).expect("hide");
+        assert!(doc.is_exit_retained(auto));
+        let dlg = attached(&mut doc, host, "dialog");
+        let closed = doc.show_dialog(dlg).expect("show");
+        assert!(
+            closed.is_empty(),
+            "retained victim must not be returned, got {closed:?}"
+        );
+        assert!(!doc.is_exit_retained(auto), "retention must end");
+        assert!(doc.is_dialog_open(dlg));
+
+        // Same flaw, pre-existing in show_popover's retained
+        // loop: showing a second auto ends the first's
+        // retention without returning it.
+        let mut doc = Document::new();
+        let host = stage(&mut doc);
+        let first = open_popover(&mut doc, host, "auto");
+        doc.hide_popover_deferred(first, 60.0).expect("hide");
+        let second = attached(&mut doc, host, "div");
+        doc.set_attribute(second, "popover", "auto");
+        let closed = doc.show_popover(second).expect("show second");
+        assert!(
+            closed.is_empty(),
+            "retained victim must not be returned by show_popover, got {closed:?}"
+        );
+        assert!(!doc.is_exit_retained(first));
+        assert!(doc.is_popover_open(second));
+
+        // But a LIVE victim with a stored exit duration IS
+        // returned (its toggle fires now, at close time)
+        // even though it is newly retained for the exit.
+        let mut doc = Document::new();
+        let host = stage(&mut doc);
+        let live = open_popover(&mut doc, host, "auto");
+        doc.store_exit_duration(live, 60.0);
+        let dlg = attached(&mut doc, host, "dialog");
+        let closed = doc.show_dialog(dlg).expect("show");
+        assert_eq!(closed, vec![live]);
+        assert!(doc.is_exit_retained(live));
+    }
+
+    #[test]
+    fn show_dialog_leaves_ancestor_auto_open() {
+        // w85fix issue 5 + Chrome probe 2 Q3: a dialog
+        // nested inside an open auto popover coexists with
+        // it — showing the dialog (non-modal or modal)
+        // hides sibling autos but never its own ancestor.
+        for modal in [false, true] {
+            let mut doc = Document::new();
+            let host = stage(&mut doc);
+            let outer = open_popover(&mut doc, host, "auto");
+            let inner = attached(&mut doc, outer, "dialog");
+            let sibling = open_popover(&mut doc, host, "auto");
+            // Sibling show victimised nothing (outer is an
+            // ancestor of nothing here, sibling is a sibling
+            // of outer: showing it hid outer). Rebuild the
+            // ancestor state explicitly instead: hide the
+            // sibling, re-show the outer.
+            doc.hide_popover(sibling).expect("hide sibling");
+            doc.show_popover(outer).expect("re-show outer");
+            let closed = if modal {
+                doc.show_dialog_modal(inner).expect("showModal")
+            } else {
+                doc.show_dialog(inner).expect("show")
+            };
+            assert!(
+                closed.is_empty(),
+                "modal={modal}: ancestor auto must not be a victim, got {closed:?}"
+            );
+            assert!(doc.is_popover_open(outer), "ancestor auto stays open");
+            assert!(doc.is_dialog_open(inner));
+            assert_eq!(doc.is_dialog_modal(inner), modal);
+        }
+        // And the sibling case is unchanged: an unrelated
+        // auto still hides at dialog-show time.
+        let mut doc = Document::new();
+        let host = stage(&mut doc);
+        let auto = open_popover(&mut doc, host, "auto");
+        let dlg = attached(&mut doc, host, "dialog");
+        let closed = doc.show_dialog(dlg).expect("show");
+        assert_eq!(closed, vec![auto]);
+    }
+
+    #[test]
+    fn light_dismiss_until_stops_at_retained_ancestor_position() {
+        // w85fix issue 4: a live auto below a retained
+        // popover, with a press/release pair inside the
+        // retained popover, must survive — the until-set
+        // stops at the retained ancestor's original
+        // position. (Nesting is what lets both coexist:
+        // sibling autos victimise each other at show time.)
+        let mut doc = Document::new();
+        let host = stage(&mut doc);
+        let outer = open_popover(&mut doc, host, "auto");
+        let inner = attached(&mut doc, outer, "div");
+        doc.set_attribute(inner, "popover", "auto");
+        doc.show_popover(inner).expect("show nested auto");
+        let clicked = attached(&mut doc, inner, "span");
+        doc.hide_popover_deferred(inner, 60.0).expect("hide inner");
+        assert!(doc.is_exit_retained(inner));
+        assert_eq!(
+            doc.popover_light_dismiss_ancestor(Some(clicked)),
+            Some(inner),
+            "a retained ancestor still records, so until() can stop at it"
+        );
+        assert_eq!(
+            doc.light_dismiss_popovers_until(Some(inner)),
+            Vec::<NodeId>::new(),
+            "live auto below the retained popover must survive"
+        );
+        // An auto above the retained ancestor still hides.
+        let above = attached(&mut doc, inner, "div");
+        doc.set_attribute(above, "popover", "auto");
+        doc.show_popover(above).expect("show above retained");
+        assert_eq!(doc.light_dismiss_popovers_until(Some(inner)), vec![above]);
+        assert_eq!(
+            doc.light_dismiss_popovers_until(None),
+            vec![above, outer],
+            "an outside click still hides every live auto"
+        );
+    }
+
+    #[test]
+    fn escape_falls_through_watcherless_top_to_nonmodal_dialog() {
+        // w85fix, Chrome probe 2 Q2: Escape closes an
+        // escapable non-modal dialog while a manual popover
+        // stays open, in both setup orders (the dialog is
+        // not top-layered by show(), so the top member is
+        // the manual popover either way).
+        for closedby in ["any", "closerequest"] {
+            for manual_first in [true, false] {
+                let mut doc = Document::new();
+                let host = stage(&mut doc);
+                let manual = attached(&mut doc, host, "div");
+                doc.set_attribute(manual, "popover", "manual");
+                let dlg = attached(&mut doc, host, "dialog");
+                doc.set_attribute(dlg, "closedby", closedby);
+                if manual_first {
+                    doc.show_popover(manual).expect("show manual");
+                    doc.show_dialog(dlg).expect("show dialog");
+                } else {
+                    doc.show_dialog(dlg).expect("show dialog");
+                    doc.show_popover(manual).expect("show manual");
+                }
+                assert_eq!(
+                    doc.topmost_escape_target(),
+                    Some(EscapeTarget::NonModalDialog(dlg)),
+                    "closedby={closedby} manual_first={manual_first}"
+                );
+                assert!(doc.is_popover_open(manual));
+            }
+        }
+        // A hint popover on top likewise does not block the
+        // non-modal watcher, while a modal dialog below a
+        // manual popover stays blocked (w84 pin, kept).
+        let mut doc = Document::new();
+        let host = stage(&mut doc);
+        let hint = open_popover(&mut doc, host, "hint");
+        let dlg = attached(&mut doc, host, "dialog");
+        doc.set_attribute(dlg, "closedby", "any");
+        doc.show_dialog(dlg).expect("show dialog");
+        assert_eq!(
+            doc.topmost_escape_target(),
+            Some(EscapeTarget::NonModalDialog(dlg))
+        );
+        assert!(doc.is_popover_open(hint));
+    }
+
+    #[test]
+    fn escape_manual_over_auto_does_not_fall_through_to_dialog() {
+        // w85fix re-review: a live auto below a
+        // watcher-less top member blocks the non-modal
+        // dialog fallback — the fallback runs only when
+        // no live auto remains below the top. Probe 3
+        // shows Chrome closes BOTH the dialog and the
+        // auto on one Escape; that multi-target rule is
+        // a next-wave item (see the
+        // `topmost_escape_target` comment), so the
+        // honest stopgap answer here is None, not the
+        // dialog and not a guessed single winner.
+        // Construction note: production `show_dialog`
+        // hides a non-ancestor auto, so the dialog must
+        // be shown first (or nested inside the auto) for
+        // all three to coexist.
+        for dialog_first in [true, false] {
+            let mut doc = Document::new();
+            let host = stage(&mut doc);
+            let auto = attached(&mut doc, host, "div");
+            doc.set_attribute(auto, "popover", "auto");
+            let manual = attached(&mut doc, host, "div");
+            doc.set_attribute(manual, "popover", "manual");
+            let dlg = if dialog_first {
+                attached(&mut doc, host, "dialog")
+            } else {
+                attached(&mut doc, auto, "dialog")
+            };
+            doc.set_attribute(dlg, "closedby", "any");
+            if dialog_first {
+                doc.show_dialog(dlg).expect("show dialog");
+                doc.show_popover(auto).expect("show auto");
+            } else {
+                doc.show_popover(auto).expect("show auto");
+                doc.show_dialog(dlg).expect("show nested dialog");
+            }
+            doc.show_popover(manual).expect("show manual");
+            assert_eq!(
+                doc.top_layer().last(),
+                Some(&manual),
+                "dialog_first={dialog_first}: manual must be top"
+            );
+            assert_eq!(
+                doc.topmost_escape_target(),
+                None,
+                "dialog_first={dialog_first}: live auto below manual must block the dialog fallback"
+            );
+            assert!(doc.is_popover_open(auto));
+            assert!(doc.is_popover_open(manual));
+            assert!(doc.is_dialog_open(dlg));
+        }
+        // Control: the same stack without the auto still
+        // falls through, and an auto on top still wins.
+        let mut doc = Document::new();
+        let host = stage(&mut doc);
+        let manual = open_popover(&mut doc, host, "manual");
+        let dlg = attached(&mut doc, host, "dialog");
+        doc.set_attribute(dlg, "closedby", "any");
+        doc.show_dialog(dlg).expect("show dialog");
+        assert_eq!(
+            doc.topmost_escape_target(),
+            Some(EscapeTarget::NonModalDialog(dlg)),
+            "no live auto below: fallthrough survives"
+        );
+        let auto = open_popover(&mut doc, host, "auto");
+        assert_eq!(
+            doc.topmost_escape_target(),
+            Some(EscapeTarget::AutoPopover(auto)),
+            "auto on top still wins outright"
+        );
+        assert!(doc.is_popover_open(manual));
+    }
+
+    #[test]
+    fn markup_open_dialog_matches_api_shown_for_closedby() {
+        // Chrome probe 2 Q1 confirmation: a markup-open
+        // dialog (open attribute, never shown via API)
+        // behaves identically to an API-shown dialog for
+        // Escape and light-dismiss, per closedby value.
+        for closedby in ["any", "closerequest"] {
+            let mut doc = Document::new();
+            let host = stage(&mut doc);
+            let markup = attached(&mut doc, host, "dialog");
+            doc.set_attribute(markup, "open", "");
+            doc.set_attribute(markup, "closedby", closedby);
+            assert_eq!(
+                doc.topmost_escape_target(),
+                Some(EscapeTarget::NonModalDialog(markup)),
+                "markup-open closedby={closedby} must gain Escape"
+            );
+            let outside = attached(&mut doc, host, "div");
+            if closedby == "any" {
+                assert_eq!(
+                    doc.light_dismiss_dialog_candidate(Some(outside)),
+                    Some(markup),
+                    "markup-open closedby=any must light-dismiss on an outside click"
+                );
+            } else {
+                assert_eq!(
+                    doc.light_dismiss_dialog_candidate(Some(outside)),
+                    None,
+                    "markup-open closedby=closerequest must not light-dismiss"
+                );
+            }
+            // API-shown control: identical answers.
+            let mut doc = Document::new();
+            let host = stage(&mut doc);
+            let api = attached(&mut doc, host, "dialog");
+            doc.set_attribute(api, "closedby", closedby);
+            doc.show_dialog(api).expect("show");
+            assert_eq!(
+                doc.topmost_escape_target(),
+                Some(EscapeTarget::NonModalDialog(api))
+            );
+            let outside = attached(&mut doc, host, "div");
+            assert_eq!(
+                doc.light_dismiss_dialog_candidate(Some(outside)),
+                if closedby == "any" { Some(api) } else { None }
+            );
+        }
+    }
+
+    #[test]
+    fn computed_closed_by_states_and_escape_gate() {
+        // Missing/invalid -> Auto: modal is CloseRequest,
+        // non-modal is None. The near-miss `closedrequest`
+        // is invalid, not a fourth value.
+        let mut doc = Document::new();
+        let host = stage(&mut doc);
+        let dlg = open_modal(&mut doc, host);
+        assert_eq!(doc.computed_closed_by(dlg), ClosedBy::CloseRequest);
+        assert_eq!(
+            doc.topmost_escape_target(),
+            Some(EscapeTarget::ModalDialog(dlg))
+        );
+        doc.set_attribute(dlg, "closedby", "none");
+        assert_eq!(doc.computed_closed_by(dlg), ClosedBy::None);
+        assert_eq!(
+            doc.topmost_escape_target(),
+            None,
+            "closedby=none blocks Escape even for a modal dialog"
+        );
+        doc.set_attribute(dlg, "closedby", "any");
+        assert_eq!(doc.computed_closed_by(dlg), ClosedBy::Any);
+        assert_eq!(
+            doc.topmost_escape_target(),
+            Some(EscapeTarget::ModalDialog(dlg))
+        );
+        doc.set_attribute(dlg, "closedby", "closedrequest");
+        assert_eq!(
+            doc.computed_closed_by(dlg),
+            ClosedBy::CloseRequest,
+            "misspelled value falls back to Auto, which is CloseRequest for a modal"
+        );
+        doc.set_attribute(dlg, "closedby", "CLOSEREQUEST");
+        assert_eq!(
+            doc.computed_closed_by(dlg),
+            ClosedBy::CloseRequest,
+            "values are ASCII case-insensitive"
+        );
+
+        // Non-modal: Auto is None (no Escape), explicit
+        // closerequest/any gain Escape (w85 decision).
+        let mut doc = Document::new();
+        let host = stage(&mut doc);
+        let dlg = attached(&mut doc, host, "dialog");
+        doc.show_dialog(dlg).expect("show");
+        assert_eq!(doc.computed_closed_by(dlg), ClosedBy::None);
+        assert_eq!(doc.topmost_escape_target(), None);
+        doc.set_attribute(dlg, "closedby", "closerequest");
+        assert_eq!(doc.computed_closed_by(dlg), ClosedBy::CloseRequest);
+        assert_eq!(
+            doc.topmost_escape_target(),
+            Some(EscapeTarget::NonModalDialog(dlg))
+        );
+        doc.set_attribute(dlg, "closedby", "any");
+        assert_eq!(
+            doc.topmost_escape_target(),
+            Some(EscapeTarget::NonModalDialog(dlg))
+        );
+        doc.set_attribute(dlg, "closedby", "none");
+        assert_eq!(doc.topmost_escape_target(), None);
+
+        // close() ignores closedby: a closedby=none dialog
+        // still closes via close().
+        assert!(doc.close_dialog(dlg, None).expect("close"));
+        assert!(!doc.is_dialog_open(dlg));
+
+        // Non-dialogs report None, never Any/CloseRequest.
+        let mut doc = Document::new();
+        let host = stage(&mut doc);
+        let div = attached(&mut doc, host, "div");
+        doc.set_attribute(div, "closedby", "any");
+        assert_eq!(doc.computed_closed_by(div), ClosedBy::None);
+    }
+
+    #[test]
+    fn dialog_light_dismiss_candidate_needs_any_and_outside_click() {
+        let mut doc = Document::new();
+        let host = stage(&mut doc);
+        let dlg = attached(&mut doc, host, "dialog");
+        doc.show_dialog_modal(dlg).expect("showModal");
+        // Default modal state is CloseRequest: no
+        // light-dismiss, even outside.
+        assert_eq!(doc.light_dismiss_dialog_candidate(None), None);
+        let other = attached(&mut doc, host, "div");
+        assert_eq!(doc.light_dismiss_dialog_candidate(Some(other)), None);
+        // Explicit any: outside dismisses, inside does not.
+        doc.set_attribute(dlg, "closedby", "any");
+        assert_eq!(doc.light_dismiss_dialog_candidate(None), Some(dlg));
+        assert_eq!(doc.light_dismiss_dialog_candidate(Some(other)), Some(dlg));
+        assert_eq!(doc.light_dismiss_dialog_candidate(Some(dlg)), None);
+        let inner = attached(&mut doc, dlg, "span");
+        assert_eq!(doc.light_dismiss_dialog_candidate(Some(inner)), None);
+        assert_eq!(doc.dialog_light_dismiss_ancestor(Some(inner)), Some(dlg));
+        assert_eq!(doc.dialog_light_dismiss_ancestor(Some(other)), None);
+        // closerequest: close requests only, no
+        // light-dismiss.
+        doc.set_attribute(dlg, "closedby", "closerequest");
+        assert_eq!(doc.light_dismiss_dialog_candidate(None), None);
+
+        // Non-modal dialog with any is a dialog candidate
+        // too (topmost open dialog, no top-layer member).
+        let mut doc = Document::new();
+        let host = stage(&mut doc);
+        let dlg = attached(&mut doc, host, "dialog");
+        doc.show_dialog(dlg).expect("show");
+        doc.set_attribute(dlg, "closedby", "any");
+        assert_eq!(doc.light_dismiss_dialog_candidate(None), Some(dlg));
+    }
+
+    /// A `<dialog popover=auto>` shown via `showPopover` then
+    /// `showModal`: the dual sequence from the w85 brief.
+    fn open_modal_dual(doc: &mut Document, host: NodeId) -> NodeId {
+        let dlg = attached(doc, host, "dialog");
+        doc.set_attribute(dlg, "popover", "auto");
+        doc.show_popover(dlg).expect("show as popover");
+        doc.show_dialog_modal(dlg).expect("showModal");
+        assert!(doc.is_dialog_modal(dlg));
+        dlg
+    }
+
+    fn assert_modal_dual_intact(doc: &Document, dlg: NodeId) {
+        assert!(doc.is_dialog_open(dlg), "dialog must stay open");
+        assert!(doc.is_dialog_modal(dlg), "dialog must stay :modal");
+        assert!(
+            doc.is_in_top_layer(dlg),
+            "dialog must stay in the top layer"
+        );
+        assert_eq!(
+            doc.top_layer().last(),
+            Some(&dlg),
+            "dialog must stay on top"
+        );
+    }
+
+    #[test]
+    fn hide_popover_throws_for_live_modal_dialog_and_leaves_it_intact() {
+        // w85: the old code demoted here, stranding
+        // `dialog_modal` and `open` outside the top layer
+        // with no `close` event, so a later `showModal`
+        // threw InvalidState while the dialog still matched
+        // `:modal`. Now both hide paths throw, and the
+        // dialog survives whole: `close()` and a later
+        // `showModal()` still work.
+        for deferred in [false, true] {
+            let mut doc = Document::new();
+            let host = stage(&mut doc);
+            let dlg = open_modal_dual(&mut doc, host);
+            let err = if deferred {
+                doc.hide_popover_deferred(dlg, 60.0)
+            } else {
+                doc.hide_popover(dlg)
+            }
+            .expect_err("hide on a live modal dialog must throw");
+            assert_eq!(err, PopoverError::ModalDialog);
+            assert!(
+                err.to_string().contains("showing modally"),
+                "error must name the modal state, got {err}"
+            );
+            assert_modal_dual_intact(&doc, dlg);
+            assert!(doc.close_dialog(dlg, None).expect("close"));
+            assert!(!doc.is_dialog_open(dlg));
+            doc.show_dialog_modal(dlg).expect("re-showModal");
+            assert_modal_dual_intact(&doc, dlg);
+        }
+    }
+
+    #[test]
+    fn hide_popover_retained_modal_is_a_no_op_not_a_throw() {
+        // Ordering: the exit-retention no-op comes BEFORE
+        // the modal throw. A modal dialog closed with an
+        // exit transition is already closed for API purposes;
+        // hiding it must leave the retention alone.
+        let mut doc = Document::new();
+        let host = stage(&mut doc);
+        let dlg = open_modal_dual(&mut doc, host);
+        assert!(doc.close_dialog_deferred(dlg, None, 60.0).expect("close"));
+        assert!(!doc.is_dialog_open(dlg));
+        assert!(doc.is_exit_retained(dlg));
+        assert!(
+            doc.is_dialog_modal(dlg),
+            "retained modal still matches :modal"
+        );
+        doc.hide_popover(dlg).expect("retained hide is a no-op");
+        assert!(doc.is_exit_retained(dlg), "retention must survive");
+        doc.hide_popover_deferred(dlg, 60.0)
+            .expect("retained deferred hide is a no-op");
+        assert!(doc.is_exit_retained(dlg));
+        // Not-showing is likewise a no-op, never a throw:
+        // a closed, non-retained dual and a never-shown
+        // popover both hide cleanly.
+        let mut doc = Document::new();
+        let host = stage(&mut doc);
+        let plain = open_popover(&mut doc, host, "auto");
+        doc.hide_popover(plain).expect("plain hide");
+        doc.hide_popover(plain).expect("hidden hide is a no-op");
+        let dlg = attached(&mut doc, host, "dialog");
+        doc.set_attribute(dlg, "popover", "auto");
+        doc.hide_popover(dlg)
+            .expect("never-shown dual hide is a no-op");
+    }
+
+    #[test]
+    fn toggle_popover_hide_directions_throw_for_live_modal_dialog() {
+        // w85: toggle inherits the guard via delegation.
+        // Forced-false and bare toggles throw; forced-true
+        // on the already-live member is a no-op returning
+        // true, never a hide, so it does not throw. The
+        // deferred twin behaves the same.
+        for deferred in [false, true] {
+            for force in [Some(false), None] {
+                let mut doc = Document::new();
+                let host = stage(&mut doc);
+                let dlg = open_modal_dual(&mut doc, host);
+                let err = if deferred {
+                    doc.toggle_popover_deferred(dlg, force, 60.0)
+                } else {
+                    doc.toggle_popover(dlg, force)
+                }
+                .expect_err("hide-direction toggle on a modal must throw");
+                assert_eq!(err, PopoverError::ModalDialog);
+                assert_modal_dual_intact(&doc, dlg);
+            }
+            let mut doc = Document::new();
+            let host = stage(&mut doc);
+            let dlg = open_modal_dual(&mut doc, host);
+            let (open, _) = if deferred {
+                doc.toggle_popover_deferred(dlg, Some(true), 60.0)
+            } else {
+                doc.toggle_popover(dlg, Some(true))
+            }
+            .expect("forced-true on a live member is a no-op");
+            assert!(open);
+            assert_modal_dual_intact(&doc, dlg);
+        }
+    }
+
+    #[test]
+    fn plain_popover_inside_modal_dialog_hides_alone() {
+        // The guard keys on the TARGET, not its ancestors:
+        // a plain popover nested inside a modal dialog hides
+        // via `hidePopover` and via light-dismiss from a press
+        // inside the dialog but outside the popover, while the
+        // dialog stays modal, open, and on top.
+        let mut doc = Document::new();
+        let host = stage(&mut doc);
+        let dlg = open_modal(&mut doc, host);
+        let pop = attached(&mut doc, dlg, "div");
+        doc.set_attribute(pop, "popover", "auto");
+        doc.show_popover(pop).expect("show nested popover");
+        assert_eq!(doc.top_layer().last(), Some(&pop));
+        doc.hide_popover(pop).expect("nested hide");
+        assert!(!doc.is_popover_open(pop));
+        assert_modal_dual_intact(&doc, dlg);
+
+        // Light-dismiss twin: press inside the dialog (a
+        // sibling of the popover) but outside the popover.
+        doc.show_popover(pop).expect("re-show nested popover");
+        let sibling = attached(&mut doc, dlg, "span");
+        assert_eq!(doc.light_dismiss_popover(Some(sibling)), vec![pop]);
+        assert!(!doc.is_popover_open(pop));
+        assert_modal_dual_intact(&doc, dlg);
+    }
+
+    #[test]
+    fn window_level_light_dismiss_with_modal_on_top_dismisses_nothing() {
+        // A modal dialog on top (itself a `popover=auto`
+        // dual, or a plain modal above an auto popover)
+        // blocks a window-level outside press entirely.
+        let mut doc = Document::new();
+        let host = stage(&mut doc);
+        let dlg = open_modal_dual(&mut doc, host);
+        assert_eq!(doc.light_dismiss_popover(None), Vec::<NodeId>::new());
+        assert_modal_dual_intact(&doc, dlg);
+
+        // w85 revision: the old second half pinned an auto
+        // surviving under a modal dialog. That state no
+        // longer arises — showing the modal hides the auto
+        // at show time (Chrome 155 probe §2a) — so this half
+        // now pins the show-time outcome: the auto is
+        // already closed when the press would land, and the
+        // dialog stays modal and open.
+        let mut doc = Document::new();
+        let host = stage(&mut doc);
+        let auto = open_popover(&mut doc, host, "auto");
+        let dlg = open_modal(&mut doc, host);
+        assert!(!doc.is_popover_open(auto));
+        assert_eq!(doc.light_dismiss_popover(None), Vec::<NodeId>::new());
+        assert!(doc.is_dialog_modal(dlg));
+        assert!(doc.is_dialog_open(dlg));
     }
 }

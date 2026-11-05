@@ -2501,6 +2501,17 @@ impl<'a, 'x, 'h> ScriptHost<'a, 'x, 'h> {
         Some(self.tb.arena[idx].tag.to_string())
     }
 
+    /// Namespace of an element, exactly as stored in the arena:
+    /// unlike the snapshot-based all-element enumeration (which
+    /// only covers connected elements), this also answers for
+    /// detached elements (a `createElementNS` result never
+    /// attached), whose stored namespace is otherwise
+    /// unreachable. `None` for a stale handle.
+    pub fn element_namespace(&self, el: ScriptElement) -> Option<Namespace> {
+        let idx = self.check_el(el)?;
+        Some(self.tb.arena[idx].ns.clone())
+    }
+
     /// `nextElementSibling` (`next = true`) / `previousElementSibling`.
     /// Returns None for stale handles or when there is no such sibling.
     pub fn sibling_element(&self, el: ScriptElement, next: bool) -> Option<ScriptElement> {

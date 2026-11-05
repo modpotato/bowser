@@ -2447,6 +2447,40 @@ impl crate::window::JsDispatch for PageEventDispatch {
         tab.sync_dirty_flags();
     }
 
+    fn dispatch_submit(&mut self, tab: &mut crate::tab::Tab, form: NodeId) -> bool {
+        // Form `submit` (HTML §4.10.21.2): cancelable, bubbling,
+        // fired at the form; a prevented submit runs no submission
+        // step. Delivered through the click path's eval mechanism
+        // (inline `onsubmit` first, then the same event object to
+        // the listeners via `dispatchEvent`), NOT the trusted host
+        // path `cancel`/`close` use — there is no `Vm` submit
+        // native, and adding one to `bowser_js` is out of this
+        // wave's scope. Consequence, stated not hidden: like a
+        // click today, a page override of `dispatchEvent` could
+        // swallow this event, where a trusted host event could
+        // not; a `Vm::dispatch_submit_event` native is the
+        // follow-up that closes that gap. Same reentrancy / pump
+        // discipline as `dispatch_click`.
+        let inline = tab
+            .document_ref()
+            .and_then(|doc| doc.get_attribute(form, "onsubmit").map(|s| s.to_owned()));
+        let Some(installed) = tab.installed_mut() else {
+            return false;
+        };
+        let (doc, page_vm) = installed.document_and_vm_mut();
+        crate::tab::InstalledDocument::assert_no_live_borrow(doc);
+        let prevented = self.dispatch_typed_with_inline(
+            doc,
+            page_vm,
+            form,
+            "{type:'submit',bubbles:true,cancelable:true}",
+            inline.as_deref(),
+        );
+        page_vm.pump();
+        tab.sync_dirty_flags();
+        prevented
+    }
+
     fn dispatch_toggle(&mut self, tab: &mut crate::tab::Tab, target: NodeId) {
         // Popover `toggle` (HTML §6.12): non-bubbling, non-cancelable.
         // (a) Bubbling: the spec's "fire an event named `toggle` ...

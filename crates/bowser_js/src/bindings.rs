@@ -4296,6 +4296,9 @@ const SHIM_ELEMENT_OWN_NAMES: &[&str] = &[
     "close",
     "open",
     "returnValue",
+    // w85: stripped at upgrade so the production prototype's
+    // `closedBy` accessor serves upgraded wrappers.
+    "closedBy",
     // w81: stripped at upgrade so the production prototype's
     // `animate` (not the shim's parse native, which fails closed
     // once the host is gone) serves upgraded wrappers.
@@ -4994,6 +4997,19 @@ fn install_web_apis_inner(
                 "returnValue",
                 n_dialog_return_value_get,
                 n_dialog_return_value_set,
+            )?;
+            // w85: `HTMLDialogElement.closedBy` reflects the
+            // `closedby` content attribute (plain reflection:
+            // the raw value, `""` when absent; the normalized
+            // query is `Document::computed_closed_by`). A
+            // non-dialog getter reads `""`, a non-dialog
+            // setter throws, like `returnValue`.
+            def_accessor(
+                heap,
+                element_proto,
+                "closedBy",
+                n_dialog_closed_by_get,
+                n_dialog_closed_by_set,
             )?;
             // w79k: `Element.querySelector`/`querySelectorAll`, scoped
             // to the receiver's descendants. (The parse shim's versions
@@ -13216,7 +13232,10 @@ fn production_exit_transition_duration(
 
 /// `HTMLElement.hidePopover()` (w80): demote from the top layer.
 /// `NotSupportedError` without a `popover` attribute; hiding a
-/// popover that is not showing is a no-op. A live popover that
+/// popover that is not showing is a no-op. A live modal dialog
+/// throws `InvalidStateError` (w85, via
+/// [`Document::hide_popover`]) and fires no `toggle` event.
+/// A live popover that
 /// is hidden fires a trusted `toggle` event (`open` ->
 /// `closed`) at hide time — even when the demotion is deferred
 /// into an exit retention, the event fires now (retention
@@ -13324,6 +13343,9 @@ fn n_toggle_popover(heap: &mut Heap, this: Value, args: &[Value]) -> Result<Valu
 /// `NotSupportedError` for a non-dialog receiver,
 /// `InvalidStateError` when detached or already open. No
 /// top-layer promotion, no modal flag, no focus move (W4/W5).
+/// Showing a dialog hides open `auto` popovers (w85
+/// show-time rule): their `toggle` events fire here, in
+/// [`Document::show_dialog`]'s returned order.
 fn n_show_dialog(heap: &mut Heap, this: Value, _args: &[Value]) -> Result<Value, NativeError> {
     let rc = apis_rc(heap, this)?;
     let node = {
@@ -13331,7 +13353,7 @@ fn n_show_dialog(heap: &mut Heap, this: Value, _args: &[Value]) -> Result<Value,
         target_node(heap, this, &g)?
     };
     let doc_rc = rc.borrow().live_document()?;
-    doc_rc
+    let closed = doc_rc
         .borrow_mut()
         .show_dialog(node)
         .map_err(|e| err_type(format!("show: {e}")))?;
@@ -13342,6 +13364,9 @@ fn n_show_dialog(heap: &mut Heap, this: Value, _args: &[Value]) -> Result<Value,
     // focus. The mirrored host focus (maintained by the embedder)
     // is snapshotted here; the sync consumes it.
     doc_rc.borrow_mut().note_dialog_show(node);
+    for victim in closed {
+        dispatch_popover_toggle(heap, &rc, victim, "open", "closed")?;
+    }
     Ok(Value::Undefined)
 }
 
@@ -13359,7 +13384,7 @@ fn n_show_dialog_modal(
         target_node(heap, this, &g)?
     };
     let doc_rc = rc.borrow().live_document()?;
-    doc_rc
+    let closed = doc_rc
         .borrow_mut()
         .show_dialog_modal(node)
         .map_err(|e| err_type(format!("showModal: {e}")))?;
@@ -13374,6 +13399,14 @@ fn n_show_dialog_modal(
     } else {
         doc_rc.borrow_mut().store_exit_duration(node, 0.0);
     }
+    // Showing a dialog hides open `auto` popovers (w85
+    // show-time rule): their `toggle` events fire here, in
+    // `Document::show_dialog_modal`'s returned order, after
+    // the dialog's own exit duration is measured so a victim
+    // listener cannot perturb that measurement.
+    for victim in closed {
+        dispatch_popover_toggle(heap, &rc, victim, "open", "closed")?;
+    }
     Ok(Value::Undefined)
 }
 
@@ -13385,6 +13418,18 @@ fn n_show_dialog_modal(
 /// (no event); a non-dialog receiver is `NotSupportedError`.
 /// The document borrow is dropped before dispatch, so a listener
 /// that re-opens the dialog re-enters a clean state.
+/// w85fix (retained-dual corner, decided at close time, not
+/// at retention end): closing a dialog that is also a live
+/// popover member (shown via `show()` then `showPopover()`,
+/// non-modal) additionally fires its popover `toggle`
+/// (`open` -> `closed`) after the `close` event — a popover
+/// hide would have fired it at hide time, and `close()` is
+/// what hides it here, so the toggle belongs to the close,
+/// not to a later show ending the retention (which would
+/// fire late, or never if the retention simply expires).
+/// A modal dual is excluded (C10: it was never opened in
+/// popover mode), and a `close` listener that re-shows the
+/// popover suppresses the toggle (the popover is open again).
 fn n_close_dialog(heap: &mut Heap, this: Value, args: &[Value]) -> Result<Value, NativeError> {
     let rc = apis_rc(heap, this)?;
     let node = {
@@ -13396,6 +13441,15 @@ fn n_close_dialog(heap: &mut Heap, this: Value, args: &[Value]) -> Result<Value,
         v => Some(arg_to_string(&mut *heap, v)?),
     };
     let doc_rc = rc.borrow().live_document()?;
+    // w85fix: snapshot the dual-popover state BEFORE the
+    // close (see the fn docs): a live popover member closed
+    // via `close()` gets its popover toggle at close time.
+    let was_popover_live = {
+        let doc = doc_rc.borrow();
+        doc.top_layer().contains(&node)
+            && doc.popover_state(node).is_some()
+            && !doc.is_dialog_modal(node)
+    };
     // w82: measure the exit transition BEFORE closing (the
     // pre-close values are the exit's start values); a positive
     // duration defers only the top-layer demotion — the dialog
@@ -13430,6 +13484,14 @@ fn n_close_dialog(heap: &mut Heap, this: Value, args: &[Value]) -> Result<Value,
     let r = run_event_dispatch(heap, &rc, node, event_val, handle);
     heap.release_temp(base);
     r?;
+    // w85fix: the dual's popover toggle, after the `close`
+    // event — unless a `close` listener re-showed the
+    // popover, in which case it is open again and no toggle
+    // is owed (a retained member is not live, so a deferred
+    // close still fires here).
+    if was_popover_live && !doc_rc.borrow().top_layer().contains(&node) {
+        dispatch_popover_toggle(heap, &rc, node, "open", "closed")?;
+    }
     Ok(Value::Undefined)
 }
 
@@ -13536,6 +13598,17 @@ fn n_request_close_dialog(
     // the listener's re-open is a real open, and the unprevented
     // cancel's close must still land on it.
     // Otherwise this is `close()` from here on, verbatim.
+    // w85fix: snapshot AFTER the cancel dispatch (a cancel
+    // listener may have closed and re-opened the dialog,
+    // case (b) above): the dual-popover toggle, like in
+    // `n_close_dialog`, fires at close time when the dialog
+    // being closed is a live popover member.
+    let was_popover_live = {
+        let doc = doc_rc.borrow();
+        doc.top_layer().contains(&node)
+            && doc.popover_state(node).is_some()
+            && !doc.is_dialog_modal(node)
+    };
     let exit = production_exit_transition_duration(&rc, node);
     let closed = match exit {
         Some(d) => doc_rc.borrow_mut().close_dialog_deferred(
@@ -13561,6 +13634,9 @@ fn n_request_close_dialog(
     let r = run_event_dispatch(heap, &rc, node, event_val, handle);
     heap.release_temp(base);
     r?;
+    if was_popover_live && !doc_rc.borrow().top_layer().contains(&node) {
+        dispatch_popover_toggle(heap, &rc, node, "open", "closed")?;
+    }
     Ok(Value::Undefined)
 }
 
@@ -13659,6 +13735,69 @@ fn n_dialog_return_value_set(
         args.first().copied().unwrap_or(Value::Undefined),
     )?;
     doc_rc.borrow_mut().set_dialog_return_value(node, &value);
+    Ok(Value::Undefined)
+}
+
+/// `HTMLDialogElement.closedBy` getter (w85): reflects the
+/// `closedby` content attribute, `""` for a non-dialog
+/// receiver or a dialog without the attribute.
+fn n_dialog_closed_by_get(
+    heap: &mut Heap,
+    this: Value,
+    _args: &[Value],
+) -> Result<Value, NativeError> {
+    let rc = apis_rc(heap, this)?;
+    let node = {
+        let g = rc.borrow();
+        target_node(heap, this, &g)?
+    };
+    let doc_rc = rc.borrow().live_document()?;
+    // w85fix: a non-dialog getter reads `""`, like the
+    // neighbouring `returnValue` getter (whose DOM query is
+    // fail-closed for non-dialogs) — the raw attribute must
+    // not leak through for a plain element carrying
+    // `closedby="any"`.
+    if !doc_rc.borrow().is_dialog_element(node) {
+        return heap
+            .alloc_str("")
+            .map(Value::Str)
+            .map_err(|_| NativeError::OutOfMemory);
+    }
+    let val = doc_rc
+        .borrow()
+        .get_attribute(node, "closedby")
+        .unwrap_or("")
+        .to_string();
+    heap.alloc_str(&val)
+        .map(Value::Str)
+        .map_err(|_| NativeError::OutOfMemory)
+}
+
+/// `HTMLDialogElement.closedBy` setter (w85): sets the
+/// `closedby` content attribute verbatim (normalization
+/// happens in `Document::computed_closed_by`, not here).
+/// Throws on a non-dialog receiver.
+fn n_dialog_closed_by_set(
+    heap: &mut Heap,
+    this: Value,
+    args: &[Value],
+) -> Result<Value, NativeError> {
+    let rc = apis_rc(heap, this)?;
+    let node = {
+        let g = rc.borrow();
+        target_node(heap, this, &g)?
+    };
+    let doc_rc = rc.borrow().live_document()?;
+    if !doc_rc.borrow().is_dialog_element(node) {
+        return Err(err_type(
+            "closedBy: NotSupportedError: element is not a dialog element",
+        ));
+    }
+    let value = arg_to_string(
+        &mut *heap,
+        args.first().copied().unwrap_or(Value::Undefined),
+    )?;
+    doc_rc.borrow_mut().set_attribute(node, "closedby", &value);
     Ok(Value::Undefined)
 }
 
@@ -24950,6 +25089,16 @@ fn wrap_parse_element(
                 n_parse_el_dialog_return_value_set,
             )
             .map_err(|_| NativeError::OutOfMemory)?;
+            // w85: the parse shim's own `closedBy`, stripped
+            // at upgrade like `open` / `returnValue` above.
+            def_accessor(
+                heap,
+                obj,
+                "closedBy",
+                n_parse_el_dialog_closed_by_get,
+                n_parse_el_dialog_closed_by_set,
+            )
+            .map_err(|_| NativeError::OutOfMemory)?;
             // Web Animations (w81): the parse shim's own `animate`
             // — shim wrappers carry no prototype chain to the
             // minimal `Element.prototype` built by
@@ -33301,8 +33450,8 @@ fn n_parse_el_remove(heap: &mut Heap, this: Value, _args: &[Value]) -> Result<Va
 /// are their states, anything else is `auto`). The parser's tree
 /// carries no top-layer set, so the state machine lives in the
 /// shared shim roots (see [`ParseShimRoots::top_layer`]).
-fn parse_popover_state(
-    host: &ScriptHost<'static, 'static, 'static>,
+fn parse_popover_state<'a, 'x, 'h>(
+    host: &ScriptHost<'a, 'x, 'h>,
     el: ScriptElement,
 ) -> Option<&'static str> {
     let value = host
@@ -33315,6 +33464,76 @@ fn parse_popover_state(
         "hint" => "hint",
         _ => "auto",
     })
+}
+
+/// Popover state for an arena index with no recorded wrapper
+/// (w85fix): the fallback `parse_dialog_show`'s retained arm
+/// uses when the wrapper lookup misses. Walks the connected
+/// tree from the document element (the same walk
+/// `prune_shim_top_layer_subtree` uses), so an unwrapped
+/// retained `auto` reads as `auto` instead of surviving as
+/// non-auto. `None` when the element is not found in the
+/// connected tree (detached, template contents, or inside a
+/// shadow root — see the one-walk form's doc for why the
+/// shadow miss is unreachable for a genuine victim) or
+/// carries no `popover` attribute — fail-closed, like the old
+/// missing-wrapper read.
+fn shim_popover_state_for_arena<'a, 'x, 'h>(
+    host: &ScriptHost<'a, 'x, 'h>,
+    arena: usize,
+) -> Option<&'static str> {
+    let root = host.document_element()?;
+    let mut stack = vec![root];
+    while let Some(el) = stack.pop() {
+        if el.arena_index() == arena {
+            return parse_popover_state(host, el);
+        }
+        stack.extend(host.child_elements(el));
+    }
+    None
+}
+
+/// One-walk form of [`shim_popover_state_for_arena`] for a
+/// candidate set (w85fix S4): a single DFS from the document
+/// element records the `popover` state of just the candidates
+/// it meets, instead of one full walk per candidate. A
+/// candidate the walk never meets (detached, template
+/// contents, or inside a shadow root — see below) is absent
+/// from the map, which the caller reads as non-auto.
+/// Shadow limitation, explicit and fail-closed: the walk runs
+/// over `child_elements`, which does not cross into shadow
+/// roots (the host exposes no shadow-child accessor), so a
+/// shadow-tree candidate reads as non-auto here. That miss is
+/// unreachable for a genuine retained victim: reaching
+/// retention requires a shim show then a shim hide, both of
+/// which run on a wrapper, so a retained candidate always
+/// has a wrapper record and the caller's wrapper branch —
+/// not this fallback — answers it. Template contents are
+/// likewise unreachable: a template-content element is never
+/// connected, so it can never have been shown or retained.
+fn shim_popover_states_for_arenas<'a, 'x, 'h>(
+    host: &ScriptHost<'a, 'x, 'h>,
+    candidates: &[usize],
+) -> HashMap<usize, &'static str> {
+    let mut wanted: HashSet<usize> = candidates.iter().copied().collect();
+    let mut out = HashMap::new();
+    let Some(root) = host.document_element() else {
+        return out;
+    };
+    let mut stack = vec![root];
+    while let Some(el) = stack.pop() {
+        let arena = el.arena_index();
+        if wanted.remove(&arena)
+            && let Some(state) = parse_popover_state(host, el)
+        {
+            out.insert(arena, state);
+        }
+        if wanted.is_empty() {
+            break;
+        }
+        stack.extend(host.child_elements(el));
+    }
+    out
 }
 
 /// Shared show/hide/toggle core for the shim popover natives: the
@@ -33402,6 +33621,18 @@ fn parse_popover_apply(
     // `togglePopover(true)` on an open popover returns true.
     match (op, force) {
         ("togglePopover", Some(true)) if is_open => return Ok(true),
+        // w85fix: forced-true on a live modal dual is a
+        // no-op returning true, like production
+        // `Document::toggle_popover`'s live-member arm —
+        // a showModal-only dual sits in `dialog_modal`,
+        // not in the popover set, so without this arm it
+        // fell through to the show branch and flipped the
+        // unified entry's kind to Popover. (A retained
+        // modal never reaches here: close drops it from
+        // `dialog_modal`, so forced-true on it still
+        // re-opens through the show branch, as production
+        // does for a retained member.)
+        ("togglePopover", Some(true)) if is_dialog_modal => return Ok(true),
         // Reconciled retention rule (w82 final review):
         // retained counts as hidden, so a forced-false or bare
         // toggle on it is a no-op returning false, before
@@ -33410,7 +33641,13 @@ fn parse_popover_apply(
         // show branch below, which cancels the retention and
         // re-opens.
         ("togglePopover", Some(false)) if is_retained => return Ok(false),
-        ("togglePopover", Some(false)) if !is_open => return Ok(false),
+        // w85: a modal dialog is a hide-direction target even
+        // when the shim's popover-only `is_open` misses it (a
+        // showModal-only dual sits in `dialog_modal`, not in
+        // the popover top-layer set), so the forced-false
+        // no-op must not swallow it: it falls through to the
+        // hide arm below, which throws like production.
+        ("togglePopover", Some(false)) if !is_open && !is_dialog_modal => return Ok(false),
         ("togglePopover", None) if is_retained => return Ok(false),
         _ => {}
     }
@@ -33426,6 +33663,23 @@ fn parse_popover_apply(
         ("togglePopover", Some(false)) => false,
         _ => !is_open,
     };
+    // w85fix: bare `togglePopover()` on a modal dual must
+    // throw like production (where the bare toggle delegates
+    // to `hide_popover` and hits the modal guard), not show.
+    // The shim's popover-only `is_open` is false for a
+    // showModal-only dual, so the bare toggle computed
+    // `show=true` and inserted the dialog into the popover
+    // top-layer set, returning true where production throws.
+    // This sits after the retention no-op above on purpose
+    // (a retained modal is already closed for API purposes)
+    // and after validity (a non-popover modal is
+    // NotSupported, not InvalidState).
+    if op == "togglePopover" && force.is_none() && is_dialog_modal {
+        return Err(err_type(format!(
+            "{op}: InvalidStateError: dialog is showing modally; \
+             togglePopover cannot close a modal dialog, use close()"
+        )));
+    }
     // Reconciled retention rule, hide arm: `hidePopover` on a
     // retained popover is a no-op that leaves the retention
     // alone (the toggle arms already returned above). This
@@ -33434,6 +33688,27 @@ fn parse_popover_apply(
     // non-popover, retained or not.
     if !show && is_retained {
         return Ok(false);
+    }
+    // w85 modal guard, shim twin of production
+    // `Document::hide_popover` / `hide_popover_deferred`:
+    // a hide-direction call (`hidePopover`, a forced-false
+    // toggle that fell through, or a bare toggle on a live
+    // popover dual) on a modal dialog throws instead of
+    // removing it from the top layer, which would strand
+    // its modal flag and `open` attribute. The retention
+    // no-op above comes first on purpose: a retained modal
+    // dialog is already closed for API purposes. A
+    // `showModal`-only dual is also caught here
+    // (`is_dialog_modal` does not need `is_open`): the
+    // shim's popover-only `is_open` misses it, but the
+    // dialog is showing modally, so hiding it must throw
+    // just like production, where `showModal` promotes to
+    // the top layer.
+    if !show && is_dialog_modal {
+        return Err(err_type(format!(
+            "{op}: InvalidStateError: dialog is showing modally; \
+             hidePopover cannot close a modal dialog, use close()"
+        )));
     }
     if show {
         if !host_element_connected(host_ref, el) {
@@ -33580,9 +33855,11 @@ fn n_parse_el_toggle_popover(
 /// The namespace resolves through the slot's all-element
 /// enumeration (cached per mutation epoch, like the identity
 /// refresh): an element with no enumeration record (detached,
-/// template contents, never wrapped) keeps the tag-only answer,
-/// since no tree API exposes its namespace — such an element
-/// fails the connected check in `show` / `close` anyway.
+/// template contents, never wrapped) keeps the tag-only answer
+/// here — such an element fails the connected check in `show`
+/// / `close` anyway, so the fail-open is rescued there. Where
+/// no later connected check exists, the direct check below
+/// is used instead.
 fn parse_dialog_is_dialog(
     id: u64,
     host: &ScriptHost<'static, 'static, 'static>,
@@ -33609,6 +33886,28 @@ fn parse_dialog_is_dialog(
         map.get(&el.arena_index()).map(|(_, ns)| ns.clone())
     });
     ns.is_none_or(|ns| ns == Namespace::Html)
+}
+
+/// The shim-side dialog test against the arena's stored
+/// namespace (w85fix BLOCKER B): tag name, ASCII
+/// case-insensitive, AND `Namespace::Html` read straight from
+/// the parse host. Unlike [`parse_dialog_is_dialog`], this
+/// never fail-opens: an element with no enumeration record
+/// (detached, template contents, never wrapped) still carries
+/// its stored namespace, so a detached SVG `dialog` is not a
+/// dialog here. Used only where no later connected check
+/// rescues a fail-open answer — the `closedBy` accessor,
+/// whose getter/setter otherwise leak/accept the attribute
+/// for foreign `dialog` elements. The show/close natives keep
+/// [`parse_dialog_is_dialog`]: they fail the connected check
+/// for such elements anyway.
+fn parse_dialog_is_dialog_direct(
+    host: &ScriptHost<'static, 'static, 'static>,
+    el: ScriptElement,
+) -> bool {
+    host.tag_name(el)
+        .is_some_and(|t| t.eq_ignore_ascii_case("dialog"))
+        && host.element_namespace(el) == Some(Namespace::Html)
 }
 
 /// Whether `el` carries an `open` attribute in the parser's tree
@@ -33687,16 +33986,107 @@ fn parse_dialog_show(
         let entry = hosts
             .get_mut(&id)
             .ok_or_else(|| err_type("document is not available outside the parser"))?;
-        // Re-showing during an exit transition cancels it.
-        entry
-            .listeners
-            .borrow_mut()
+        // w85fix: showing a dialog hides open `auto`
+        // popovers at show time, mirroring production
+        // `Document::show_dialog` / `show_dialog_modal`
+        // (Chrome probe RESULTS.md §2a: a mid-parse
+        // auto.showPopover(); dlg.showModal(); must not
+        // adopt as a modal dialog above a still-open auto).
+        // Live victims demote in show order; retained autos
+        // end their retention silently (the shim fires no
+        // toggles at all, per `parse_popover_apply`'s docs).
+        // Excepted, like production: the dialog itself, its
+        // ancestors (Chrome probe 2 Q3: a dialog nested
+        // inside an open auto coexists with it), and modal
+        // dialogs (C10).
+        let mut roots = entry.listeners.borrow_mut();
+        let mut ancestors = HashSet::new();
+        let mut cur = host_ref.parent_element(el);
+        while let Some(p) = cur {
+            ancestors.insert(p.arena_index());
+            cur = host_ref.parent_element(p);
+        }
+        for other in roots.top_layer_ordered() {
+            if other == el.arena_index()
+                || ancestors.contains(&other)
+                || roots.dialog_modal.contains(&other)
+            {
+                continue;
+            }
+            // w85fix S1: a live victim with no wrapper record
+            // reads its state straight from the tree, like the
+            // retained arm's fallback — a wrapper miss must
+            // not read as non-auto and let a live auto
+            // survive a dialog show.
+            let other_is_auto = match roots
+                .element_wrappers
+                .iter()
+                .find(|rec| rec.el.arena_index() == other)
+            {
+                Some(rec) => parse_popover_state(host_ref, rec.el) == Some("auto"),
+                None => shim_popover_state_for_arena(host_ref, other) == Some("auto"),
+            };
+            if other_is_auto {
+                roots.top_layer_remove(other);
+            }
+        }
+        // w85fix re-review: the retained arm ends ONLY
+        // retained `auto` popovers, like the live-victim
+        // loop above and like production
+        // `hide_open_auto_popovers_except` — the old
+        // kind-only filter ended ANY retained popover
+        // with an exit duration, so a retained manual
+        // (or hint) popover died on a shim dialog show
+        // that must leave it retained. The wrapper-based
+        // auto check is the live loop's, applied to the
+        // retained candidate's own wrapper; when the
+        // wrapper lookup misses, the fallback reads the
+        // candidate's `popover` attribute straight from
+        // the tree, so a retained auto cannot survive a
+        // dialog show on a missing wrapper.
+        let retained_candidates: Vec<usize> = roots
             .exit_retained
-            .remove(&el.arena_index());
-        entry
-            .listeners
-            .borrow_mut()
-            .dialog_open_insert(el.arena_index(), modal);
+            .iter()
+            .filter(|(arena, (_, kind))| {
+                **arena != el.arena_index()
+                    && !ancestors.contains(*arena)
+                    && *kind == TopLayerShowKind::Popover
+            })
+            .map(|(arena, _)| *arena)
+            .collect();
+        // w85fix S4: one DFS for the wrapper-missing
+        // candidates (see `shim_popover_states_for_arenas`),
+        // not one walk per candidate.
+        let retained_states = if retained_candidates.iter().any(|arena| {
+            !roots
+                .element_wrappers
+                .iter()
+                .any(|rec| rec.el.arena_index() == *arena)
+        }) {
+            shim_popover_states_for_arenas(host_ref, &retained_candidates)
+        } else {
+            HashMap::new()
+        };
+        let retained_autos: Vec<usize> = retained_candidates
+            .into_iter()
+            .filter(|arena| {
+                if let Some(rec) = roots
+                    .element_wrappers
+                    .iter()
+                    .find(|rec| rec.el.arena_index() == *arena)
+                {
+                    return parse_popover_state(host_ref, rec.el) == Some("auto");
+                }
+                retained_states.get(arena) == Some(&"auto")
+            })
+            .collect();
+        for other in retained_autos {
+            roots.exit_retained.remove(&other);
+        }
+        // Re-showing during an exit transition cancels it.
+        roots.exit_retained.remove(&el.arena_index());
+        roots.dialog_open_insert(el.arena_index(), modal);
+        drop(roots);
         entry.layout_hook.style_cache.clear();
         entry.layout_hook.entries.clear();
         Ok::<(), NativeError>(())
@@ -34233,6 +34623,63 @@ fn n_parse_el_dialog_return_value_set(
                 .insert(el.arena_index(), value);
         }
     });
+    Ok(Value::Undefined)
+}
+
+/// `el.closedBy` getter on the parse shim (w85): the
+/// `closedby` attribute, `""` when absent, when the document
+/// is gone (mirroring the shim's fail-closed reads), or for a
+/// non-dialog receiver (including a detached foreign dialog).
+fn n_parse_el_dialog_closed_by_get(
+    heap: &mut Heap,
+    this: Value,
+    _args: &[Value],
+) -> Result<Value, NativeError> {
+    let (_id, host, el) = parse_el_host(heap, this, "closedBy")?;
+    // w85fix: a non-dialog getter reads `""`, mirroring the
+    // production getter — the raw attribute must not leak
+    // through for a plain element carrying `closedby="any"`,
+    // or for a detached SVG `dialog` carrying it (the direct
+    // check reads its stored namespace; the enumeration-based
+    // check fail-opens for detached elements).
+    if !parse_dialog_is_dialog_direct(deref_parse_host(host), el) {
+        return heap
+            .alloc_str("")
+            .map(Value::Str)
+            .map_err(|_| NativeError::OutOfMemory);
+    }
+    let val = deref_parse_host(host)
+        .get_attributes(el)
+        .into_iter()
+        .find(|(name, _)| name.eq_ignore_ascii_case("closedby"))
+        .map(|(_, value)| value)
+        .unwrap_or_default();
+    heap.alloc_str(&val)
+        .map(Value::Str)
+        .map_err(|_| NativeError::OutOfMemory)
+}
+
+/// `el.closedBy` setter on the parse shim (w85): sets the
+/// `closedby` attribute. Throws on a non-dialog receiver,
+/// like production — including a detached foreign `dialog`,
+/// which the direct check (see the getter) rejects where the
+/// enumeration-based check fail-opened and let the set land.
+fn n_parse_el_dialog_closed_by_set(
+    heap: &mut Heap,
+    this: Value,
+    args: &[Value],
+) -> Result<Value, NativeError> {
+    let (_id, host, el) = parse_el_host(heap, this, "closedBy")?;
+    if !parse_dialog_is_dialog_direct(deref_parse_host(host), el) {
+        return Err(err_type(
+            "closedBy: NotSupportedError: element is not a dialog element",
+        ));
+    }
+    let value = arg_to_string(
+        &mut *heap,
+        args.first().copied().unwrap_or(Value::Undefined),
+    )?;
+    deref_parse_host(host).set_attribute(el, "closedby", &value);
     Ok(Value::Undefined)
 }
 
@@ -46275,6 +46722,119 @@ mod tests {
         }
     }
 
+    /// Probe executor for the w85 retained-auto fallback
+    /// test: records `shim_popover_state_for_arena` for
+    /// markup elements it looks up through the host API
+    /// only — deliberately never wrapping them in JS, so
+    /// no `element_wrappers` record exists — plus a
+    /// detached `createElement` element carrying
+    /// `popover="auto"`, which the connected-tree walk must
+    /// still miss.
+    struct ShimPopoverFallbackProbe {
+        results: Rc<RefCell<Vec<String>>>,
+    }
+
+    impl bowser_html::ScriptExecutor for ShimPopoverFallbackProbe {
+        fn execute_script(
+            &mut self,
+            host: &mut ScriptHost<'_, '_, '_>,
+            _el: ScriptElement,
+            _attrs: &[(String, String)],
+            _script: &str,
+        ) {
+            for id in ["a", "m", "n"] {
+                let state = host
+                    .get_element_by_id(id)
+                    .and_then(|el| shim_popover_state_for_arena(host, el.arena_index()))
+                    .unwrap_or("");
+                self.results.borrow_mut().push(format!("{id}:{state}"));
+            }
+            // w85fix S3: the detached element carries
+            // `popover="auto"` now, so the empty read pins
+            // the walk missing it — not the attribute being
+            // absent, which the old probe could not
+            // distinguish.
+            let detached = host.create_element("div");
+            host.set_attribute(detached, "popover", "auto");
+            let state =
+                shim_popover_state_for_arena(host, detached.arena_index()).unwrap_or("");
+            self.results.borrow_mut().push(format!("detached:{state}"));
+        }
+    }
+
+    /// Probe executor for the w85 S2 retained-filter test:
+    /// installs the parse shim (like [`ShimEval`]) but never
+    /// evaluates script, so no element ever gets a wrapper
+    /// record; it then inserts `exit_retained` entries by
+    /// hand for the unwrapped `auto` and `manual` popovers
+    /// and drives [`parse_dialog_show`] itself. The results
+    /// record whether each retention survived the show.
+    struct ShimDialogShowRetainedProbe {
+        vm: Vm,
+        results: Rc<RefCell<Vec<String>>>,
+    }
+
+    impl bowser_html::ScriptExecutor for ShimDialogShowRetainedProbe {
+        fn execute_script(
+            &mut self,
+            host: &mut ScriptHost<'_, '_, '_>,
+            _el: ScriptElement,
+            _attrs: &[(String, String)],
+            _script: &str,
+        ) {
+            #[allow(clippy::unnecessary_cast)]
+            let host_ptr =
+                host as *mut ScriptHost<'_, '_, '_> as *mut ScriptHost<'static, 'static, 'static>;
+            let shim = install_parse_document_shim(&mut self.vm, host_ptr, None)
+                .expect("parse shim install");
+            let id = shim.id;
+            let pop = host.get_element_by_id("p").expect("p");
+            let manual = host.get_element_by_id("m").expect("m");
+            let dlg = host.get_element_by_id("d").expect("d");
+            let listeners = PARSE_HOSTS.with(|hosts| {
+                hosts.borrow().get(&id).map(|e| e.listeners.clone())
+            });
+            let listeners = listeners.expect("shim slot");
+            {
+                let mut roots = listeners.borrow_mut();
+                roots.exit_retain(pop.arena_index(), TopLayerShowKind::Popover, 60.0);
+                roots.exit_retain(manual.arena_index(), TopLayerShowKind::Popover, 60.0);
+            }
+            parse_dialog_show(id, host_ptr, dlg, false).expect("dialog show");
+            let roots = listeners.borrow();
+            self.results.borrow_mut().push(format!(
+                "p:{}",
+                if roots.exit_retained.contains_key(&pop.arena_index()) {
+                    "kept"
+                } else {
+                    "ended"
+                }
+            ));
+            self.results.borrow_mut().push(format!(
+                "m:{}",
+                if roots.exit_retained.contains_key(&manual.arena_index()) {
+                    "kept"
+                } else {
+                    "ended"
+                }
+            ));
+            self.results.borrow_mut().push(format!(
+                "d:{}",
+                if host
+                    .get_attributes(dlg)
+                    .iter()
+                    .any(|(name, _)| name.eq_ignore_ascii_case("open"))
+                {
+                    "open"
+                } else {
+                    "closed"
+                }
+            ));
+            drop(roots);
+            shim.uninstall(&mut self.vm);
+        }
+    }
+
     /// Read a parse wrapper's slot tag ([`PARSE_CTX_KEY`]).
     fn parse_el_slot(vm: &Vm, name: &str) -> u64 {
         let Value::Object(obj) = vm.get_global(name).expect("global installed") else {
@@ -50739,6 +51299,371 @@ mod tests {
     }
 
     #[test]
+    fn parse_shim_dialog_show_hides_open_auto_popover() {
+        // w85fix issue 2: a mid-parse auto.showPopover();
+        // dlg.showModal(); must adopt as a modal dialog with
+        // the auto closed — the state Chrome probe §2a says
+        // never arises (modal above a still-open auto) must
+        // not be adoptable. Same for non-modal show().
+        let (mut probe, doc, ctx) = captured_install(
+            b"<html><body><div id=\"p\" popover=\"auto\">hi</div><dialog id=\"d\">hi</dialog><script>\
+              globalThis.__p = document.getElementById('p');\
+              globalThis.__d = document.getElementById('d');\
+              __p.showPopover();\
+              __d.showModal();\
+              globalThis.__pOpen = String(__p.matches(':popover-open'));\
+              globalThis.__dModal = String(__d.matches(':modal'));\
+              </script></body></html>",
+        );
+        assert_eq!(node_list_str(&mut probe.vm, "globalThis.__pOpen;"), "false");
+        assert_eq!(
+            node_list_str(&mut probe.vm, "globalThis.__dModal;"),
+            "true"
+        );
+        let p_node = doc.borrow().get_element_by_id("p").expect("div#p");
+        let d_node = doc.borrow().get_element_by_id("d").expect("dialog#d");
+        assert!(!doc.borrow().is_popover_open(p_node));
+        assert!(doc.borrow().is_dialog_modal(d_node));
+        assert!(doc.borrow().is_in_top_layer(d_node));
+        remove_context(ContextId(ctx));
+
+        let (mut probe, doc, ctx) = captured_install(
+            b"<html><body><div id=\"p\" popover=\"auto\">hi</div><dialog id=\"d\">hi</dialog><script>\
+              globalThis.__p = document.getElementById('p');\
+              globalThis.__d = document.getElementById('d');\
+              __p.showPopover();\
+              __d.show();\
+              globalThis.__pOpen = String(__p.matches(':popover-open'));\
+              globalThis.__dOpen = String(__d.open);\
+              </script></body></html>",
+        );
+        assert_eq!(node_list_str(&mut probe.vm, "globalThis.__pOpen;"), "false");
+        assert_eq!(node_list_str(&mut probe.vm, "globalThis.__dOpen;"), "true");
+        let p_node = doc.borrow().get_element_by_id("p").expect("div#p");
+        let d_node = doc.borrow().get_element_by_id("d").expect("dialog#d");
+        assert!(!doc.borrow().is_popover_open(p_node));
+        assert!(doc.borrow().is_dialog_open(d_node));
+        assert!(!doc.borrow().is_dialog_modal(d_node));
+        remove_context(ContextId(ctx));
+    }
+
+    #[test]
+    fn parse_shim_dialog_show_ends_retained_auto_not_retained_manual() {
+        // w85fix re-review: the shim dialog-show hide arm
+        // must end a retained `auto` popover's retention
+        // but leave a retained `manual` popover's
+        // retention intact — the old kind-only retained
+        // filter ended both. Both popovers hide with an
+        // exit transition first, so both are retained
+        // when the dialog shows.
+        let (mut probe, doc, ctx) = captured_install(
+            b"<html><body><div id=\"m\" popover=\"manual\">hi</div><div id=\"a\" popover=\"auto\">hi</div><dialog id=\"d\">hi</dialog><script>\
+              globalThis.__m = document.getElementById('m');\
+              globalThis.__a = document.getElementById('a');\
+              globalThis.__d = document.getElementById('d');\
+              __m.style.transition = 'overlay 2s allow-discrete, display 2s allow-discrete';\
+              __a.style.transition = 'overlay 2s allow-discrete, display 2s allow-discrete';\
+              __m.showPopover();\
+              __m.hidePopover();\
+              __a.showPopover();\
+              __a.hidePopover();\
+              __d.show();\
+              globalThis.__dOpen = String(__d.open);\
+              </script></body></html>",
+        );
+        assert_eq!(node_list_str(&mut probe.vm, "globalThis.__dOpen;"), "true");
+        let m_node = doc.borrow().get_element_by_id("m").expect("div#m");
+        let a_node = doc.borrow().get_element_by_id("a").expect("div#a");
+        let d_node = doc.borrow().get_element_by_id("d").expect("dialog#d");
+        assert!(doc.borrow().is_dialog_open(d_node));
+        assert!(
+            doc.borrow().is_exit_retained(m_node),
+            "retained manual popover must survive a shim dialog show"
+        );
+        assert!(
+            !doc.borrow().is_exit_retained(a_node),
+            "retained auto popover must end on a shim dialog show"
+        );
+        remove_context(ContextId(ctx));
+    }
+
+    #[test]
+    fn w85_parse_shim_closed_by_getter_non_dialog_with_attribute_reads_empty() {
+        // w85fix, shim twin of the production test above:
+        // mid-parse, a div carrying `closedby="any"` must
+        // read `""` through the shim getter, while dialogs
+        // still reflect verbatim.
+        let (mut probe, _doc, ctx) = captured_install(
+            b"<html><body><div id=\"x\" closedby=\"any\">hi</div><dialog id=\"d\" closedby=\"any\">hi</dialog><dialog id=\"plain\">hi</dialog><script>\
+              globalThis.__x = document.getElementById('x');\
+              globalThis.__d = document.getElementById('d');\
+              globalThis.__plain = document.getElementById('plain');\
+              globalThis.__xClosed = __x.closedBy;\
+              globalThis.__dClosed = __d.closedBy;\
+              globalThis.__plainClosed = __plain.closedBy;\
+              </script></body></html>",
+        );
+        assert_eq!(node_list_str(&mut probe.vm, "globalThis.__xClosed;"), "");
+        assert_eq!(
+            node_list_str(&mut probe.vm, "globalThis.__dClosed;"),
+            "any"
+        );
+        assert_eq!(
+            node_list_str(&mut probe.vm, "globalThis.__plainClosed;"),
+            ""
+        );
+        remove_context(ContextId(ctx));
+    }
+
+    #[test]
+    fn w85fix_parse_shim_closed_by_detached_foreign_dialog_reads_empty() {
+        // w85fix BLOCKER B, shim twin of the production
+        // test: a detached SVG `dialog` (made with
+        // `createElementNS`, never attached, so it has no
+        // enumeration record) carrying `closedby="any"`
+        // must read `""` through the shim getter, and its
+        // setter must throw — the old enumeration check
+        // fail-opened to HTML for it and leaked the
+        // attribute. A detached HTML `dialog` reads
+        // verbatim, and a detached `div` reads `""`.
+        let (mut probe, _doc, ctx) = captured_install(
+            b"<html><body><script>\
+              var svgDlg = document.createElementNS('http://www.w3.org/2000/svg', 'dialog');\
+              svgDlg.setAttribute('closedby', 'any');\
+              globalThis.__svgClosed = svgDlg.closedBy;\
+              try { svgDlg.closedBy = 'any'; globalThis.__svgSet = 'no-throw'; }\
+              catch (e) { globalThis.__svgSet = String(e); }\
+              var htmlDlg = document.createElementNS(null, 'dialog');\
+              htmlDlg.setAttribute('closedby', 'any');\
+              globalThis.__htmlClosed = htmlDlg.closedBy;\
+              var div = document.createElement('div');\
+              div.setAttribute('closedby', 'any');\
+              globalThis.__divClosed = div.closedBy;\
+              </script></body></html>",
+        );
+        assert_eq!(
+            node_list_str(&mut probe.vm, "globalThis.__svgClosed;"),
+            "",
+            "detached SVG dialog must not leak its closedby attribute"
+        );
+        assert!(
+            node_list_str(&mut probe.vm, "globalThis.__svgSet;")
+                .contains("NotSupportedError"),
+            "setter on a detached SVG dialog must throw NotSupportedError"
+        );
+        assert_eq!(
+            node_list_str(&mut probe.vm, "globalThis.__htmlClosed;"),
+            "any"
+        );
+        assert_eq!(
+            node_list_str(&mut probe.vm, "globalThis.__divClosed;"),
+            ""
+        );
+        remove_context(ContextId(ctx));
+    }
+
+    #[test]
+    fn w85_parse_shim_dialog_show_fires_no_toggle_for_live_auto_victim_pinned() {
+        // PINNED DIVERGENCE, not a fix: production
+        // `n_show_dialog_modal` fires one `toggle` per live
+        // auto victim (see the production test
+        // `w85_dialog_closed_by_accessor_and_show_hides_auto_with_toggle`),
+        // while the shim `parse_dialog_show` fires none — the
+        // shim has a global no-toggle rule during parsing
+        // (see `parse_popover_apply`'s docs), so changing
+        // the shim to fire toggles here could break parse
+        // tests. This test pins the current shim behaviour
+        // explicitly: the victim closes and the dialog
+        // opens, but no `toggle` listener runs mid-parse.
+        // It asserts the empty listener log, not just the
+        // state, so a future shim toggle change fails
+        // loudly instead of silently diverging — and it
+        // asserts `__pOpenBefore` first, so the pin cannot
+        // pass vacuously for a victim that was never open.
+        let (mut probe, doc, ctx) = captured_install(
+            b"<html><body><div id=\"p\" popover=\"auto\">hi</div><dialog id=\"d\">hi</dialog><script>\
+              globalThis.__seen = [];\
+              globalThis.__p = document.getElementById('p');\
+              globalThis.__d = document.getElementById('d');\
+              __p.addEventListener('toggle', function(e) { __seen.push('toggle'); });\
+              __p.showPopover();\
+              globalThis.__pOpenBefore = String(__p.matches(':popover-open'));\
+              __d.showModal();\
+              globalThis.__midTog = __seen.join(',');\
+              globalThis.__pOpen = String(__p.matches(':popover-open'));\
+              globalThis.__dModal = String(__d.matches(':modal'));\
+              </script></body></html>",
+        );
+        assert_eq!(
+            node_list_str(&mut probe.vm, "globalThis.__midTog;"),
+            "",
+            "shim dialog show must fire no toggle for its live auto victim (pinned divergence)"
+        );
+        assert_eq!(
+            node_list_str(&mut probe.vm, "globalThis.__pOpenBefore;"),
+            "true",
+            "the victim must actually have been open before the dialog show, or the no-toggle pin is vacuous"
+        );
+        assert_eq!(node_list_str(&mut probe.vm, "globalThis.__pOpen;"), "false");
+        assert_eq!(
+            node_list_str(&mut probe.vm, "globalThis.__dModal;"),
+            "true"
+        );
+        let p_node = doc.borrow().get_element_by_id("p").expect("div#p");
+        let d_node = doc.borrow().get_element_by_id("d").expect("dialog#d");
+        assert!(!doc.borrow().is_popover_open(p_node));
+        assert!(doc.borrow().is_dialog_modal(d_node));
+        remove_context(ContextId(ctx));
+
+        let (mut probe, doc, ctx) = captured_install(
+            b"<html><body><div id=\"p\" popover=\"auto\">hi</div><dialog id=\"d\">hi</dialog><script>\
+              globalThis.__seen = [];\
+              globalThis.__p = document.getElementById('p');\
+              globalThis.__d = document.getElementById('d');\
+              __p.addEventListener('toggle', function(e) { __seen.push('toggle'); });\
+              __p.showPopover();\
+              globalThis.__pOpenBefore = String(__p.matches(':popover-open'));\
+              __d.show();\
+              globalThis.__midTog = __seen.join(',');\
+              globalThis.__pOpen = String(__p.matches(':popover-open'));\
+              globalThis.__dOpen = String(__d.open);\
+              </script></body></html>",
+        );
+        assert_eq!(
+            node_list_str(&mut probe.vm, "globalThis.__midTog;"),
+            "",
+            "shim non-modal dialog show must fire no toggle for its live auto victim (pinned divergence)"
+        );
+        assert_eq!(
+            node_list_str(&mut probe.vm, "globalThis.__pOpenBefore;"),
+            "true",
+            "the victim must actually have been open before the dialog show, or the no-toggle pin is vacuous"
+        );
+        assert_eq!(node_list_str(&mut probe.vm, "globalThis.__pOpen;"), "false");
+        assert_eq!(node_list_str(&mut probe.vm, "globalThis.__dOpen;"), "true");
+        let p_node = doc.borrow().get_element_by_id("p").expect("div#p");
+        let d_node = doc.borrow().get_element_by_id("d").expect("dialog#d");
+        assert!(!doc.borrow().is_popover_open(p_node));
+        assert!(doc.borrow().is_dialog_open(d_node));
+        remove_context(ContextId(ctx));
+    }
+
+    #[test]
+    fn w85_shim_retained_auto_fallback_reads_popover_attribute_without_wrapper() {
+        // w85fix: pins the retained-arm fallback read itself
+        // (`shim_popover_state_for_arena`), for elements
+        // that were never wrapped in JS — no wrapper record
+        // exists for them, so the wrapper lookup in
+        // `parse_dialog_show` would miss. The retained-arm
+        // filter itself (not just this helper) is pinned by
+        // `w85_parse_dialog_show_retained_filter_ends_unwrapped_auto`
+        // below, which drives `parse_dialog_show` with
+        // hand-inserted retentions; this test proves the
+        // helper reads the attribute correctly when no
+        // wrapper exists, and that a detached element
+        // carrying `popover="auto"` (not in the connected
+        // walk) reads as absent, not auto.
+        let results: Rc<RefCell<Vec<String>>> = Rc::new(RefCell::new(Vec::new()));
+        let mut probe = ShimPopoverFallbackProbe {
+            results: results.clone(),
+        };
+        bowser_html::parse_with_scripting_and_executor(
+            b"<html><body><div id=\"a\" popover=\"auto\">hi</div><div id=\"m\" popover=\"manual\">hi</div><div id=\"n\">hi</div><script>/* probe */</script></body></html>",
+            true,
+            &mut probe,
+        );
+        assert_eq!(
+            results.borrow().clone(),
+            vec![
+                "a:auto".to_string(),
+                "m:manual".to_string(),
+                "n:".to_string(),
+                "detached:".to_string(),
+            ]
+        );
+    }
+
+    #[test]
+    fn w85_parse_dialog_show_retained_filter_ends_unwrapped_auto() {
+        // w85fix S2: drives `parse_dialog_show` itself,
+        // with hand-inserted `exit_retained` entries for
+        // popovers that were never wrapped in JS (no
+        // `element_wrappers` record exists for either, so
+        // the retained arm must take its tree fallback /
+        // hoisted map). The retained `auto` must end and
+        // the retained `manual` must survive, while the
+        // dialog opens. Deleting the fallback lookup
+        // leaves the auto retained and fails this test —
+        // the helper-only test above cannot catch that.
+        let results: Rc<RefCell<Vec<String>>> = Rc::new(RefCell::new(Vec::new()));
+        let mut probe = ShimDialogShowRetainedProbe {
+            vm: Vm::new(),
+            results: results.clone(),
+        };
+        bowser_html::parse_with_scripting_and_executor(
+            b"<html><body><div id=\"p\" popover=\"auto\">hi</div><div id=\"m\" popover=\"manual\">hi</div><dialog id=\"d\">hi</dialog><script>/* probe */</script></body></html>",
+            true,
+            &mut probe,
+        );
+        assert_eq!(
+            results.borrow().clone(),
+            vec![
+                "p:ended".to_string(),
+                "m:kept".to_string(),
+                "d:open".to_string(),
+            ]
+        );
+    }
+
+    #[test]
+    fn parse_shim_bare_toggle_on_modal_dual_throws_and_forced_true_is_noop() {
+        // w85fix issue 3: a <dialog popover> shown via
+        // showModal() only — the shim's popover-only is_open
+        // is false for it — must throw on bare
+        // togglePopover() (production throws) instead of
+        // inserting it into the popover top-layer set and
+        // returning true, and forced-true must return true
+        // side-effect-free (production live-member arm)
+        // instead of flipping its kind to Popover.
+        let (mut probe, doc, ctx) = captured_install(
+            b"<html><body><dialog id=\"d\" popover=\"auto\">hi</dialog><script>\
+              globalThis.__d = document.getElementById('d');\
+              __d.showModal();\
+              try { __d.togglePopover(); globalThis.__bare = 'no-throw'; }\
+              catch (e) { globalThis.__bare = String(e); }\
+              globalThis.__modalAfterBare = String(__d.matches(':modal'));\
+              globalThis.__forced = String(__d.togglePopover(true));\
+              globalThis.__modalAfterForced = String(__d.matches(':modal'));\
+              </script></body></html>",
+        );
+        let bare = node_list_str(&mut probe.vm, "globalThis.__bare;");
+        assert!(
+            bare.contains("InvalidStateError"),
+            "bare toggle on a modal dual must throw InvalidStateError, got {bare}"
+        );
+        assert!(
+            bare.contains("modal"),
+            "bare toggle error must name the modal state, got {bare}"
+        );
+        assert_eq!(
+            node_list_str(&mut probe.vm, "globalThis.__modalAfterBare;"),
+            "true"
+        );
+        assert_eq!(
+            node_list_str(&mut probe.vm, "globalThis.__forced;"),
+            "true"
+        );
+        assert_eq!(
+            node_list_str(&mut probe.vm, "globalThis.__modalAfterForced;"),
+            "true"
+        );
+        let d_node = doc.borrow().get_element_by_id("d").expect("dialog#d");
+        assert!(doc.borrow().is_dialog_modal(d_node));
+        assert!(doc.borrow().is_in_top_layer(d_node));
+        remove_context(ContextId(ctx));
+    }
+
+    #[test]
     fn parse_shim_dialog_show_plus_show_popover_close_retains() {
         // w82fix JS-m4: a dialog opened via `show()` and then
         // top-layered via `showPopover()` is in the shim
@@ -51053,7 +51978,8 @@ mod tests {
               try { __d.showPopover(); globalThis.__popErr = 'no-throw'; }\
               catch (e) { globalThis.__popErr = String(e); }\
               globalThis.__midModalAfterShow = String(__d.matches(':modal'));\
-              __d.togglePopover();\
+              try { __d.togglePopover(); globalThis.__togErr = 'no-throw'; }\
+              catch (e) { globalThis.__togErr = String(e); }\
               globalThis.__midModal = String(__d.matches(':modal'));\
               globalThis.__midPop = String(__d.matches(':popover-open'));\
               __e.showPopover();\
@@ -51070,6 +51996,18 @@ mod tests {
         assert_eq!(
             node_list_str(&mut probe.vm, "globalThis.__midModalAfterShow;"),
             "true"
+        );
+        // w85fix issue 3: bare togglePopover() on a
+        // showModal-only dual throws in production (the bare
+        // toggle delegates to hidePopover, which hits the
+        // modal guard) — the old unguarded call pinned the
+        // shim bug where it silently inserted the dialog
+        // into the popover set and returned true.
+        assert!(
+            node_list_str(&mut probe.vm, "globalThis.__togErr;")
+                .contains("InvalidStateError"),
+            "bare toggle on a modal dual must throw InvalidStateError, got: {}",
+            node_list_str(&mut probe.vm, "globalThis.__togErr;")
         );
         assert_eq!(
             node_list_str(&mut probe.vm, "globalThis.__midModal;"),
@@ -51324,6 +52262,53 @@ mod tests {
         assert!(
             !doc.borrow().is_exit_retained(p_node),
             "forced-true re-open must cancel the retention, not leave it live"
+        );
+        remove_context(ContextId(ctx));
+    }
+
+    // w85, shim twin of production
+    // `production_hide_popover_throws_for_live_modal_dialog_no_toggle`:
+    // a mid-parse `<dialog popover>` shown via `showPopover`
+    // then `showModal` must throw on `hidePopover` and on
+    // hide-direction toggles, not demote out of the top
+    // layer — and `close()` + re-`showModal()` still work.
+    // A plain popover is unaffected (covered by the
+    // production tests and the retained tests above).
+    #[test]
+    fn parse_shim_hide_popover_throws_for_live_modal_dialog() {
+        let (mut probe, doc, ctx) = captured_install(
+            b"<html><body><dialog id=\"d\" popover>hi</dialog><script>\
+              globalThis.__d = document.getElementById('d');\
+              globalThis.__out = [];\
+              __d.showPopover();\
+              __d.showModal();\
+              try { __d.hidePopover(); __out.push('no-throw'); }\
+              catch (e) { __out.push(String(e).indexOf('InvalidStateError') >= 0 ? 'invalidstate' : 'other:' + String(e)); }\
+              __out.push(String(__d.matches(':modal')));\
+              try { __out.push(String(__d.togglePopover(false))); }\
+              catch (e) { __out.push(String(e).indexOf('InvalidStateError') >= 0 ? 'invalidstate' : 'other:' + String(e)); }\
+              __out.push(String(__d.matches(':modal')));\
+              try { __out.push(String(__d.togglePopover())); }\
+              catch (e) { __out.push(String(e).indexOf('InvalidStateError') >= 0 ? 'invalidstate' : 'other:' + String(e)); }\
+              __out.push(String(__d.matches(':modal')));\
+              __d.close();\
+              __out.push(String(__d.matches(':modal')));\
+              __d.showModal();\
+              __out.push(String(__d.matches(':modal')));\
+              </script></body></html>",
+        );
+        assert_eq!(
+            node_list_str(&mut probe.vm, "__out.join(';');"),
+            "invalidstate;true;invalidstate;true;invalidstate;true;false;true"
+        );
+        let d_node = doc.borrow().get_element_by_id("d").expect("dialog#d");
+        assert!(
+            doc.borrow().is_dialog_modal(d_node),
+            "adopted dialog must still be modal"
+        );
+        assert!(
+            doc.borrow().is_in_top_layer(d_node),
+            "adopted dialog must still be in the top layer"
         );
         remove_context(ContextId(ctx));
     }
@@ -51794,6 +52779,195 @@ mod tests {
         assert!(targets(&fx).is_empty());
     }
 
+    #[test]
+    fn production_hide_popover_throws_for_live_modal_dialog_no_toggle() {
+        // w85: a `<dialog popover>` shown via `showPopover`
+        // then `showModal` must NOT be stranded by
+        // `hidePopover` / hide-direction `togglePopover`:
+        // both throw `InvalidStateError` naming the modal
+        // state, fire no `toggle` event, and leave the dialog
+        // fully intact, so `close()` + re-`showModal()` work.
+        let mut fx =
+            setup("<html><body><dialog id=\"d\" popover=\"auto\">hi</dialog></body></html>");
+        let d = call_get_element_by_id(&mut fx, "d");
+        let listener = probe_listener(&mut fx.heap);
+        add_listener(&mut fx, d, "toggle", listener, false);
+        let modal_sel = str_val(&mut fx, ":modal");
+        let open_sel = str_val(&mut fx, ":open");
+        n_show_popover(&mut fx.heap, d, &[]).unwrap();
+        n_show_dialog_modal(&mut fx.heap, d, &[]).unwrap();
+        assert_eq!(
+            n_matches(&mut fx.heap, d, &[modal_sel]).unwrap(),
+            Value::Bool(true)
+        );
+        assert_eq!(
+            n_matches(&mut fx.heap, d, &[open_sel]).unwrap(),
+            Value::Bool(true)
+        );
+        fx.invoker.borrow().calls.borrow_mut().clear();
+        match n_hide_popover(&mut fx.heap, d, &[]) {
+            Err(NativeError::TypeError(m)) => {
+                assert!(m.contains("InvalidStateError"), "hide message: {m}");
+                assert!(
+                    m.contains("showing modally"),
+                    "hide message must name the modal state, got {m}"
+                );
+            }
+            other => panic!("hide on a live modal dialog must throw, got {other:?}"),
+        }
+        assert!(
+            dispatch_log(&fx).is_empty(),
+            "a throwing hide must fire no toggle event"
+        );
+        match n_toggle_popover(&mut fx.heap, d, &[Value::Bool(false)]) {
+            Err(NativeError::TypeError(m)) => {
+                assert!(
+                    m.contains("InvalidStateError"),
+                    "toggle(false) message: {m}"
+                );
+                assert!(m.contains("showing modally"), "toggle(false) message: {m}");
+            }
+            other => panic!("toggle(false) on a modal must throw, got {other:?}"),
+        }
+        match n_toggle_popover(&mut fx.heap, d, &[]) {
+            Err(NativeError::TypeError(m)) => {
+                assert!(m.contains("InvalidStateError"), "bare toggle message: {m}");
+            }
+            other => panic!("bare toggle on a modal must throw, got {other:?}"),
+        }
+        assert!(
+            dispatch_log(&fx).is_empty(),
+            "throwing toggles must fire no toggle event"
+        );
+        // Forced-true on the live member is a no-op, not a hide.
+        assert_eq!(
+            n_toggle_popover(&mut fx.heap, d, &[Value::Bool(true)]).unwrap(),
+            Value::Bool(true)
+        );
+        assert!(dispatch_log(&fx).is_empty());
+        // Dialog fully intact: still :modal and :open, then
+        // close() + re-showModal() work.
+        assert_eq!(
+            n_matches(&mut fx.heap, d, &[modal_sel]).unwrap(),
+            Value::Bool(true)
+        );
+        assert_eq!(
+            n_matches(&mut fx.heap, d, &[open_sel]).unwrap(),
+            Value::Bool(true)
+        );
+        n_close_dialog(&mut fx.heap, d, &[]).unwrap();
+        assert_eq!(
+            n_matches(&mut fx.heap, d, &[modal_sel]).unwrap(),
+            Value::Bool(false)
+        );
+        n_show_dialog_modal(&mut fx.heap, d, &[]).unwrap();
+        assert_eq!(
+            n_matches(&mut fx.heap, d, &[modal_sel]).unwrap(),
+            Value::Bool(true)
+        );
+        remove_context(fx.ctx);
+    }
+
+    #[test]
+    fn production_show_modal_fires_no_toggle_for_retained_auto() {
+        // w85fix issue 1: a retained auto already got its
+        // toggle at hide time, so showModal() inside the
+        // exit window must fire zero new toggles for it —
+        // while still ending the retention. The inline
+        // transition is what makes the hide retain (rather
+        // than demote synchronously); the retained
+        // assertion below keeps this test non-vacuous.
+        let mut fx = setup(
+            "<html><body><div id=\"p\" popover=\"auto\" \
+             style=\"transition: overlay 2s allow-discrete, display 2s allow-discrete\">hi</div>\
+             <dialog id=\"d\">hi</dialog></body></html>",
+        );
+        let p = call_get_element_by_id(&mut fx, "p");
+        let d = call_get_element_by_id(&mut fx, "d");
+        let listener = probe_listener(&mut fx.heap);
+        add_listener(&mut fx, p, "toggle", listener, false);
+        n_show_popover(&mut fx.heap, p, &[]).unwrap();
+        let p_node = node_of(&fx, p);
+        fx.invoker.borrow().calls.borrow_mut().clear();
+        n_hide_popover(&mut fx.heap, p, &[]).unwrap();
+        assert!(
+            fx.doc.borrow().is_exit_retained(p_node),
+            "hide with a 2s exit transition must retain"
+        );
+        assert_eq!(
+            dispatch_log(&fx).len(),
+            1,
+            "exactly one toggle (open -> closed) at hide time"
+        );
+        fx.invoker.borrow().calls.borrow_mut().clear();
+        n_show_dialog_modal(&mut fx.heap, d, &[]).unwrap();
+        assert!(
+            dispatch_log(&fx).is_empty(),
+            "showModal must fire no new toggle for the retained victim"
+        );
+        assert!(
+            !fx.doc.borrow().is_exit_retained(p_node),
+            "showModal must still end the retention"
+        );
+        let modal_sel = str_val(&mut fx, ":modal");
+        assert_eq!(
+            n_matches(&mut fx.heap, d, &[modal_sel]).unwrap(),
+            Value::Bool(true)
+        );
+        remove_context(fx.ctx);
+    }
+
+    #[test]
+    fn production_close_of_popover_dual_fires_toggle_at_close_time() {
+        // w85fix issue 1, retained-dual corner (decided at
+        // close time, not at retention end): a dialog shown
+        // via show() then showPopover(), closed via close()
+        // with an exit transition, fires its popover toggle
+        // (open -> closed) at close time — once — and a
+        // later showModal() on another dialog fires no
+        // further toggle for it when the retention ends.
+        let mut fx = setup(
+            "<html><body><dialog id=\"d\" popover=\"auto\" \
+             style=\"transition: overlay 2s allow-discrete, display 2s allow-discrete\">hi</dialog>\
+             <dialog id=\"e\">hi</dialog></body></html>",
+        );
+        let d = call_get_element_by_id(&mut fx, "d");
+        let e = call_get_element_by_id(&mut fx, "e");
+        let listener = probe_listener(&mut fx.heap);
+        add_listener(&mut fx, d, "toggle", listener, false);
+        n_show_dialog(&mut fx.heap, d, &[]).unwrap();
+        n_show_popover(&mut fx.heap, d, &[]).unwrap();
+        let d_node = node_of(&fx, d);
+        assert_eq!(
+            dispatch_log(&fx).len(),
+            1,
+            "showPopover fires the popover-open toggle"
+        );
+        fx.invoker.borrow().calls.borrow_mut().clear();
+        n_close_dialog(&mut fx.heap, d, &[]).unwrap();
+        assert!(
+            fx.doc.borrow().is_exit_retained(d_node),
+            "close with a 2s exit transition must retain (was_modal=false)"
+        );
+        assert!(
+            !fx.doc.borrow().is_dialog_modal(d_node),
+            "a non-modal dual retains as a popover, not as modal"
+        );
+        assert_eq!(
+            dispatch_log(&fx).len(),
+            1,
+            "exactly one popover toggle (open -> closed) at close time"
+        );
+        fx.invoker.borrow().calls.borrow_mut().clear();
+        n_show_dialog_modal(&mut fx.heap, e, &[]).unwrap();
+        assert!(
+            dispatch_log(&fx).is_empty(),
+            "ending the retention at a later show fires no second toggle"
+        );
+        assert!(!fx.doc.borrow().is_exit_retained(d_node));
+        remove_context(fx.ctx);
+    }
+
     // w81 phase 2: dialog production natives — show / showModal /
     // close, `open` / `returnValue` accessors, UA display and
     // position rules, and `:open` / `:modal` matching, mirroring
@@ -51957,6 +53131,163 @@ mod tests {
         n_close_dialog(&mut fx.heap, d, &[nope]).unwrap();
         assert!(!is_open(&mut fx));
         assert_eq!(rv(&mut fx), "");
+        remove_context(fx.ctx);
+    }
+
+    #[test]
+    fn w85_dialog_closed_by_accessor_and_show_hides_auto_with_toggle() {
+        // `closedBy` reflects the attribute verbatim; the
+        // computed query (DOM level) normalizes. A non-dialog
+        // getter reads `""`, a non-dialog setter throws.
+        let mut fx = setup(
+            "<html><body><dialog id=\"d\">hi</dialog><div id=\"x\">hi</div></body></html>",
+        );
+        let d = call_get_element_by_id(&mut fx, "d");
+        let x = call_get_element_by_id(&mut fx, "x");
+        let get = |fx: &mut Fixture, el: Value| {
+            rv_str(n_dialog_closed_by_get(&mut fx.heap, el, &[]).unwrap())
+        };
+        assert_eq!(get(&mut fx, d), "");
+        assert_eq!(get(&mut fx, x), "");
+        let any = str_val(&mut fx, "any");
+        n_dialog_closed_by_set(&mut fx.heap, d, &[any]).unwrap();
+        assert_eq!(get(&mut fx, d), "any");
+        assert_eq!(
+            fx.doc
+                .borrow()
+                .get_attribute(node_of(&fx, d), "closedby")
+                .unwrap(),
+            "any"
+        );
+        match n_dialog_closed_by_set(&mut fx.heap, x, &[any]) {
+            Err(NativeError::TypeError(m)) => {
+                assert!(
+                    m.contains("NotSupportedError"),
+                    "setter error must name NotSupportedError, got {m}"
+                )
+            }
+            other => panic!("closedBy setter on a non-dialog must throw, got {other:?}"),
+        }
+        remove_context(fx.ctx);
+
+        // Show-time rule at bindings level: an open auto
+        // popover closes (with its `toggle`) when a dialog
+        // shows, modal or not; the dialog itself opens.
+        let mut fx = setup(
+            "<html><body><div id=\"pop\" popover>hi</div><dialog id=\"d\">hi</dialog></body></html>",
+        );
+        let pop = call_get_element_by_id(&mut fx, "pop");
+        let d = call_get_element_by_id(&mut fx, "d");
+        let listener = probe_listener(&mut fx.heap);
+        add_listener(&mut fx, pop, "toggle", listener, false);
+        let targets = |fx: &Fixture| -> Vec<Option<String>> {
+            dispatch_log(fx).into_iter().map(|(_, id)| id).collect()
+        };
+        n_show_popover(&mut fx.heap, pop, &[]).unwrap();
+        assert!(fx.doc.borrow().is_popover_open(node_of(&fx, pop)));
+        fx.invoker.borrow().calls.borrow_mut().clear();
+        n_show_dialog_modal(&mut fx.heap, d, &[]).unwrap();
+        assert!(!fx.doc.borrow().is_popover_open(node_of(&fx, pop)));
+        assert!(fx.doc.borrow().is_dialog_open(node_of(&fx, d)));
+        assert_eq!(
+            targets(&fx),
+            vec![Some("pop".to_string())],
+            "the victim's toggle fires on dialog show"
+        );
+        remove_context(fx.ctx);
+
+        // Same for non-modal show().
+        let mut fx = setup(
+            "<html><body><div id=\"pop\" popover>hi</div><dialog id=\"d\">hi</dialog></body></html>",
+        );
+        let pop = call_get_element_by_id(&mut fx, "pop");
+        let d = call_get_element_by_id(&mut fx, "d");
+        n_show_popover(&mut fx.heap, pop, &[]).unwrap();
+        n_show_dialog(&mut fx.heap, d, &[]).unwrap();
+        assert!(!fx.doc.borrow().is_popover_open(node_of(&fx, pop)));
+        assert!(fx.doc.borrow().is_dialog_open(node_of(&fx, d)));
+        assert!(!fx.doc.borrow().is_dialog_modal(node_of(&fx, d)));
+        remove_context(fx.ctx);
+    }
+
+    #[test]
+    fn w85_closed_by_getter_non_dialog_with_attribute_reads_empty() {
+        // w85fix: the pre-fix getter returned the raw
+        // attribute for any element, so a div carrying
+        // `closedby="any"` read `"any"` despite the doc
+        // comment promising `""` for a non-dialog. The
+        // guard above makes the non-dialog getter read
+        // `""` while dialogs still reflect verbatim.
+        let mut fx = setup(
+            "<html><body><div id=\"x\" closedby=\"any\">hi</div><dialog id=\"d\" closedby=\"any\">hi</dialog><dialog id=\"plain\">hi</dialog></body></html>",
+        );
+        let get = |fx: &mut Fixture, el: Value| {
+            rv_str(n_dialog_closed_by_get(&mut fx.heap, el, &[]).unwrap())
+        };
+        let x = call_get_element_by_id(&mut fx, "x");
+        let d = call_get_element_by_id(&mut fx, "d");
+        let plain = call_get_element_by_id(&mut fx, "plain");
+        assert_eq!(get(&mut fx, x), "");
+        assert_eq!(get(&mut fx, d), "any");
+        assert_eq!(get(&mut fx, plain), "");
+        remove_context(fx.ctx);
+    }
+
+    #[test]
+    fn w85fix_closed_by_detached_foreign_dialog_reads_empty() {
+        // w85fix BLOCKER B, production twin: detached
+        // elements have no enumeration record anywhere, so
+        // the getter must key on the stored namespace, not
+        // on a fail-open lookup. A detached SVG `dialog`
+        // carrying `closedby="any"` reads `""` (and its
+        // setter throws), a detached HTML `dialog` reads
+        // verbatim, and a detached `div` reads `""`.
+        let mut fx = setup("<html><body></body></html>");
+        let doc_val = global_prop(&fx, "document");
+        let svg_ns = str_val(&mut fx, "http://www.w3.org/2000/svg");
+        let dialog_tag = str_val(&mut fx, "dialog");
+        let div_tag = str_val(&mut fx, "div");
+        let svg_dlg = call_method(
+            &mut fx,
+            doc_val,
+            n_create_element_ns,
+            &[svg_ns, dialog_tag],
+        );
+        let html_dlg = call_method(
+            &mut fx,
+            doc_val,
+            n_create_element_ns,
+            &[Value::Null, dialog_tag],
+        );
+        let div = call_method(
+            &mut fx,
+            doc_val,
+            n_create_element_ns,
+            &[Value::Null, div_tag],
+        );
+        for el in [svg_dlg, html_dlg, div] {
+            fx.doc
+                .borrow_mut()
+                .set_attribute(node_of(&fx, el), "closedby", "any");
+        }
+        let get = |fx: &mut Fixture, el: Value| {
+            rv_str(n_dialog_closed_by_get(&mut fx.heap, el, &[]).unwrap())
+        };
+        assert_eq!(get(&mut fx, svg_dlg), "");
+        assert_eq!(get(&mut fx, html_dlg), "any");
+        assert_eq!(get(&mut fx, div), "");
+        let any = str_val(&mut fx, "any");
+        match n_dialog_closed_by_set(&mut fx.heap, svg_dlg, &[any]) {
+            Err(NativeError::TypeError(m)) => {
+                assert!(
+                    m.contains("NotSupportedError"),
+                    "setter on a detached SVG dialog must throw NotSupportedError, got {m}"
+                );
+            }
+            other => panic!(
+                "closedBy setter on a detached SVG dialog must throw, got {other:?}"
+            ),
+        }
         remove_context(fx.ctx);
     }
 

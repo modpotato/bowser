@@ -1006,17 +1006,42 @@ pub fn normalize_offsets(keyframes: &[Keyframe]) -> Vec<f64> {
 ///   flips at `t > 0`, shown -> shown flips at `t >= 0.5`;
 /// * every other discrete pair flips at `t >= 0.5`.
 ///
-/// UNVERIFIED (w82fix JS-m1): no spec or WPT citation for
-/// the WAAPI `display` asymmetry was found — the local WPT
-/// checkout is sparse (css-position, CSS2, css-tables only;
-/// no web-animations display tests) and no in-repo spec note
-/// covers it. The branch is deliberately KEPT, not removed:
-/// the transition path depends on the same asymmetry and
-/// the overlay-transition-dialog reftest passes with it, and
-/// removing it would change WAAPI `display` segments to the
-/// generic 0.5 flip. If a Chrome datum or a WPT WAAPI display
-/// test contradicts the asymmetry, this branch is the place
-/// to revisit — not the transition engine.
+/// CHROME-CONFIRMED (w85, supersedes the w82fix JS-m1
+/// UNVERIFIED mark): headless Chrome 155.0.8059.91,
+/// driven over CDP, running `el.animate([{display:
+/// from}, {display: to}], {duration: 1000, fill:
+/// 'both'})`, paused, with `getComputedStyle(el)
+/// .display` sampled at `currentTime` = 0, 1, 100, 250,
+/// 499, 500, 501, 750, 999, 1000 ms — 1 ms resolution
+/// at both boundaries (0/1 ms and 999/1000 ms) over
+/// the 1000 ms duration. Read the rows below as sampled
+/// points, not as a continuous trace: between any two
+/// consecutive samples no flip was observed, so each row
+/// only bounds its flip to its sample interval, and the
+/// branches below keep the boundary the samples support.
+/// block -> none: block at the 0, 1, 100, 250, 499, 500,
+/// 501, 750, 999 ms samples; none only at the 1000 ms
+/// sample, so the flip reads at progress 1.0, NOT at 0.5.
+/// none -> block: none at the 0 ms sample; block at the
+/// 1 ms sample and thereafter, so the flip reads at
+/// progress > 0. block -> flex: block at the 0-499 ms
+/// samples; flex at the 500 ms sample and thereafter,
+/// so the flip reads at progress 0.5 or later.
+/// block -> inline is an extra pair following the same
+/// t >= 0.5 rule as block -> flex: block at the 0-499 ms
+/// samples; inline at the 500 ms sample and thereafter.
+/// Control: the same block -> none animation with
+/// `fill: 'none'` reads block at 1000 ms, as expected
+/// (the animation no longer applies past its end);
+/// that is a fill effect, not a flip-point datum.
+/// The asymmetry is real in Chrome (the `none` end
+/// value is special), not a Bowser quirk; the branches
+/// below are kept unchanged on the strength of this
+/// datum. Raw probe log (secondary reference only):
+/// `~/workspace/scratch/w85-chrome-probes/RESULTS.md`
+/// §1 (`raw-results.json` -> `q1`); this comment
+/// carries the table so the repo alone verifies the
+/// citation without that untracked scratch file.
 fn discrete_segment_value<'a>(from: &'a str, to: &'a str, prop: &str, t: f64) -> &'a str {
     if prop == "overlay" {
         match (from, to) {
@@ -2251,9 +2276,21 @@ mod tests {
         // w82: WAAPI `display` uses the same `none` vs shown
         // asymmetry as `overlay` (direct unit test of the
         // segment function, no animation registry needed).
+        // w85: the boundary points are now pinned to the
+        // Chrome 155 datum (full sampled table in the
+        // `discrete_segment_value` doc comment; raw log
+        // in scratch RESULTS.md §1 is secondary only):
+        // shown->none still shown at 999/1000 ms,
+        // none->shown shown at 1 ms, shown->shown
+        // flipping exactly at 500 ms.
         assert_eq!(
             discrete_segment_value("block", "none", "display", 0.5),
             "block"
+        );
+        assert_eq!(
+            discrete_segment_value("block", "none", "display", 0.999),
+            "block",
+            "shown->none must not flip before t=1.0 (Chrome: block at 999 ms)"
         );
         assert_eq!(
             discrete_segment_value("block", "none", "display", 1.0),
@@ -2264,11 +2301,20 @@ mod tests {
             "none"
         );
         assert_eq!(
+            discrete_segment_value("none", "block", "display", 0.001),
+            "block",
+            "none->shown must flip as soon as t>0 (Chrome: block at 1 ms)"
+        );
+        assert_eq!(
             discrete_segment_value("none", "block", "display", 0.5),
             "block"
         );
         assert_eq!(
             discrete_segment_value("block", "flex", "display", 0.4),
+            "block"
+        );
+        assert_eq!(
+            discrete_segment_value("block", "flex", "display", 0.499),
             "block"
         );
         assert_eq!(

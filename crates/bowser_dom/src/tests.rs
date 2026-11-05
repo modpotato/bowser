@@ -4830,11 +4830,14 @@ fn popover_deferred_hide_retains_then_syncs() {
 }
 
 #[test]
-fn popover_show_returns_auto_closed_including_retained_and_defers_live_victims() {
-    // w82 fixpaths B1/m10: show returns every auto-closed
-    // popover — live and retained — so callers can fire a
-    // toggle for each; a live victim with a stored exit
-    // duration is retained (not sync-demoted) for it.
+fn popover_show_returns_auto_closed_and_defers_live_victims() {
+    // w82 fixpaths B1/m10, as corrected by w85fix: show
+    // returns every LIVE auto-closed popover so callers can
+    // fire a toggle for each; a retained victim is ended
+    // silently and NOT returned — its toggle already fired
+    // at hide time, so returning it would double-fire. A
+    // live victim with a stored exit duration is retained
+    // (not sync-demoted) for it, and IS returned.
     let mut doc = Document::new();
     let host = doc.create_element("div");
     doc.append_child(doc.root(), host);
@@ -4857,8 +4860,9 @@ fn popover_show_returns_auto_closed_including_retained_and_defers_live_victims()
     assert!(!doc.is_popover_open(live_victim));
     // Defer the retained victim's own exit, then re-show the
     // live victim with a stored duration for it: the live
-    // victim's show must auto-close the retained victim and
-    // report it.
+    // victim's show must auto-close the retained victim
+    // (ending its retention silently, w85fix) while the
+    // newcomer show reports only the live victim.
     doc.hide_popover_deferred(retained_victim, 60.0)
         .expect("defer retained victim");
     assert!(doc.is_exit_retained(retained_victim));
@@ -4885,7 +4889,10 @@ fn popover_show_returns_auto_closed_including_retained_and_defers_live_victims()
     doc2.hide_popover_deferred(a, 60.0).expect("defer a");
     assert!(doc2.is_exit_retained(a));
     let closed = doc2.show_popover(b).expect("show b auto-closes retained a");
-    assert_eq!(closed, vec![a]);
+    assert!(
+        closed.is_empty(),
+        "w85fix: retained victim ends silently, not returned, got {closed:?}"
+    );
     assert!(!doc2.is_exit_retained(a), "auto-close ends the retention");
     assert!(!doc2.is_popover_open(a));
 }

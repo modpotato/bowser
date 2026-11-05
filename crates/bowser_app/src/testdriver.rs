@@ -625,12 +625,16 @@ struct PointerSourceState {
     pointer_id: i32,
     touch_target: Option<NodeId>,
     touch_pan: Option<usize>,
-    /// Light-dismiss pointerdown record (HTML §6.12.2), mirroring
-    /// the windowed input path: the popover a primary-button
-    /// press outside it named as its dismiss candidate. The
-    /// release dismisses it only when it resolves to the same
-    /// popover; cleared on every pointerup / pointercancel.
-    light_dismiss_pending: Option<NodeId>,
+    /// Light-dismiss pointerdown records (HTML §6.12.2,
+    /// §4.11.5; w85 hide-all-until), mirroring the windowed
+    /// input path: the press-time popover ancestor and
+    /// dialog ancestor, each `Some(ancestor)` when a press
+    /// was recorded (`None` ancestor = press outside all
+    /// of that kind) and `None` when no press was recorded.
+    /// The release dismisses only on an equal ancestor;
+    /// cleared on every pointerup / pointercancel.
+    light_dismiss_popover_press: Option<Option<NodeId>>,
+    light_dismiss_dialog_press: Option<Option<NodeId>>,
     /// Executor tick of this pointer's last stored action (see
     /// [`ExecutorState::pointer_use_seq`]): the deterministic
     /// "most recently active pointer" key for wheel actions with
@@ -650,7 +654,8 @@ impl Default for PointerSourceState {
             pointer_id: 1,
             touch_target: None,
             touch_pan: None,
-            light_dismiss_pending: None,
+            light_dismiss_popover_press: None,
+            light_dismiss_dialog_press: None,
             last_used: 0,
         }
     }
@@ -1169,6 +1174,21 @@ impl TestDriver {
         previous: Option<NodeId>,
         was_modal: bool,
     ) {
+        // w85fix BLOCKER A, second wipe path: the sequence
+        // -end sync runs after the dialog arm, so a `close`
+        // listener that re-showed a nested popover has
+        // already run by the time this restore replays the
+        // close journal entry. Focus inside that live
+        // popover is legitimate and must survive the
+        // restore too — without this, the dialog-arm guard
+        // is undone here (the previous focus inside the
+        // closed dialog reads invalid, so the restore
+        // clears it). The windowed path needs no twin:
+        // its restore runs before `dispatch_close`, so a
+        // listener re-show cannot precede it.
+        if self.focus_inside_live_popover(tab, dialog) {
+            return;
+        }
         let (inside, valid_previous) = match tab.document_ref() {
             Some(doc) => {
                 let inside = match self.actions.focused {
@@ -1375,11 +1395,18 @@ impl TestDriver {
             return false;
         };
         match target {
-            EscapeTarget::ModalDialog(dialog) => {
+            EscapeTarget::ModalDialog(dialog) | EscapeTarget::NonModalDialog(dialog) => {
                 let canceled = JsDispatch::dispatch_cancel(&mut self.dispatch, tab, dialog);
                 if canceled {
                     return true;
                 }
+                // Dual snapshot after `cancel`, before the
+                // close (see
+                // [`crate::window::fire_dual_popover_toggle_after_close`]).
+                let was_dual = tab
+                    .document_ref()
+                    .map(|doc| crate::window::is_live_dual_popover(&doc, dialog))
+                    .unwrap_or(false);
                 let closed = match tab.installed_mut() {
                     Some(installed) => crate::window::deferred_close_dialog(
                         &mut installed.document().borrow_mut(),
@@ -1391,6 +1418,12 @@ impl TestDriver {
                     return true;
                 }
                 JsDispatch::dispatch_close(&mut self.dispatch, tab, dialog);
+                crate::window::fire_dual_popover_toggle_after_close(
+                    &mut self.dispatch,
+                    tab,
+                    dialog,
+                    was_dual,
+                );
                 self.clear_focus_inside(tab, dialog);
                 true
             }
@@ -1425,6 +1458,58 @@ impl TestDriver {
         };
         if inside {
             self.set_focus(tab, None);
+        }
+    }
+
+    /// Whether executor focus currently sits inside a
+    /// *live* top-layer popover other than `closed` itself
+    /// (w85fix BLOCKER A guard, shared by the dialog-arm
+    /// clear and by [`Self::restore_focus_after_close`]).
+    /// A popover nested inside the dialog, re-shown by the
+    /// dialog's `close` listener with focus moved into it,
+    /// is a DOM descendant of the dialog, so a plain
+    /// inside-dialog clear (or a close restore, which runs
+    /// at sequence end, after the listener) would wipe
+    /// that legitimate focus. The check walks the focused
+    /// node's ancestor-or-self chain for a live top-layer
+    /// member carrying a `popover` attribute: live
+    /// membership (not `is_popover_open`, which counts
+    /// retentions) is what makes the focus legitimate, and
+    /// excluding `closed` itself keeps a dual dialog's own
+    /// close clearing focus on the dialog.
+    fn focus_inside_live_popover(&self, tab: &Tab, closed: NodeId) -> bool {
+        match (self.actions.focused, tab.document_ref()) {
+            (Some(focused), Some(doc)) => {
+                let mut current = Some(focused);
+                while let Some(node) = current {
+                    if node != closed
+                        && doc.top_layer().contains(&node)
+                        && doc.popover_state(node).is_some()
+                    {
+                        return true;
+                    }
+                    current = doc.parent(node);
+                }
+                false
+            }
+            _ => false,
+        }
+    }
+
+    /// Dialog-close focus clear with the w85fix BLOCKER A
+    /// guard: like [`Self::clear_focus_inside`], except it
+    /// never wipes focus sitting inside a *live* top-layer
+    /// popover other than `closed` itself (see
+    /// [`Self::focus_inside_live_popover`]). This guard was
+    /// chosen over moving the clear before `dispatch_close`
+    /// (the windowed ordering): moving it would still leave
+    /// the testdriver's standing divergence — the close
+    /// listener would observe cleared focus instead of the
+    /// windowed path's restored focus — while the guard
+    /// fixes the wipe without touching that divergence.
+    fn clear_focus_inside_dialog_guarded(&mut self, tab: &mut Tab, closed: NodeId) {
+        if !self.focus_inside_live_popover(tab, closed) {
+            self.clear_focus_inside(tab, closed);
         }
     }
 
@@ -1521,10 +1606,14 @@ impl TestDriver {
     /// events, so they report it held. A primary-button press
     /// swallowed by modal inertness ([`crate::window::modal_press_blocked`])
     /// dispatches nothing and records no press target, so its
-    /// release synthesizes no click — mirroring the windowed path.
+    /// release synthesizes no click — mirroring the windowed path —
+    /// but it still records its light-dismiss ancestors (w85
+    /// exemption: inertness swallows activation, not
+    /// light-dismiss recording), so the release can dismiss a
+    /// `closedby=any` dialog or an auto popover above the modal.
     /// A primary-button press otherwise records its light-dismiss
-    /// candidate (HTML §6.12.2) before any event fires; the release
-    /// dismisses only on a matching candidate (see
+    /// ancestors (HTML §6.12.2, §4.11.5) before any event fires;
+    /// the release dismisses only on matching ancestors (see
     /// [`Self::execute_pointer_up`]).
     fn execute_pointer_down(&mut self, tab: &mut Tab, source: &ActionSource, item: &ActionItem) {
         let mut st = self.pointer_snapshot(source);
@@ -1541,15 +1630,25 @@ impl TestDriver {
                 Some(doc) => crate::window::modal_press_blocked(&doc, target),
                 None => false,
             };
+            // Blocked or not, the light-dismiss ancestors are
+            // recorded (w85 exemption above); only event
+            // dispatch and click synthesis are swallowed by
+            // the block.
+            st.light_dismiss_popover_press = tab
+                .document_ref()
+                .map(|doc| crate::window::light_dismiss_popover_press_ancestor(&doc, target));
+            st.light_dismiss_dialog_press = tab.document_ref().map(|_| {
+                crate::window::dialog_light_dismiss_press_ancestor(
+                    tab,
+                    target,
+                    st.x as f32,
+                    st.y as f32,
+                )
+            });
             if blocked {
-                st.light_dismiss_pending = None;
                 self.store_pointer(source, st);
                 return;
             }
-            st.light_dismiss_pending = match tab.document_ref() {
-                Some(doc) => crate::window::light_dismiss_pending_target(&doc, target),
-                None => None,
-            };
         }
         if let Some(t) = target {
             st.down_targets.insert(button, t);
@@ -1628,9 +1727,10 @@ impl TestDriver {
     fn execute_pointer_up(&mut self, tab: &mut Tab, source: &ActionSource, item: &ActionItem) {
         let mut st = self.pointer_snapshot(source);
         let button = item.button.unwrap_or(0);
-        // The light-dismiss record is taken here so every release
-        // clears it, whether or not the release dismisses.
-        let light_dismiss_pending = st.light_dismiss_pending.take();
+        // The light-dismiss records are taken here so every release
+        // clears them, whether or not the release dismisses.
+        let light_dismiss_popover_press = st.light_dismiss_popover_press.take();
+        let light_dismiss_dialog_press = st.light_dismiss_dialog_press.take();
         let hit = self
             .dispatch
             .hit_test_at_point(tab, st.x as f32, st.y as f32);
@@ -1680,36 +1780,172 @@ impl TestDriver {
                     button as i32,
                     (0.0, 0.0),
                 );
-                // Light-dismiss on release (HTML §6.12.2), before
-                // the synthesized click: only when the release
-                // resolves to the same popover the press recorded.
-                // A press outside dragged inside the popover, or
-                // onto its invoker, before release dismisses
-                // nothing, and the click below then runs normally.
-                if button == 0
-                    && let Some(pop) = light_dismiss_pending
-                    && tab
-                        .document_ref()
-                        .and_then(|doc| crate::window::light_dismiss_pending_target(&doc, Some(t)))
-                        == Some(pop)
-                {
-                    // w82 fixpaths M4: gate on was-open, like
-                    // the windowed Escape arm — `hide_popover`
-                    // alone reports `Ok` for an already-hidden
-                    // popover, which used to fire a spurious
-                    // `toggle`. Deferred hide (B3) renders the
-                    // exit transition when one was stored.
-                    let hidden = match tab.installed_mut() {
-                        Some(installed) => {
-                            let mut doc = installed.document().borrow_mut();
-                            let was_open = doc.is_popover_open(pop);
-                            was_open && crate::window::deferred_hide_popover(&mut doc, pop)
+                // Light-dismiss on release (HTML §6.12.2,
+                // §4.11.5; w85 hide-all-until), before the
+                // synthesized click: popovers first, then
+                // dialogs. A kind dismisses only when the
+                // release resolves to the same ancestor the
+                // press recorded — a press outside dragged
+                // inside the popover, or onto its invoker,
+                // before release dismisses nothing, and the
+                // click below then runs normally.
+                if button == 0 {
+                    // Deferred popover focus clears, mirroring
+                    // the windowed `light_dismiss_for_release`
+                    // (w85fix): collected here, applied only
+                    // after the dialog arm below, so a dialog
+                    // `cancel`/`close` listener observes the
+                    // pre-dismissal focus instead of focus
+                    // already cleared out of the popover.
+                    let mut deferred_focus_clears: Vec<NodeId> = Vec::new();
+                    if let Some(press_ancestor) = light_dismiss_popover_press {
+                        let release_ancestor = tab.document_ref().map(|doc| {
+                            crate::window::light_dismiss_popover_press_ancestor(&doc, Some(t))
+                        });
+                        if release_ancestor == Some(press_ancestor) {
+                            let victims = tab
+                                .document_ref()
+                                .map(|doc| doc.light_dismiss_popovers_until(press_ancestor))
+                                .unwrap_or_default();
+                            for pop in victims {
+                                // w82 fixpaths M4: gate on
+                                // was-open, like the windowed
+                                // Escape arm — `hide_popover`
+                                // alone reports `Ok` for an
+                                // already-hidden popover, which
+                                // used to fire a spurious
+                                // `toggle`. Deferred hide (B3)
+                                // renders the exit transition
+                                // when one was stored.
+                                let hidden = match tab.installed_mut() {
+                                    Some(installed) => {
+                                        let mut doc = installed.document().borrow_mut();
+                                        let was_open = doc.is_popover_open(pop);
+                                        was_open
+                                            && crate::window::deferred_hide_popover(&mut doc, pop)
+                                    }
+                                    None => false,
+                                };
+                                if hidden {
+                                    JsDispatch::dispatch_toggle(&mut self.dispatch, tab, pop);
+                                    // Deferred, not inline: the
+                                    // dialog arm's `cancel`/`close`
+                                    // listener must still observe
+                                    // the pre-dismissal focus.
+                                    deferred_focus_clears.push(pop);
+                                }
+                            }
                         }
-                        None => false,
-                    };
-                    if hidden {
-                        JsDispatch::dispatch_toggle(&mut self.dispatch, tab, pop);
-                        self.clear_focus_inside(tab, pop);
+                    }
+                    if let Some(press_ancestor) = light_dismiss_dialog_press {
+                        let release_ancestor = tab.document_ref().map(|_| {
+                            crate::window::dialog_light_dismiss_press_ancestor(
+                                tab,
+                                Some(t),
+                                st.x as f32,
+                                st.y as f32,
+                            )
+                        });
+                        if release_ancestor == Some(press_ancestor) {
+                            let candidate = tab.document_ref().and_then(|doc| {
+                                let effective = crate::window::dialog_effective_hit(
+                                    tab,
+                                    Some(t),
+                                    st.x as f32,
+                                    st.y as f32,
+                                );
+                                doc.light_dismiss_dialog_candidate(effective)
+                            });
+                            if let Some(dialog) = candidate {
+                                let canceled =
+                                    JsDispatch::dispatch_cancel(&mut self.dispatch, tab, dialog);
+                                if !canceled {
+                                    // Dual snapshot after
+                                    // `cancel`, before the close
+                                    // (see the helper docs).
+                                    let was_dual = tab
+                                        .document_ref()
+                                        .map(|doc| {
+                                            crate::window::is_live_dual_popover(&doc, dialog)
+                                        })
+                                        .unwrap_or(false);
+                                    let closed = match tab.installed_mut() {
+                                        Some(installed) => crate::window::deferred_close_dialog(
+                                            &mut installed.document().borrow_mut(),
+                                            dialog,
+                                        ),
+                                        None => false,
+                                    };
+                                    if closed {
+                                        JsDispatch::dispatch_close(&mut self.dispatch, tab, dialog);
+                                        crate::window::fire_dual_popover_toggle_after_close(
+                                            &mut self.dispatch,
+                                            tab,
+                                            dialog,
+                                            was_dual,
+                                        );
+                                        // Focus divergence, accepted
+                                        // as the testdriver's
+                                        // standing divergence (cf.
+                                        // the Escape note at
+                                        // [`Self::sync_modal_focus`]
+                                        // and the submit note in
+                                        // [`Self::execute_click`]):
+                                        // this arm only clears
+                                        // focus inside the dialog,
+                                        // and the restore happens
+                                        // later at the
+                                        // sequence/drain
+                                        // `sync_modal_focus`, so
+                                        // a `close` listener here
+                                        // observes cleared focus,
+                                        // where the windowed path
+                                        // restores focus before
+                                        // firing `close` and its
+                                        // listener observes the
+                                        // restored focus. Do not
+                                        // "fix" this arm in
+                                        // isolation: the restore
+                                        // belongs to the sync,
+                                        // which is what replays
+                                        // the dialog journal in
+                                        // order.
+                                        // w85fix BLOCKER A: guarded, not
+                                        // plain — a `close` listener
+                                        // that re-showed a popover
+                                        // nested in this dialog and
+                                        // moved focus into it must
+                                        // keep that focus (see
+                                        // `clear_focus_inside_dialog_guarded`).
+                                        self.clear_focus_inside_dialog_guarded(tab, dialog);
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    // Dialog arm done: now clear focus inside
+                    // the dismissed popovers. A dialog restore
+                    // that already moved focus out of a popover
+                    // makes its clear a no-op, and the clear
+                    // runs even when the dialog's `cancel` was
+                    // prevented (the dialog arm then ran
+                    // nothing above, but the popover still
+                    // hid). The re-show check is live
+                    // top-layer membership, as in the windowed
+                    // path: a dialog listener that re-showed a
+                    // dismissed popover keeps its focus, while
+                    // an exit-retained victim — still
+                    // `is_popover_open`, but not live — clears,
+                    // since no later clear runs at retention
+                    // expiry.
+                    for pop in deferred_focus_clears {
+                        let re_shown = tab
+                            .document_ref()
+                            .map(|doc| doc.top_layer().contains(&pop))
+                            .unwrap_or(false);
+                        if !re_shown {
+                            self.clear_focus_inside(tab, pop);
+                        }
                     }
                 }
                 match button {
@@ -1802,6 +2038,44 @@ impl TestDriver {
                                             target,
                                         );
                                     }
+                                    // Submit-button activation
+                                    // (w85fix): the same shared
+                                    // helper the windowed
+                                    // `on_click` and
+                                    // `execute_click` paths run,
+                                    // after popover activation
+                                    // and gated on the unprevented
+                                    // click — a real pointer
+                                    // sequence on a
+                                    // `method="dialog"` submit
+                                    // used to synthesize the
+                                    // click and run popover
+                                    // activation, then stop, so
+                                    // it fired no `submit` and
+                                    // closed nothing. A handled
+                                    // submit is terminal: no
+                                    // other default action
+                                    // follows it in this arm.
+                                    let (_handled, closed_dialog, was_dual) =
+                                        crate::window::submit_activation_close(
+                                            &mut self.dispatch,
+                                            tab,
+                                            ct,
+                                        );
+                                    if let Some(dialog) = closed_dialog {
+                                        JsDispatch::dispatch_close(
+                                            &mut self.dispatch,
+                                            tab,
+                                            dialog,
+                                        );
+                                        crate::window::fire_dual_popover_toggle_after_close(
+                                            &mut self.dispatch,
+                                            tab,
+                                            dialog,
+                                            was_dual,
+                                        );
+                                        self.clear_focus_inside(tab, dialog);
+                                    }
                                 }
                             }
                         }
@@ -1854,7 +2128,8 @@ impl TestDriver {
         st.down_targets.clear();
         st.touch_target = None;
         st.touch_pan = None;
-        st.light_dismiss_pending = None;
+        st.light_dismiss_popover_press = None;
+        st.light_dismiss_dialog_press = None;
         self.store_pointer(source, st);
     }
 
@@ -2180,6 +2455,32 @@ impl TestDriver {
             }
             if let Some(target) = changed {
                 JsDispatch::dispatch_toggle(&mut self.dispatch, tab, target);
+            }
+            // Submit-button activation (w85, shared helper
+            // with the windowed `on_click` branch — see
+            // [`crate::window::submit_activation_close`]):
+            // validation vacuous, then `submit` at the form,
+            // then the dialog close, minus the window's modal
+            // focus stack: the executor clears focus inside
+            // the closed dialog instead (see
+            // [`Self::execute_escape`]). A handled submit
+            // never falls through to anything else; a
+            // non-dialog method fires `submit` and stops
+            // (navigation deferred).
+            let (_handled, closed_dialog, was_dual) = crate::window::submit_activation_close(
+                &mut self.dispatch,
+                tab,
+                node,
+            );
+            if let Some(dialog) = closed_dialog {
+                JsDispatch::dispatch_close(&mut self.dispatch, tab, dialog);
+                crate::window::fire_dual_popover_toggle_after_close(
+                    &mut self.dispatch,
+                    tab,
+                    dialog,
+                    was_dual,
+                );
+                self.clear_focus_inside(tab, dialog);
             }
         }
         Self::grant_activation(tab);
@@ -4748,19 +5049,15 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "w84-dialog C7 deferred: no submit-activation path exists, so clicking a method=dialog submit button closes nothing today; enable when submit activation lands"]
     fn w84_dialog_form_method_dialog_submit_closes_with_submitter_value() {
         // C7, expected per WHATWG HTML §4.11.4 / form
         // submission: submitting a form with method="dialog"
         // closes the dialog directly — no `cancel` event, one
         // `close` event, `returnValue` = the submitter's value
-        // (`""` when the submitter has none). Today the click
-        // fires no submit activation at all, so this fails
-        // with the dialog still open and no `close` event.
-        // Deliberately NOT half-built here: it needs a real
-        // submit-activation path (constraint validation,
-        // `submit` event, formmethod override), not a click
-        // hook that closes dialogs.
+        // (`""` when the submitter has none). Enabled by w85:
+        // the click now runs a real submit-activation path
+        // (constraint validation, `submit` event, formmethod
+        // override), not a click hook that closes dialogs.
         let (mut tab, dlg, sub, plain) = dialog_form_tab();
         eval(
             &mut tab,
@@ -4792,6 +5089,1564 @@ mod tests {
         assert!(
             js_true(&mut tab, "d.returnValue === ''"),
             "returnValue must be empty for an unvalued submitter"
+        );
+    }
+
+    /// A tab from arbitrary HTML, for the w85 submit-activation
+    /// tests (each builds its own dialog/form shape). Same
+    /// install pattern as [`dialog_form_tab`]: no layout boxes,
+    /// the click path only needs the document.
+    fn tab_from_html(html: &[u8]) -> Tab {
+        use std::cell::RefCell;
+        use std::rc::Rc;
+        let doc = Rc::new(RefCell::new(bowser_dom::Document::parse_html(html).0));
+        let base = bowser_url::parse("http://example.com/page.html", None).expect("test url");
+        let page =
+            crate::script::PageVm::new_for_document(doc.clone(), &base, "TestBrowser/9.9", &[])
+                .expect("install web apis");
+        let mut tab = crate::Tab::new(bowser_layout::Size { w: 800.0, h: 600.0 });
+        tab.install_document(doc, page);
+        tab.dirty.layout = true;
+        tab
+    }
+
+    /// The element with `id` in `tab`'s document.
+    fn el(tab: &Tab, id: &str) -> NodeId {
+        tab.document_ref()
+            .expect("document")
+            .get_element_by_id(id)
+            .unwrap_or_else(|| panic!("element #{id}"))
+    }
+
+    #[test]
+    fn w85_dialog_formmethod_overrides_form_method_both_directions() {
+        // Effective method = submitter `formmethod` when present,
+        // else the form's `method` (ASCII case-insensitive). A
+        // `formmethod="dialog"` on a `method="get"` form closes;
+        // a `formmethod="post"` on a `method="dialog"` form does
+        // not close — it fires `submit` and stops (navigation
+        // deferred in w85), leaving the dialog open.
+        let mut tab = tab_from_html(
+            b"<html><body><dialog id=\"dlg1\"><form id=\"f1\" method=\"get\">\
+              <button id=\"b1\" type=\"submit\" formmethod=\"dialog\" value=\"ok1\">ok</button>\
+              </form></dialog>\
+              <dialog id=\"dlg2\"><form id=\"f2\" method=\"dialog\">\
+              <button id=\"b2\" type=\"submit\" formmethod=\"post\" value=\"x\">go</button>\
+              </form></dialog></body></html>",
+        );
+        eval(
+            &mut tab,
+            "var d1 = document.getElementById('dlg1'); var d2 = document.getElementById('dlg2'); \
+             window.__ev1 = []; window.__ev2 = []; window.__sub2 = 0; \
+             d1.addEventListener('cancel', function() { window.__ev1.push('cancel'); }); \
+             d1.addEventListener('close', function() { window.__ev1.push('close'); }); \
+             d2.addEventListener('close', function() { window.__ev2.push('close'); }); \
+             document.getElementById('f2').addEventListener('submit', function() { window.__sub2++; }); \
+             d1.showModal();",
+        );
+        let mut driver = TestDriver::new();
+        let b1 = el(&tab, "b1");
+        driver.execute_click(&mut tab, b1).expect("click");
+        assert!(
+            !tab.document_ref()
+                .expect("document")
+                .is_dialog_open(el(&tab, "dlg1")),
+            "formmethod=dialog must close even when the form method is get"
+        );
+        assert!(
+            js_true(&mut tab, "window.__ev1.join(',') === 'close'"),
+            "formmethod=dialog must fire close only, no cancel"
+        );
+        assert!(
+            js_true(&mut tab, "d1.returnValue === 'ok1'"),
+            "returnValue must be the overriding submitter's value"
+        );
+        eval(&mut tab, "d2.showModal();");
+        let b2 = el(&tab, "b2");
+        driver.execute_click(&mut tab, b2).expect("click");
+        assert!(
+            tab.document_ref()
+                .expect("document")
+                .is_dialog_open(el(&tab, "dlg2")),
+            "formmethod=post must keep a method=dialog form's dialog open"
+        );
+        assert!(
+            js_true(&mut tab, "window.__sub2 === 1"),
+            "the non-dialog submit must still fire a submit event"
+        );
+        assert!(
+            js_true(&mut tab, "window.__ev2.length === 0"),
+            "the non-dialog submit must fire no close event"
+        );
+    }
+
+    #[test]
+    fn w85_dialog_input_submit_value_and_no_value() {
+        // `<input type="submit">` is a submitter too. Pinned rule
+        // (see `resolve_submit_activation`): returnValue is the
+        // `value` attribute, or `""` when absent — for inputs as
+        // for buttons. Browsers give a valueless input submit a
+        // localized `"Submit"` default value; Bowser has no such
+        // default anywhere today, so `""` is the pinned Bowser
+        // behavior and the browser default is deferred, not
+        // silently approximated.
+        let mut tab = tab_from_html(
+            b"<html><body><dialog id=\"dlg\"><form method=\"dialog\">\
+              <input id=\"go\" type=\"submit\" value=\"go\">\
+              <input id=\"bare\" type=\"submit\">\
+              </form></dialog></body></html>",
+        );
+        eval(
+            &mut tab,
+            "var d = document.getElementById('dlg'); d.showModal();",
+        );
+        let mut driver = TestDriver::new();
+        let go = el(&tab, "go");
+        driver.execute_click(&mut tab, go).expect("click");
+        assert!(
+            !tab.document_ref()
+                .expect("document")
+                .is_dialog_open(el(&tab, "dlg")),
+            "valued input submit must close the dialog"
+        );
+        assert!(
+            js_true(&mut tab, "d.returnValue === 'go'"),
+            "returnValue must be the input submitter's value"
+        );
+        eval(&mut tab, "d.showModal();");
+        let bare = el(&tab, "bare");
+        driver.execute_click(&mut tab, bare).expect("click");
+        assert!(
+            !tab.document_ref()
+                .expect("document")
+                .is_dialog_open(el(&tab, "dlg")),
+            "valueless input submit must close the dialog too"
+        );
+        assert!(
+            js_true(&mut tab, "d.returnValue === ''"),
+            "returnValue must be empty for a valueless input submitter (pinned)"
+        );
+    }
+
+    #[test]
+    fn w85_dialog_form_no_ancestor_dialog_closes_nothing() {
+        // A `method="dialog"` form with no dialog ancestor has
+        // nothing to close: the submit event still fires, the
+        // unrelated open dialog stays open with no `close`
+        // event, and the form is not submitted anywhere (no
+        // navigation in this wave). The testdriver click path
+        // performs no navigation at all, so the pin here is
+        // submit-fired plus nothing-closed; the windowed path
+        // returns before link navigation by construction.
+        let mut tab = tab_from_html(
+            b"<html><body><dialog id=\"dlg\">hi</dialog>\
+              <form id=\"f\" method=\"dialog\">\
+              <button id=\"sub\" type=\"submit\" value=\"v\">ok</button>\
+              </form></body></html>",
+        );
+        eval(
+            &mut tab,
+            "var d = document.getElementById('dlg'); window.__ev = []; window.__sub = 0; \
+             d.addEventListener('close', function() { window.__ev.push('close'); }); \
+             document.getElementById('f').addEventListener('submit', function() { window.__sub++; }); \
+             d.showModal();",
+        );
+        let mut driver = TestDriver::new();
+        let sub = el(&tab, "sub");
+        driver.execute_click(&mut tab, sub).expect("click");
+        assert!(
+            js_true(&mut tab, "window.__sub === 1"),
+            "the dialog-less submit must still fire a submit event"
+        );
+        assert!(
+            tab.document_ref()
+                .expect("document")
+                .is_dialog_open(el(&tab, "dlg")),
+            "an unrelated open dialog must stay open: the form has no dialog ancestor"
+        );
+        assert!(
+            js_true(&mut tab, "window.__ev.length === 0"),
+            "no close event may fire without a dialog ancestor"
+        );
+        assert!(
+            tab.document_ref()
+                .expect("document")
+                .get_element_by_id("f")
+                .is_some(),
+            "the form must survive: no navigation replaced the document"
+        );
+    }
+
+    #[test]
+    fn w85_dialog_prevented_submit_keeps_dialog_open() {
+        // A prevented `submit` event keeps the dialog open —
+        // both via a listener calling `preventDefault()` and via
+        // an inline `onsubmit` returning false. The submit event
+        // must still have fired in the listener case.
+        let mut tab = tab_from_html(
+            b"<html><body><dialog id=\"dlg1\"><form id=\"f1\" method=\"dialog\">\
+              <button id=\"b1\" type=\"submit\" value=\"v1\">ok</button>\
+              </form></dialog>\
+              <dialog id=\"dlg2\"><form id=\"f2\" method=\"dialog\" onsubmit=\"return false;\">\
+              <button id=\"b2\" type=\"submit\" value=\"v2\">ok</button>\
+              </form></dialog></body></html>",
+        );
+        eval(
+            &mut tab,
+            "var d1 = document.getElementById('dlg1'); var d2 = document.getElementById('dlg2'); \
+             window.__ev1 = []; window.__ev2 = []; window.__sub1 = 0; \
+             d1.addEventListener('close', function() { window.__ev1.push('close'); }); \
+             d2.addEventListener('close', function() { window.__ev2.push('close'); }); \
+             document.getElementById('f1').addEventListener('submit', function(e) { window.__sub1++; e.preventDefault(); }); \
+             d1.showModal(); d2.showModal();",
+        );
+        let mut driver = TestDriver::new();
+        let b1 = el(&tab, "b1");
+        driver.execute_click(&mut tab, b1).expect("click");
+        assert!(
+            js_true(&mut tab, "window.__sub1 === 1"),
+            "the prevented submit must still fire a submit event"
+        );
+        assert!(
+            tab.document_ref()
+                .expect("document")
+                .is_dialog_open(el(&tab, "dlg1")),
+            "a preventDefaulted submit must keep the dialog open"
+        );
+        assert!(
+            js_true(&mut tab, "window.__ev1.length === 0"),
+            "a prevented submit must fire no close event"
+        );
+        let b2 = el(&tab, "b2");
+        driver.execute_click(&mut tab, b2).expect("click");
+        assert!(
+            tab.document_ref()
+                .expect("document")
+                .is_dialog_open(el(&tab, "dlg2")),
+            "an onsubmit returning false must keep the dialog open"
+        );
+        assert!(
+            js_true(&mut tab, "window.__ev2.length === 0"),
+            "an inline-prevented submit must fire no close event"
+        );
+    }
+
+    #[test]
+    fn w85_dialog_non_submitter_and_disabled_do_not_submit() {
+        // Neither a `type="button"` button nor a `disabled`
+        // submit button activates submission: no `submit` event,
+        // no close, dialog stays open.
+        let mut tab = tab_from_html(
+            b"<html><body><dialog id=\"dlg\"><form id=\"f\" method=\"dialog\">\
+              <button id=\"plain\" type=\"button\" value=\"x\">no</button>\
+              <button id=\"dis\" type=\"submit\" disabled value=\"y\">no</button>\
+              </form></dialog></body></html>",
+        );
+        eval(
+            &mut tab,
+            "var d = document.getElementById('dlg'); window.__ev = []; window.__sub = 0; \
+             d.addEventListener('close', function() { window.__ev.push('close'); }); \
+             document.getElementById('f').addEventListener('submit', function() { window.__sub++; }); \
+             d.showModal();",
+        );
+        let mut driver = TestDriver::new();
+        let plain = el(&tab, "plain");
+        driver.execute_click(&mut tab, plain).expect("click");
+        let dis = el(&tab, "dis");
+        driver.execute_click(&mut tab, dis).expect("click");
+        assert!(
+            tab.document_ref()
+                .expect("document")
+                .is_dialog_open(el(&tab, "dlg")),
+            "non-submitter and disabled clicks must leave the dialog open"
+        );
+        assert!(
+            js_true(&mut tab, "window.__sub === 0"),
+            "neither click may fire a submit event"
+        );
+        assert!(
+            js_true(&mut tab, "window.__ev.length === 0"),
+            "neither click may fire a close event"
+        );
+    }
+
+    #[test]
+    fn w85_dialog_click_on_button_child_submits() {
+        // Hit-testing targets the deepest child box, so a click
+        // on a `<span>` inside the submit button must still
+        // resolve the button as the submitter.
+        let mut tab = tab_from_html(
+            b"<html><body><dialog id=\"dlg\"><form method=\"dialog\">\
+              <button id=\"sub\" type=\"submit\" value=\"inner\"><span id=\"inner\">ok</span></button>\
+              </form></dialog></body></html>",
+        );
+        eval(
+            &mut tab,
+            "var d = document.getElementById('dlg'); d.showModal();",
+        );
+        let mut driver = TestDriver::new();
+        let inner = el(&tab, "inner");
+        driver.execute_click(&mut tab, inner).expect("click");
+        assert!(
+            !tab.document_ref()
+                .expect("document")
+                .is_dialog_open(el(&tab, "dlg")),
+            "a click on the submit button's child must submit the form"
+        );
+        assert!(
+            js_true(&mut tab, "d.returnValue === 'inner'"),
+            "returnValue must be the button's value even when a child was clicked"
+        );
+    }
+
+    #[test]
+    fn w85_dialog_form_attribute_owner_closes_form_dialog() {
+        // The form owner comes from the `form` attribute when
+        // present, even when the submitter sits outside the
+        // dialog: the dialog closed is the FORM's nearest
+        // ancestor dialog, not the submitter's.
+        let mut tab = tab_from_html(
+            b"<html><body><dialog id=\"dlg\"><form id=\"f\" method=\"dialog\"></form></dialog>\
+              <button id=\"ext\" type=\"submit\" form=\"f\" value=\"ext\">ok</button></body></html>",
+        );
+        eval(
+            &mut tab,
+            "var d = document.getElementById('dlg'); d.showModal();",
+        );
+        let mut driver = TestDriver::new();
+        let ext = el(&tab, "ext");
+        driver.execute_click(&mut tab, ext).expect("click");
+        assert!(
+            !tab.document_ref()
+                .expect("document")
+                .is_dialog_open(el(&tab, "dlg")),
+            "a form-attribute submitter outside the dialog must close the form's dialog"
+        );
+        assert!(
+            js_true(&mut tab, "d.returnValue === 'ext'"),
+            "returnValue must be the outside submitter's value"
+        );
+    }
+
+    /// A tab with layout boxes for a pointer-sequence submit
+    /// test: `#sub` (0,0,100,50) and `#plain` (100,0,100,50)
+    /// inside a `method="dialog"` form in `#dlg`. Same
+    /// document shape as [`dialog_form_tab`], plus boxes so
+    /// pointer hit-testing can find the buttons.
+    fn dialog_form_seq_tab() -> (Tab, NodeId, NodeId, NodeId) {
+        use std::cell::RefCell;
+        use std::rc::Rc;
+        let doc = Rc::new(RefCell::new(
+            bowser_dom::Document::parse_html(
+                b"<html><body><button id=\"out\">o</button>\
+                  <dialog id=\"dlg\"><form method=\"dialog\">\
+                  <button id=\"sub\" type=\"submit\" value=\"confirm\">ok</button>\
+                  <button id=\"plain\" type=\"submit\">p</button>\
+                  </form></dialog></body></html>",
+            )
+            .0,
+        ));
+        let (dlg, sub, plain) = {
+            let d = doc.borrow();
+            (
+                d.get_element_by_id("dlg").expect("dlg"),
+                d.get_element_by_id("sub").expect("sub"),
+                d.get_element_by_id("plain").expect("plain"),
+            )
+        };
+        let base = bowser_url::parse("http://example.com/page.html", None).expect("test url");
+        let page =
+            crate::script::PageVm::new_for_document(doc.clone(), &base, "TestBrowser/9.9", &[])
+                .expect("install web apis");
+        let mut tab = crate::Tab::new(bowser_layout::Size { w: 800.0, h: 600.0 });
+        tab.install_document(doc, page);
+        tab.layout_root = Some(Rc::new(actions_box(
+            (0.0, 0.0, 800.0, 600.0),
+            None,
+            vec![
+                actions_box((0.0, 0.0, 100.0, 50.0), Some(sub), vec![]),
+                actions_box((100.0, 0.0, 100.0, 50.0), Some(plain), vec![]),
+            ],
+        )));
+        (tab, dlg, sub, plain)
+    }
+
+    #[test]
+    fn w85fix_pointer_sequence_submit_closes_with_submitter_value() {
+        // Mirror of
+        // `w84_dialog_form_method_dialog_submit_closes_with_submitter_value`,
+        // through a real pointer down/up sequence instead of
+        // `execute_click`: the pointer-up arm used to
+        // synthesize the click and run popover activation,
+        // then stop, so a `method="dialog"` submit fired no
+        // `submit` event and closed nothing.
+        let (mut tab, dlg, _sub, _plain) = dialog_form_seq_tab();
+        eval(
+            &mut tab,
+            "var d = document.getElementById('dlg'); window.__ev = []; window.__sub = 0; \
+             d.addEventListener('cancel', function() { __ev.push('cancel'); }); \
+             d.addEventListener('close', function() { __ev.push('close'); }); \
+             document.querySelector('form').addEventListener('submit', function() { window.__sub++; }); \
+             d.showModal();",
+        );
+        let click_at = |x: f64, y: f64| {
+            sequence_request(vec![pointer_source(
+                "mouse",
+                vec![
+                    move_item(x, y, ActionOrigin::Viewport),
+                    button_item(ActionItemKind::PointerDown, 0),
+                    button_item(ActionItemKind::PointerUp, 0),
+                ],
+            )])
+        };
+        let mut driver = TestDriver::new();
+        driver.execute(&mut tab, click_at(50.0, 25.0));
+        assert!(
+            !tab.document_ref().expect("document").is_dialog_open(dlg),
+            "pointer-sequence method=dialog submit must close the dialog"
+        );
+        assert!(
+            js_true(&mut tab, "__ev.join(',') === 'close'"),
+            "pointer-sequence submit must fire close only, no cancel"
+        );
+        assert!(
+            js_true(&mut tab, "d.returnValue === 'confirm'"),
+            "returnValue must be the valued submitter's value"
+        );
+        assert!(
+            js_true(&mut tab, "window.__sub === 1"),
+            "pointer-sequence submit must fire exactly one submit event"
+        );
+        eval(&mut tab, "d.showModal();");
+        driver.execute(&mut tab, click_at(150.0, 25.0));
+        assert!(
+            !tab.document_ref().expect("document").is_dialog_open(dlg),
+            "unvalued pointer-sequence submit must close the dialog too"
+        );
+        assert!(
+            js_true(&mut tab, "d.returnValue === ''"),
+            "returnValue must be empty for an unvalued submitter"
+        );
+    }
+
+    /// A tab with layout boxes for a two-popover pointer
+    /// test: `#btnA` (0,0,100,50) targets `#popA`,
+    /// `#btnB` (0,60,100,50) targets `#popB`, `#popA`
+    /// (200,200,100,100), `#popB` (350,200,100,100).
+    /// `#popB` is nested inside `#popA`, so showing both
+    /// autos does not auto-close the first.
+    fn two_popover_seq_tab() -> (Tab, NodeId, NodeId, NodeId) {
+        use std::cell::RefCell;
+        use std::rc::Rc;
+        let doc = Rc::new(RefCell::new(
+            bowser_dom::Document::parse_html(
+                b"<html><body><button id=\"btnA\" popovertarget=\"popA\">a</button>\
+                  <button id=\"btnB\" popovertarget=\"popB\">b</button>\
+                  <div id=\"popA\" popover>hi<div id=\"popB\" popover>hi</div></div></body></html>",
+            )
+            .0,
+        ));
+        let (btn_a, btn_b, pop_a, pop_b) = {
+            let d = doc.borrow();
+            (
+                d.get_element_by_id("btnA").expect("btnA"),
+                d.get_element_by_id("btnB").expect("btnB"),
+                d.get_element_by_id("popA").expect("popA"),
+                d.get_element_by_id("popB").expect("popB"),
+            )
+        };
+        let base = bowser_url::parse("http://example.com/page.html", None).expect("test url");
+        let page =
+            crate::script::PageVm::new_for_document(doc.clone(), &base, "TestBrowser/9.9", &[])
+                .expect("install web apis");
+        let mut tab = crate::Tab::new(bowser_layout::Size { w: 800.0, h: 600.0 });
+        tab.install_document(doc, page);
+        tab.layout_root = Some(Rc::new(actions_box(
+            (0.0, 0.0, 800.0, 600.0),
+            None,
+            vec![
+                actions_box((0.0, 0.0, 100.0, 50.0), Some(btn_a), vec![]),
+                actions_box((0.0, 60.0, 100.0, 50.0), Some(btn_b), vec![]),
+                actions_box((200.0, 200.0, 100.0, 100.0), Some(pop_a), vec![]),
+                actions_box((350.0, 200.0, 100.0, 100.0), Some(pop_b), vec![]),
+            ],
+        )));
+        (tab, btn_a, pop_a, pop_b)
+    }
+
+    #[test]
+    fn w85fix_pointer_lower_invoker_closes_both_exactly_once() {
+        // Pointer-sequence twin of the windowed lower-invoker
+        // test: a click on the lower auto's invoker
+        // light-dismisses only the auto above it, then
+        // toggles the lower auto — both closed, one toggle
+        // each, upper first.
+        let (mut tab, _btn_a, pop_a, pop_b) = two_popover_seq_tab();
+        open_popover_td(&mut tab, pop_a);
+        open_popover_td(&mut tab, pop_b);
+        eval(
+            &mut tab,
+            "window.__toggles = []; \
+             document.getElementById('popA').addEventListener('toggle', function() { window.__toggles.push('a'); }); \
+             document.getElementById('popB').addEventListener('toggle', function() { window.__toggles.push('b'); });",
+        );
+        let mut driver = TestDriver::new();
+        driver.execute(
+            &mut tab,
+            sequence_request(vec![pointer_source(
+                "mouse",
+                vec![
+                    move_item(50.0, 25.0, ActionOrigin::Viewport),
+                    button_item(ActionItemKind::PointerDown, 0),
+                    button_item(ActionItemKind::PointerUp, 0),
+                ],
+            )]),
+        );
+        assert!(
+            !popover_open(&tab, pop_a),
+            "lower auto must end closed after its own invoker was clicked"
+        );
+        assert!(
+            !popover_open(&tab, pop_b),
+            "upper auto must end closed"
+        );
+        assert!(
+            js_true(&mut tab, "window.__toggles.join(',') === 'b,a'"),
+            "exactly one toggle per popover, light-dismiss victim before activation"
+        );
+
+        // Press on the lower invoker, release outside:
+        // ancestors mismatch, so nothing dismisses.
+        let (mut tab, _, pop_a, pop_b) = two_popover_seq_tab();
+        open_popover_td(&mut tab, pop_a);
+        open_popover_td(&mut tab, pop_b);
+        eval(
+            &mut tab,
+            "window.__toggles = []; \
+             document.getElementById('popA').addEventListener('toggle', function() { window.__toggles.push('a'); }); \
+             document.getElementById('popB').addEventListener('toggle', function() { window.__toggles.push('b'); });",
+        );
+        let mut driver = TestDriver::new();
+        driver.execute(
+            &mut tab,
+            sequence_request(vec![pointer_source(
+                "mouse",
+                vec![
+                    move_item(50.0, 25.0, ActionOrigin::Viewport),
+                    button_item(ActionItemKind::PointerDown, 0),
+                    move_item(700.0, 500.0, ActionOrigin::Viewport),
+                    button_item(ActionItemKind::PointerUp, 0),
+                ],
+            )]),
+        );
+        assert!(
+            popover_open(&tab, pop_a),
+            "press-on-invoker/release-outside must not dismiss the lower auto"
+        );
+        assert!(
+            popover_open(&tab, pop_b),
+            "press-on-invoker/release-outside must not dismiss the upper auto"
+        );
+        assert!(
+            js_true(&mut tab, "window.__toggles.length === 0"),
+            "no toggle may fire on a mismatched press/release pair"
+        );
+    }
+
+    #[test]
+    fn w85fix_submit_listener_mutates_value_and_method_mid_submit() {
+        // A `submit` listener mutating the submitter must
+        // change the close: the live value (not the
+        // pre-event snapshot) becomes `returnValue`, and a
+        // flipped effective method decides whether the
+        // dialog closes at all, in both directions.
+        let mut tab = tab_from_html(
+            b"<html><body><dialog id=\"dlg\"><form id=\"f\" method=\"dialog\">\
+              <button id=\"sub\" type=\"submit\" value=\"orig\">ok</button>\
+              </form></dialog></body></html>",
+        );
+        eval(
+            &mut tab,
+            "var d = document.getElementById('dlg'); \
+             document.getElementById('f').addEventListener('submit', function() { \
+               document.getElementById('sub').setAttribute('value', 'mutated'); }); \
+             d.showModal();",
+        );
+        let mut driver = TestDriver::new();
+        let click_node = el(&tab, "sub");
+        driver.execute_click(&mut tab, click_node).expect("click");
+        assert!(
+            !tab.document_ref().expect("document").is_dialog_open(el(&tab, "dlg")),
+            "value-mutated submit must still close"
+        );
+        assert!(
+            js_true(&mut tab, "d.returnValue === 'mutated'"),
+            "returnValue must be the listener-mutated value, not the pre-event one"
+        );
+
+        // Dialog -> non-dialog flip: the dialog stays open.
+        let mut tab = tab_from_html(
+            b"<html><body><dialog id=\"dlg\"><form id=\"f\" method=\"dialog\">\
+              <button id=\"sub\" type=\"submit\" formmethod=\"dialog\" value=\"x\">ok</button>\
+              </form></dialog></body></html>",
+        );
+        eval(
+            &mut tab,
+            "var d = document.getElementById('dlg'); window.__sub = 0; window.__close = 0; \
+             d.addEventListener('close', function() { window.__close++; }); \
+             document.getElementById('f').addEventListener('submit', function() { \
+               window.__sub++; \
+               document.getElementById('sub').setAttribute('formmethod', 'post'); }); \
+             d.showModal();",
+        );
+        let mut driver = TestDriver::new();
+        let click_node = el(&tab, "sub");
+        driver.execute_click(&mut tab, click_node).expect("click");
+        assert!(
+            tab.document_ref().expect("document").is_dialog_open(el(&tab, "dlg")),
+            "a listener flipping formmethod away from dialog must keep the dialog open"
+        );
+        assert!(
+            js_true(&mut tab, "window.__sub === 1 && window.__close === 0"),
+            "the flipped submit must fire submit and no close"
+        );
+
+        // Non-dialog -> dialog flip: the dialog closes with
+        // the mutated value.
+        let mut tab = tab_from_html(
+            b"<html><body><dialog id=\"dlg\"><form id=\"f\" method=\"post\">\
+              <button id=\"sub\" type=\"submit\" value=\"before\">ok</button>\
+              </form></dialog></body></html>",
+        );
+        eval(
+            &mut tab,
+            "var d = document.getElementById('dlg'); \
+             document.getElementById('f').addEventListener('submit', function() { \
+               var s = document.getElementById('sub'); \
+               s.setAttribute('formmethod', 'dialog'); s.setAttribute('value', 'flipped'); }); \
+             d.showModal();",
+        );
+        let mut driver = TestDriver::new();
+        let click_node = el(&tab, "sub");
+        driver.execute_click(&mut tab, click_node).expect("click");
+        assert!(
+            !tab.document_ref().expect("document").is_dialog_open(el(&tab, "dlg")),
+            "a listener flipping formmethod to dialog must close the dialog"
+        );
+        assert!(
+            js_true(&mut tab, "d.returnValue === 'flipped'"),
+            "returnValue must be the listener-mutated value on a flipped-to-dialog submit"
+        );
+    }
+
+    #[test]
+    fn w85fix_dialog_fieldset_disabled_and_uppercase_click() {
+        // End-to-end twin of the resolve-level test: a
+        // fieldset-disabled submitter fires no `submit` and
+        // closes nothing; its first-legend sibling closes;
+        // uppercase `formmethod` / `method` close.
+        let mut tab = tab_from_html(
+            b"<html><body><dialog id=\"dlg\"><form id=\"f\" method=\"dialog\">\
+              <fieldset disabled><button id=\"dis\" type=\"submit\" value=\"x\">x</button></fieldset>\
+              </form></dialog></body></html>",
+        );
+        eval(
+            &mut tab,
+            "var d = document.getElementById('dlg'); window.__sub = 0; window.__close = 0; \
+             d.addEventListener('close', function() { window.__close++; }); \
+             document.getElementById('f').addEventListener('submit', function() { window.__sub++; }); \
+             d.showModal();",
+        );
+        let mut driver = TestDriver::new();
+        let click_node = el(&tab, "dis");
+        driver.execute_click(&mut tab, click_node).expect("click");
+        assert!(
+            tab.document_ref().expect("document").is_dialog_open(el(&tab, "dlg")),
+            "a fieldset-disabled submitter must leave the dialog open"
+        );
+        assert!(
+            js_true(&mut tab, "window.__sub === 0 && window.__close === 0"),
+            "a fieldset-disabled submitter must fire neither submit nor close"
+        );
+
+        let mut tab = tab_from_html(
+            b"<html><body><dialog id=\"dlg\"><form method=\"dialog\">\
+              <fieldset disabled><legend><button id=\"leg\" type=\"submit\" value=\"leg\">x</button></legend></fieldset>\
+              </form></dialog></body></html>",
+        );
+        eval(
+            &mut tab,
+            "var d = document.getElementById('dlg'); d.showModal();",
+        );
+        let mut driver = TestDriver::new();
+        let click_node = el(&tab, "leg");
+        driver.execute_click(&mut tab, click_node).expect("click");
+        assert!(
+            !tab.document_ref().expect("document").is_dialog_open(el(&tab, "dlg")),
+            "a first-legend submitter escapes the fieldset's disabled"
+        );
+        assert!(
+            js_true(&mut tab, "d.returnValue === 'leg'"),
+            "returnValue must be the first-legend submitter's value"
+        );
+
+        let mut tab = tab_from_html(
+            b"<html><body><dialog id=\"dlg1\"><form method=\"get\">\
+              <button id=\"b1\" type=\"submit\" formmethod=\"DIALOG\" value=\"u\">u</button></form></dialog>\
+              <dialog id=\"dlg2\"><form method=\"DIALOG\">\
+              <button id=\"b2\" type=\"submit\" value=\"v\">v</button></form></dialog></body></html>",
+        );
+        eval(
+            &mut tab,
+            "var d1 = document.getElementById('dlg1'); var d2 = document.getElementById('dlg2'); \
+             d1.showModal();",
+        );
+        let mut driver = TestDriver::new();
+        let click_node = el(&tab, "b1");
+        driver.execute_click(&mut tab, click_node).expect("click");
+        assert!(
+            !tab.document_ref().expect("document").is_dialog_open(el(&tab, "dlg1")),
+            "formmethod=DIALOG (uppercase) must close"
+        );
+        eval(&mut tab, "d2.showModal();");
+        let click_node = el(&tab, "b2");
+        driver.execute_click(&mut tab, click_node).expect("click");
+        assert!(
+            !tab.document_ref().expect("document").is_dialog_open(el(&tab, "dlg2")),
+            "method=DIALOG (uppercase) must close"
+        );
+    }
+
+    #[test]
+    fn w85fix_request_close_closedby_none_closes() {
+        // `requestClose()` never consults `computed_closed_by`:
+        // a `closedby="none"` dialog — which blocks Escape
+        // and light-dismiss — still closes through its close
+        // watcher, modal and non-modal alike.
+        let mut tab = tab_from_html(
+            b"<html><body><dialog id=\"dlg\" closedby=\"none\"><button id=\"a\">a</button></dialog></body></html>",
+        );
+        eval(
+            &mut tab,
+            "var d = document.getElementById('dlg'); window.__log = []; \
+             d.addEventListener('cancel', function(e) { __log.push('cancel:' + e.isTrusted + ':' + e.cancelable); }); \
+             d.addEventListener('close', function(e) { __log.push('close:' + e.isTrusted + ':' + e.cancelable); }); \
+             d.showModal(); d.requestClose('rv');",
+        );
+        assert!(
+            !tab.document_ref().expect("document").is_dialog_open(el(&tab, "dlg")),
+            "requestClose must close a closedby=none modal dialog"
+        );
+        assert!(
+            js_true(&mut tab, "__log.join(';') === 'cancel:true:true;close:true:false'"),
+            "closedby=none requestClose must fire cancel then close"
+        );
+        assert!(
+            js_true(&mut tab, "d.returnValue === 'rv'"),
+            "closedby=none requestClose must apply its argument"
+        );
+        eval(&mut tab, "d.show(); d.requestClose('nm');");
+        assert!(
+            !tab.document_ref().expect("document").is_dialog_open(el(&tab, "dlg")),
+            "requestClose must close a closedby=none non-modal dialog too"
+        );
+        assert!(
+            js_true(&mut tab, "d.returnValue === 'nm'"),
+            "closedby=none non-modal requestClose must apply its argument"
+        );
+    }
+
+    /// A tab with layout boxes for a dual light-dismiss
+    /// test: `#dlg` at (200,200,100,100) in an 800x600
+    /// viewport, so a pointer at (700,500) hits nothing and
+    /// falls back to the body.
+    fn dual_seq_tab(html: &str) -> (Tab, NodeId) {
+        use std::cell::RefCell;
+        use std::rc::Rc;
+        let doc = Rc::new(RefCell::new(
+            bowser_dom::Document::parse_html(html.as_bytes()).0,
+        ));
+        let dlg = doc
+            .borrow()
+            .get_element_by_id("dlg")
+            .expect("dlg");
+        let base = bowser_url::parse("http://example.com/page.html", None).expect("test url");
+        let page =
+            crate::script::PageVm::new_for_document(doc.clone(), &base, "TestBrowser/9.9", &[])
+                .expect("install web apis");
+        let mut tab = crate::Tab::new(bowser_layout::Size { w: 800.0, h: 600.0 });
+        tab.install_document(doc, page);
+        tab.layout_root = Some(Rc::new(actions_box(
+            (0.0, 0.0, 800.0, 600.0),
+            None,
+            vec![actions_box((200.0, 200.0, 100.0, 100.0), Some(dlg), vec![])],
+        )));
+        (tab, dlg)
+    }
+
+    #[test]
+    fn w85fix_dual_escape_fires_toggle_after_close() {
+        // JS-level twin of the windowed Escape dual test,
+        // with event order: a manual dual closed by Escape
+        // fires cancel, then close, then its popover toggle
+        // (`open` -> `closed`) — the toggle belongs to the
+        // close, after it. Manual state reaches the dialog
+        // arm directly (an auto dual on top would be
+        // Escape's popover target instead).
+        let mut tab = tab_from_html(
+            b"<html><body><dialog id=\"dlg\" popover=\"manual\" closedby=\"closerequest\">\
+              <button id=\"a\">a</button></dialog></body></html>",
+        );
+        eval(
+            &mut tab,
+            "var d = document.getElementById('dlg'); window.__log = []; \
+             d.addEventListener('cancel', function() { __log.push('cancel'); }); \
+             d.addEventListener('close', function() { __log.push('close'); }); \
+             d.addEventListener('toggle', function() { __log.push('toggle'); }); \
+             d.show(); d.showPopover(); window.__log = [];",
+        );
+        let mut driver = TestDriver::new();
+        driver.execute(
+            &mut tab,
+            sequence_request(vec![key_source(vec![
+                key_item(ActionItemKind::KeyDown, "Escape"),
+                key_item(ActionItemKind::KeyUp, "Escape"),
+            ])]),
+        );
+        assert!(
+            !tab.document_ref().expect("document").is_dialog_open(el(&tab, "dlg")),
+            "Escape must close the dual dialog"
+        );
+        assert!(
+            !tab.document_ref()
+                .expect("document")
+                .is_popover_open(el(&tab, "dlg")),
+            "Escape must end the dual's popover membership"
+        );
+        assert!(
+            js_true(&mut tab, "window.__log.join(',') === 'cancel,close,toggle'"),
+            "Escape-closed dual must fire cancel, close, then exactly one toggle, in that order"
+        );
+
+        // Modal dual excluded (C10): Escape closes it with
+        // cancel and close only, no toggle.
+        let mut tab = tab_from_html(
+            b"<html><body><dialog id=\"dlg\" popover=\"auto\"><button id=\"a\">a</button></dialog></body></html>",
+        );
+        eval(
+            &mut tab,
+            "var d = document.getElementById('dlg'); window.__log = []; \
+             d.addEventListener('cancel', function() { __log.push('cancel'); }); \
+             d.addEventListener('close', function() { __log.push('close'); }); \
+             d.addEventListener('toggle', function() { __log.push('toggle'); }); \
+             d.showModal(); window.__log = [];",
+        );
+        let mut driver = TestDriver::new();
+        driver.execute(
+            &mut tab,
+            sequence_request(vec![key_source(vec![
+                key_item(ActionItemKind::KeyDown, "Escape"),
+                key_item(ActionItemKind::KeyUp, "Escape"),
+            ])]),
+        );
+        assert!(
+            !tab.document_ref().expect("document").is_dialog_open(el(&tab, "dlg")),
+            "Escape must close the modal dual dialog"
+        );
+        assert!(
+            js_true(&mut tab, "window.__log.join(',') === 'cancel,close'"),
+            "a modal dual's Escape close must fire no popover toggle"
+        );
+    }
+
+    #[test]
+    fn w85fix_dual_light_dismiss_fires_toggle_after_close() {
+        // Manual dual, `closedby=any`, outside pointer
+        // sequence: cancel, close, then the dual toggle.
+        let (mut tab, dlg) = dual_seq_tab(
+            "<html><body><dialog id=\"dlg\" popover=\"manual\" closedby=\"any\">\
+             <button id=\"a\">a</button></dialog></body></html>",
+        );
+        eval(
+            &mut tab,
+            "var d = document.getElementById('dlg'); window.__log = []; \
+             d.addEventListener('cancel', function() { __log.push('cancel'); }); \
+             d.addEventListener('close', function() { __log.push('close'); }); \
+             d.addEventListener('toggle', function() { __log.push('toggle'); }); \
+             d.show(); d.showPopover(); window.__log = [];",
+        );
+        let mut driver = TestDriver::new();
+        driver.execute(
+            &mut tab,
+            sequence_request(vec![pointer_source(
+                "mouse",
+                vec![
+                    move_item(700.0, 500.0, ActionOrigin::Viewport),
+                    button_item(ActionItemKind::PointerDown, 0),
+                    button_item(ActionItemKind::PointerUp, 0),
+                ],
+            )]),
+        );
+        assert!(
+            !tab.document_ref().expect("document").is_dialog_open(dlg),
+            "light-dismiss must close the dual dialog"
+        );
+        assert!(
+            !tab.document_ref().expect("document").is_popover_open(dlg),
+            "light-dismiss must end the dual's popover membership"
+        );
+        assert!(
+            js_true(&mut tab, "window.__log.join(',') === 'cancel,close,toggle'"),
+            "light-dismiss-closed dual must fire cancel, close, then exactly one toggle, in that order"
+        );
+
+        // Auto dual, outside pointer sequence: the popover
+        // arm hides it first (one toggle), so the dialog
+        // arm's snapshot is no longer live and must not
+        // fire a second toggle for the same close.
+        let (mut tab, dlg) = dual_seq_tab(
+            "<html><body><dialog id=\"dlg\" popover=\"auto\" closedby=\"any\">\
+             <button id=\"a\">a</button></dialog></body></html>",
+        );
+        eval(
+            &mut tab,
+            "var d = document.getElementById('dlg'); window.__log = []; \
+             d.addEventListener('cancel', function() { __log.push('cancel'); }); \
+             d.addEventListener('close', function() { __log.push('close'); }); \
+             d.addEventListener('toggle', function() { __log.push('toggle'); }); \
+             d.show(); d.showPopover(); window.__log = [];",
+        );
+        let mut driver = TestDriver::new();
+        driver.execute(
+            &mut tab,
+            sequence_request(vec![pointer_source(
+                "mouse",
+                vec![
+                    move_item(700.0, 500.0, ActionOrigin::Viewport),
+                    button_item(ActionItemKind::PointerDown, 0),
+                    button_item(ActionItemKind::PointerUp, 0),
+                ],
+            )]),
+        );
+        assert!(
+            !tab.document_ref().expect("document").is_dialog_open(dlg),
+            "light-dismiss must close the auto dual dialog"
+        );
+        assert!(
+            js_true(&mut tab, "window.__log.join(',') === 'toggle,cancel,close'"),
+            "an auto dual light-dismissed outside must toggle exactly once (the popover hide first), with no second close toggle"
+        );
+    }
+
+    #[test]
+    fn w85fix_td_light_dismiss_defers_popover_focus_clear_past_dialog_close() {
+        // Testdriver twin of the windowed deferral: one
+        // outside gesture dismisses both an auto popover
+        // and a `closedby=any` dialog. The popover's focus
+        // clear (observable as the popover's `blur`, fired
+        // by the executor's `set_focus(None)`) must land
+        // AFTER the dialog's `cancel` and `close`, so a
+        // dialog listener observes pre-dismissal focus —
+        // the old inline clear blurred before `cancel`.
+        // The popover and dialog are siblings, so the
+        // dialog arm's own post-close clear (inside the
+        // dialog only) cannot mask the popover clear.
+        let html = "<html><body><button id=\"btn\" popovertarget=\"pop\">\
+             <span id=\"span\">t</span></button>\
+             <div id=\"pop\" popover>hi</div>\
+             <dialog id=\"dlg\" closedby=\"any\"><button id=\"a\">a</button></dialog></body></html>";
+        let (mut tab, _, pop) = popover_seq_tab(html);
+        let dlg = el(&tab, "dlg");
+        // Dialog first: `show_dialog` hides open autos, so
+        // showing it after the popover would hide the
+        // popover before the gesture (windowed tests use
+        // the same dialog-then-popover order).
+        tab.installed_mut()
+            .expect("installed")
+            .document()
+            .borrow_mut()
+            .show_dialog(dlg)
+            .expect("show dialog");
+        open_popover_td(&mut tab, pop);
+        eval(
+            &mut tab,
+            "window.__log = []; \
+             document.getElementById('pop').addEventListener('blur', function() { __log.push('blur'); }); \
+             var d = document.getElementById('dlg'); \
+             d.addEventListener('cancel', function() { __log.push('cancel'); }); \
+             d.addEventListener('close', function() { __log.push('close'); });",
+        );
+        let mut driver = TestDriver::new();
+        driver.actions.focused = Some(pop);
+        driver.execute(
+            &mut tab,
+            sequence_request(vec![pointer_source(
+                "mouse",
+                vec![
+                    move_item(700.0, 500.0, ActionOrigin::Viewport),
+                    button_item(ActionItemKind::PointerDown, 0),
+                    button_item(ActionItemKind::PointerUp, 0),
+                ],
+            )]),
+        );
+        assert!(
+            !popover_open(&tab, pop),
+            "outside gesture must light-dismiss the popover"
+        );
+        assert!(
+            !tab.document_ref().expect("document").is_dialog_open(dlg),
+            "outside gesture must light-dismiss the closedby=any dialog"
+        );
+        assert!(
+            js_true(&mut tab, "window.__log.join(',') === 'cancel,close,blur'"),
+            "popover blur must fire after the dialog cancel and close, not before cancel"
+        );
+        assert_eq!(
+            driver.actions.focused, None,
+            "deferred popover focus clear must still run after the dialog arm"
+        );
+
+        // Re-show half: a dialog `close` listener that
+        // re-shows the dismissed popover keeps its focus —
+        // the deferred clear's live-membership check must
+        // skip a live-again popover, so no blur fires.
+        let (mut tab, _, pop) = popover_seq_tab(html);
+        let dlg = el(&tab, "dlg");
+        // Dialog first: `show_dialog` hides open autos, so
+        // showing it after the popover would hide the
+        // popover before the gesture (windowed tests use
+        // the same dialog-then-popover order).
+        tab.installed_mut()
+            .expect("installed")
+            .document()
+            .borrow_mut()
+            .show_dialog(dlg)
+            .expect("show dialog");
+        open_popover_td(&mut tab, pop);
+        eval(
+            &mut tab,
+            "window.__log = []; \
+             document.getElementById('pop').addEventListener('blur', function() { __log.push('blur'); }); \
+             var d = document.getElementById('dlg'); \
+             d.addEventListener('cancel', function() { __log.push('cancel'); }); \
+             d.addEventListener('close', function() { __log.push('close'); \
+               document.getElementById('pop').showPopover(); });",
+        );
+        let mut driver = TestDriver::new();
+        driver.actions.focused = Some(pop);
+        driver.execute(
+            &mut tab,
+            sequence_request(vec![pointer_source(
+                "mouse",
+                vec![
+                    move_item(700.0, 500.0, ActionOrigin::Viewport),
+                    button_item(ActionItemKind::PointerDown, 0),
+                    button_item(ActionItemKind::PointerUp, 0),
+                ],
+            )]),
+        );
+        assert!(
+            popover_open(&tab, pop),
+            "close listener must have re-shown the popover"
+        );
+        assert!(
+            !tab.document_ref().expect("document").is_dialog_open(dlg),
+            "outside gesture must light-dismiss the closedby=any dialog"
+        );
+        assert!(
+            js_true(&mut tab, "window.__log.join(',') === 'cancel,close'"),
+            "no blur must fire for a re-shown popover"
+        );
+        assert_eq!(
+            driver.actions.focused,
+            Some(pop),
+            "deferred clear must not wipe focus inside a re-shown popover"
+        );
+    }
+
+    #[test]
+    fn w85fix_td_nested_popover_in_dialog_close_listener_reshow_keeps_focus() {
+        // w85fix BLOCKER A: a popover nested inside the
+        // dialog, re-shown by the dialog's `close`
+        // listener with focus on its child, must keep
+        // that focus. Without the guard, the dialog arm's
+        // post-close clear wipes it — the popover child is
+        // a DOM descendant of the dialog, so the plain
+        // `clear_focus_inside(dialog)` matches it — even
+        // though the deferred loop's re-show check would
+        // have skipped the popover's own clear. The
+        // listener's `focus()` call is in the script for
+        // intent, but the pin is the executor focus on the
+        // popover child at clear time: it must survive
+        // with no blur.
+        let html = "<html><body><button id=\"btn\" popovertarget=\"pop\">\
+             <span id=\"span\">t</span></button>\
+             <dialog id=\"dlg\" closedby=\"any\"><button id=\"a\">a</button>\
+             <div id=\"pop\" popover><button id=\"pc\">pc</button></div></dialog></body></html>";
+        let (mut tab, _, pop) = popover_seq_tab(html);
+        let dlg = el(&tab, "dlg");
+        let pc = el(&tab, "pc");
+        tab.installed_mut()
+            .expect("installed")
+            .document()
+            .borrow_mut()
+            .show_dialog(dlg)
+            .expect("show dialog");
+        open_popover_td(&mut tab, pop);
+        eval(
+            &mut tab,
+            "window.__log = []; \
+             document.getElementById('pc').addEventListener('blur', function() { __log.push('blur'); }); \
+             var d = document.getElementById('dlg'); \
+             d.addEventListener('cancel', function() { __log.push('cancel'); }); \
+             d.addEventListener('close', function() { __log.push('close'); \
+               document.getElementById('pop').showPopover(); \
+               document.getElementById('pc').focus(); });",
+        );
+        let mut driver = TestDriver::new();
+        driver.actions.focused = Some(pc);
+        driver.execute(
+            &mut tab,
+            sequence_request(vec![pointer_source(
+                "mouse",
+                vec![
+                    move_item(700.0, 500.0, ActionOrigin::Viewport),
+                    button_item(ActionItemKind::PointerDown, 0),
+                    button_item(ActionItemKind::PointerUp, 0),
+                ],
+            )]),
+        );
+        assert!(
+            popover_open(&tab, pop),
+            "close listener must have re-shown the nested popover"
+        );
+        assert!(
+            !tab.document_ref().expect("document").is_dialog_open(dlg),
+            "outside gesture must light-dismiss the closedby=any dialog"
+        );
+        assert!(
+            js_true(&mut tab, "window.__log.join(',') === 'cancel,close'"),
+            "no blur must fire for focus inside a re-shown nested popover"
+        );
+        assert_eq!(
+            driver.actions.focused,
+            Some(pc),
+            "dialog-arm clear must not wipe focus inside a live popover nested in the dialog"
+        );
+    }
+
+    #[test]
+    fn w85fix_td_nested_popover_close_listener_focus_move_limit() {
+        // w85fix S3, testdriver half — stated as a limit,
+        // not as moved-in coverage: focus starts on a
+        // dialog child, and the `close` listener re-shows
+        // the nested popover and calls `focus()` on its
+        // child. But `HTMLElement.focus()` is a no-op in
+        // the bindings (`n_element_focus` returns without
+        // touching executor focus), so no JS listener can
+        // move executor focus mid-close in testdriver:
+        // the dialog child's focus is correctly cleared
+        // (it must not linger on the closed dialog), and
+        // the re-shown popover stays open. The guard's
+        // moved-in condition — focus inside a live
+        // popover at clear time — is pinned by the
+        // sibling test above, where focus is on the
+        // popover child when the dialog arm clears.
+        let html = "<html><body><button id=\"btn\" popovertarget=\"pop\">\
+             <span id=\"span\">t</span></button>\
+             <dialog id=\"dlg\" closedby=\"any\"><button id=\"a\">a</button>\
+             <div id=\"pop\" popover><button id=\"pc\">pc</button></div></dialog></body></html>";
+        let (mut tab, _, pop) = popover_seq_tab(html);
+        let dlg = el(&tab, "dlg");
+        let a = el(&tab, "a");
+        tab.installed_mut()
+            .expect("installed")
+            .document()
+            .borrow_mut()
+            .show_dialog(dlg)
+            .expect("show dialog");
+        open_popover_td(&mut tab, pop);
+        eval(
+            &mut tab,
+            "window.__log = []; \
+             document.getElementById('a').addEventListener('blur', function() { __log.push('blur'); }); \
+             var d = document.getElementById('dlg'); \
+             d.addEventListener('cancel', function() { __log.push('cancel'); }); \
+             d.addEventListener('close', function() { __log.push('close'); \
+               document.getElementById('pop').showPopover(); \
+               document.getElementById('pc').focus(); });",
+        );
+        let mut driver = TestDriver::new();
+        driver.actions.focused = Some(a);
+        driver.execute(
+            &mut tab,
+            sequence_request(vec![pointer_source(
+                "mouse",
+                vec![
+                    move_item(700.0, 500.0, ActionOrigin::Viewport),
+                    button_item(ActionItemKind::PointerDown, 0),
+                    button_item(ActionItemKind::PointerUp, 0),
+                ],
+            )]),
+        );
+        assert!(
+            popover_open(&tab, pop),
+            "close listener must have re-shown the nested popover"
+        );
+        assert!(
+            !tab.document_ref().expect("document").is_dialog_open(dlg),
+            "outside gesture must light-dismiss the closedby=any dialog"
+        );
+        assert!(
+            js_true(&mut tab, "window.__log.join(',') === 'cancel,close,blur'"),
+            "the dialog child's blur must fire after cancel and close, since JS focus() cannot move executor focus into the popover mid-close"
+        );
+        assert_eq!(
+            driver.actions.focused, None,
+            "focus on a dialog child must not linger on the closed dialog"
+        );
+    }
+
+    #[test]
+    fn w85fix_td_light_dismiss_deferred_clear_retained_and_prevented_cancel() {
+        // w85fix S2: the halves the deferred loop's comment
+        // claims but the plain deferral test does not pin.
+        // Retained half: a victim with a stored exit
+        // duration is exit-retained at deferred-clear time
+        // (not live), so the clear must still run.
+        // Retained-then-reshown half: a retained victim
+        // the `close` listener re-shows is live again, so
+        // the clear must skip it. Prevented-cancel half:
+        // the dialog arm runs nothing when `cancel` is
+        // prevented, but the popover still hid, so the
+        // deferred clear must still run.
+        let html = "<html><body><button id=\"btn\" popovertarget=\"pop\">\
+             <span id=\"span\">t</span></button>\
+             <div id=\"pop\" popover>hi</div>\
+             <dialog id=\"dlg\" closedby=\"any\"><button id=\"a\">a</button></dialog></body></html>";
+        let gesture = || {
+            sequence_request(vec![pointer_source(
+                "mouse",
+                vec![
+                    move_item(700.0, 500.0, ActionOrigin::Viewport),
+                    button_item(ActionItemKind::PointerDown, 0),
+                    button_item(ActionItemKind::PointerUp, 0),
+                ],
+            )])
+        };
+        // Retained half.
+        let (mut tab, _, pop) = popover_seq_tab(html);
+        let dlg = el(&tab, "dlg");
+        tab.installed_mut()
+            .expect("installed")
+            .document()
+            .borrow_mut()
+            .show_dialog(dlg)
+            .expect("show dialog");
+        open_popover_td(&mut tab, pop);
+        tab.installed_mut()
+            .expect("installed")
+            .document()
+            .borrow_mut()
+            .store_exit_duration(pop, 60.0);
+        eval(
+            &mut tab,
+            "window.__log = []; \
+             document.getElementById('pop').addEventListener('blur', function() { __log.push('blur'); }); \
+             var d = document.getElementById('dlg'); \
+             d.addEventListener('cancel', function() { __log.push('cancel'); }); \
+             d.addEventListener('close', function() { __log.push('close'); });",
+        );
+        let mut driver = TestDriver::new();
+        driver.actions.focused = Some(pop);
+        driver.execute(&mut tab, gesture());
+        let (retained, live, dialog_open) = {
+            let doc = tab.document_ref().expect("document");
+            (
+                doc.is_exit_retained(pop),
+                doc.top_layer().contains(&pop),
+                doc.is_dialog_open(dlg),
+            )
+        };
+        assert!(
+            retained,
+            "stored duration must retain the dismissed popover"
+        );
+        assert!(
+            !live,
+            "a retained victim is not a live top-layer member"
+        );
+        assert!(
+            !dialog_open,
+            "outside gesture must light-dismiss the closedby=any dialog"
+        );
+        assert!(
+            js_true(&mut tab, "window.__log.join(',') === 'cancel,close,blur'"),
+            "focus inside a retained victim must end cleared, after cancel and close"
+        );
+        assert_eq!(
+            driver.actions.focused, None,
+            "deferred clear must run for a retained victim"
+        );
+
+        // Retained-then-reshown half.
+        let (mut tab, _, pop) = popover_seq_tab(html);
+        let dlg = el(&tab, "dlg");
+        tab.installed_mut()
+            .expect("installed")
+            .document()
+            .borrow_mut()
+            .show_dialog(dlg)
+            .expect("show dialog");
+        open_popover_td(&mut tab, pop);
+        tab.installed_mut()
+            .expect("installed")
+            .document()
+            .borrow_mut()
+            .store_exit_duration(pop, 60.0);
+        eval(
+            &mut tab,
+            "window.__log = []; \
+             document.getElementById('pop').addEventListener('blur', function() { __log.push('blur'); }); \
+             var d = document.getElementById('dlg'); \
+             d.addEventListener('cancel', function() { __log.push('cancel'); }); \
+             d.addEventListener('close', function() { __log.push('close'); \
+               document.getElementById('pop').showPopover(); });",
+        );
+        let mut driver = TestDriver::new();
+        driver.actions.focused = Some(pop);
+        driver.execute(&mut tab, gesture());
+        let (live, retained) = {
+            let doc = tab.document_ref().expect("document");
+            (doc.top_layer().contains(&pop), doc.is_exit_retained(pop))
+        };
+        assert!(
+            live,
+            "close listener must have re-shown the retained popover to live membership"
+        );
+        assert!(
+            !retained,
+            "re-show must cancel the exit retention"
+        );
+        assert!(
+            js_true(&mut tab, "window.__log.join(',') === 'cancel,close'"),
+            "no blur must fire for a retained-then-reshown popover"
+        );
+        assert_eq!(
+            driver.actions.focused,
+            Some(pop),
+            "deferred clear must not wipe focus inside a retained-then-reshown popover"
+        );
+
+        // Prevented-cancel half.
+        let (mut tab, _, pop) = popover_seq_tab(html);
+        let dlg = el(&tab, "dlg");
+        tab.installed_mut()
+            .expect("installed")
+            .document()
+            .borrow_mut()
+            .show_dialog(dlg)
+            .expect("show dialog");
+        open_popover_td(&mut tab, pop);
+        eval(
+            &mut tab,
+            "window.__log = []; \
+             document.getElementById('pop').addEventListener('blur', function() { __log.push('blur'); }); \
+             var d = document.getElementById('dlg'); \
+             d.addEventListener('cancel', function(e) { __log.push('cancel'); e.preventDefault(); }); \
+             d.addEventListener('close', function() { __log.push('close'); });",
+        );
+        let mut driver = TestDriver::new();
+        driver.actions.focused = Some(pop);
+        driver.execute(&mut tab, gesture());
+        assert!(
+            !popover_open(&tab, pop),
+            "popover must light-dismiss even when the dialog cancel is prevented"
+        );
+        assert!(
+            tab.document_ref().expect("document").is_dialog_open(dlg),
+            "prevented cancel must keep the dialog open"
+        );
+        assert!(
+            js_true(&mut tab, "window.__log.join(',') === 'cancel,blur'"),
+            "deferred clear must run after a prevented cancel, with no close"
+        );
+        assert_eq!(
+            driver.actions.focused, None,
+            "deferred popover focus clear must run even when cancel is prevented"
+        );
+    }
+
+    #[test]
+    fn w85fix_td_light_dismiss_deferred_clear_child_blur_order() {
+        // w85fix S4: the blur-order pin with a focusable
+        // child inside the popover, not the plain
+        // non-focusable popover div itself. Focus sits on
+        // the child, so the deferred clear's `blur` fires
+        // on the child and must still land after the
+        // dialog's `cancel` and `close`.
+        let html = "<html><body><button id=\"btn\" popovertarget=\"pop\">\
+             <span id=\"span\">t</span></button>\
+             <div id=\"pop\" popover><button id=\"pc\">pc</button></div>\
+             <dialog id=\"dlg\" closedby=\"any\"><button id=\"a\">a</button></dialog></body></html>";
+        let (mut tab, _, pop) = popover_seq_tab(html);
+        let dlg = el(&tab, "dlg");
+        let pc = el(&tab, "pc");
+        tab.installed_mut()
+            .expect("installed")
+            .document()
+            .borrow_mut()
+            .show_dialog(dlg)
+            .expect("show dialog");
+        open_popover_td(&mut tab, pop);
+        eval(
+            &mut tab,
+            "window.__log = []; \
+             document.getElementById('pc').addEventListener('blur', function() { __log.push('blur'); }); \
+             var d = document.getElementById('dlg'); \
+             d.addEventListener('cancel', function() { __log.push('cancel'); }); \
+             d.addEventListener('close', function() { __log.push('close'); });",
+        );
+        let mut driver = TestDriver::new();
+        driver.actions.focused = Some(pc);
+        driver.execute(
+            &mut tab,
+            sequence_request(vec![pointer_source(
+                "mouse",
+                vec![
+                    move_item(700.0, 500.0, ActionOrigin::Viewport),
+                    button_item(ActionItemKind::PointerDown, 0),
+                    button_item(ActionItemKind::PointerUp, 0),
+                ],
+            )]),
+        );
+        assert!(
+            !popover_open(&tab, pop),
+            "outside gesture must light-dismiss the popover"
+        );
+        assert!(
+            !tab.document_ref().expect("document").is_dialog_open(dlg),
+            "outside gesture must light-dismiss the closedby=any dialog"
+        );
+        assert!(
+            js_true(&mut tab, "window.__log.join(',') === 'cancel,close,blur'"),
+            "the popover child's blur must fire after the dialog cancel and close, not before cancel"
+        );
+        assert_eq!(
+            driver.actions.focused, None,
+            "deferred popover focus clear must still run for a focusable child"
+        );
+    }
+
+    #[test]
+    fn w85fix_dual_submit_fires_toggle_after_close() {
+        // Auto dual, `method="dialog"` submit: submit,
+        // close, then the dual toggle.
+        let mut tab = tab_from_html(
+            b"<html><body><dialog id=\"dlg\" popover=\"auto\"><form method=\"dialog\">\
+              <button id=\"sub\" type=\"submit\" value=\"go\">ok</button>\
+              </form></dialog></body></html>",
+        );
+        eval(
+            &mut tab,
+            "var d = document.getElementById('dlg'); window.__log = []; \
+             d.addEventListener('close', function() { __log.push('close'); }); \
+             d.addEventListener('toggle', function() { __log.push('toggle'); }); \
+             document.querySelector('form').addEventListener('submit', function() { __log.push('submit'); }); \
+             d.show(); d.showPopover(); window.__log = [];",
+        );
+        let mut driver = TestDriver::new();
+        let click_node = el(&tab, "sub");
+        driver.execute_click(&mut tab, click_node).expect("click");
+        assert!(
+            !tab.document_ref().expect("document").is_dialog_open(el(&tab, "dlg")),
+            "submit must close the dual dialog"
+        );
+        assert!(
+            !tab.document_ref()
+                .expect("document")
+                .is_popover_open(el(&tab, "dlg")),
+            "submit must end the dual's popover membership"
+        );
+        assert!(
+            js_true(&mut tab, "window.__log.join(',') === 'submit,close,toggle'"),
+            "submit-closed dual must fire submit, close, then exactly one toggle, in that order"
+        );
+        assert!(
+            js_true(&mut tab, "d.returnValue === 'go'"),
+            "returnValue must still be the submitter's value"
+        );
+
+        // Close-listener re-show suppresses the dual
+        // toggle: the re-show's own toggle is the only one
+        // (count 1), and the popover ends open again while
+        // the dialog stays closed.
+        let mut tab = tab_from_html(
+            b"<html><body><dialog id=\"dlg\" popover=\"auto\"><form method=\"dialog\">\
+              <button id=\"sub\" type=\"submit\" value=\"go\">ok</button>\
+              </form></dialog></body></html>",
+        );
+        eval(
+            &mut tab,
+            "var d = document.getElementById('dlg'); window.__log = []; \
+             d.addEventListener('close', function() { __log.push('close'); d.showPopover(); }); \
+             d.addEventListener('toggle', function() { __log.push('toggle'); }); \
+             document.querySelector('form').addEventListener('submit', function() { __log.push('submit'); }); \
+             d.show(); d.showPopover(); window.__log = [];",
+        );
+        let mut driver = TestDriver::new();
+        let click_node = el(&tab, "sub");
+        driver.execute_click(&mut tab, click_node).expect("click");
+        assert!(
+            !tab.document_ref().expect("document").is_dialog_open(el(&tab, "dlg")),
+            "re-show case: submit must still close the dialog"
+        );
+        assert!(
+            tab.document_ref()
+                .expect("document")
+                .is_popover_open(el(&tab, "dlg")),
+            "re-show case: the close listener's showPopover must leave the popover open"
+        );
+        assert!(
+            js_true(&mut tab, "window.__log.join(',') === 'submit,close,toggle'"),
+            "re-show case: exactly one toggle (the re-show's) must fire, never a second dual toggle"
+        );
+    }
+
+    #[test]
+    fn w85fix_dual_attribute_removal_fires_no_events() {
+        // Boundary pin, not an app close path: removing
+        // `open` from a dual closes it state-wise but fires
+        // no events at all (the w84 silent-removal rule for
+        // `close`), so it fires no popover toggle either —
+        // membership ends by demotion, not by an event.
+        // This is why the toggle rule is scoped to real
+        // closes (Escape, light-dismiss, submit, `close()` /
+        // `requestClose()`), not to every state change.
+        let mut tab = tab_from_html(
+            b"<html><body><dialog id=\"dlg\" popover=\"auto\"><button id=\"a\">a</button></dialog></body></html>",
+        );
+        eval(
+            &mut tab,
+            "var d = document.getElementById('dlg'); window.__log = []; \
+             d.addEventListener('cancel', function() { __log.push('cancel'); }); \
+             d.addEventListener('close', function() { __log.push('close'); }); \
+             d.addEventListener('toggle', function() { __log.push('toggle'); }); \
+             d.show(); d.showPopover(); window.__log = []; d.removeAttribute('open');",
+        );
+        assert!(
+            !tab.document_ref().expect("document").is_dialog_open(el(&tab, "dlg")),
+            "removeAttribute('open') must close the dual state-wise"
+        );
+        assert!(
+            !tab.document_ref()
+                .expect("document")
+                .is_popover_open(el(&tab, "dlg")),
+            "removeAttribute('open') must end the dual's popover membership"
+        );
+        assert!(
+            js_true(&mut tab, "window.__log.length === 0"),
+            "removeAttribute('open') must fire neither close nor toggle"
         );
     }
 
