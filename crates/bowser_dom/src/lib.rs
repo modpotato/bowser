@@ -583,14 +583,26 @@ pub enum ClosedBy {
     None,
 }
 
-/// What pressing Escape dismisses: the single top-layer member
-/// that is dismissible by Escape, or — when the top layer is
-/// empty, or its top member is watcher-less — a non-modal
-/// dialog whose computed closed-by state opts it into close
-/// requests (w85, see [`Document::topmost_escape_target`]).
-/// A `manual` (or `hint`) popover on top still blocks a modal
-/// dialog below it, but not a non-modal dialog's watcher
-/// (Chrome probe 2 Q2, w85fix).
+/// What pressing Escape dismisses: every escapable watcher
+/// live at key-down time, in canonical event order — all
+/// escapable dialogs first (newest first), then every open
+/// `auto` popover (newest first, nested inner before outer).
+/// Chrome 155 (w86-chrome-probes RESULTS.md verdict A) closes
+/// them ALL on one Escape keyDown: `cancel` on every escapable
+/// dialog newest-first, then `close` on each newest-first, then
+/// `toggle closed` on every open auto newest-first. Manual and
+/// hint popovers never close, and `closedby="none"` dialogs
+/// (modal or not) never close and never block anything below
+/// them (A4/A5/A8: fallthrough below a none dialog, modal or
+/// not, in both show orders). Two sibling autos can never
+/// coexist (showing the second hides the first), so the
+/// multi-auto case only arises nested. The auto toggle's exact
+/// position relative to the dialog closes is unstable in Chrome
+/// (A7: 5/6 after closes, 1/6 between cancels and closes), so
+/// Bowser implements the canonical cancels → closes → toggles
+/// order and does not pin the toggle position. Callers iterate
+/// [`Document::escape_targets`] and run the dialog cancels,
+/// then the dialog closes, then the auto hides, in that order.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum EscapeTarget {
     /// A modal dialog: close it with its `returnValue` unchanged
@@ -790,6 +802,21 @@ pub struct Document {
     /// is never in this set. Nodes are arena-allocated and never
     /// freed, so the set only grows with the node count.
     dialog_modal: HashSet<NodeId>,
+    /// Dialog show-order sequence (w86fix B1, Chrome 155 A3):
+    /// a monotonically increasing number assigned when a
+    /// dialog becomes open (`show()` / `showModal()` / a
+    /// fresh `open` attribute write), so Escape and
+    /// light-dismiss order escapable dialogs newest-first
+    /// by SHOW order, not document order. A dialog with no
+    /// recorded show (markup `<dialog open>`, whose
+    /// attribute predates any API call the DOM observed)
+    /// has no entry and sorts as oldest, in document order
+    /// among its own kind. The entry is dropped when the
+    /// dialog closes (`open` removed), so a re-show gets a
+    /// fresh sequence. Sequences start at 1; 0 means "no
+    /// recorded show" in the order key.
+    dialog_show_seq: HashMap<NodeId, u64>,
+    next_dialog_show_seq: u64,
     /// Per-dialog `returnValue` (HTML §4.11.4, w81 phase 2): the
     /// value last passed to `close(returnValue)` (or set through
     /// the IDL accessor). Not a content attribute, so it lives
@@ -976,6 +1003,8 @@ impl Document {
             top_layer_seq: HashMap::new(),
             next_top_layer_seq: 0,
             dialog_modal: HashSet::new(),
+            dialog_show_seq: HashMap::new(),
+            next_dialog_show_seq: 1,
             dialog_return_values: HashMap::new(),
             dialog_focus_events: Vec::new(),
             host_focused: None,
@@ -2114,6 +2143,17 @@ impl Document {
             self.note_id_gain(new_id_atom, el);
         }
         if changed {
+            // w86fix B1: a fresh `open` write on a dialog
+            // records its show order (covers `show()` /
+            // `showModal()`, which route through here, the
+            // IDL `open` setter, and shim adoption; a
+            // no-op rewrite — `changed == false` — keeps
+            // the original sequence).
+            if name.eq_ignore_ascii_case("open") && self.is_dialog_element(el) {
+                let seq = self.next_dialog_show_seq;
+                self.next_dialog_show_seq = seq.wrapping_add(1).max(1);
+                self.dialog_show_seq.insert(el, seq);
+            }
             // Attribute selectors (`[data-x]`, `[data-x="v"]`, ...) can
             // match any attribute, so every attribute write can change
             // selector matching: the style stage re-runs. Boxes can
@@ -2205,6 +2245,11 @@ impl Document {
             // demotion with an exit retention immediately after.
             if name.eq_ignore_ascii_case("open") && self.is_dialog_element(el) {
                 self.dialog_modal.remove(&el);
+                // w86fix B1: closing drops the show-order
+                // sequence, so a later re-show gets a fresh
+                // one (a retained deferred close routes
+                // through here too).
+                self.dialog_show_seq.remove(&el);
                 if !retain_top_layer {
                     self.remove_from_top_layer(el);
                 }
@@ -3007,6 +3052,25 @@ impl Document {
         }
     }
 
+    /// Record a parse-time dialog show in show order (w86fix B1):
+    /// assign `node` the next show sequence, so a dialog shown by
+    /// a mid-parse script sorts by show order in
+    /// [`Document::escape_targets`] exactly like a production
+    /// `show()` / `showModal()` (whose `open` write records the
+    /// sequence in [`Document::set_attribute`]). Called by the
+    /// parse-shim adoption, in show order, for dialogs still open
+    /// at install; no-op for non-dialogs and for dialogs without
+    /// `open` (already closed mid-parse). A re-show after close
+    /// gets a fresh sequence because close drops the entry (see
+    /// `remove_attribute_inner`).
+    pub fn adopt_dialog_show_seq(&mut self, node: NodeId) {
+        if self.is_dialog_open(node) {
+            let seq = self.next_dialog_show_seq;
+            self.next_dialog_show_seq = seq.wrapping_add(1).max(1);
+            self.dialog_show_seq.insert(node, seq);
+        }
+    }
+
     /// Mark `node` as a modal dialog without validating state:
     /// the raw set operation behind parse-shim adoption and the
     /// style-rebuild promotion (both validate first — the node
@@ -3283,134 +3347,123 @@ impl Document {
             .copied()
     }
 
-    /// What Escape dismisses, if anything. With a live
-    /// top-layer member, the member itself owns the key, as
-    /// before: a modal dialog wins over any popover below
-    /// (unless its computed closed-by state is None, w85
-    /// `closedby=none`, in which case Escape does nothing
-    /// even for a modal dialog); an `auto` popover wins over
-    /// any dialog below; a watcher-less top member (a
-    /// `manual`/`hint` popover) does NOT block a non-modal
-    /// dialog's watcher below it — Chrome probe 2 Q2 closes
-    /// the escapable non-modal dialog and leaves the manual
-    /// popover open in both top-layer orders — so that case
-    /// falls through to the non-modal fallback below
-    /// (w85fix). It still blocks a *modal* dialog below it,
-    /// exactly as the w84 pin says: the fallback searches
-    /// non-modal dialogs only, never a modal one.
-    /// With NO live top-layer member, a non-modal dialog
-    /// with explicit `closedby` of `closerequest` or `any`
-    /// gains Escape (w85 decision, pinned by test): the
-    /// spec establishes a close watcher for every open
-    /// dialog (dialog setup steps run for `show()` as well
-    /// as `showModal()`), and the computed-state rule makes
-    /// explicit values modal-independent — only the Auto
-    /// state distinguishes modal (Close Request) from
-    /// non-modal (None). If explicit values were also
-    /// modal-only, `closerequest` on a non-modal dialog
-    /// would be a dead state (Escape never reaching it and
-    /// `requestClose()` ignoring closed-by), which the
-    /// spec's Auto/modal distinction exists to avoid. The
-    /// fallback picks the last open escapable dialog in
-    /// document order: Bowser keeps no open-dialogs list
-    /// (spec order is setup order), so document order is
-    /// the approximation, documented here rather than
-    /// hidden. This is a pure query: the caller runs the
-    /// `cancel` check (dialogs) and fires the event before
-    /// closing/hiding.
-    pub fn topmost_escape_target(&self) -> Option<EscapeTarget> {
-        match self.top_layer.last() {
-            Some(&top) => {
-                if self.is_dialog_modal(top) {
-                    match self.computed_closed_by(top) {
-                        ClosedBy::None => None,
-                        _ => Some(EscapeTarget::ModalDialog(top)),
-                    }
-                } else if self.is_popover_open(top)
-                    && self.popover_state(top) == Some(PopoverState::Auto)
-                {
-                    Some(EscapeTarget::AutoPopover(top))
-                } else {
-                    // w85fix (Chrome probe 2 Q2): a
-                    // watcher-less top member does not swallow
-                    // the key for a non-modal dialog's watcher.
-                    // The fallback is non-modal only, so a
-                    // modal dialog below a manual popover is
-                    // still blocked (w84 pin, kept).
-                    // w85fix re-review: the fallback runs
-                    // ONLY when no live auto popover remains
-                    // below the top member. With a live auto
-                    // below (manual over auto over an
-                    // escapable dialog), falling through would
-                    // let the dialog skip the auto whose
-                    // watcher should compete — and with no
-                    // dialog it already returns None
-                    // (manual blocks auto), so the dialog
-                    // must not change that answer. Return
-                    // None instead, preserving the
-                    // manual-blocks-auto behavior.
-                    // Probe 3 (Chrome 155, w85-chrome-probes3
-                    // RESULTS.md) shows this stopgap is a
-                    // safe UNDER-approximation, not the
-                    // Chrome rule: with manual M + auto A +
-                    // non-modal closedby="any" dialog D all
-                    // open, one Escape closes BOTH D and A
-                    // together — D's `cancel` then `close`,
-                    // then A's `toggle` to closed — leaving
-                    // M open, in both show orders where all
-                    // three coexist. API-closing D leaves A
-                    // open, so the double-close is
-                    // Escape-specific, not a side effect.
-                    // The full rule (multi-target Escape) is
-                    // a NEXT-WAVE item, deliberately not
-                    // built here: the current Escape
-                    // machinery assumes a single target
-                    // (`topmost_escape_target`,
-                    // `handle_escape`, `execute_escape`,
-                    // focus restore), and the modal+auto
-                    // and multi-auto/dialog matrix is still
-                    // unprobed — a half-probed multi-close
-                    // rule risks breaking pinned modal
-                    // single-target Escape. Until then,
-                    // None for the 3-stack closes nothing
-                    // rather than closing the wrong subset.
-                    let live_auto_below = self.top_layer[..self.top_layer.len().saturating_sub(1)]
-                        .iter()
-                        .any(|&n| {
-                            self.is_popover_open(n)
-                                && self.popover_state(n) == Some(PopoverState::Auto)
-                        });
-                    if live_auto_below {
-                        None
-                    } else {
-                        self.nonmodal_escape_target()
-                    }
-                }
-            }
-            None => self.nonmodal_escape_target(),
-        }
+    /// Every open dialog, newest-shown first (w86fix B1,
+    /// w86fix S2). Shared by [`Document::escape_targets`] and
+    /// [`Document::topmost_open_dialog`] so Escape and
+    /// light-dismiss agree on which dialog is topmost.
+    /// Primary key is the recorded show sequence (0 for a
+    /// dialog with no recorded show — markup `<dialog open>`,
+    /// which sorts as oldest); the tiebreak among equal
+    /// sequences is REVERSE DOCUMENT order, not the arena
+    /// index — a script `insertBefore` move changes document
+    /// position without changing the arena index, so keying
+    /// on `n.index()` kept the pre-move order. The vec below
+    /// is already in document order (`get_elements_by_tag_name`
+    /// traverses in document order), so reversing it and then
+    /// stable-sorting by sequence descending keeps equal-seq
+    /// peers in reverse document order.
+    fn open_dialogs_newest_first(&self) -> Vec<NodeId> {
+        let mut dialogs: Vec<NodeId> = self
+            .get_elements_by_tag_name("dialog")
+            .into_iter()
+            .filter(|&n| self.is_dialog_open(n))
+            .collect();
+        dialogs.reverse();
+        dialogs.sort_by_key(|&n| {
+            std::cmp::Reverse(self.dialog_show_seq.get(&n).copied().unwrap_or(0))
+        });
+        dialogs
     }
 
-    /// The non-modal fallback for
-    /// [`Document::topmost_escape_target`]: the last open
-    /// escapable non-modal dialog in document order (see the
-    /// method docs for the approximation note). Markup-open
-    /// dialogs count identically to API-shown ones (Chrome
+    /// What one Escape keyDown dismisses (Chrome 155,
+    /// w86-chrome-probes RESULTS.md verdict A): EVERY escapable
+    /// watcher live, in canonical order — all escapable dialogs
+    /// newest-first, then every open `auto` popover
+    /// newest-first (nested inner before outer). Callers run the
+    /// dialog `cancel`s newest-first, then the dialog `close`s
+    /// newest-first, then the auto hides+toggles newest-first.
+    /// Dialog order is SHOW order (w86fix B1, Chrome A3a/A3b):
+    /// a dialog shown later cancels first, whether modal or
+    /// not — the open-dialogs list is setup order across
+    /// kinds, so a non-modal shown after a modal cancels
+    /// first, and vice versa. A `cancel` on an Escape
+    /// `cancel` event cannot be prevented (Chrome 155 P2:
+    /// the event is `cancelable=false`), so callers must
+    /// use the non-cancelable Escape cancel path; a
+    /// prevented `cancel` here is a no-op. Manual and hint popovers are
+    /// never included and never block: a modal dialog below a
+    /// manual popover still closes (A6), as does a non-modal
+    /// dialog below one (probe 2 Q2). `closedby="none"` dialogs
+    /// are never included and never block anything below them
+    /// (A4/A5/A8). This is a pure query: the caller runs the
+    /// `cancel` check (dialogs) and fires the events before
+    /// closing/hiding.
+    ///
+    /// A non-modal dialog that is ALSO top-layered (a popover
+    /// dual) appears once, as a dialog — the autos pass below
+    /// skips every node already collected as a dialog
+    /// (w86fix B2). Markup-open dialogs count identically to API-shown ones (Chrome
     /// probe 2 Q1): open-ness here is the `open` attribute,
-    /// however it got set.
-    fn nonmodal_escape_target(&self) -> Option<EscapeTarget> {
-        self.get_elements_by_tag_name("dialog")
-            .into_iter()
-            .rev()
-            .find(|&n| {
-                self.is_dialog_open(n)
-                    && !self.is_dialog_modal(n)
-                    && matches!(
-                        self.computed_closed_by(n),
-                        ClosedBy::Any | ClosedBy::CloseRequest
-                    )
-            })
-            .map(EscapeTarget::NonModalDialog)
+    /// however it got set. The spec's close-watcher rule is
+    /// what makes explicit `closerequest`/`any` modal-independent:
+    /// only the Auto state distinguishes modal (CloseRequest)
+    /// from non-modal (None); if explicit values were also
+    /// modal-only, `closerequest` on a non-modal dialog would
+    /// be a dead state.
+    pub fn escape_targets(&self) -> Vec<EscapeTarget> {
+        let escapable = |n: NodeId| {
+            self.is_dialog_open(n)
+                && matches!(
+                    self.computed_closed_by(n),
+                    ClosedBy::Any | ClosedBy::CloseRequest
+                )
+        };
+        let mut out = Vec::new();
+        // All escapable dialogs, newest-shown first
+        // (w86fix B1/B2: one unified show-order pass, so a
+        // dual dialog is collected exactly once).
+        let mut dialog_nodes: Vec<NodeId> = Vec::new();
+        for n in self.open_dialogs_newest_first() {
+            if escapable(n) {
+                dialog_nodes.push(n);
+                out.push(if self.is_dialog_modal(n) {
+                    EscapeTarget::ModalDialog(n)
+                } else {
+                    EscapeTarget::NonModalDialog(n)
+                });
+            }
+        }
+        // Every open auto popover, newest first; modal dialogs
+        // are never in this set (w84fix C10: a modal dialog
+        // carrying `popover=auto` was never opened in popover
+        // mode, so it closes through the dialog arm, never the
+        // popover toggle path). Nodes already collected as
+        // dialogs are skipped (w86fix B2): a non-modal dual
+        // (`<dialog popover=auto>` open via both `show()` and
+        // `showPopover()`) closes through the dialog arm,
+        // which fires its dual toggle after `close`.
+        for &n in self.top_layer.iter().rev() {
+            if self.is_popover_open(n)
+                && self.popover_state(n) == Some(PopoverState::Auto)
+                && !self.is_dialog_modal(n)
+                && !dialog_nodes.contains(&n)
+            {
+                out.push(EscapeTarget::AutoPopover(n));
+            }
+        }
+        out
+    }
+
+    /// The first [`Document::escape_targets`] member, if any:
+    /// the single target the old single-winner Escape machinery
+    /// dismissed. Kept for callers and tests that only need one
+    /// target (a lone dialog, a lone popover); multi-target
+    /// callers use `escape_targets` directly. Note the first
+    /// member is a dialog whenever any escapable dialog is live,
+    /// even with an auto popover on top — dialogs precede autos
+    /// in the canonical order.
+    pub fn topmost_escape_target(&self) -> Option<EscapeTarget> {
+        self.escape_targets().into_iter().next()
     }
 
     /// The popover a press/release at `clicked` would light-dismiss,
@@ -3468,7 +3521,7 @@ impl Document {
     }
 
     /// Hide-all-until for popovers (w85, HTML §6.12): every
-    /// open `auto` popover above `ancestor` in top-layer
+    /// open `auto` OR `hint` popover above `ancestor` in top-layer
     /// order, returned topmost-first — the order their
     /// `toggle` events fire in. `ancestor` is the release
     /// ancestor from
@@ -3478,7 +3531,14 @@ impl Document {
     /// clicked inside likewise stops the set, so the autos
     /// below it survive). `None` (outside every popover,
     /// or inside a non-popover element such as a dialog)
-    /// hides every open auto popover. Modal dialogs are
+    /// hides every open auto/hint popover. Manual popovers
+    /// are never in the set (explicit dismiss only). Hint
+    /// popovers light-dismiss exactly like autos (w86fix P4:
+    /// Chrome 155 closes a hint over a modal after the
+    /// modal, same order as an auto); only ESCAPE excludes
+    /// hints (no probe covers hint Escape, so
+    /// [`Document::escape_targets`] stays auto-only).
+    /// Modal dialogs are
     /// never in the set (w84fix C10): a modal dialog
     /// carrying `popover=auto` was never opened in popover
     /// mode, so hiding it as a popover would strand its
@@ -3505,7 +3565,10 @@ impl Document {
                 break;
             }
             if self.top_layer.contains(&member)
-                && self.popover_state(member) == Some(PopoverState::Auto)
+                && matches!(
+                    self.popover_state(member),
+                    Some(PopoverState::Auto) | Some(PopoverState::Hint)
+                )
                 && !self.is_dialog_modal(member)
             {
                 out.push(member);
@@ -3515,28 +3578,14 @@ impl Document {
     }
 
     /// The topmost open dialog (WHATWG §4.11.5's last element
-    /// of the open dialogs list, approximated): the last
-    /// open dialog in top-layer order when any open dialog
-    /// is in the top layer, else the last open dialog in
-    /// document order. Bowser keeps no open-dialogs list
-    /// (spec order is setup order), so the non-top-layer
-    /// arm is a document-order approximation, documented
-    /// here rather than hidden. A dialog shown via
+    /// of the open dialogs list): the last-shown open dialog,
+    /// in show order (w86fix B1) — dialogs with no recorded
+    /// show (markup `<dialog open>`) fall back to document
+    /// order among themselves. A dialog shown via
     /// `showPopover` alone is not open (no `open`
     /// attribute) and never counts here.
     pub fn topmost_open_dialog(&self) -> Option<NodeId> {
-        if let Some(&dialog) = self
-            .top_layer
-            .iter()
-            .rev()
-            .find(|n| self.is_dialog_open(**n))
-        {
-            return Some(dialog);
-        }
-        self.get_elements_by_tag_name("dialog")
-            .into_iter()
-            .rev()
-            .find(|&n| self.is_dialog_open(n))
+        self.open_dialogs_newest_first().into_iter().next()
     }
 
     /// The nearest open-dialog ancestor-or-self of `clicked`,
@@ -6661,37 +6710,38 @@ mod w81_light_dismiss_tests {
     #[test]
     fn escape_target_is_top_layer_member_only() {
         let mut doc = Document::new();
-        assert_eq!(doc.topmost_escape_target(), None, "nothing open");
+        assert_eq!(
+            doc.escape_targets(),
+            Vec::<EscapeTarget>::new(),
+            "nothing open"
+        );
         let host = stage(&mut doc);
         let dlg = open_modal(&mut doc, host);
-        assert_eq!(
-            doc.topmost_escape_target(),
-            Some(EscapeTarget::ModalDialog(dlg))
-        );
-        // An auto popover promoted above the dialog wins the key.
+        assert_eq!(doc.escape_targets(), vec![EscapeTarget::ModalDialog(dlg)]);
+        // An auto popover above the dialog does not win
+        // outright: the dialog precedes it in canonical
+        // order, and one Escape closes both (w86 A1).
         let pop = open_popover(&mut doc, host, "auto");
         assert_eq!(
-            doc.topmost_escape_target(),
-            Some(EscapeTarget::AutoPopover(pop))
+            doc.escape_targets(),
+            vec![
+                EscapeTarget::ModalDialog(dlg),
+                EscapeTarget::AutoPopover(pop)
+            ]
         );
         // Hiding the popover hands the key back to the dialog.
         doc.hide_popover(pop).expect("hide");
-        assert_eq!(
-            doc.topmost_escape_target(),
-            Some(EscapeTarget::ModalDialog(dlg))
-        );
-        // A manual popover on top dismisses nothing, even with a
-        // dismissible dialog below it.
+        assert_eq!(doc.escape_targets(), vec![EscapeTarget::ModalDialog(dlg)]);
+        // A manual popover on top dismisses nothing itself,
+        // and does not block the dialog below it (w86 A6).
         let manual = open_popover(&mut doc, host, "manual");
-        assert_eq!(doc.topmost_escape_target(), None);
+        assert_eq!(doc.escape_targets(), vec![EscapeTarget::ModalDialog(dlg)]);
         doc.hide_popover(manual).expect("hide manual");
-        assert_eq!(
-            doc.topmost_escape_target(),
-            Some(EscapeTarget::ModalDialog(dlg))
-        );
-        // A hint popover on top likewise blocks the key.
+        assert_eq!(doc.escape_targets(), vec![EscapeTarget::ModalDialog(dlg)]);
+        // A hint popover on top likewise neither closes nor
+        // blocks.
         let hint = open_popover(&mut doc, host, "hint");
-        assert_eq!(doc.topmost_escape_target(), None);
+        assert_eq!(doc.escape_targets(), vec![EscapeTarget::ModalDialog(dlg)]);
         doc.hide_popover(hint).expect("hide hint");
     }
 
@@ -6997,8 +7047,7 @@ mod w81_light_dismiss_tests {
         doc.set_attribute(inner, "popover", "auto");
         doc.show_popover(inner).expect("show nested auto");
         let clicked = attached(&mut doc, inner, "span");
-        doc.hide_popover_deferred(inner, 60.0)
-            .expect("hide inner");
+        doc.hide_popover_deferred(inner, 60.0).expect("hide inner");
         assert!(doc.is_exit_retained(inner));
         assert_eq!(
             doc.light_dismiss_popover(Some(clicked)),
@@ -7008,53 +7057,94 @@ mod w81_light_dismiss_tests {
         assert!(doc.is_popover_open(outer));
         assert!(doc.is_exit_retained(inner));
         // Control: an outside click still hides the live auto.
-        assert_eq!(
-            doc.light_dismiss_popover(None),
-            vec![outer]
-        );
+        assert_eq!(doc.light_dismiss_popover(None), vec![outer]);
         assert!(!doc.is_popover_open(outer));
     }
 
     #[test]
-    fn escape_none_modal_on_top_returns_none_without_fallthrough() {
-        // w85 pin, no behavior change: a modal dialog
-        // with closedby=none on top returns None, and
-        // does NOT fall through to an escapable non-modal
-        // dialog below it. Whether Chrome falls through
-        // below a none-modal is UNPROBED (no Chrome datum
-        // covers a none-modal above an escapable dialog);
-        // the None here is Bowser's current answer,
-        // pinned, not a Chrome-verified rule.
+    fn escape_none_dialogs_never_block_fallthrough() {
+        // w86, Chrome 155 A4/A5/A8: a closedby=none dialog
+        // (modal or not) never closes on Escape and NEVER
+        // blocks anything below it — the escapable dialog
+        // below still closes, and an auto above a none-modal
+        // still closes. The w85 pin (None, no fallthrough)
+        // is replaced: A8 contradicts it directly.
+        // A8: escapable non-modal dialog below a none modal.
         let mut doc = Document::new();
         let host = stage(&mut doc);
         let below = attached(&mut doc, host, "dialog");
         doc.set_attribute(below, "closedby", "any");
         doc.show_dialog(below).expect("show non-modal");
         assert_eq!(
-            doc.topmost_escape_target(),
-            Some(EscapeTarget::NonModalDialog(below))
+            doc.escape_targets(),
+            vec![EscapeTarget::NonModalDialog(below)]
         );
         let modal = attached(&mut doc, host, "dialog");
         doc.set_attribute(modal, "closedby", "none");
         doc.show_dialog_modal(modal).expect("showModal");
         assert_eq!(doc.top_layer().last(), Some(&modal));
         assert_eq!(
-            doc.topmost_escape_target(),
-            None,
-            "closedby=none modal blocks Escape with no fallthrough to the escapable dialog below"
+            doc.escape_targets(),
+            vec![EscapeTarget::NonModalDialog(below)],
+            "none modal must not block Escape to the escapable dialog below (A8)"
         );
         assert!(doc.is_dialog_open(below));
+        assert!(doc.is_dialog_open(modal));
+
+        // A5: none non-modal above an escapable dialog, both
+        // show orders.
+        for none_first in [true, false] {
+            let mut doc = Document::new();
+            let host = stage(&mut doc);
+            let esc = attached(&mut doc, host, "dialog");
+            doc.set_attribute(esc, "closedby", "any");
+            let none = attached(&mut doc, host, "dialog");
+            doc.set_attribute(none, "closedby", "none");
+            if none_first {
+                doc.show_dialog(none).expect("show none");
+                doc.show_dialog(esc).expect("show escapable");
+            } else {
+                doc.show_dialog(esc).expect("show escapable");
+                doc.show_dialog(none).expect("show none");
+            }
+            assert_eq!(
+                doc.escape_targets(),
+                vec![EscapeTarget::NonModalDialog(esc)],
+                "none_first={none_first}: fallthrough below a none non-modal (A5)"
+            );
+        }
+
+        // A4: none modal + auto: only the auto closes.
+        let mut doc = Document::new();
+        let host = stage(&mut doc);
+        let modal = attached(&mut doc, host, "dialog");
+        doc.set_attribute(modal, "closedby", "none");
+        doc.show_dialog_modal(modal).expect("showModal");
+        let auto = open_popover(&mut doc, host, "auto");
+        assert_eq!(
+            doc.escape_targets(),
+            vec![EscapeTarget::AutoPopover(auto)],
+            "none modal must not block Escape to the auto above it (A4)"
+        );
+
+        // Control: a lone none dialog (modal or not) has no
+        // Escape target at all.
+        let mut doc = Document::new();
+        let host = stage(&mut doc);
+        let modal = attached(&mut doc, host, "dialog");
+        doc.set_attribute(modal, "closedby", "none");
+        doc.show_dialog_modal(modal).expect("showModal");
+        assert_eq!(doc.escape_targets(), Vec::<EscapeTarget>::new());
     }
 
     #[test]
-    fn nonmodal_escape_and_topmost_dialog_use_document_order_not_show_order() {
-        // w85 pin, no behavior change: Bowser keeps no
-        // open-dialogs (setup-order) list, so both the
-        // non-modal Escape fallback and topmost_open_dialog
-        // fall back to document order. When show order
-        // disagrees with document order, the
-        // document-last escapable dialog wins in both
-        // show orders.
+    fn nonmodal_escape_and_topmost_dialog_use_show_order() {
+        // w86fix B1, Chrome 155 A3a/A3b: Escape order is
+        // SHOW order, not document order — the last-shown
+        // dialog cancels first in both show orders. This
+        // replaces the w85/w86 pin that asserted
+        // document-last wins (falsified by A3b: show D2
+        // then D1 → cancels D1,D2).
         for second_shown_first in [false, true] {
             let mut doc = Document::new();
             let host = stage(&mut doc);
@@ -7073,17 +7163,189 @@ mod w81_light_dismiss_tests {
                 doc.top_layer().is_empty(),
                 "non-modal dialogs are not top-layered"
             );
+            let (newest, oldest) = if second_shown_first {
+                (first, second)
+            } else {
+                (second, first)
+            };
             assert_eq!(
                 doc.topmost_escape_target(),
-                Some(EscapeTarget::NonModalDialog(second)),
-                "second_shown_first={second_shown_first}: document-last wins, not last-shown"
+                Some(EscapeTarget::NonModalDialog(newest)),
+                "second_shown_first={second_shown_first}: last-shown wins, not document-last"
             );
             assert_eq!(
                 doc.topmost_open_dialog(),
-                Some(second),
+                Some(newest),
                 "second_shown_first={second_shown_first}"
             );
+            assert_eq!(
+                doc.escape_targets(),
+                vec![
+                    EscapeTarget::NonModalDialog(newest),
+                    EscapeTarget::NonModalDialog(oldest),
+                ],
+                "second_shown_first={second_shown_first}: Escape newest-first by show order (A3)"
+            );
         }
+    }
+
+    #[test]
+    fn markup_open_dialogs_fall_back_to_document_order() {
+        // w86fix B1: dialogs with no recorded show (bare
+        // `open` attribute from the parser, which builds
+        // elements with attributes directly and never
+        // routes through `set_attribute`) have no show
+        // sequence, so they order among themselves by
+        // document order (document-last first), and sort
+        // as older than any API-shown dialog.
+        let (mut doc, _) = Document::parse_html(
+            b"<html><body><dialog id=\"a\" closedby=\"any\" open>x</dialog>\
+              <dialog id=\"b\" closedby=\"any\" open>y</dialog></body></html>",
+        );
+        let first = doc.get_element_by_id("a").expect("a");
+        let second = doc.get_element_by_id("b").expect("b");
+        assert_eq!(
+            doc.escape_targets(),
+            vec![
+                EscapeTarget::NonModalDialog(second),
+                EscapeTarget::NonModalDialog(first),
+            ],
+            "markup-open dialogs fall back to document order among themselves"
+        );
+        assert_eq!(doc.topmost_open_dialog(), Some(second));
+        // And an API-shown dialog sorts newer than both.
+        let shown = {
+            let body = doc
+                .get_elements_by_tag_name("body")
+                .into_iter()
+                .next()
+                .expect("body");
+            let d = doc.create_element("dialog");
+            doc.append_child(body, d);
+            doc.set_attribute(d, "closedby", "any");
+            doc.show_dialog(d).expect("show");
+            d
+        };
+        assert_eq!(
+            doc.escape_targets(),
+            vec![
+                EscapeTarget::NonModalDialog(shown),
+                EscapeTarget::NonModalDialog(second),
+                EscapeTarget::NonModalDialog(first),
+            ],
+            "API-shown dialog is newer than markup-open ones"
+        );
+        // w86fix S2: moving a markup-open dialog with
+        // `insertBefore` flips the tiebreak — the order follows
+        // live document position, not the arena index (which
+        // the move does not change). Move `a` after `b` (i.e.
+        // `b` before `a`) and the newest-first order becomes
+        // [shown, a, b] (the API-shown dialog stays newest).
+        let body = doc
+            .get_elements_by_tag_name("body")
+            .into_iter()
+            .next()
+            .expect("body");
+        doc.insert_before(body, second, Some(first));
+        assert_eq!(
+            doc.escape_targets(),
+            vec![
+                EscapeTarget::NonModalDialog(shown),
+                EscapeTarget::NonModalDialog(first),
+                EscapeTarget::NonModalDialog(second),
+            ],
+            "moved markup-open dialogs re-tiebreak by live document order"
+        );
+    }
+
+    #[test]
+    fn escape_targets_mixed_modal_nonmodal_show_order() {
+        // w86fix B1/S7: the open-dialogs list is setup
+        // order ACROSS kinds — a non-modal shown after a
+        // modal cancels first, and a modal shown after a
+        // non-modal cancels first. No w86 probe mixes the
+        // kinds; this is the A3 rule extrapolated across
+        // them, matching the spec's single setup-order list.
+        // Modal first, non-modal second.
+        let mut doc = Document::new();
+        let host = stage(&mut doc);
+        let modal = attached(&mut doc, host, "dialog");
+        doc.set_attribute(modal, "closedby", "any");
+        doc.show_dialog_modal(modal).expect("showModal");
+        let nonmodal = attached(&mut doc, host, "dialog");
+        doc.set_attribute(nonmodal, "closedby", "any");
+        doc.show_dialog(nonmodal).expect("show non-modal");
+        assert_eq!(
+            doc.escape_targets(),
+            vec![
+                EscapeTarget::NonModalDialog(nonmodal),
+                EscapeTarget::ModalDialog(modal),
+            ],
+            "non-modal shown after modal cancels first"
+        );
+        assert_eq!(doc.topmost_open_dialog(), Some(nonmodal));
+        // Non-modal first, modal second.
+        let mut doc = Document::new();
+        let host = stage(&mut doc);
+        let nonmodal = attached(&mut doc, host, "dialog");
+        doc.set_attribute(nonmodal, "closedby", "any");
+        doc.show_dialog(nonmodal).expect("show non-modal");
+        let modal = attached(&mut doc, host, "dialog");
+        doc.set_attribute(modal, "closedby", "any");
+        doc.show_dialog_modal(modal).expect("showModal");
+        assert_eq!(
+            doc.escape_targets(),
+            vec![
+                EscapeTarget::ModalDialog(modal),
+                EscapeTarget::NonModalDialog(nonmodal),
+            ],
+            "modal shown after non-modal cancels first"
+        );
+        assert_eq!(doc.topmost_open_dialog(), Some(modal));
+        // Three-way interleave: D1, MD, D2 → D2, MD, D1.
+        let mut doc = Document::new();
+        let host = stage(&mut doc);
+        let d1 = attached(&mut doc, host, "dialog");
+        doc.set_attribute(d1, "closedby", "any");
+        doc.show_dialog(d1).expect("show d1");
+        let md = attached(&mut doc, host, "dialog");
+        doc.set_attribute(md, "closedby", "any");
+        doc.show_dialog_modal(md).expect("showModal");
+        let d2 = attached(&mut doc, host, "dialog");
+        doc.set_attribute(d2, "closedby", "any");
+        doc.show_dialog(d2).expect("show d2");
+        assert_eq!(
+            doc.escape_targets(),
+            vec![
+                EscapeTarget::NonModalDialog(d2),
+                EscapeTarget::ModalDialog(md),
+                EscapeTarget::NonModalDialog(d1),
+            ],
+            "interleaved show order is a single newest-first list"
+        );
+    }
+
+    #[test]
+    fn escape_targets_dual_dialog_listed_once() {
+        // w86fix B2: a `<dialog popover=auto>` open via
+        // both `show()` and `showPopover()` is one Escape
+        // target (NonModalDialog), not two — the autos pass
+        // skips nodes already collected as dialogs. (The
+        // prevented-cancel half of this case is pinned at
+        // the window/testdriver level, where the Escape
+        // cancel is non-cancelable per Chrome 155 P2.)
+        let mut doc = Document::new();
+        let host = stage(&mut doc);
+        let dual = attached(&mut doc, host, "dialog");
+        doc.set_attribute(dual, "popover", "auto");
+        doc.set_attribute(dual, "closedby", "any");
+        doc.show_popover(dual).expect("showPopover");
+        doc.show_dialog(dual).expect("show dialog");
+        assert_eq!(
+            doc.escape_targets(),
+            vec![EscapeTarget::NonModalDialog(dual)],
+            "dual dialog must appear exactly once in escape_targets"
+        );
     }
 
     #[test]
@@ -7341,8 +7603,11 @@ mod w81_light_dismiss_tests {
             }
         }
         // A hint popover on top likewise does not block the
-        // non-modal watcher, while a modal dialog below a
-        // manual popover stays blocked (w84 pin, kept).
+        // A hint popover on top likewise does not block the
+        // non-modal watcher. A modal dialog below a manual
+        // popover is NOT blocked either (w86, Chrome 155 A6:
+        // Escape closes the modal and leaves the manual open,
+        // in both show orders) — the old w84 pin said blocked.
         let mut doc = Document::new();
         let host = stage(&mut doc);
         let hint = open_popover(&mut doc, host, "hint");
@@ -7354,20 +7619,30 @@ mod w81_light_dismiss_tests {
             Some(EscapeTarget::NonModalDialog(dlg))
         );
         assert!(doc.is_popover_open(hint));
+
+        // Modal below a manual popover (A6): the modal is
+        // still an Escape target; the manual never is.
+        let mut doc = Document::new();
+        let host = stage(&mut doc);
+        let modal = open_modal(&mut doc, host);
+        let manual = open_popover(&mut doc, host, "manual");
+        assert_eq!(
+            doc.escape_targets(),
+            vec![EscapeTarget::ModalDialog(modal)],
+            "modal below a manual popover still closes on Escape"
+        );
+        assert!(doc.is_popover_open(manual));
     }
 
     #[test]
-    fn escape_manual_over_auto_does_not_fall_through_to_dialog() {
-        // w85fix re-review: a live auto below a
-        // watcher-less top member blocks the non-modal
-        // dialog fallback — the fallback runs only when
-        // no live auto remains below the top. Probe 3
-        // shows Chrome closes BOTH the dialog and the
-        // auto on one Escape; that multi-target rule is
-        // a next-wave item (see the
-        // `topmost_escape_target` comment), so the
-        // honest stopgap answer here is None, not the
-        // dialog and not a guessed single winner.
+    fn escape_manual_over_auto_closes_dialog_and_auto() {
+        // w86, Chrome 155 probe 3 / verdict A: one Escape
+        // closes BOTH the escapable dialog and the live auto
+        // below a watcher-less top member, dialog first,
+        // leaving the manual popover open — in both
+        // constructions where all three coexist. The w85
+        // stopgap (None: the live auto blocks the dialog
+        // fallback) is replaced by the multi-target rule.
         // Construction note: production `show_dialog`
         // hides a non-ancestor auto, so the dialog must
         // be shown first (or nested inside the auto) for
@@ -7399,16 +7674,21 @@ mod w81_light_dismiss_tests {
                 "dialog_first={dialog_first}: manual must be top"
             );
             assert_eq!(
-                doc.topmost_escape_target(),
-                None,
-                "dialog_first={dialog_first}: live auto below manual must block the dialog fallback"
+                doc.escape_targets(),
+                vec![
+                    EscapeTarget::NonModalDialog(dlg),
+                    EscapeTarget::AutoPopover(auto),
+                ],
+                "dialog_first={dialog_first}: dialog and auto both close, manual never does"
             );
             assert!(doc.is_popover_open(auto));
             assert!(doc.is_popover_open(manual));
             assert!(doc.is_dialog_open(dlg));
         }
         // Control: the same stack without the auto still
-        // falls through, and an auto on top still wins.
+        // falls through, and an auto on top no longer wins
+        // outright — the dialog precedes it in canonical
+        // order, and both close on one Escape.
         let mut doc = Document::new();
         let host = stage(&mut doc);
         let manual = open_popover(&mut doc, host, "manual");
@@ -7416,17 +7696,100 @@ mod w81_light_dismiss_tests {
         doc.set_attribute(dlg, "closedby", "any");
         doc.show_dialog(dlg).expect("show dialog");
         assert_eq!(
-            doc.topmost_escape_target(),
-            Some(EscapeTarget::NonModalDialog(dlg)),
+            doc.escape_targets(),
+            vec![EscapeTarget::NonModalDialog(dlg)],
             "no live auto below: fallthrough survives"
         );
         let auto = open_popover(&mut doc, host, "auto");
         assert_eq!(
-            doc.topmost_escape_target(),
-            Some(EscapeTarget::AutoPopover(auto)),
-            "auto on top still wins outright"
+            doc.escape_targets(),
+            vec![
+                EscapeTarget::NonModalDialog(dlg),
+                EscapeTarget::AutoPopover(auto),
+            ],
+            "auto on top no longer wins outright: dialog first, auto second"
         );
         assert!(doc.is_popover_open(manual));
+    }
+
+    #[test]
+    fn escape_targets_two_dialogs_and_nested_autos() {
+        // w86fix B1, Chrome 155 A3a/A3b: two non-modal
+        // closedby=any dialogs both close, newest first
+        // by SHOW order — last-shown first in both
+        // configurations (the old comment claimed
+        // document order stands in for show order; A3b
+        // falsifies that).
+        for second_shown_first in [false, true] {
+            let mut doc = Document::new();
+            let host = stage(&mut doc);
+            let first = attached(&mut doc, host, "dialog");
+            doc.set_attribute(first, "closedby", "any");
+            let second = attached(&mut doc, host, "dialog");
+            doc.set_attribute(second, "closedby", "any");
+            if second_shown_first {
+                doc.show_dialog(second).expect("show second");
+                doc.show_dialog(first).expect("show first");
+            } else {
+                doc.show_dialog(first).expect("show first");
+                doc.show_dialog(second).expect("show second");
+            }
+            let (newest, oldest) = if second_shown_first {
+                (first, second)
+            } else {
+                (second, first)
+            };
+            assert_eq!(
+                doc.escape_targets(),
+                vec![
+                    EscapeTarget::NonModalDialog(newest),
+                    EscapeTarget::NonModalDialog(oldest),
+                ],
+                "second_shown_first={second_shown_first}: both dialogs, last-shown first (A3)"
+            );
+        }
+
+        // A7: two dialogs + one auto — dialogs first
+        // (newest first), then the auto.
+        let mut doc = Document::new();
+        let host = stage(&mut doc);
+        let d1 = attached(&mut doc, host, "dialog");
+        doc.set_attribute(d1, "closedby", "any");
+        doc.show_dialog(d1).expect("show d1");
+        let d2 = attached(&mut doc, host, "dialog");
+        doc.set_attribute(d2, "closedby", "any");
+        doc.show_dialog(d2).expect("show d2");
+        let auto = open_popover(&mut doc, host, "auto");
+        assert_eq!(
+            doc.escape_targets(),
+            vec![
+                EscapeTarget::NonModalDialog(d2),
+                EscapeTarget::NonModalDialog(d1),
+                EscapeTarget::AutoPopover(auto),
+            ],
+            "A7: cancels/closes run dialog-newest-first, auto last"
+        );
+
+        // A2c: dialog + nested autos — inner auto before
+        // outer auto (newest first in top-layer order).
+        let mut doc = Document::new();
+        let host = stage(&mut doc);
+        let dlg = attached(&mut doc, host, "dialog");
+        doc.set_attribute(dlg, "closedby", "any");
+        doc.show_dialog(dlg).expect("show dialog");
+        let outer = open_popover(&mut doc, host, "auto");
+        let inner = attached(&mut doc, outer, "div");
+        doc.set_attribute(inner, "popover", "auto");
+        doc.show_popover(inner).expect("show nested auto");
+        assert_eq!(
+            doc.escape_targets(),
+            vec![
+                EscapeTarget::NonModalDialog(dlg),
+                EscapeTarget::AutoPopover(inner),
+                EscapeTarget::AutoPopover(outer),
+            ],
+            "A2c: nested autos close inner before outer"
+        );
     }
 
     #[test]

@@ -1138,32 +1138,55 @@ fn cb_scrollable_size(
     (w.max(0.0), h.max(0.0))
 }
 
-/// Scrollport `(origin, size, live scroll offset)` for one axis of the
-/// sticky box `i`: the scrollport of the nearest scroll container with
-/// a matching scrollable axis (see [`sticky_scroller`]), or the
-/// viewport's when the box scrolls with the viewport on that axis. The
-/// scroll offset is measured from the content origin, so the view
-/// rectangle's origin in document coordinates is the content-box
-/// origin, not the padding-box origin: a scroller's padding offsets
-/// the stuck position by that padding (WPT
-/// `position-sticky-overflow-padding`: with 20px top padding a
+/// Scrollport `(origin, size, live scroll offset, near padding, far
+/// padding)` for one axis of the sticky box `i`: the scrollport of the
+/// nearest scroll container with a matching scrollable axis (see
+/// [`sticky_scroller`]), or the viewport's when the box scrolls with
+/// the viewport on that axis. The scroll offset is measured from the
+/// content origin, so the view rectangle's origin in document
+/// coordinates is the content-box origin, not the padding-box origin:
+/// a scroller's padding offsets the stuck position by that padding
+/// (WPT `position-sticky-overflow-padding`: with 20px top padding a
 /// `top: 0` box sticks at scroll + 20, and at scroll 315 the
 /// containing-block bound, not the scrollport, pins it at 320). The
 /// origin is therefore deliberately NOT moved here (w79: the
 /// start-edge pins are untouched).
-/// The SIZE term, however, is the scrollport's own extent, and the
-/// scrollport IS the padding box (CSS Overflow 3 §2.3: the visual
-/// viewport of a scroll container "coincides with its padding box,
-/// and is called the scrollport"; CSS Position 3 §3.4: the sticky
-/// view rectangle is the scrollport inset by the sticky offsets).
-/// Pre-w79 the size subtracted borders AND paddings (the content
-/// box), so a `bottom: 0` / `right: 0` box in a padded scroller was
-/// pinned a full padding short of the scrollport's far edge. Since
-/// w79 the size subtracts borders only. That size change is the
-/// whole w79 far-edge fix: `sticky_cb` is NOT changed — the
-/// containing-block bound is a different rectangle (the containing
-/// block of a block container is its content box), and its padded
-/// pins (`w78_sticky_padded_cb_margin_counts_at_*`) stay as they are.
+///
+/// The SIZE term is the scrollport's client size: the border-box size
+/// minus borders (w79: the scrollport IS the padding box, CSS
+/// Overflow 3 §2.3 — the pre-w79 content-box size pinned a `bottom:
+/// 0` / `right: 0` box a full padding short of the far edge), minus
+/// the forced classic scrollbar strip on the perpendicular axis
+/// (w86: `overflow: scroll` always shows that scrollbar and its
+/// thickness comes out of the client size — Chrome 155 C4 reports
+/// client 85x225 under 15px bars where the border box is 100x240;
+/// Bowser's own thickness is [`crate::SCROLLBAR_THICKNESS`], so the
+/// strip here is 12px, not 15px). The strip sits on the far edge for
+/// the vertical axis (the horizontal scrollbar) and on the inline-end
+/// edge for the horizontal axis (the vertical scrollbar: the right
+/// under LTR, the left under RTL — under RTL it also shifts the
+/// content origin past itself, matching the forced-scrollbar
+/// reservation in `crate::forced_scrollbar_reservation`, which lays
+/// children out past the left strip). `overflow: auto` scrollbars are
+/// NOT subtracted: whether one shows depends on the overflow extent,
+/// which this pass does not measure (the `scroll` case is the pinned
+/// one; an `auto` scroller with overflowing content sticks up to one
+/// strip too far — a known gap, see the w86 gutter test).
+///
+/// The FAR EDGE the caller derives from this is the scrollport's
+/// CONTENT-box edge, not the padding-box edge: Chrome 155 (w86
+/// probes §C, re-running the w79 baseline page) sticks a `bottom: 0`
+/// box's bottom edge at `clientHeight - paddingBottom` — 220, not
+/// 260, for the w79 padded geometry — so the caller subtracts both
+/// paddings from the size term when forming the far clamp. The w79
+/// size term above is preserved as the base: only the border (and
+/// the forced strip) come out of it here; the paddings come out in
+/// the clamp in [`apply_sticky_constraints`]. Reconciliation
+/// (w86fix nit): the two readings do not contradict — CSS Overflow
+/// 3 §2.3 governs the SIZE term (the scrollport IS the padding
+/// box), while the Chrome §C datum governs the FAR EDGE derived
+/// from it (the content-box edge); the paddings are the difference
+/// between the two, and they are subtracted in the clamp, not here.
 /// The nested scroller's offset comes from `nested_offsets` (see
 /// [`nested_scroll_offset`]); inside a `fixed` subtree with no scroll
 /// container of its own the viewport frame constrains at a zero offset
@@ -1177,21 +1200,56 @@ fn sticky_scrollport_axis(
     horizontal: bool,
     doc_scroll: f32,
     vp_size: f32,
-) -> (f32, f32, f32) {
+) -> (f32, f32, f32, f32, f32) {
     match sticky_scroller(forest, i, fixed_limit, horizontal) {
         Some(p) => {
             let n = &forest.nodes[p];
             let m = &n.metrics;
             let (sx, sy) = nested_scroll_offset(forest, p, nested_offsets);
             let s = if horizontal { sx } else { sy };
+            // Forced classic scrollbar strip on the perpendicular axis
+            // (see the fn docs): `overflow: scroll` always shows it.
+            let forced = |prop: u8| {
+                n.style.as_ref().is_some_and(|st| {
+                    st.get_str_by_index(prop)
+                        .is_some_and(|v| v.eq_ignore_ascii_case("scroll"))
+                })
+            };
             if horizontal {
-                (n.rect.x + m.bl + m.pl, (n.rect.w - m.bl - m.br).max(0.0), s)
+                let strip = if forced(props::OVERFLOW_Y) {
+                    crate::SCROLLBAR_THICKNESS
+                } else {
+                    0.0
+                };
+                // Under RTL the vertical strip sits on the left and the
+                // content origin moves past it (matching the layout
+                // reservation); under LTR it sits on the right and the
+                // origin is untouched.
+                let origin = n.rect.x + m.bl + m.pl + if n.data.rtl { strip } else { 0.0 };
+                (
+                    origin,
+                    (n.rect.w - m.bl - m.br - strip).max(0.0),
+                    s,
+                    m.pl,
+                    m.pr,
+                )
             } else {
-                (n.rect.y + m.bt + m.pt, (n.rect.h - m.bt - m.bb).max(0.0), s)
+                let strip = if forced(props::OVERFLOW_X) {
+                    crate::SCROLLBAR_THICKNESS
+                } else {
+                    0.0
+                };
+                (
+                    n.rect.y + m.bt + m.pt,
+                    (n.rect.h - m.bt - m.bb - strip).max(0.0),
+                    s,
+                    m.pt,
+                    m.pb,
+                )
             }
         }
-        None if fixed_limit.is_some() => (0.0, vp_size, 0.0),
-        None => (0.0, vp_size, doc_scroll),
+        None if fixed_limit.is_some() => (0.0, vp_size, 0.0, 0.0, 0.0),
+        None => (0.0, vp_size, doc_scroll, 0.0, 0.0),
     }
 }
 
@@ -1415,7 +1473,15 @@ fn nested_scroll_offset(
 ///    axis are `auto`, in which case the axis is unconstrained). The
 ///    box's *border* box is clamped into it: it sticks when scrolling
 ///    would move a border edge outside the rectangle, and unsticks when
-///    scrolled back. Over-constrained ranges resolve to the start side —
+///    scrolled back. The far edge of that rectangle is the scrollport's
+///    CONTENT-box edge (w86, Chrome 155 §C: a `bottom: 0` box's bottom
+///    edge sticks at `client - far padding`; the w79 padding-box far
+///    edge sat a full near+far padding too far). The far-edge result
+///    is additionally floored by the containing block (w86: `offset =
+///    max(cbEdge, min(natural, ceiling))` — when the ceiling would
+///    push the box above its containing-block edge it parks there and
+///    slides with scroll until the ceiling relaxes past the floor).
+///    Over-constrained ranges resolve to the start side —
 ///    the `top` edge always, the `left` edge in LTR and the `right` edge
 ///    in RTL (the containing block's writing mode). The nested scroller's
 ///    offset comes from `nested_offsets`, keyed by the scroller's DOM
@@ -1533,9 +1599,16 @@ pub(crate) fn apply_sticky_constraints(
         //    matching scrollable axis (see [`sticky_scroller`]). An axis
         //    whose insets are both `auto` is unconstrained: the box stays
         //    where it was laid out there.
-        let (sp_x, sp_w, sp_sx) =
+        //
+        //    The far edge is the scrollport's CONTENT-box edge (w86,
+        //    Chrome 155 §C): the far clamp subtracts both paddings from
+        //    the client size, so a `bottom: 0` box's bottom edge lands at
+        //    `client - far padding`, not at the padding-box edge the w79
+        //    model used (which sat a full near+far padding too far: 160
+        //    where Chrome puts 120 for the padded geometry).
+        let (sp_x, sp_w, sp_sx, sp_pl, sp_pr) =
             sticky_scrollport_axis(forest, i, fixed_limit, nested_offsets, true, scroll_x, vp_w);
-        let (sp_y, sp_h, sp_sy) = sticky_scrollport_axis(
+        let (sp_y, sp_h, sp_sy, sp_pt, sp_pb) = sticky_scrollport_axis(
             forest,
             i,
             fixed_limit,
@@ -1549,7 +1622,7 @@ pub(crate) fn apply_sticky_constraints(
         } else {
             let s_lo_x = left.map(|l| sp_x + sp_sx + l).unwrap_or(f32::NEG_INFINITY);
             let s_hi_x = right
-                .map(|r| sp_x + sp_sx + sp_w - r - bw)
+                .map(|r| sp_x + sp_sx + (sp_w - sp_pl - sp_pr).max(0.0) - r - bw)
                 .unwrap_or(f32::INFINITY);
             clamp_start_wins(px, s_lo_x, s_hi_x, !cb_rtl)
         };
@@ -1558,15 +1631,13 @@ pub(crate) fn apply_sticky_constraints(
         } else {
             let s_lo_y = top.map(|t| sp_y + sp_sy + t).unwrap_or(f32::NEG_INFINITY);
             let s_hi_y = bottom
-                .map(|b| sp_y + sp_sy + sp_h - b - bh)
+                .map(|b| sp_y + sp_sy + (sp_h - sp_pt - sp_pb).max(0.0) - b - bh)
                 .unwrap_or(f32::INFINITY);
             clamp_start_wins(py, s_lo_y, s_hi_y, true)
         };
-        // 2. containing-block bound on the position box (see [`sticky_cb`]).
-        //    When the CB is itself a scroll container the bound uses its
-        //    scrollable overflow size (see [`cb_scrollable_size`]); when
-        //    the position box exceeds the bound the proviso is vacuous
-        //    and the axis is skipped.
+        // The containing-block bound below needs the CB's scrollable
+        // size when the CB is itself a scroll container (see
+        // [`cb_scrollable_size`]); otherwise the CB's own size.
         let (bound_w, bound_h) = match cb_node {
             Some(c) => {
                 let sx = is_scroll_container_axis(forest, c, true);
@@ -1582,6 +1653,19 @@ pub(crate) fn apply_sticky_constraints(
             }
             None => (vp_w, vp_h),
         };
+        // 2. containing-block bound on the position box (see [`sticky_cb`]).
+        //    When the CB is itself a scroll container the bound uses its
+        //    scrollable overflow size (see [`cb_scrollable_size`]); when
+        //    the position box exceeds the bound the proviso is vacuous
+        //    and the axis is skipped.
+        //    The clamp's lower bound IS the containing-block floor
+        //    (Chrome 155 C4a2/E1/E2): when the scrollport ceiling would
+        //    push the box above its containing-block edge, the clamp
+        //    parks it at that edge and it slides with scroll until the
+        //    ceiling relaxes past the floor. No separate floor step is
+        //    needed — the former step 1b `max` against the same edge
+        //    was a provable no-op (its gates are exactly this step's
+        //    run conditions) and was removed (w86fix).
         let fx = if left.is_none() && right.is_none() || mw > bound_w {
             qx
         } else {

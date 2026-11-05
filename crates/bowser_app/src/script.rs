@@ -2194,6 +2194,54 @@ impl PageEventDispatch {
     }
 }
 
+/// Shared body of [`crate::window::JsDispatch::dispatch_cancel`]
+/// and `dispatch_cancel_escape`: trusted host `cancel` dispatch
+/// (w83 single-wrapper inline mechanism, reentrancy gate,
+/// error/pump discipline — see `dispatch_close` for the same
+/// shape). `escape == true` fires the non-cancelable Escape
+/// shape (Chrome 155 P2: `preventDefault()` is a no-op, so
+/// `prevented` is always false); `false` fires the cancelable
+/// light-dismiss shape.
+fn dispatch_cancel_shaped(tab: &mut crate::tab::Tab, target: NodeId, escape: bool) -> bool {
+    let inline = tab
+        .document_ref()
+        .and_then(|doc| doc.get_attribute(target, "oncancel").map(|s| s.to_owned()));
+    let Some(installed) = tab.installed_mut() else {
+        return false;
+    };
+    // Disjoint field borrow: the DOM handle and the realm, with no
+    // `Rc` clone — the tab keeps the sole strong owner.
+    let (doc, page_vm) = installed.document_and_vm_mut();
+    // Reentrancy gate (see `InstalledDocument::assert_no_live_borrow`):
+    // the inline source and the listener dispatch re-enter the
+    // page VM, whose natives re-borrow the document through the
+    // registry `Weak` — so no `Ref`/`RefMut` may be alive across
+    // either eval.
+    crate::tab::InstalledDocument::assert_no_live_borrow(doc);
+    let outcome = if escape {
+        page_vm
+            .vm_mut()
+            .dispatch_escape_cancel_event(target, inline.as_deref())
+    } else {
+        page_vm
+            .vm_mut()
+            .dispatch_cancel_event(target, inline.as_deref())
+    };
+    if let Some(e) = outcome.inline_error {
+        page_vm.record_error(ScriptError::from_vm_error(target, None, &e));
+    }
+    // A mid-flight core failure is recorded exactly like an
+    // inline throw: it must never silently read as "not
+    // prevented" (see `HostEventOutcome::dispatch_error`).
+    if let Some(e) = outcome.dispatch_error {
+        page_vm.record_error(ScriptError::from_vm_error(target, None, &e));
+    }
+    let prevented = outcome.prevented;
+    page_vm.pump();
+    tab.sync_dirty_flags();
+    prevented
+}
+
 impl crate::window::JsDispatch for PageEventDispatch {
     fn dispatch_click(&mut self, tab: &mut crate::tab::Tab, target: NodeId) -> bool {
         // Read the inline source before borrowing the VM: both live on
@@ -2369,8 +2417,11 @@ impl crate::window::JsDispatch for PageEventDispatch {
 
     fn dispatch_cancel(&mut self, tab: &mut crate::tab::Tab, target: NodeId) -> bool {
         // Dialog `cancel` (HTML §4.11.4 / close-watcher close request):
-        // non-bubbling, cancelable. The caller (window `handle_escape`,
-        // testdriver `execute_escape`) already honors the return value:
+        // non-bubbling, cancelable — the LIGHT-DISMISS shape, where
+        // `preventDefault()` genuinely keeps the dialog open
+        // (Chrome 155 P2). The caller (window
+        // light-dismiss cancel/finish halves, testdriver's
+        // light-dismiss arm) already honors the return value:
         // `true` keeps the dialog open. Fail closed with no installed
         // document, exactly like `dispatch_click` above.
         //
@@ -2380,37 +2431,17 @@ impl crate::window::JsDispatch for PageEventDispatch {
         // the shared dispatch core — never through the public
         // `dispatchEvent`, so a page override cannot swallow or
         // untrust it.
-        let inline = tab
-            .document_ref()
-            .and_then(|doc| doc.get_attribute(target, "oncancel").map(|s| s.to_owned()));
-        let Some(installed) = tab.installed_mut() else {
-            return false;
-        };
-        // Disjoint field borrow: the DOM handle and the realm, with no
-        // `Rc` clone — the tab keeps the sole strong owner.
-        let (doc, page_vm) = installed.document_and_vm_mut();
-        // Reentrancy gate (see `InstalledDocument::assert_no_live_borrow`):
-        // the inline source and the listener dispatch re-enter the
-        // page VM, whose natives re-borrow the document through the
-        // registry `Weak` — so no `Ref`/`RefMut` may be alive across
-        // either eval.
-        crate::tab::InstalledDocument::assert_no_live_borrow(doc);
-        let outcome = page_vm
-            .vm_mut()
-            .dispatch_cancel_event(target, inline.as_deref());
-        if let Some(e) = outcome.inline_error {
-            page_vm.record_error(ScriptError::from_vm_error(target, None, &e));
-        }
-        // A mid-flight core failure is recorded exactly like an
-        // inline throw: it must never silently read as "not
-        // prevented" (see `HostEventOutcome::dispatch_error`).
-        if let Some(e) = outcome.dispatch_error {
-            page_vm.record_error(ScriptError::from_vm_error(target, None, &e));
-        }
-        let prevented = outcome.prevented;
-        page_vm.pump();
-        tab.sync_dirty_flags();
-        prevented
+        dispatch_cancel_shaped(tab, target, false)
+    }
+
+    fn dispatch_cancel_escape(&mut self, tab: &mut crate::tab::Tab, target: NodeId) -> bool {
+        // Escape `cancel` (Chrome 155 P2): non-bubbling and
+        // NON-cancelable — a listener's `preventDefault()` is a
+        // no-op, the dialog always closes, and the return value
+        // is always false. Same trusted dispatch as
+        // `dispatch_cancel`, only the event's cancelability
+        // differs.
+        dispatch_cancel_shaped(tab, target, true)
     }
 
     fn dispatch_close(&mut self, tab: &mut crate::tab::Tab, target: NodeId) {
@@ -2450,17 +2481,20 @@ impl crate::window::JsDispatch for PageEventDispatch {
     fn dispatch_submit(&mut self, tab: &mut crate::tab::Tab, form: NodeId) -> bool {
         // Form `submit` (HTML §4.10.21.2): cancelable, bubbling,
         // fired at the form; a prevented submit runs no submission
-        // step. Delivered through the click path's eval mechanism
-        // (inline `onsubmit` first, then the same event object to
-        // the listeners via `dispatchEvent`), NOT the trusted host
-        // path `cancel`/`close` use — there is no `Vm` submit
-        // native, and adding one to `bowser_js` is out of this
-        // wave's scope. Consequence, stated not hidden: like a
-        // click today, a page override of `dispatchEvent` could
-        // swallow this event, where a trusted host event could
-        // not; a `Vm::dispatch_submit_event` native is the
-        // follow-up that closes that gap. Same reentrancy / pump
-        // discipline as `dispatch_click`.
+        // step.
+        //
+        // Trusted host dispatch (w86): the `Vm` native builds one
+        // trusted wrapper, runs the inline `onsubmit` source on it,
+        // then delivers that same wrapper to the listeners through
+        // the shared dispatch core — never through the public
+        // `dispatchEvent`, so a page override cannot swallow or
+        // untrust it. `submit` is the first BUBBLING trusted host
+        // event: the core runs the bubble phase (capture, target,
+        // then bubble listeners up the ancestor chain), and an
+        // inline `stopPropagation()` carries into the listener
+        // plan as the core's initial stop flag (w86fix — see
+        // `HostEventFrame::stop_propagation`). Same
+        // error/pump discipline as `dispatch_cancel`.
         let inline = tab
             .document_ref()
             .and_then(|doc| doc.get_attribute(form, "onsubmit").map(|s| s.to_owned()));
@@ -2469,13 +2503,19 @@ impl crate::window::JsDispatch for PageEventDispatch {
         };
         let (doc, page_vm) = installed.document_and_vm_mut();
         crate::tab::InstalledDocument::assert_no_live_borrow(doc);
-        let prevented = self.dispatch_typed_with_inline(
-            doc,
-            page_vm,
-            form,
-            "{type:'submit',bubbles:true,cancelable:true}",
-            inline.as_deref(),
-        );
+        let outcome = page_vm
+            .vm_mut()
+            .dispatch_submit_event(form, inline.as_deref());
+        if let Some(e) = outcome.inline_error {
+            page_vm.record_error(ScriptError::from_vm_error(form, None, &e));
+        }
+        // A mid-flight core failure is recorded exactly like an
+        // inline throw: it must never silently read as "not
+        // prevented" (see `HostEventOutcome::dispatch_error`).
+        if let Some(e) = outcome.dispatch_error {
+            page_vm.record_error(ScriptError::from_vm_error(form, None, &e));
+        }
+        let prevented = outcome.prevented;
         page_vm.pump();
         tab.sync_dirty_flags();
         prevented
@@ -2490,6 +2530,30 @@ impl crate::window::JsDispatch for PageEventDispatch {
         // toggle, which this hook deliberately does not serve (all
         // production call sites fire it only after a popover
         // visibility change).
+        //
+        // Known divergence (w86fix S1, Chrome 155 probe S2): Chrome
+        // drops the `open` toggle for a popover opened then hidden
+        // within one synchronous task (task-level coalescing — only
+        // the net `closed` fires). Bowser fires toggles synchronously
+        // at the state change, so it fires both. Coalescing would
+        // need a deferred-toggle queue flushed at task/pump boundaries
+        // across every emission site (show/hide, dialog close,
+        // Escape, light-dismiss, invoker, testdriver), and would
+        // invalidate the synchronous-order pins (`cancel,close,toggle`
+        // asserted in one log) — it does not fit the existing
+        // dispatch path, so it is documented here, not implemented.
+        // The STATES are correct throughout; only a same-task
+        // show+hide overstates the `open` count in the log.
+        // Order divergence, same cause (w86fix, Chrome
+        // S-P1-cancel-reshow raw data): a `cancel`-listener
+        // re-show's `toggle open` fires AFTER the dialog's
+        // `close` in Chrome (`cancel, cancel-reshow-after,
+        // click, close, toggle:open`), while Bowser fires it
+        // synchronously at the re-show, before `close`. The
+        // testdriver P1 cancel-reshow half therefore asserts
+        // state-only (auto stays open, no `toggle closed`),
+        // not order. A toggle queue would fix both halves of
+        // this note; it is deferred to a later wave.
         //
         // Direction without a trait argument: the `JsDispatch`
         // trait carries no old/new state, but every production call
@@ -3859,6 +3923,50 @@ mod tests {
         assert!(
             js_is_true(vm, "gotCancelable"),
             "dialog cancel is cancelable"
+        );
+    }
+
+    #[test]
+    fn page_event_dispatch_escape_cancel_is_not_cancelable() {
+        // w86fix P2 (Chrome 155): an Escape `cancel` has
+        // `cancelable=false` — a listener's
+        // `preventDefault()` is a no-op (`defaultPrevented`
+        // stays false, the event reports `cancelable`
+        // false) and an inline `return false` does not
+        // prevent either. Contrast `dispatch_cancel` (the
+        // light-dismiss shape), which stays cancelable.
+        use crate::window::JsDispatch;
+
+        let (mut tab, dialog) =
+            dispatch_tab("<html><body><dialog id=\"t\">x</dialog></body></html>");
+        tab.page_vm_mut()
+            .expect("page vm")
+            .eval("document.getElementById('t').addEventListener('cancel', function(e) { ran = true; gotCancelable = e.cancelable; e.preventDefault(); sawPrevented = e.defaultPrevented; });")
+            .expect("register listener");
+
+        let mut dispatch = PageEventDispatch::new();
+        let prevented = dispatch.dispatch_cancel_escape(&mut tab, dialog);
+
+        assert!(!prevented, "Escape cancel preventDefault() must be a no-op");
+        let vm = tab.page_vm_mut().expect("page vm");
+        assert!(js_is_true(vm, "ran"), "cancel listener still ran");
+        assert!(
+            !js_is_true(vm, "gotCancelable"),
+            "Escape cancel must report cancelable=false"
+        );
+        assert!(
+            !js_is_true(vm, "sawPrevented"),
+            "preventDefault() on a non-cancelable Escape cancel must leave defaultPrevented false"
+        );
+
+        // Inline `return false` likewise does not prevent.
+        let (mut tab, dialog) = dispatch_tab(
+            "<html><body><dialog id=\"t\" oncancel=\"return false;\">x</dialog></body></html>",
+        );
+        let mut dispatch = PageEventDispatch::new();
+        assert!(
+            !dispatch.dispatch_cancel_escape(&mut tab, dialog),
+            "inline return false must not prevent a non-cancelable Escape cancel"
         );
     }
 

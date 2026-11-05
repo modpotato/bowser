@@ -1373,77 +1373,124 @@ impl TestDriver {
     }
 
     /// Escape default action for the executor, mirroring
-    /// `WindowApp::handle_escape`: dismiss the top-layer member
-    /// itself (a modal dialog via cancel-then-close, an `auto`
-    /// popover via hide), with the `cancel` / `close` / `toggle`
-    /// hooks routed through the [`JsDispatch`] trait — production
-    /// delivery runs through the `script.rs` implementation
-    /// (wired, not deferred), exactly as in the windowed path.
-    /// Dialog closes and popover hides demote through the
-    /// deferred helpers in [`crate::window`] (w82 fixpaths B3),
-    /// so a stored exit duration renders the transition.
-    /// Returns true when a dismissible target existed, even when
-    /// a canceled `cancel` kept the dialog open. Executor focus
-    /// inside a dismissed target is cleared, like the windowed
-    /// path's `clear_focus_inside`.
+    /// `WindowApp::handle_escape`: dismiss EVERY escapable
+    /// watcher live (w86, Chrome 155 verdict A) — `cancel`
+    /// on every escapable dialog newest-first, then `close`
+    /// on each newest-first, then `toggle closed` on every
+    /// open `auto` popover newest-first — with the `cancel` /
+    /// `close` / `toggle` hooks routed through the
+    /// [`JsDispatch`] trait. The Escape `cancel` is
+    /// non-cancelable (Chrome 155 P2), so a prevented `cancel`
+    /// here is a no-op — every dialog proceeds to close (see
+    /// the `escape_targets` docs in `bowser_dom`).
+    /// Dialog closes and popover hides
+    /// demote through the deferred helpers in
+    /// [`crate::window`] (w82 fixpaths B3), so a stored exit
+    /// duration renders the transition. Returns true when a
+    /// dismissible target existed, even when a canceled
+    /// `cancel` kept the dialog open. Executor focus inside
+    /// a dismissed target is cleared, like the windowed
+    /// path's `clear_focus_inside` (with the standing
+    /// divergence documented at [`Self::sync_modal_focus`]:
+    /// the executor clears after `close` instead of
+    /// restoring before it — do not "fix" that here).
     fn execute_escape(&mut self, tab: &mut Tab) -> bool {
-        let target = match tab.document_ref() {
-            Some(doc) => doc.topmost_escape_target(),
-            None => None,
+        let targets = match tab.document_ref() {
+            Some(doc) => doc.escape_targets(),
+            None => Vec::new(),
         };
-        let Some(target) = target else {
+        if targets.is_empty() {
             return false;
-        };
-        match target {
-            EscapeTarget::ModalDialog(dialog) | EscapeTarget::NonModalDialog(dialog) => {
-                let canceled = JsDispatch::dispatch_cancel(&mut self.dispatch, tab, dialog);
-                if canceled {
-                    return true;
+        }
+        let mut dialogs: Vec<NodeId> = Vec::new();
+        let mut autos: Vec<NodeId> = Vec::new();
+        for target in targets {
+            match target {
+                EscapeTarget::ModalDialog(dialog) | EscapeTarget::NonModalDialog(dialog) => {
+                    dialogs.push(dialog);
                 }
-                // Dual snapshot after `cancel`, before the
-                // close (see
-                // [`crate::window::fire_dual_popover_toggle_after_close`]).
-                let was_dual = tab
-                    .document_ref()
-                    .map(|doc| crate::window::is_live_dual_popover(&doc, dialog))
-                    .unwrap_or(false);
-                let closed = match tab.installed_mut() {
-                    Some(installed) => crate::window::deferred_close_dialog(
-                        &mut installed.document().borrow_mut(),
-                        dialog,
-                    ),
-                    None => false,
-                };
-                if !closed {
-                    return true;
-                }
-                JsDispatch::dispatch_close(&mut self.dispatch, tab, dialog);
-                crate::window::fire_dual_popover_toggle_after_close(
-                    &mut self.dispatch,
-                    tab,
-                    dialog,
-                    was_dual,
-                );
-                self.clear_focus_inside(tab, dialog);
-                true
-            }
-            EscapeTarget::AutoPopover(pop) => {
-                let hidden = match tab.installed_mut() {
-                    Some(installed) => {
-                        let mut doc = installed.document().borrow_mut();
-                        let was_open = doc.is_popover_open(pop);
-                        was_open && crate::window::deferred_hide_popover(&mut doc, pop)
-                    }
-                    None => false,
-                };
-                if !hidden {
-                    return true;
-                }
-                JsDispatch::dispatch_toggle(&mut self.dispatch, tab, pop);
-                self.clear_focus_inside(tab, pop);
-                true
+                EscapeTarget::AutoPopover(pop) => autos.push(pop),
             }
         }
+        // Phase 1: `cancel` on every escapable dialog,
+        // newest first. The Escape `cancel` is
+        // non-cancelable (Chrome 155 P2), so a listener's
+        // `preventDefault()` is a no-op and every dialog
+        // proceeds to close. A `cancel` listener may close
+        // another target, so open-ness is re-checked.
+        let mut to_close: Vec<NodeId> = Vec::new();
+        for dialog in dialogs {
+            let open = tab
+                .document_ref()
+                .map(|doc| doc.is_dialog_open(dialog))
+                .unwrap_or(false);
+            if !open {
+                continue;
+            }
+            let canceled = JsDispatch::dispatch_cancel_escape(&mut self.dispatch, tab, dialog);
+            if !canceled {
+                to_close.push(dialog);
+            }
+        }
+        // Phase 2: `close` on each surviving dialog, newest
+        // first.
+        for dialog in to_close {
+            // Dual snapshot after `cancel`, before the
+            // close (see
+            // [`crate::window::fire_dual_popover_toggle_after_close`]).
+            let was_dual = tab
+                .document_ref()
+                .map(|doc| crate::window::is_live_dual_popover(&doc, dialog))
+                .unwrap_or(false);
+            let closed = match tab.installed_mut() {
+                Some(installed) => crate::window::deferred_close_dialog(
+                    &mut installed.document().borrow_mut(),
+                    dialog,
+                ),
+                None => false,
+            };
+            if !closed {
+                continue;
+            }
+            JsDispatch::dispatch_close(&mut self.dispatch, tab, dialog);
+            crate::window::fire_dual_popover_toggle_after_close(
+                &mut self.dispatch,
+                tab,
+                dialog,
+                was_dual,
+            );
+            // w86fix (Escape-review finding 5): the
+            // guarded clear, as the light-dismiss dialog
+            // arm uses — a `close` listener may have
+            // re-shown a popover nested in the dialog and
+            // moved focus into it, and a plain clear
+            // would wipe that legitimate focus.
+            self.clear_focus_inside_dialog_guarded(tab, dialog);
+        }
+        // Phase 3: hide every open `auto` popover, newest
+        // first, firing its `toggle` after all dialog closes.
+        // Unprobed (w86fix): a dialog `close` listener that
+        // re-shows an auto also in this phase-3 snapshot gets
+        // it hidden again — there is no re-show check here,
+        // unlike light-dismiss — so the re-show does not
+        // survive Escape. Needs a Chrome probe before any fix;
+        // do not add a speculative re-show check.
+        for pop in autos {
+            let hidden = match tab.installed_mut() {
+                Some(installed) => {
+                    let mut doc = installed.document().borrow_mut();
+                    let was_open = doc.is_popover_open(pop);
+                    was_open && crate::window::deferred_hide_popover(&mut doc, pop)
+                }
+                None => false,
+            };
+            if !hidden {
+                continue;
+            }
+            JsDispatch::dispatch_toggle(&mut self.dispatch, tab, pop);
+            self.clear_focus_inside(tab, pop);
+        }
+        true
     }
 
     /// Clear executor focus when it sits on `closed` or inside it
@@ -1510,6 +1557,47 @@ impl TestDriver {
     fn clear_focus_inside_dialog_guarded(&mut self, tab: &mut Tab, closed: NodeId) {
         if !self.focus_inside_live_popover(tab, closed) {
             self.clear_focus_inside(tab, closed);
+        }
+    }
+
+    /// Fire `toggle`s for hidden popover victims and clear
+    /// focus inside them (w86fix P5 split helper): shared by
+    /// the pointerup begin half (no pending dialog — the
+    /// toggles fire at pointerup, before the click) and the
+    /// finish half (pending dialog — the toggles fire after
+    /// the dialog's `close`). A re-shown victim is live
+    /// again and skips both; a retained victim clears, since
+    /// no later clear runs at retention expiry.
+    /// Known edge (w86fix nit, same as the windowed path):
+    /// a victim re-shown AND hidden again between the hide
+    /// and this deferred toggle still toggles once here, on
+    /// top of the re-hide's own toggle — two `closed`
+    /// toggles for one net hide. Closing it needs task-level
+    /// toggle coalescing (see S1 in
+    /// `PageEventDispatch::dispatch_toggle`).
+    fn fire_ld_popover_toggles_and_clears(
+        &mut self,
+        tab: &mut Tab,
+        hidden_pops: &[NodeId],
+        deferred_focus_clears: Vec<NodeId>,
+    ) {
+        for pop in hidden_pops {
+            let re_shown = tab
+                .document_ref()
+                .map(|doc| doc.top_layer().contains(pop))
+                .unwrap_or(false);
+            if !re_shown {
+                JsDispatch::dispatch_toggle(&mut self.dispatch, tab, *pop);
+            }
+        }
+        for pop in deferred_focus_clears {
+            let re_shown = tab
+                .document_ref()
+                .map(|doc| doc.top_layer().contains(&pop))
+                .unwrap_or(false);
+            if !re_shown {
+                self.clear_focus_inside(tab, pop);
+            }
         }
     }
 
@@ -1633,10 +1721,18 @@ impl TestDriver {
             // Blocked or not, the light-dismiss ancestors are
             // recorded (w85 exemption above); only event
             // dispatch and click synthesis are swallowed by
-            // the block.
-            st.light_dismiss_popover_press = tab
-                .document_ref()
-                .map(|doc| crate::window::light_dismiss_popover_press_ancestor(&doc, target));
+            // the block. Point-aware (w86 B3d): a press inside
+            // an auto popover but outside an open modal
+            // dialog's box is a backdrop press, recording
+            // `None`, not the auto.
+            st.light_dismiss_popover_press = tab.document_ref().map(|_| {
+                crate::window::light_dismiss_popover_ancestor_for_point(
+                    tab,
+                    target,
+                    st.x as f32,
+                    st.y as f32,
+                )
+            });
             st.light_dismiss_dialog_press = tab.document_ref().map(|_| {
                 crate::window::dialog_light_dismiss_press_ancestor(
                     tab,
@@ -1770,6 +1866,10 @@ impl TestDriver {
             // as a cancelled `pointerdown` suppresses `mousedown`.
             // Light-dismiss is part of that chain: a cancelled
             // `pointerup` dismisses nothing either.
+            // (w86fix: this suppression has no windowed-path twin
+            // yet — whether the windowed path also suppresses
+            // light-dismiss on a cancelled `pointerup` is unprobed;
+            // needs a Chrome probe before any change.)
             if !up_prevented && !touch_prevented {
                 self.fire_pointer(
                     tab,
@@ -1781,28 +1881,54 @@ impl TestDriver {
                     (0.0, 0.0),
                 );
                 // Light-dismiss on release (HTML §6.12.2,
-                // §4.11.5; w85 hide-all-until), before the
-                // synthesized click: popovers first, then
-                // dialogs. A kind dismisses only when the
-                // release resolves to the same ancestor the
-                // press recorded — a press outside dragged
-                // inside the popover, or onto its invoker,
-                // before release dismisses nothing, and the
-                // click below then runs normally.
+                // §4.11.5; w85 hide-all-until, w86 dialog-first),
+                // split across the synthesized click (w86fix P5):
+                // this block is only the BEGIN half — popover
+                // victims hide (state only) and the dialog's
+                // `cancel` fires — and the FINISH half (dialog
+                // `close`, popover `toggle`s, focus clears) runs
+                // after the click match below, so Chrome's
+                // `cancel` → `click` → `close` order holds. A
+                // kind dismisses only when the release resolves
+                // to the same ancestor the press recorded — a
+                // press outside dragged inside the popover, or
+                // onto its invoker, before release dismisses
+                // nothing, and the click below then runs
+                // normally. The popover victims hide BEFORE
+                // the dialog arm (state only) and their
+                // `toggle`s fire AFTER it, mirroring the
+                // windowed `light_dismiss_for_release` — see
+                // its docs for why the hide precedes the arm
+                // while the toggle follows it (re-show).
+                // Pending finish-half state, hoisted out of
+                // the `button == 0` block so the finish below
+                // can see it.
+                let mut ld_pending_dialog: Option<NodeId> = None;
+                let mut ld_hidden_pops: Vec<NodeId> = Vec::new();
+                let mut ld_deferred_focus_clears: Vec<NodeId> = Vec::new();
                 if button == 0 {
                     // Deferred popover focus clears, mirroring
                     // the windowed `light_dismiss_for_release`
                     // (w85fix): collected here, applied only
-                    // after the dialog arm below, so a dialog
+                    // in the finish half, so a dialog
                     // `cancel`/`close` listener observes the
                     // pre-dismissal focus instead of focus
                     // already cleared out of the popover.
-                    let mut deferred_focus_clears: Vec<NodeId> = Vec::new();
+                    // Popover victims, snapshotted before the
+                    // dialog arm: hide now, toggle after.
+                    // (`ld_hidden_pops` /
+                    // `ld_deferred_focus_clears` are the hoisted
+                    // finish-half locals — the begin half fills
+                    // them in place.)
                     if let Some(press_ancestor) = light_dismiss_popover_press {
-                        let release_ancestor = tab.document_ref().map(|doc| {
-                            crate::window::light_dismiss_popover_press_ancestor(&doc, Some(t))
-                        });
-                        if release_ancestor == Some(press_ancestor) {
+                        let release_ancestor =
+                            crate::window::light_dismiss_popover_ancestor_for_point(
+                                tab,
+                                Some(t),
+                                st.x as f32,
+                                st.y as f32,
+                            );
+                        if release_ancestor == press_ancestor {
                             let victims = tab
                                 .document_ref()
                                 .map(|doc| doc.light_dismiss_popovers_until(press_ancestor))
@@ -1816,7 +1942,9 @@ impl TestDriver {
                                 // used to fire a spurious
                                 // `toggle`. Deferred hide (B3)
                                 // renders the exit transition
-                                // when one was stored.
+                                // when one was stored. The
+                                // `toggle` fires after the
+                                // dialog arm below (w86).
                                 let hidden = match tab.installed_mut() {
                                     Some(installed) => {
                                         let mut doc = installed.document().borrow_mut();
@@ -1827,12 +1955,12 @@ impl TestDriver {
                                     None => false,
                                 };
                                 if hidden {
-                                    JsDispatch::dispatch_toggle(&mut self.dispatch, tab, pop);
+                                    ld_hidden_pops.push(pop);
                                     // Deferred, not inline: the
                                     // dialog arm's `cancel`/`close`
                                     // listener must still observe
                                     // the pre-dismissal focus.
-                                    deferred_focus_clears.push(pop);
+                                    ld_deferred_focus_clears.push(pop);
                                 }
                             }
                         }
@@ -1857,95 +1985,31 @@ impl TestDriver {
                                 doc.light_dismiss_dialog_candidate(effective)
                             });
                             if let Some(dialog) = candidate {
+                                // Begin half only (w86fix P5):
+                                // the `cancel` fires now; the
+                                // `close` runs in the finish half,
+                                // after the click below.
                                 let canceled =
                                     JsDispatch::dispatch_cancel(&mut self.dispatch, tab, dialog);
                                 if !canceled {
-                                    // Dual snapshot after
-                                    // `cancel`, before the close
-                                    // (see the helper docs).
-                                    let was_dual = tab
-                                        .document_ref()
-                                        .map(|doc| {
-                                            crate::window::is_live_dual_popover(&doc, dialog)
-                                        })
-                                        .unwrap_or(false);
-                                    let closed = match tab.installed_mut() {
-                                        Some(installed) => crate::window::deferred_close_dialog(
-                                            &mut installed.document().borrow_mut(),
-                                            dialog,
-                                        ),
-                                        None => false,
-                                    };
-                                    if closed {
-                                        JsDispatch::dispatch_close(&mut self.dispatch, tab, dialog);
-                                        crate::window::fire_dual_popover_toggle_after_close(
-                                            &mut self.dispatch,
-                                            tab,
-                                            dialog,
-                                            was_dual,
-                                        );
-                                        // Focus divergence, accepted
-                                        // as the testdriver's
-                                        // standing divergence (cf.
-                                        // the Escape note at
-                                        // [`Self::sync_modal_focus`]
-                                        // and the submit note in
-                                        // [`Self::execute_click`]):
-                                        // this arm only clears
-                                        // focus inside the dialog,
-                                        // and the restore happens
-                                        // later at the
-                                        // sequence/drain
-                                        // `sync_modal_focus`, so
-                                        // a `close` listener here
-                                        // observes cleared focus,
-                                        // where the windowed path
-                                        // restores focus before
-                                        // firing `close` and its
-                                        // listener observes the
-                                        // restored focus. Do not
-                                        // "fix" this arm in
-                                        // isolation: the restore
-                                        // belongs to the sync,
-                                        // which is what replays
-                                        // the dialog journal in
-                                        // order.
-                                        // w85fix BLOCKER A: guarded, not
-                                        // plain — a `close` listener
-                                        // that re-showed a popover
-                                        // nested in this dialog and
-                                        // moved focus into it must
-                                        // keep that focus (see
-                                        // `clear_focus_inside_dialog_guarded`).
-                                        self.clear_focus_inside_dialog_guarded(tab, dialog);
-                                    }
+                                    ld_pending_dialog = Some(dialog);
                                 }
                             }
                         }
                     }
-                    // Dialog arm done: now clear focus inside
-                    // the dismissed popovers. A dialog restore
-                    // that already moved focus out of a popover
-                    // makes its clear a no-op, and the clear
-                    // runs even when the dialog's `cancel` was
-                    // prevented (the dialog arm then ran
-                    // nothing above, but the popover still
-                    // hid). The re-show check is live
-                    // top-layer membership, as in the windowed
-                    // path: a dialog listener that re-showed a
-                    // dismissed popover keeps its focus, while
-                    // an exit-retained victim — still
-                    // `is_popover_open`, but not live — clears,
-                    // since no later clear runs at retention
-                    // expiry.
-                    for pop in deferred_focus_clears {
-                        let re_shown = tab
-                            .document_ref()
-                            .map(|doc| doc.top_layer().contains(&pop))
-                            .unwrap_or(false);
-                        if !re_shown {
-                            self.clear_focus_inside(tab, pop);
-                        }
+                    // No pending dialog close: the popover
+                    // toggles and focus clears fire HERE, at
+                    // pointerup — only a pending dialog close
+                    // defers them past the click (w86fix P5;
+                    // preserves the w85 victim-before-activation
+                    // order for popover-only dismissals).
+                    if ld_pending_dialog.is_none() {
+                        self.fire_ld_popover_toggles_and_clears(
+                            tab,
+                            &ld_hidden_pops,
+                            std::mem::take(&mut ld_deferred_focus_clears),
+                        );
+                        ld_hidden_pops.clear();
                     }
                 }
                 match button {
@@ -2063,11 +2127,7 @@ impl TestDriver {
                                             ct,
                                         );
                                     if let Some(dialog) = closed_dialog {
-                                        JsDispatch::dispatch_close(
-                                            &mut self.dispatch,
-                                            tab,
-                                            dialog,
-                                        );
+                                        JsDispatch::dispatch_close(&mut self.dispatch, tab, dialog);
                                         crate::window::fire_dual_popover_toggle_after_close(
                                             &mut self.dispatch,
                                             tab,
@@ -2081,6 +2141,86 @@ impl TestDriver {
                         }
                     }
                     _ => {}
+                }
+                // Finish half of the light-dismiss release
+                // (w86fix P5): after the click above — close
+                // the pending dialog, then fire the hidden
+                // popovers' `toggle`s and clear focus inside
+                // them. The dialog close re-checks open-ness:
+                // a click listener may have closed it already,
+                // in which case no second `close` fires. A
+                // victim a dialog listener re-showed is live
+                // in the top layer again — skip its stale
+                // `toggle` (the re-show fired its own `open`
+                // toggle); every other victim toggles exactly
+                // once, after the dialog's `cancel`/`close`
+                // (Chrome 155 verdict B). (With no pending
+                // dialog the begin half already fired the
+                // toggles/clears, so this runs on empty vecs.)
+                if button == 0 {
+                    if let Some(dialog) = ld_pending_dialog {
+                        // Dual snapshot at close time (after the
+                        // click — a click listener may have
+                        // hidden or shown the popover since
+                        // `cancel`).
+                        let was_dual = tab
+                            .document_ref()
+                            .map(|doc| crate::window::is_live_dual_popover(&doc, dialog))
+                            .unwrap_or(false);
+                        let open = tab
+                            .document_ref()
+                            .map(|doc| doc.is_dialog_open(dialog))
+                            .unwrap_or(false);
+                        let closed = if open {
+                            match tab.installed_mut() {
+                                Some(installed) => crate::window::deferred_close_dialog(
+                                    &mut installed.document().borrow_mut(),
+                                    dialog,
+                                ),
+                                None => false,
+                            }
+                        } else {
+                            false
+                        };
+                        if closed {
+                            JsDispatch::dispatch_close(&mut self.dispatch, tab, dialog);
+                            crate::window::fire_dual_popover_toggle_after_close(
+                                &mut self.dispatch,
+                                tab,
+                                dialog,
+                                was_dual,
+                            );
+                            // Focus divergence, accepted as the
+                            // testdriver's standing divergence (cf.
+                            // the Escape note at
+                            // [`Self::sync_modal_focus`] and the
+                            // submit note in [`Self::execute_click`]):
+                            // this arm only clears focus inside the
+                            // dialog, and the restore happens later
+                            // at the sequence/drain `sync_modal_focus`,
+                            // so a `close` listener here observes
+                            // cleared focus, where the windowed path
+                            // restores focus before firing `close` and
+                            // its listener observes the restored focus.
+                            // Do not "fix" this arm in isolation: the
+                            // restore belongs to the sync, which is
+                            // what replays the dialog journal in order.
+                            // w85fix BLOCKER A: guarded, not plain —
+                            // a `close` listener that re-showed a
+                            // popover nested in this dialog and moved
+                            // focus into it must keep that focus (see
+                            // `clear_focus_inside_dialog_guarded`).
+                            self.clear_focus_inside_dialog_guarded(tab, dialog);
+                        }
+                    }
+                    // (When there was no pending dialog, the begin
+                    // half already fired these and the vecs are
+                    // empty.)
+                    self.fire_ld_popover_toggles_and_clears(
+                        tab,
+                        &ld_hidden_pops,
+                        ld_deferred_focus_clears,
+                    );
                 }
             }
         }
@@ -2467,11 +2607,8 @@ impl TestDriver {
             // never falls through to anything else; a
             // non-dialog method fires `submit` and stops
             // (navigation deferred).
-            let (_handled, closed_dialog, was_dual) = crate::window::submit_activation_close(
-                &mut self.dispatch,
-                tab,
-                node,
-            );
+            let (_handled, closed_dialog, was_dual) =
+                crate::window::submit_activation_close(&mut self.dispatch, tab, node);
             if let Some(dialog) = closed_dialog {
                 JsDispatch::dispatch_close(&mut self.dispatch, tab, dialog);
                 crate::window::fire_dual_popover_toggle_after_close(
@@ -4863,11 +5000,15 @@ mod tests {
         // attribute (`return false`) does NOT gate the close,
         // so the dialog closes. The windowed Escape path serves
         // the same attribute through the host dispatch
-        // (`dispatch_cancel` in `script.rs`), so Escape on the
-        // same dialog keeps it open. Routing the JS cancel
-        // through the host dispatch would need a
-        // bindings-to-window channel that does not exist; until
-        // it does, this test pins the split.
+        // (`dispatch_cancel_escape` in `script.rs`) — but
+        // w86fix P2 (Chrome 155) makes the Escape `cancel`
+        // NON-cancelable, so the inline `return false` does
+        // not gate Escape either: Escape now closes the
+        // dialog too. What remains pinned here is only the
+        // requestClose half (inline oncancel unserved by
+        // the JS-native core); the old Escape half (inline
+        // `return false` keeps the dialog open on Escape)
+        // is superseded by P2.
         let (mut tab, _out, dlg, _a) = dialog_tab();
         let mut driver = TestDriver::new();
         eval(
@@ -4889,8 +5030,8 @@ mod tests {
             "Escape must find the modal dialog dismissible"
         );
         assert!(
-            tab.document_ref().expect("document").is_dialog_open(dlg),
-            "Escape must keep the dialog open when inline oncancel returns false"
+            !tab.document_ref().expect("document").is_dialog_open(dlg),
+            "P2: Escape must close the dialog even when inline oncancel returns false — the Escape cancel is non-cancelable"
         );
     }
 
@@ -5332,6 +5473,98 @@ mod tests {
     }
 
     #[test]
+    fn w86_dialog_submit_survives_dispatch_event_override() {
+        // End to end for the w86 `Vm::dispatch_submit_event`
+        // native: the page overwrites `dispatchEvent` on both
+        // forms (the exact swallow the old eval path was
+        // vulnerable to — it called `el.dispatchEvent(...)`),
+        // and the trusted submit still fires, still bubbles
+        // (an ancestor listener sees it), still closes the
+        // dialog — while a `preventDefault()` in a submit
+        // listener still gates the close. Both halves in one
+        // tab so the override is identical for each.
+        let mut tab = tab_from_html(
+            b"<html><body><dialog id=\"dlg1\"><form id=\"f1\" method=\"dialog\">\
+              <button id=\"b1\" type=\"submit\" value=\"v1\">ok</button>\
+              </form></dialog>\
+              <dialog id=\"dlg2\"><form id=\"f2\" method=\"dialog\">\
+              <button id=\"b2\" type=\"submit\" value=\"v2\">ok</button>\
+              </form></dialog></body></html>",
+        );
+        eval(
+            &mut tab,
+            "var d1 = document.getElementById('dlg1'); var d2 = document.getElementById('dlg2'); \
+             var f1 = document.getElementById('f1'); var f2 = document.getElementById('f2'); \
+             window.__override = 0; window.__sub1 = 0; window.__sub2 = 0; \
+             window.__trusted1 = false; window.__bubbled1 = false; \
+             window.__ev1 = []; window.__ev2 = []; \
+             f1.dispatchEvent = function() { window.__override++; return false; }; \
+             f2.dispatchEvent = function() { window.__override++; return false; }; \
+             f1.addEventListener('submit', function(e) { \
+                 window.__sub1++; window.__trusted1 = e.isTrusted; }); \
+             d1.addEventListener('submit', function() { window.__bubbled1 = true; }); \
+             d1.addEventListener('close', function() { window.__ev1.push('close'); }); \
+             f2.addEventListener('submit', function(e) { \
+                 window.__sub2++; e.preventDefault(); }); \
+             d2.addEventListener('close', function() { window.__ev2.push('close'); }); \
+             d1.showModal(); d2.showModal();",
+        );
+        let mut driver = TestDriver::new();
+        let b1 = el(&tab, "b1");
+        driver.execute_click(&mut tab, b1).expect("click");
+        assert!(
+            js_true(&mut tab, "window.__sub1 === 1"),
+            "the submit event must fire despite the dispatchEvent override"
+        );
+        assert!(
+            js_true(&mut tab, "window.__trusted1 === true"),
+            "the submit event must be trusted despite the override"
+        );
+        assert!(
+            js_true(&mut tab, "window.__bubbled1 === true"),
+            "the submit event must bubble to the dialog ancestor"
+        );
+        assert!(
+            js_true(&mut tab, "window.__override === 0"),
+            "the host submit dispatch must never call the overridden dispatchEvent"
+        );
+        assert!(
+            !tab.document_ref()
+                .expect("document")
+                .is_dialog_open(el(&tab, "dlg1")),
+            "an unprevented submit must close the dialog despite the override"
+        );
+        assert!(
+            js_true(&mut tab, "window.__ev1.join(',') === 'close'"),
+            "the close event must fire after the override-surviving submit"
+        );
+        assert!(
+            js_true(&mut tab, "d1.returnValue === 'v1'"),
+            "returnValue must be the submitter's value"
+        );
+        let b2 = el(&tab, "b2");
+        driver.execute_click(&mut tab, b2).expect("click");
+        assert!(
+            js_true(&mut tab, "window.__sub2 === 1"),
+            "the prevented submit must still fire despite the override"
+        );
+        assert!(
+            tab.document_ref()
+                .expect("document")
+                .is_dialog_open(el(&tab, "dlg2")),
+            "a preventDefaulted submit must keep the dialog open despite the override"
+        );
+        assert!(
+            js_true(&mut tab, "window.__ev2.length === 0"),
+            "a prevented submit must fire no close event"
+        );
+        assert!(
+            js_true(&mut tab, "window.__override === 0"),
+            "neither submit may call the overridden dispatchEvent"
+        );
+    }
+
+    #[test]
     fn w85_dialog_non_submitter_and_disabled_do_not_submit() {
         // Neither a `type="button"` button nor a `disabled`
         // submit button activates submission: no `submit` event,
@@ -5606,10 +5839,7 @@ mod tests {
             !popover_open(&tab, pop_a),
             "lower auto must end closed after its own invoker was clicked"
         );
-        assert!(
-            !popover_open(&tab, pop_b),
-            "upper auto must end closed"
-        );
+        assert!(!popover_open(&tab, pop_b), "upper auto must end closed");
         assert!(
             js_true(&mut tab, "window.__toggles.join(',') === 'b,a'"),
             "exactly one toggle per popover, light-dismiss victim before activation"
@@ -5676,7 +5906,9 @@ mod tests {
         let click_node = el(&tab, "sub");
         driver.execute_click(&mut tab, click_node).expect("click");
         assert!(
-            !tab.document_ref().expect("document").is_dialog_open(el(&tab, "dlg")),
+            !tab.document_ref()
+                .expect("document")
+                .is_dialog_open(el(&tab, "dlg")),
             "value-mutated submit must still close"
         );
         assert!(
@@ -5703,7 +5935,9 @@ mod tests {
         let click_node = el(&tab, "sub");
         driver.execute_click(&mut tab, click_node).expect("click");
         assert!(
-            tab.document_ref().expect("document").is_dialog_open(el(&tab, "dlg")),
+            tab.document_ref()
+                .expect("document")
+                .is_dialog_open(el(&tab, "dlg")),
             "a listener flipping formmethod away from dialog must keep the dialog open"
         );
         assert!(
@@ -5730,7 +5964,9 @@ mod tests {
         let click_node = el(&tab, "sub");
         driver.execute_click(&mut tab, click_node).expect("click");
         assert!(
-            !tab.document_ref().expect("document").is_dialog_open(el(&tab, "dlg")),
+            !tab.document_ref()
+                .expect("document")
+                .is_dialog_open(el(&tab, "dlg")),
             "a listener flipping formmethod to dialog must close the dialog"
         );
         assert!(
@@ -5761,7 +5997,9 @@ mod tests {
         let click_node = el(&tab, "dis");
         driver.execute_click(&mut tab, click_node).expect("click");
         assert!(
-            tab.document_ref().expect("document").is_dialog_open(el(&tab, "dlg")),
+            tab.document_ref()
+                .expect("document")
+                .is_dialog_open(el(&tab, "dlg")),
             "a fieldset-disabled submitter must leave the dialog open"
         );
         assert!(
@@ -5782,7 +6020,9 @@ mod tests {
         let click_node = el(&tab, "leg");
         driver.execute_click(&mut tab, click_node).expect("click");
         assert!(
-            !tab.document_ref().expect("document").is_dialog_open(el(&tab, "dlg")),
+            !tab.document_ref()
+                .expect("document")
+                .is_dialog_open(el(&tab, "dlg")),
             "a first-legend submitter escapes the fieldset's disabled"
         );
         assert!(
@@ -5805,14 +6045,18 @@ mod tests {
         let click_node = el(&tab, "b1");
         driver.execute_click(&mut tab, click_node).expect("click");
         assert!(
-            !tab.document_ref().expect("document").is_dialog_open(el(&tab, "dlg1")),
+            !tab.document_ref()
+                .expect("document")
+                .is_dialog_open(el(&tab, "dlg1")),
             "formmethod=DIALOG (uppercase) must close"
         );
         eval(&mut tab, "d2.showModal();");
         let click_node = el(&tab, "b2");
         driver.execute_click(&mut tab, click_node).expect("click");
         assert!(
-            !tab.document_ref().expect("document").is_dialog_open(el(&tab, "dlg2")),
+            !tab.document_ref()
+                .expect("document")
+                .is_dialog_open(el(&tab, "dlg2")),
             "method=DIALOG (uppercase) must close"
         );
     }
@@ -5834,11 +6078,16 @@ mod tests {
              d.showModal(); d.requestClose('rv');",
         );
         assert!(
-            !tab.document_ref().expect("document").is_dialog_open(el(&tab, "dlg")),
+            !tab.document_ref()
+                .expect("document")
+                .is_dialog_open(el(&tab, "dlg")),
             "requestClose must close a closedby=none modal dialog"
         );
         assert!(
-            js_true(&mut tab, "__log.join(';') === 'cancel:true:true;close:true:false'"),
+            js_true(
+                &mut tab,
+                "__log.join(';') === 'cancel:true:true;close:true:false'"
+            ),
             "closedby=none requestClose must fire cancel then close"
         );
         assert!(
@@ -5847,7 +6096,9 @@ mod tests {
         );
         eval(&mut tab, "d.show(); d.requestClose('nm');");
         assert!(
-            !tab.document_ref().expect("document").is_dialog_open(el(&tab, "dlg")),
+            !tab.document_ref()
+                .expect("document")
+                .is_dialog_open(el(&tab, "dlg")),
             "requestClose must close a closedby=none non-modal dialog too"
         );
         assert!(
@@ -5866,10 +6117,7 @@ mod tests {
         let doc = Rc::new(RefCell::new(
             bowser_dom::Document::parse_html(html.as_bytes()).0,
         ));
-        let dlg = doc
-            .borrow()
-            .get_element_by_id("dlg")
-            .expect("dlg");
+        let dlg = doc.borrow().get_element_by_id("dlg").expect("dlg");
         let base = bowser_url::parse("http://example.com/page.html", None).expect("test url");
         let page =
             crate::script::PageVm::new_for_document(doc.clone(), &base, "TestBrowser/9.9", &[])
@@ -5914,7 +6162,9 @@ mod tests {
             ])]),
         );
         assert!(
-            !tab.document_ref().expect("document").is_dialog_open(el(&tab, "dlg")),
+            !tab.document_ref()
+                .expect("document")
+                .is_dialog_open(el(&tab, "dlg")),
             "Escape must close the dual dialog"
         );
         assert!(
@@ -5950,7 +6200,9 @@ mod tests {
             ])]),
         );
         assert!(
-            !tab.document_ref().expect("document").is_dialog_open(el(&tab, "dlg")),
+            !tab.document_ref()
+                .expect("document")
+                .is_dialog_open(el(&tab, "dlg")),
             "Escape must close the modal dual dialog"
         );
         assert!(
@@ -6000,10 +6252,13 @@ mod tests {
             "light-dismiss-closed dual must fire cancel, close, then exactly one toggle, in that order"
         );
 
-        // Auto dual, outside pointer sequence: the popover
-        // arm hides it first (one toggle), so the dialog
-        // arm's snapshot is no longer live and must not
-        // fire a second toggle for the same close.
+        // Auto dual, outside pointer sequence: dialog first
+        // (w86 verdict B) — cancel, close, then the dual
+        // toggle. The popover arm hides the dual before the
+        // dialog arm (state only), so the dialog arm's dual
+        // snapshot is no longer live and fires no second
+        // toggle; the deferred toggle after the close is the
+        // dual's one toggle for the same close.
         let (mut tab, dlg) = dual_seq_tab(
             "<html><body><dialog id=\"dlg\" popover=\"auto\" closedby=\"any\">\
              <button id=\"a\">a</button></dialog></body></html>",
@@ -6033,8 +6288,849 @@ mod tests {
             "light-dismiss must close the auto dual dialog"
         );
         assert!(
-            js_true(&mut tab, "window.__log.join(',') === 'toggle,cancel,close'"),
-            "an auto dual light-dismissed outside must toggle exactly once (the popover hide first), with no second close toggle"
+            js_true(&mut tab, "window.__log.join(',') === 'cancel,close,toggle'"),
+            "an auto dual light-dismissed outside must toggle exactly once (after the dialog close), with no second close toggle"
+        );
+    }
+
+    #[test]
+    fn w86_escape_closes_two_dialogs_and_auto_newest_first() {
+        // w86, Chrome 155 A3/A7: one Escape closes two
+        // non-modal closedby=any dialogs AND the auto — all
+        // cancels newest-first, then all closes newest-first,
+        // then the auto toggle.
+        let mut tab = tab_from_html(
+            b"<html><body><dialog id=\"d1\" closedby=\"any\">one</dialog>\
+              <dialog id=\"d2\" closedby=\"any\">two</dialog>\
+              <div id=\"pop\" popover>hi</div></body></html>",
+        );
+        eval(
+            &mut tab,
+            "var d1 = document.getElementById('d1'); var d2 = document.getElementById('d2'); \
+             var p = document.getElementById('pop'); window.__log = []; \
+             d1.addEventListener('cancel', function() { __log.push('cancel:d1'); }); \
+             d1.addEventListener('close', function() { __log.push('close:d1'); }); \
+             d2.addEventListener('cancel', function() { __log.push('cancel:d2'); }); \
+             d2.addEventListener('close', function() { __log.push('close:d2'); }); \
+             p.addEventListener('toggle', function() { __log.push('toggle:p'); }); \
+             d1.show(); d2.show(); p.showPopover(); window.__log = [];",
+        );
+        let mut driver = TestDriver::new();
+        driver.execute(
+            &mut tab,
+            sequence_request(vec![key_source(vec![
+                key_item(ActionItemKind::KeyDown, "Escape"),
+                key_item(ActionItemKind::KeyUp, "Escape"),
+            ])]),
+        );
+        assert!(
+            !tab.document_ref()
+                .expect("document")
+                .is_dialog_open(el(&tab, "d1")),
+            "Escape must close the first dialog"
+        );
+        assert!(
+            !tab.document_ref()
+                .expect("document")
+                .is_dialog_open(el(&tab, "d2")),
+            "Escape must close the second dialog"
+        );
+        assert!(
+            !tab.document_ref()
+                .expect("document")
+                .is_popover_open(el(&tab, "pop")),
+            "Escape must hide the auto popover"
+        );
+        assert!(
+            js_true(
+                &mut tab,
+                "window.__log.join(',') === 'cancel:d2,cancel:d1,close:d2,close:d1,toggle:p'"
+            ),
+            "one Escape: all cancels newest-first, then all closes newest-first, then the auto toggle (A3/A7)"
+        );
+    }
+
+    #[test]
+    fn w86fix_p5_light_dismiss_single_dialog_cancel_click_close_order() {
+        // w86fix P5 (Chrome 155): one outside click
+        // light-dismisses EXACTLY ONE dialog — the topmost
+        // (last-shown) — in the order `cancel` → `click` →
+        // `close` → `toggle`. The other dialog stays open.
+        let mut tab = tab_from_html(
+            b"<html><body><dialog id=\"d1\" closedby=\"any\">one</dialog>\
+              <dialog id=\"d2\" closedby=\"any\">two</dialog>\
+              <div id=\"pop\" popover>hi</div><div id=\"out\">o</div></body></html>",
+        );
+        eval(
+            &mut tab,
+            "var d1 = document.getElementById('d1'); var d2 = document.getElementById('d2'); \
+             var p = document.getElementById('pop'); window.__log = []; \
+             d1.addEventListener('cancel', function() { __log.push('cancel:d1'); }); \
+             d1.addEventListener('close', function() { __log.push('close:d1'); }); \
+             d2.addEventListener('cancel', function() { __log.push('cancel:d2'); }); \
+             d2.addEventListener('close', function() { __log.push('close:d2'); }); \
+             p.addEventListener('toggle', function() { __log.push('toggle:p'); }); \
+             document.addEventListener('click', function() { __log.push('click'); }); \
+             d1.show(); d2.show(); p.showPopover(); window.__log = [];",
+        );
+        let mut driver = TestDriver::new();
+        driver.execute(
+            &mut tab,
+            sequence_request(vec![pointer_source(
+                "mouse",
+                vec![
+                    move_item(700.0, 500.0, ActionOrigin::Viewport),
+                    button_item(ActionItemKind::PointerDown, 0),
+                    button_item(ActionItemKind::PointerUp, 0),
+                ],
+            )]),
+        );
+        assert!(
+            !tab.document_ref()
+                .expect("document")
+                .is_dialog_open(el(&tab, "d2")),
+            "P5: one outside click closes the topmost (last-shown) dialog"
+        );
+        assert!(
+            tab.document_ref()
+                .expect("document")
+                .is_dialog_open(el(&tab, "d1")),
+            "P5: the dialog below stays open"
+        );
+        assert!(
+            !tab.document_ref()
+                .expect("document")
+                .is_popover_open(el(&tab, "pop")),
+            "P5: the auto still light-dismisses on the same click"
+        );
+        assert!(
+            js_true(
+                &mut tab,
+                "window.__log.join(',') === 'cancel:d2,click,close:d2,toggle:p'"
+            ),
+            "P5: cancel, then the click dispatches, then close, then the auto toggle"
+        );
+
+        // Reversed show order (w86fix): dialogs shown d2
+        // then d1 — document order is d1,d2 but the topmost
+        // is d1 (last-shown), so the same outside click must
+        // close d1 and leave d2 open.
+        let mut tab = tab_from_html(
+            b"<html><body><dialog id=\"d1\" closedby=\"any\">one</dialog>\
+              <dialog id=\"d2\" closedby=\"any\">two</dialog>\
+              <div id=\"pop\" popover>hi</div><div id=\"out\">o</div></body></html>",
+        );
+        eval(
+            &mut tab,
+            "var d1 = document.getElementById('d1'); var d2 = document.getElementById('d2'); \
+             var p = document.getElementById('pop'); window.__log = []; \
+             d1.addEventListener('cancel', function() { __log.push('cancel:d1'); }); \
+             d1.addEventListener('close', function() { __log.push('close:d1'); }); \
+             d2.addEventListener('cancel', function() { __log.push('cancel:d2'); }); \
+             d2.addEventListener('close', function() { __log.push('close:d2'); }); \
+             p.addEventListener('toggle', function() { __log.push('toggle:p'); }); \
+             document.addEventListener('click', function() { __log.push('click'); }); \
+             d2.show(); d1.show(); p.showPopover(); window.__log = [];",
+        );
+        let mut driver = TestDriver::new();
+        driver.execute(
+            &mut tab,
+            sequence_request(vec![pointer_source(
+                "mouse",
+                vec![
+                    move_item(700.0, 500.0, ActionOrigin::Viewport),
+                    button_item(ActionItemKind::PointerDown, 0),
+                    button_item(ActionItemKind::PointerUp, 0),
+                ],
+            )]),
+        );
+        assert!(
+            !tab.document_ref()
+                .expect("document")
+                .is_dialog_open(el(&tab, "d1")),
+            "P5 reversed: one outside click closes the topmost (last-shown) dialog d1"
+        );
+        assert!(
+            tab.document_ref()
+                .expect("document")
+                .is_dialog_open(el(&tab, "d2")),
+            "P5 reversed: the dialog below (d2, shown first) stays open"
+        );
+        assert!(
+            js_true(
+                &mut tab,
+                "window.__log.join(',') === 'cancel:d1,click,close:d1,toggle:p'"
+            ),
+            "P5 reversed: cancel:d1, then the click, then close:d1, then the auto toggle"
+        );
+    }
+
+    #[test]
+    fn w86fix_p1_dialog_close_listener_reshow_keeps_auto_open() {
+        // w86fix P1 (Chrome 155): a dialog `close` listener
+        // that re-shows the about-to-dismiss auto leaves it
+        // open with NO `toggle closed` — the pending closed
+        // toggle is coalesced away and only the re-show's
+        // `toggle open` fires. Same for a `cancel` listener
+        // re-show (second half).
+        let html = "<html><body><button id=\"btn\" popovertarget=\"pop\">\
+             <span id=\"span\">t</span></button>\
+             <div id=\"pop\" popover>hi</div>\
+             <dialog id=\"dlg\" closedby=\"any\"><button id=\"a\">a</button></dialog></body></html>";
+        let (mut tab, _, pop) = popover_seq_tab(html);
+        let dlg = el(&tab, "dlg");
+        tab.installed_mut()
+            .expect("installed")
+            .document()
+            .borrow_mut()
+            .show_dialog(dlg)
+            .expect("show dialog");
+        open_popover_td(&mut tab, pop);
+        eval(
+            &mut tab,
+            "window.__log = []; \
+             document.getElementById('pop').addEventListener('toggle', function(e) { __log.push('toggle:' + e.newState); }); \
+             var d = document.getElementById('dlg'); \
+             d.addEventListener('cancel', function() { __log.push('cancel'); }); \
+             d.addEventListener('close', function() { __log.push('close'); document.getElementById('pop').showPopover(); });",
+        );
+        let mut driver = TestDriver::new();
+        driver.execute(
+            &mut tab,
+            sequence_request(vec![pointer_source(
+                "mouse",
+                vec![
+                    move_item(700.0, 500.0, ActionOrigin::Viewport),
+                    button_item(ActionItemKind::PointerDown, 0),
+                    button_item(ActionItemKind::PointerUp, 0),
+                ],
+            )]),
+        );
+        assert!(
+            !tab.document_ref().expect("document").is_dialog_open(dlg),
+            "P1: the dialog still closes (re-show does not veto it)"
+        );
+        assert!(
+            popover_open(&tab, pop),
+            "P1: a close-listener re-show leaves the auto open"
+        );
+        assert!(
+            js_true(
+                &mut tab,
+                "window.__log.join(',') === 'cancel,close,toggle:open'"
+            ),
+            "P1: only the re-show's toggle open fires — no toggle closed"
+        );
+
+        // Re-show from the `cancel` listener instead.
+        let (mut tab, _, pop) = popover_seq_tab(html);
+        let dlg = el(&tab, "dlg");
+        tab.installed_mut()
+            .expect("installed")
+            .document()
+            .borrow_mut()
+            .show_dialog(dlg)
+            .expect("show dialog");
+        open_popover_td(&mut tab, pop);
+        eval(
+            &mut tab,
+            "window.__log = []; \
+             document.getElementById('pop').addEventListener('toggle', function(e) { __log.push('toggle:' + e.newState); }); \
+             var d = document.getElementById('dlg'); \
+             d.addEventListener('cancel', function() { __log.push('cancel'); document.getElementById('pop').showPopover(); }); \
+             d.addEventListener('close', function() { __log.push('close'); });",
+        );
+        let mut driver = TestDriver::new();
+        driver.execute(
+            &mut tab,
+            sequence_request(vec![pointer_source(
+                "mouse",
+                vec![
+                    move_item(700.0, 500.0, ActionOrigin::Viewport),
+                    button_item(ActionItemKind::PointerDown, 0),
+                    button_item(ActionItemKind::PointerUp, 0),
+                ],
+            )]),
+        );
+        assert!(
+            !tab.document_ref().expect("document").is_dialog_open(dlg),
+            "P1: the dialog still closes on a cancel-listener re-show"
+        );
+        assert!(
+            popover_open(&tab, pop),
+            "P1: a cancel-listener re-show leaves the auto open"
+        );
+        // w86fix: state-only assertion, not order — Chrome
+        // S-P1-cancel-reshow raw data fires the re-show's open
+        // toggle AFTER close (`cancel, cancel-reshow-after,
+        // click, close, toggle:open`), while Bowser fires it
+        // synchronously at the re-show (`cancel,toggle:open,
+        // close`). The order divergence is a known gap (a
+        // toggle queue is deferred to a later wave — see the
+        // S1 note in `dispatch_toggle`); what is pinned here
+        // is the state: the auto stays open, the re-show's
+        // open toggle fires (order-free, so either order
+        // passes), and no closed toggle fires.
+        assert!(
+            js_true(&mut tab, "!window.__log.includes('toggle:closed')"),
+            "P1: cancel-listener re-show fires no toggle closed"
+        );
+        assert!(
+            js_true(&mut tab, "window.__log.includes('toggle:open')"),
+            "P1: cancel-listener re-show fires the open toggle"
+        );
+    }
+
+    #[test]
+    fn w86fix_b3_testdriver_asymmetry() {
+        // w86fix S2: testdriver equivalents of the windowed
+        // B3a/B3b/B3c/B3d cases, same coordinates and log
+        // assertions — the executor resolves hits/boxes
+        // differently from the windowed path, so twin drift
+        // here would otherwise go undetected. Boxes mirror
+        // the windowed `dismiss_tab` fixture: dialog
+        // (400,0,200,200), popover (200,200,100,100).
+        use std::rc::Rc;
+        fn b3_tab(html: &str) -> (Tab, NodeId, NodeId, NodeId) {
+            let (mut tab, btn, pop) = popover_seq_tab(html);
+            let dlg = el(&tab, "dlg");
+            tab.layout_root = Some(Rc::new(actions_box(
+                (0.0, 0.0, 800.0, 600.0),
+                None,
+                vec![
+                    actions_box((0.0, 0.0, 100.0, 50.0), Some(btn), vec![]),
+                    actions_box((200.0, 200.0, 100.0, 100.0), Some(pop), vec![]),
+                    actions_box((400.0, 0.0, 200.0, 200.0), Some(dlg), vec![]),
+                ],
+            )));
+            (tab, btn, pop, dlg)
+        }
+        fn gesture(tab: &mut Tab, x: f64, y: f64) {
+            let mut driver = TestDriver::new();
+            driver.execute(
+                tab,
+                sequence_request(vec![pointer_source(
+                    "mouse",
+                    vec![
+                        move_item(x, y, ActionOrigin::Viewport),
+                        button_item(ActionItemKind::PointerDown, 0),
+                        button_item(ActionItemKind::PointerUp, 0),
+                    ],
+                )]),
+            );
+        }
+        let html = "<html><body><button id=\"btn\" popovertarget=\"pop\">\
+             <span id=\"span\">t</span></button>\
+             <div id=\"pop\" popover>hi</div>\
+             <dialog id=\"dlg\" closedby=\"any\">x</dialog></body></html>";
+        // B3a: click inside the (non-modal) dialog, outside
+        // the auto — only the auto closes.
+        let (mut tab, _, pop, dlg) = b3_tab(html);
+        tab.installed_mut()
+            .expect("installed")
+            .document()
+            .borrow_mut()
+            .show_dialog(dlg)
+            .expect("show dialog");
+        open_popover_td(&mut tab, pop);
+        eval(
+            &mut tab,
+            "window.__log = []; \
+             document.getElementById('pop').addEventListener('toggle', function() { __log.push('toggle'); }); \
+             document.getElementById('dlg').addEventListener('cancel', function() { __log.push('cancel'); }); \
+             document.getElementById('dlg').addEventListener('close', function() { __log.push('close'); });",
+        );
+        gesture(&mut tab, 500.0, 100.0);
+        assert!(
+            !popover_open(&tab, pop),
+            "B3a: click inside the dialog closes the auto"
+        );
+        assert!(
+            tab.document_ref().expect("document").is_dialog_open(dlg),
+            "B3a: the dialog stays open"
+        );
+        assert!(
+            js_true(&mut tab, "window.__log.join(',') === 'toggle'"),
+            "B3a: only the auto toggle fires"
+        );
+        // B3b: click inside the auto, outside the (non-modal)
+        // dialog — only the dialog closes.
+        let (mut tab, _, pop, dlg) = b3_tab(html);
+        tab.installed_mut()
+            .expect("installed")
+            .document()
+            .borrow_mut()
+            .show_dialog(dlg)
+            .expect("show dialog");
+        open_popover_td(&mut tab, pop);
+        eval(
+            &mut tab,
+            "window.__log = []; \
+             document.getElementById('pop').addEventListener('toggle', function() { __log.push('toggle'); }); \
+             document.getElementById('dlg').addEventListener('cancel', function() { __log.push('cancel'); }); \
+             document.getElementById('dlg').addEventListener('close', function() { __log.push('close'); });",
+        );
+        gesture(&mut tab, 250.0, 250.0);
+        assert!(
+            popover_open(&tab, pop),
+            "B3b: click inside the auto leaves the auto open"
+        );
+        assert!(
+            !tab.document_ref().expect("document").is_dialog_open(dlg),
+            "B3b: the dialog closes"
+        );
+        assert!(
+            js_true(&mut tab, "window.__log.join(',') === 'cancel,close'"),
+            "B3b: only the dialog cancel/close fire"
+        );
+        // B3c: click inside the MODAL dialog, outside the
+        // auto — only the auto closes.
+        let (mut tab, _, pop, dlg) = b3_tab(html);
+        tab.installed_mut()
+            .expect("installed")
+            .document()
+            .borrow_mut()
+            .show_dialog_modal(dlg)
+            .expect("showModal");
+        open_popover_td(&mut tab, pop);
+        eval(
+            &mut tab,
+            "window.__log = []; \
+             document.getElementById('pop').addEventListener('toggle', function() { __log.push('toggle'); }); \
+             document.getElementById('dlg').addEventListener('cancel', function() { __log.push('cancel'); }); \
+             document.getElementById('dlg').addEventListener('close', function() { __log.push('close'); });",
+        );
+        gesture(&mut tab, 500.0, 100.0);
+        assert!(
+            !popover_open(&tab, pop),
+            "B3c: click inside the modal dialog closes the auto"
+        );
+        assert!(
+            tab.document_ref().expect("document").is_dialog_open(dlg),
+            "B3c: the modal dialog stays open"
+        );
+        assert!(
+            js_true(&mut tab, "window.__log.join(',') === 'toggle'"),
+            "B3c: only the auto toggle fires"
+        );
+        // B3d: the same click inside the auto, against a
+        // MODAL dialog — the backdrop wins hit-testing, so
+        // BOTH close, dialog first.
+        let (mut tab, _, pop, dlg) = b3_tab(html);
+        tab.installed_mut()
+            .expect("installed")
+            .document()
+            .borrow_mut()
+            .show_dialog_modal(dlg)
+            .expect("showModal");
+        open_popover_td(&mut tab, pop);
+        eval(
+            &mut tab,
+            "window.__log = []; \
+             document.getElementById('pop').addEventListener('toggle', function() { __log.push('toggle'); }); \
+             document.getElementById('dlg').addEventListener('cancel', function() { __log.push('cancel'); }); \
+             document.getElementById('dlg').addEventListener('close', function() { __log.push('close'); });",
+        );
+        gesture(&mut tab, 250.0, 250.0);
+        assert!(
+            !popover_open(&tab, pop),
+            "B3d: click inside the auto over a modal closes the auto"
+        );
+        assert!(
+            !tab.document_ref().expect("document").is_dialog_open(dlg),
+            "B3d: the modal dialog closes on the backdrop click"
+        );
+        assert!(
+            js_true(&mut tab, "window.__log.join(',') === 'cancel,close,toggle'"),
+            "B3d: dialog cancel, close, then the auto toggle"
+        );
+    }
+
+    #[test]
+    fn w86fix_p4_and_ld_prevented_cancel_testdriver_equivalents() {
+        // w86fix S3: testdriver equivalents of the windowed
+        // P4 manual/hint-over-modal tests
+        // (`w86fix_p4_manual_popover_over_modal_light_dismisses_modal_only`,
+        // `w86fix_p4_hint_popover_over_modal_closes_like_auto`)
+        // and the LD prevented-cancel keeps-open test
+        // (window.rs light-dismiss suite) — P4 uses the same
+        // coordinates and log assertions; the LD click is an
+        // equivalent outside point (700,500) vs the windowed
+        // (10,500), both outside every box.
+        // `dismiss_tab` fixture: dialog (400,0,200,200),
+        // popover (200,200,100,100); the click at (250,250)
+        // lands inside the popover, over the modal backdrop.
+        use std::rc::Rc;
+        fn p4_tab(html: &str) -> (Tab, NodeId, NodeId, NodeId) {
+            let (mut tab, btn, pop) = popover_seq_tab(html);
+            let dlg = el(&tab, "dlg");
+            tab.layout_root = Some(Rc::new(actions_box(
+                (0.0, 0.0, 800.0, 600.0),
+                None,
+                vec![
+                    actions_box((0.0, 0.0, 100.0, 50.0), Some(btn), vec![]),
+                    actions_box((200.0, 200.0, 100.0, 100.0), Some(pop), vec![]),
+                    actions_box((400.0, 0.0, 200.0, 200.0), Some(dlg), vec![]),
+                ],
+            )));
+            (tab, btn, pop, dlg)
+        }
+        fn gesture(tab: &mut Tab, x: f64, y: f64) {
+            let mut driver = TestDriver::new();
+            driver.execute(
+                tab,
+                sequence_request(vec![pointer_source(
+                    "mouse",
+                    vec![
+                        move_item(x, y, ActionOrigin::Viewport),
+                        button_item(ActionItemKind::PointerDown, 0),
+                        button_item(ActionItemKind::PointerUp, 0),
+                    ],
+                )]),
+            );
+        }
+        let html = "<html><body><button id=\"btn\" popovertarget=\"pop\">\
+             <span id=\"span\">t</span></button>\
+             <div id=\"pop\" popover>hi</div>\
+             <dialog id=\"dlg\" closedby=\"any\">x</dialog></body></html>";
+        let listeners = "window.__log = []; \
+             document.getElementById('pop').addEventListener('toggle', function() { __log.push('toggle'); }); \
+             document.getElementById('dlg').addEventListener('cancel', function() { __log.push('cancel'); }); \
+             document.getElementById('dlg').addEventListener('close', function() { __log.push('close'); });";
+        // P4 manual: click inside the manual popover counts
+        // as a backdrop click — the any modal light-dismisses
+        // while the manual popover stays open, no toggle.
+        let (mut tab, _, pop, dlg) = p4_tab(html);
+        tab.installed_mut()
+            .expect("installed")
+            .document()
+            .borrow_mut()
+            .set_attribute(pop, "popover", "manual");
+        tab.installed_mut()
+            .expect("installed")
+            .document()
+            .borrow_mut()
+            .show_dialog_modal(dlg)
+            .expect("showModal");
+        open_popover_td(&mut tab, pop);
+        eval(&mut tab, listeners);
+        gesture(&mut tab, 250.0, 250.0);
+        assert!(
+            !tab.document_ref().expect("document").is_dialog_open(dlg),
+            "P4 manual: click inside the manual popover light-dismisses the any modal"
+        );
+        assert!(
+            popover_open(&tab, pop),
+            "P4 manual: the manual popover itself never closes"
+        );
+        assert!(
+            js_true(&mut tab, "window.__log.join(',') === 'cancel,close'"),
+            "P4 manual: only the dialog cancel/close fire, no toggle"
+        );
+        // P4 hint: behaves exactly like an auto — the modal
+        // light-dismisses and the hint closes after it
+        // (`cancel,close,toggle`).
+        let (mut tab, _, pop, dlg) = p4_tab(html);
+        tab.installed_mut()
+            .expect("installed")
+            .document()
+            .borrow_mut()
+            .set_attribute(pop, "popover", "hint");
+        tab.installed_mut()
+            .expect("installed")
+            .document()
+            .borrow_mut()
+            .show_dialog_modal(dlg)
+            .expect("showModal");
+        open_popover_td(&mut tab, pop);
+        eval(&mut tab, listeners);
+        gesture(&mut tab, 250.0, 250.0);
+        assert!(
+            !tab.document_ref().expect("document").is_dialog_open(dlg),
+            "P4 hint: click inside the hint popover light-dismisses the any modal"
+        );
+        assert!(
+            !popover_open(&tab, pop),
+            "P4 hint: the hint popover closes after the modal, like an auto"
+        );
+        assert!(
+            js_true(&mut tab, "window.__log.join(',') === 'cancel,close,toggle'"),
+            "P4 hint: hint closes in the same dialog-first order as an auto"
+        );
+        // LD prevented-cancel: a `cancel` listener that
+        // prevents the default keeps the any modal open on an
+        // outside click — no `close` fires.
+        let (mut tab, _, pop, dlg) = p4_tab(html);
+        tab.installed_mut()
+            .expect("installed")
+            .document()
+            .borrow_mut()
+            .show_dialog_modal(dlg)
+            .expect("showModal");
+        let _ = pop;
+        eval(
+            &mut tab,
+            "window.__log = []; \
+             document.getElementById('dlg').addEventListener('cancel', function(e) { __log.push('cancel'); e.preventDefault(); }); \
+             document.getElementById('dlg').addEventListener('close', function() { __log.push('close'); });",
+        );
+        gesture(&mut tab, 700.0, 500.0);
+        assert!(
+            tab.document_ref().expect("document").is_dialog_open(dlg),
+            "LD: prevented cancel must keep the dialog open"
+        );
+        assert!(
+            js_true(&mut tab, "window.__log.join(',') === 'cancel'"),
+            "LD: only the cancel fires, no close"
+        );
+    }
+
+    #[test]
+    fn w86fix_s3_escape_fallthrough_below_none_dialogs() {
+        // w86fix S3 (Chrome 155 A4/A5/A8): testdriver
+        // end-to-end Escape fallthrough — an escapable
+        // dialog below a `closedby="none"` dialog (modal or
+        // not) still closes, and the none dialog stays open.
+        // A8: escapable non-modal below a none MODAL.
+        let mut tab = tab_from_html(
+            b"<html><body><dialog id=\"d1\" closedby=\"any\">one</dialog>\
+              <dialog id=\"d2\" closedby=\"none\">two</dialog></body></html>",
+        );
+        eval(
+            &mut tab,
+            "var d1 = document.getElementById('d1'); var d2 = document.getElementById('d2'); \
+             window.__log = []; \
+             d1.addEventListener('cancel', function() { __log.push('cancel:d1'); }); \
+             d1.addEventListener('close', function() { __log.push('close:d1'); }); \
+             d2.addEventListener('cancel', function() { __log.push('cancel:d2'); }); \
+             d2.addEventListener('close', function() { __log.push('close:d2'); }); \
+             d1.show(); d2.showModal(); window.__log = [];",
+        );
+        let mut driver = TestDriver::new();
+        driver.execute(
+            &mut tab,
+            sequence_request(vec![key_source(vec![
+                key_item(ActionItemKind::KeyDown, "Escape"),
+                key_item(ActionItemKind::KeyUp, "Escape"),
+            ])]),
+        );
+        assert!(
+            !tab.document_ref()
+                .expect("document")
+                .is_dialog_open(el(&tab, "d1")),
+            "A8: escapable dialog below a none modal closes on Escape"
+        );
+        assert!(
+            tab.document_ref()
+                .expect("document")
+                .is_dialog_open(el(&tab, "d2")),
+            "A8: the none modal stays open"
+        );
+        assert!(
+            js_true(&mut tab, "window.__log.join(',') === 'cancel:d1,close:d1'"),
+            "A8: only the escapable dialog's cancel/close fire"
+        );
+        // A5: escapable dialog below a none NON-modal, both
+        // show orders.
+        for none_first in [true, false] {
+            let mut tab = tab_from_html(
+                b"<html><body><dialog id=\"d1\" closedby=\"any\">one</dialog>\
+                  <dialog id=\"d2\" closedby=\"none\">two</dialog></body></html>",
+            );
+            eval(
+                &mut tab,
+                "var d1 = document.getElementById('d1'); var d2 = document.getElementById('d2'); \
+                 window.__log = []; \
+                 d1.addEventListener('cancel', function() { __log.push('cancel:d1'); }); \
+                 d1.addEventListener('close', function() { __log.push('close:d1'); }); \
+                 d2.addEventListener('cancel', function() { __log.push('cancel:d2'); }); \
+                 d2.addEventListener('close', function() { __log.push('close:d2'); });",
+            );
+            if none_first {
+                eval(&mut tab, "d2.show(); d1.show(); window.__log = [];");
+            } else {
+                eval(&mut tab, "d1.show(); d2.show(); window.__log = [];");
+            }
+            let mut driver = TestDriver::new();
+            driver.execute(
+                &mut tab,
+                sequence_request(vec![key_source(vec![
+                    key_item(ActionItemKind::KeyDown, "Escape"),
+                    key_item(ActionItemKind::KeyUp, "Escape"),
+                ])]),
+            );
+            assert!(
+                !tab.document_ref()
+                    .expect("document")
+                    .is_dialog_open(el(&tab, "d1")),
+                "A5 none_first={none_first}: escapable dialog below a none non-modal closes"
+            );
+            assert!(
+                tab.document_ref()
+                    .expect("document")
+                    .is_dialog_open(el(&tab, "d2")),
+                "A5 none_first={none_first}: the none non-modal stays open"
+            );
+            assert!(
+                js_true(&mut tab, "window.__log.join(',') === 'cancel:d1,close:d1'"),
+                "A5 none_first={none_first}: only the escapable dialog fires"
+            );
+        }
+        // A4: none modal + auto: only the auto closes.
+        let mut tab = tab_from_html(
+            b"<html><body><dialog id=\"d1\" closedby=\"none\">one</dialog>\
+              <div id=\"pop\" popover>hi</div></body></html>",
+        );
+        eval(
+            &mut tab,
+            "var d1 = document.getElementById('d1'); var p = document.getElementById('pop'); \
+             window.__log = []; \
+             d1.addEventListener('cancel', function() { __log.push('cancel:d1'); }); \
+             d1.addEventListener('close', function() { __log.push('close:d1'); }); \
+             p.addEventListener('toggle', function() { __log.push('toggle:p'); }); \
+             d1.showModal(); p.showPopover(); window.__log = [];",
+        );
+        let mut driver = TestDriver::new();
+        driver.execute(
+            &mut tab,
+            sequence_request(vec![key_source(vec![
+                key_item(ActionItemKind::KeyDown, "Escape"),
+                key_item(ActionItemKind::KeyUp, "Escape"),
+            ])]),
+        );
+        assert!(
+            !tab.document_ref()
+                .expect("document")
+                .is_popover_open(el(&tab, "pop")),
+            "A4: the auto above a none modal closes on Escape"
+        );
+        assert!(
+            tab.document_ref()
+                .expect("document")
+                .is_dialog_open(el(&tab, "d1")),
+            "A4: the none modal stays open"
+        );
+        assert!(
+            js_true(&mut tab, "window.__log.join(',') === 'toggle:p'"),
+            "A4: only the auto toggle fires"
+        );
+    }
+
+    #[test]
+    fn w86fix_p2_escape_prevented_cancel_closes_all_targets() {
+        // w86fix P2 (Chrome 155): the Escape `cancel` is
+        // `cancelable=false` — a listener calling
+        // `preventDefault()` on D2's cancel is a no-op and
+        // D2, D1 and the auto all still close, in the A7
+        // canonical order. The listener observes
+        // `cancelable === false` and `defaultPrevented`
+        // staying false.
+        let mut tab = tab_from_html(
+            b"<html><body><dialog id=\"d1\" closedby=\"any\">one</dialog>\
+              <dialog id=\"d2\" closedby=\"any\">two</dialog>\
+              <div id=\"pop\" popover>hi</div></body></html>",
+        );
+        eval(
+            &mut tab,
+            "var d1 = document.getElementById('d1'); var d2 = document.getElementById('d2'); \
+             var p = document.getElementById('pop'); window.__log = []; \
+             d1.addEventListener('cancel', function() { __log.push('cancel:d1'); }); \
+             d1.addEventListener('close', function() { __log.push('close:d1'); }); \
+             d2.addEventListener('cancel', function(e) { __log.push('cancel:d2:' + e.cancelable); e.preventDefault(); __log.push('prevented:d2:' + e.defaultPrevented); }); \
+             d2.addEventListener('close', function() { __log.push('close:d2'); }); \
+             p.addEventListener('toggle', function() { __log.push('toggle:p'); }); \
+             d1.show(); d2.show(); p.showPopover(); window.__log = [];",
+        );
+        let mut driver = TestDriver::new();
+        driver.execute(
+            &mut tab,
+            sequence_request(vec![key_source(vec![
+                key_item(ActionItemKind::KeyDown, "Escape"),
+                key_item(ActionItemKind::KeyUp, "Escape"),
+            ])]),
+        );
+        assert!(
+            !tab.document_ref()
+                .expect("document")
+                .is_dialog_open(el(&tab, "d1")),
+            "P2: D1 closes despite D2's prevented cancel"
+        );
+        assert!(
+            !tab.document_ref()
+                .expect("document")
+                .is_dialog_open(el(&tab, "d2")),
+            "P2: D2 closes despite its own prevented cancel"
+        );
+        assert!(
+            !tab.document_ref()
+                .expect("document")
+                .is_popover_open(el(&tab, "pop")),
+            "P2: the auto closes too"
+        );
+        assert!(
+            js_true(
+                &mut tab,
+                "window.__log.join(',') === 'cancel:d2:false,prevented:d2:false,cancel:d1,close:d2,close:d1,toggle:p'"
+            ),
+            "P2: Escape cancel is non-cancelable and everything still closes, A7 order"
+        );
+    }
+
+    #[test]
+    fn w86_light_dismiss_dialog_first_interleaved_order() {
+        // w86, Chrome 155 verdict B: one outside click closes
+        // both a closedby=any dialog and an auto popover,
+        // DIALOG FIRST — a single JS log pins the interleaved
+        // order `cancel,close,toggle` (the w85fix deferral
+        // test pins the separate `cancel,close,blur` order;
+        // this pins the popover toggle after the dialog close).
+        let html = "<html><body><button id=\"btn\" popovertarget=\"pop\">\
+             <span id=\"span\">t</span></button>\
+             <div id=\"pop\" popover>hi</div>\
+             <dialog id=\"dlg\" closedby=\"any\"><button id=\"a\">a</button></dialog></body></html>";
+        let (mut tab, _, pop) = popover_seq_tab(html);
+        let dlg = el(&tab, "dlg");
+        // Dialog first: `show_dialog` hides open autos, so
+        // showing it after the popover would hide the
+        // popover before the gesture.
+        tab.installed_mut()
+            .expect("installed")
+            .document()
+            .borrow_mut()
+            .show_dialog(dlg)
+            .expect("show dialog");
+        open_popover_td(&mut tab, pop);
+        eval(
+            &mut tab,
+            "window.__log = []; \
+             document.getElementById('pop').addEventListener('toggle', function() { __log.push('toggle'); }); \
+             var d = document.getElementById('dlg'); \
+             d.addEventListener('cancel', function() { __log.push('cancel'); }); \
+             d.addEventListener('close', function() { __log.push('close'); });",
+        );
+        let mut driver = TestDriver::new();
+        driver.execute(
+            &mut tab,
+            sequence_request(vec![pointer_source(
+                "mouse",
+                vec![
+                    move_item(700.0, 500.0, ActionOrigin::Viewport),
+                    button_item(ActionItemKind::PointerDown, 0),
+                    button_item(ActionItemKind::PointerUp, 0),
+                ],
+            )]),
+        );
+        assert!(
+            !popover_open(&tab, pop),
+            "outside gesture must light-dismiss the popover"
+        );
+        assert!(
+            !tab.document_ref().expect("document").is_dialog_open(dlg),
+            "outside gesture must light-dismiss the closedby=any dialog"
+        );
+        assert!(
+            js_true(&mut tab, "window.__log.join(',') === 'cancel,close,toggle'"),
+            "outside click: dialog cancel, then close, then popover toggle (B1/B2)"
         );
     }
 
@@ -6372,10 +7468,7 @@ mod tests {
             retained,
             "stored duration must retain the dismissed popover"
         );
-        assert!(
-            !live,
-            "a retained victim is not a live top-layer member"
-        );
+        assert!(!live, "a retained victim is not a live top-layer member");
         assert!(
             !dialog_open,
             "outside gesture must light-dismiss the closedby=any dialog"
@@ -6424,10 +7517,7 @@ mod tests {
             live,
             "close listener must have re-shown the retained popover to live membership"
         );
-        assert!(
-            !retained,
-            "re-show must cancel the exit retention"
-        );
+        assert!(!retained, "re-show must cancel the exit retention");
         assert!(
             js_true(&mut tab, "window.__log.join(',') === 'cancel,close'"),
             "no blur must fire for a retained-then-reshown popover"
@@ -6559,7 +7649,9 @@ mod tests {
         let click_node = el(&tab, "sub");
         driver.execute_click(&mut tab, click_node).expect("click");
         assert!(
-            !tab.document_ref().expect("document").is_dialog_open(el(&tab, "dlg")),
+            !tab.document_ref()
+                .expect("document")
+                .is_dialog_open(el(&tab, "dlg")),
             "submit must close the dual dialog"
         );
         assert!(
@@ -6598,7 +7690,9 @@ mod tests {
         let click_node = el(&tab, "sub");
         driver.execute_click(&mut tab, click_node).expect("click");
         assert!(
-            !tab.document_ref().expect("document").is_dialog_open(el(&tab, "dlg")),
+            !tab.document_ref()
+                .expect("document")
+                .is_dialog_open(el(&tab, "dlg")),
             "re-show case: submit must still close the dialog"
         );
         assert!(
@@ -6635,7 +7729,9 @@ mod tests {
              d.show(); d.showPopover(); window.__log = []; d.removeAttribute('open');",
         );
         assert!(
-            !tab.document_ref().expect("document").is_dialog_open(el(&tab, "dlg")),
+            !tab.document_ref()
+                .expect("document")
+                .is_dialog_open(el(&tab, "dlg")),
             "removeAttribute('open') must close the dual state-wise"
         );
         assert!(

@@ -12187,20 +12187,16 @@ fn w78fix_pref_wrapper_geometry_aspect_agrees() {
 fn w78fix_sticky_bottom_padded_scroller() {
     // M2, bottom mirror of `w78_sticky_overflow_padding_*`: a
     // padded scroller (`padding: 20px 0`, content box 20..220) with
-    // `bottom: 0`. The sticky box's natural y is 220; the
-    // padding-box scrollport's far edge (w79: CSS Overflow 3 §2.3
-    // — the scrollport coincides with the padding box — and CSS
-    // Position 3 §3.4 — the sticky view rectangle is the scrollport
-    // inset by the insets) puts it at 20 (content-box origin, the
-    // scroll-origin anchor, unchanged by w79) + 240 (padding-box
-    // size) - 100 = 160. The pre-w79 content-box size (200) pinned
-    // it at 120, a full padding short of the scrollport's far edge;
-    // the full padding-box variant with a moved origin
-    // (0 + 240 - 100 = 140) is NOT used — moving the origin would
-    // change the start-edge behavior pinned by
-    // `w78_sticky_overflow_padding_*`, which w79 leaves untouched.
-    // This pins the padding-box size term in
-    // `sticky_scrollport_axis`; the origin term is already pinned
+    // `bottom: 0`. The sticky box's natural y is 220; the far edge is
+    // the scrollport's CONTENT-box edge (w86, Chrome 155 §C: the
+    // w79 padding-box reading — 20 (content-box origin) + 240
+    // (padding-box size) - 100 = 160 — is contradicted by Chrome,
+    // which sticks the bottom edge at `clientHeight - paddingBottom`
+    // = 220, putting the 100px box at 120). The containing-block
+    // bound (container content box 120..420) does not interfere: the
+    // floor (120) equals the ceiling here.
+    // This pins the content-box size term in the far clamp in
+    // `apply_sticky_constraints`; the origin term is already pinned
     // by the top-edge tests.
     let html = r#"<div id="sc"><div id="contents"><div id="pre"></div><div id="container"><div id="filler"></div><div id="sticky"></div></div></div></div>"#;
     let css = "body { margin: 0; } \
@@ -12223,17 +12219,17 @@ fn w78fix_sticky_bottom_padded_scroller() {
     let y = body(&l).children[0].children[0].children[1].children[1]
         .rect
         .y;
-    assert!(approx(y, 160.0), "bottom padded y={y} != 160");
+    assert!(approx(y, 120.0), "bottom padded y={y} != 120");
 }
 
 #[test]
 fn w78fix_sticky_right_padded_scroller() {
     // M2, right mirror: a padded scroller (`padding: 0 20px`,
     // content box 20..220) with `right: 0`. Natural x is 220
-    // (20 content origin + 200 filler); the padding-box far edge
-    // (w79, same spec citation as the bottom mirror above) puts
-    // the 100px box at 20 + 240 - 100 = 160, not the pre-w79
-    // content-box 120. The containing-block bound
+    // (20 content origin + 200 filler); the content-box far edge
+    // (w86, Chrome 155 §C — same correction as the bottom mirror
+    // above) puts the 100px box at 20 + 200 - 100 = 120, not the
+    // w79 padding-box 160. The containing-block bound
     // (container content box 20..520) does not interfere.
     let html = r#"<div id="sc"><div id="container"><div id="filler"></div><div id="sticky"></div></div></div>"#;
     let css = "body { margin: 0; } \
@@ -12254,7 +12250,332 @@ fn w78fix_sticky_right_padded_scroller() {
         &offsets,
     );
     let x = body(&l).children[0].children[0].children[1].rect.x;
-    assert!(approx(x, 160.0), "right padded x={x} != 160");
+    assert!(approx(x, 120.0), "right padded x={x} != 120");
+}
+
+/// Find a laid-out box by DOM node id (the w86 sticky tests address
+/// boxes by id instead of child paths, which get brittle across the
+/// nested-scroller geometries).
+fn w86_find(b: &crate::LayoutBox, id: bowser_dom::NodeId) -> Option<&crate::LayoutBox> {
+    if b.node == Some(id) {
+        return Some(b);
+    }
+    b.children.iter().find_map(|c| w86_find(c, id))
+}
+
+/// Lay out `html`/`css` with the given nested scroller offsets
+/// (`(scrollLeft, scrollTop)` per scroller id) and return the
+/// `sticky_id` box's rect `(x, y, w, h)` in document coordinates.
+fn w86_sticky_rect(
+    html: &str,
+    css: &str,
+    offsets: &[(&str, (f32, f32))],
+    sticky_id: &str,
+) -> (f32, f32, f32, f32) {
+    let (doc, _) = bowser_dom::Document::parse_html(html.as_bytes());
+    let ss = bowser_css::parse_stylesheet(css);
+    let mut map = HashMap::new();
+    for (id, off) in offsets {
+        map.insert(doc.get_element_by_id(id).expect("scroller id"), *off);
+    }
+    let l = crate::layout_with_scroll_and_offsets(
+        &doc,
+        &[&ss],
+        VP,
+        &FixedFontMetrics,
+        (0.0, 0.0),
+        &map,
+    );
+    let sticky = doc.get_element_by_id(sticky_id).expect("sticky id");
+    let r = w86_find(&l, sticky).expect("sticky box").rect;
+    (r.x, r.y, r.w, r.h)
+}
+
+#[test]
+fn w86_sticky_rtl_left_zero() {
+    // C1 (Chrome 155): RTL scroller, `left: 0` sticky — the mirror of
+    // LTR `right: 0`. RTL `scrollLeft` is negative (0 at the right
+    // edge, max -300 here); the sticky's left edge sticks at the
+    // content-box left edge (20) for scrollLeft 0..-100 and releases
+    // to its natural position at max scroll (paintedLeft 220).
+    // In document coordinates (scroller border box at x=0) the
+    // layout x is 20 / -80 / -80: `paintedLeft = offsetLeft -
+    // scrollLeft`. The natural position comes from a physical
+    // `margin-left: 200px` on the block sticky (container content
+    // box -280..220 in RTL, so -280 + 200 = -80); `margin-right:
+    // auto` keeps that margin from being discarded as
+    // over-constrained (CSS 2.1 §10.3.3 drops `margin-left` in RTL
+    // when width and both margins are specified). Bowser lays out
+    // inline-blocks LTR inside a right-aligned RTL line (filler
+    // [-80,120], sticky [120,220] where Chrome has filler [20,220],
+    // sticky [-80,20]), so the probe's inline geometry cannot
+    // supply the natural position here — that RTL inline-ordering
+    // divergence is out of scope for this wave; the constraint
+    // arithmetic with negative scrollLeft is what this pins.
+    let html = r#"<div id="sc"><div id="container"><div id="sticky"></div></div></div>"#;
+    let css = "body { margin: 0; } \
+         #sc { direction: rtl; position: relative; width: 200px; height: 100px; overflow: hidden; padding: 0 20px; } \
+         #container { width: 500px; } \
+         #sticky { position: sticky; left: 0; width: 100px; height: 50px; margin-left: 200px; margin-right: auto; }";
+    for (scroll_left, expect_x, expect_painted) in [
+        (0.0, 20.0, 20.0),
+        (-100.0, -80.0, 20.0),
+        (-300.0, -80.0, 220.0),
+    ] {
+        let (x, _, _, _) = w86_sticky_rect(html, css, &[("sc", (scroll_left, 0.0))], "sticky");
+        assert!(
+            approx(x, expect_x),
+            "RTL left:0 scrollLeft={scroll_left}: x={x} != {expect_x}"
+        );
+        let painted = x - scroll_left;
+        assert!(
+            approx(painted, expect_painted),
+            "RTL left:0 scrollLeft={scroll_left}: paintedLeft={painted} != {expect_painted}"
+        );
+    }
+}
+
+#[test]
+fn w86_sticky_bordered_scroller() {
+    // C2 (Chrome 155): a border shifts border-box-relative
+    // coordinates by the border width and changes nothing else —
+    // the w79 A/B geometries plus `border: 10px solid`. Layout
+    // positions (scroller border box at the page origin): stuck at
+    // 130 (content-box far edge 230 - 100) at scroll 0, natural 230
+    // from scroll 100 on (released at max scroll 300).
+    let html = r#"<div id="sc"><div id="contents"><div id="pre"></div><div id="container"><div id="filler"></div><div id="sticky"></div></div></div></div>"#;
+    let css_v = "body { margin: 0; } \
+         #sc { position: relative; width: 100px; height: 200px; overflow: hidden; padding: 20px 0; border: 10px solid black; } \
+         #contents { height: 500px; } #pre { height: 100px; } \
+         #container { height: 300px; } #filler { height: 100px; } \
+         #sticky { position: sticky; bottom: 0; height: 100px; }";
+    for (scroll, expect_y) in [(0.0, 130.0), (100.0, 230.0), (300.0, 230.0)] {
+        let (_, y, _, _) = w86_sticky_rect(html, css_v, &[("sc", (0.0, scroll))], "sticky");
+        assert!(
+            approx(y, expect_y),
+            "C2a scrollTop={scroll}: y={y} != {expect_y}"
+        );
+    }
+    let html_h = r#"<div id="sc"><div id="container"><div id="filler"></div><div id="sticky"></div></div></div>"#;
+    let css_h = "body { margin: 0; } \
+         #sc { position: relative; width: 200px; height: 100px; overflow: hidden; padding: 0 20px; border: 10px solid black; } \
+         #container { width: 500px; } \
+         #filler { display: inline-block; width: 200px; height: 50px; } \
+         #sticky { display: inline-block; position: sticky; right: 0; width: 100px; height: 50px; }";
+    for (scroll, expect_x) in [(0.0, 130.0), (100.0, 230.0), (300.0, 230.0)] {
+        let (x, _, _, _) = w86_sticky_rect(html_h, css_h, &[("sc", (scroll, 0.0))], "sticky");
+        assert!(
+            approx(x, expect_x),
+            "C2b scrollLeft={scroll}: x={x} != {expect_x}"
+        );
+    }
+}
+
+#[test]
+fn w86_sticky_nested_scroller_nearest_only() {
+    // C3a2/C3b2 (Chrome 155, fixed geometry): a sticky sticks ONLY
+    // to its NEAREST scrollport. Outer scrolling moves the whole
+    // inner box — and the sticky with it — with no sticking to the
+    // outer; the inner-relative position is invariant under outer
+    // scroll. Document coordinates here (inner border box at y=20 /
+    // x=20): the document rects are 220/245/270 (vertical) and
+    // 320/345/370 (horizontal) — inner-relative painted positions
+    // 200/225/250 and 300/325/350 before subtracting scroll — and
+    // outer-only scrolls leave them unchanged.
+    let html_v = r#"<div id="outer"><div id="inner"><div id="contents"><div id="pre"></div><div id="container"><div id="filler"></div><div id="sticky"></div></div></div></div></div>"#;
+    let css_v = "body { margin: 0; } \
+         #outer { position: relative; width: 100px; height: 200px; overflow: hidden; padding: 20px 0; } \
+         #inner { height: 300px; overflow: hidden; } \
+         #contents { height: 500px; } #pre { height: 150px; } \
+         #container { height: 300px; } #filler { height: 100px; } \
+         #sticky { position: sticky; bottom: 0; height: 100px; }";
+    for (inner, outer, expect_y) in [
+        (0.0, 0.0, 220.0),
+        (25.0, 0.0, 245.0),
+        (50.0, 0.0, 270.0),
+        (100.0, 0.0, 270.0),
+        (200.0, 0.0, 270.0),
+        (0.0, 50.0, 220.0),
+        (0.0, 100.0, 220.0),
+        (50.0, 50.0, 270.0),
+    ] {
+        let (_, y, _, _) = w86_sticky_rect(
+            html_v,
+            css_v,
+            &[("inner", (0.0, inner)), ("outer", (0.0, outer))],
+            "sticky",
+        );
+        assert!(
+            approx(y, expect_y),
+            "C3a2 inner={inner} outer={outer}: y={y} != {expect_y}"
+        );
+    }
+    let html_h = r#"<div id="outer"><div id="inner"><div id="container"><div id="filler"></div><div id="sticky"></div></div></div></div>"#;
+    let css_h = "body { margin: 0; } \
+         #outer { position: relative; width: 200px; height: 100px; overflow: hidden; padding: 0 20px; } \
+         #inner { width: 400px; overflow: hidden; } \
+         #container { width: 500px; } \
+         #filler { display: inline-block; width: 350px; height: 50px; } \
+         #sticky { display: inline-block; position: sticky; right: 0; width: 100px; height: 50px; }";
+    for (inner, outer, expect_x) in [
+        (0.0, 0.0, 320.0),
+        (25.0, 0.0, 345.0),
+        (50.0, 0.0, 370.0),
+        (100.0, 0.0, 370.0),
+        (0.0, 80.0, 320.0),
+        (0.0, 160.0, 320.0),
+        (50.0, 80.0, 370.0),
+    ] {
+        let (x, _, _, _) = w86_sticky_rect(
+            html_h,
+            css_h,
+            &[("inner", (inner, 0.0)), ("outer", (outer, 0.0))],
+            "sticky",
+        );
+        assert!(
+            approx(x, expect_x),
+            "C3b2 inner={inner} outer={outer}: x={x} != {expect_x}"
+        );
+    }
+}
+
+#[test]
+fn w86_sticky_overflow_scroll_gutter() {
+    // C4 (Chrome 155): with `overflow: scroll` the constraint uses
+    // the gutter-shrunk client size — the same content-box rule with
+    // the smaller client. Chrome's classic bars are 15px (client
+    // 225, ceiling-at-0 105); Bowser's are 12px
+    // (`SCROLLBAR_THICKNESS`), so the ceiling-at-0 here is 108 and
+    // the expectations below are Bowser's, 3px off Chrome's at small
+    // scrolls (see the floor-slide test for the slide lengths).
+    // The forced vertical bar also narrows the block sticky's own
+    // width to 88 (100 - 12), pinned here.
+    let html_v = r#"<div id="sc"><div id="contents"><div id="pre"></div><div id="container"><div id="filler"></div><div id="sticky"></div></div></div></div>"#;
+    let css_v = "body { margin: 0; } \
+         #sc { position: relative; width: 100px; height: 200px; overflow: scroll; padding: 20px 0; } \
+         #contents { height: 500px; } #pre { height: 100px; } \
+         #container { height: 300px; } #filler { height: 100px; } \
+         #sticky { position: sticky; bottom: 0; height: 100px; }";
+    // Floor is 120 (container content top 20 + pre 100), so scroll 0
+    // parks at the floor, not the 108 ceiling.
+    for (scroll, expect_y) in [(0.0, 120.0), (100.0, 208.0), (315.0, 220.0)] {
+        let (_, y, w, _) = w86_sticky_rect(html_v, css_v, &[("sc", (0.0, scroll))], "sticky");
+        assert!(
+            approx(y, expect_y),
+            "C4a scrollTop={scroll}: y={y} != {expect_y}"
+        );
+        assert!(
+            approx(w, 88.0),
+            "C4a: sticky w={w} != 88 (forced vertical bar)"
+        );
+    }
+    let html_h = r#"<div id="sc"><div id="container"><div id="filler"></div><div id="sticky"></div></div></div>"#;
+    let css_h = "body { margin: 0; } \
+         #sc { position: relative; width: 200px; height: 100px; overflow: scroll; padding: 0 20px; } \
+         #container { width: 500px; } \
+         #filler { display: inline-block; width: 200px; height: 50px; } \
+         #sticky { display: inline-block; position: sticky; right: 0; width: 100px; height: 50px; }";
+    for (scroll, expect_x) in [(0.0, 108.0), (100.0, 208.0), (315.0, 220.0)] {
+        let (x, _, _, _) = w86_sticky_rect(html_h, css_h, &[("sc", (scroll, 0.0))], "sticky");
+        assert!(
+            approx(x, expect_x),
+            "C4b scrollLeft={scroll}: x={x} != {expect_x}"
+        );
+    }
+}
+
+#[test]
+fn w86_sticky_combined_bottom_right_independent() {
+    // C5 (Chrome 155): `bottom: 0` + `right: 0` — the two axes are
+    // independent, each following its own single-axis rule (far edge
+    // at the content-box edge, 220, i.e. layout 120 at scroll 0).
+    // At (300,300) the vertical axis has released to its natural
+    // position while the horizontal axis sits at its stuck position
+    // (which coincides with natural there).
+    let html = r#"<div id="sc"><div id="contents"><div id="pre"></div><div id="container"><div id="filler"></div><div id="sticky"></div></div></div></div>"#;
+    let css = "body { margin: 0; } \
+         #sc { position: relative; width: 200px; height: 200px; overflow: hidden; padding: 20px; } \
+         #contents { width: 500px; height: 500px; } #pre { height: 100px; } \
+         #container { height: 300px; } #filler { height: 100px; } \
+         #sticky { position: sticky; bottom: 0; right: 0; width: 100px; height: 100px; margin-left: auto; }";
+    for ((top, left), (expect_x, expect_y)) in [
+        ((0.0, 0.0), (120.0, 120.0)),
+        ((100.0, 100.0), (220.0, 220.0)),
+        ((300.0, 300.0), (420.0, 220.0)),
+        ((300.0, 0.0), (120.0, 220.0)),
+        ((0.0, 300.0), (420.0, 120.0)),
+    ] {
+        let (x, y, _, _) = w86_sticky_rect(html, css, &[("sc", (left, top))], "sticky");
+        assert!(
+            approx(x, expect_x) && approx(y, expect_y),
+            "C5 scroll=({top},{left}): ({x},{y}) != ({expect_x},{expect_y})"
+        );
+    }
+}
+
+#[test]
+fn w86_sticky_containing_block_floor_slide() {
+    // E1/C4a2/E2 (Chrome 155): the containing-block floor —
+    // `offsetTop = max(cbTop, min(naturalTop, scrollTop + client -
+    // paddingBottom - height))`. Same scroller geometry
+    // (`overflow: scroll`, ceiling-at-0 108 under Bowser's 12px
+    // bars, 105 under Chrome's 15px), different `pre` heights, i.e.
+    // different floors:
+    // - E1 floor 70: below the ceiling from the start, no slide
+    //   (stuck at 108 immediately).
+    // - C4a2 floor 120: 12px slide (Chrome 15px), frozen at 120
+    //   until scroll 12, then tracking the ceiling.
+    // - E2 floor 170: 62px slide (Chrome 65px), frozen at 170
+    //   until scroll 62, then tracking the ceiling.
+    // The 3px deltas vs Chrome are the scrollbar-thickness
+    // difference (12 vs 15), not a model difference.
+    for (pre, floor, cases) in [
+        (
+            50.0,
+            70.0,
+            &[(0.0, 108.0), (15.0, 123.0), (65.0, 170.0), (100.0, 170.0)][..],
+        ),
+        (
+            100.0,
+            120.0,
+            &[
+                (0.0, 120.0),
+                (12.0, 120.0),
+                (15.0, 123.0),
+                (65.0, 173.0),
+                (100.0, 208.0),
+                (315.0, 220.0),
+            ][..],
+        ),
+        (
+            150.0,
+            170.0,
+            &[
+                (0.0, 170.0),
+                (15.0, 170.0),
+                (62.0, 170.0),
+                (65.0, 173.0),
+                (100.0, 208.0),
+                (315.0, 270.0),
+            ][..],
+        ),
+    ] {
+        let html = "<div id=\"sc\"><div id=\"contents\"><div id=\"pre\"></div><div id=\"container\"><div id=\"filler\"></div><div id=\"sticky\"></div></div></div></div>";
+        let css = format!(
+            "body {{ margin: 0; }} \
+             #sc {{ position: relative; width: 100px; height: 200px; overflow: scroll; padding: 20px 0; }} \
+             #contents {{ height: 500px; }} #pre {{ height: {pre}px; }} \
+             #container {{ height: 300px; }} #filler {{ height: 100px; }} \
+             #sticky {{ position: sticky; bottom: 0; height: 100px; }}"
+        );
+        for &(scroll, expect_y) in cases {
+            let (_, y, _, _) = w86_sticky_rect(html, &css, &[("sc", (0.0, scroll))], "sticky");
+            assert!(
+                approx(y, expect_y),
+                "floor {floor} (pre {pre}) scrollTop={scroll}: y={y} != {expect_y}"
+            );
+        }
+    }
 }
 
 #[test]

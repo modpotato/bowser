@@ -225,9 +225,9 @@ const SNAP_DISPATCH_KEY: &str = "\u{0}bowser:dispatchSnapEvent";
 /// eval'ing the dispatch.
 const SNAP_TARGET_KEY: &str = "\u{0}bowser:snapTarget";
 const SNAP_EVENT_KEY: &str = "\u{0}bowser:snapEvent";
-/// Hidden trampoline natives for host dialog/popover dispatches
+/// Hidden trampoline natives for host dialog/popover/form dispatches
 /// ([`Vm::dispatch_cancel_event`], [`Vm::dispatch_close_event`],
-/// [`Vm::dispatch_toggle_event`]): the host evals a stub calling one
+/// [`Vm::dispatch_toggle_event`], [`Vm::dispatch_submit_event`]): the host evals a stub calling one
 /// of these so listener invocation reaches the interpreter (see
 /// [`Vm::dispatch_host_event`]). They are installed locked
 /// (non-writable, non-configurable, non-enumerable — see
@@ -1624,8 +1624,39 @@ struct EventDispatchState {
     path: Vec<NodeId>,
     /// Set by `stopPropagation()`.
     stop_propagation: bool,
+    /// True when `stop_propagation` was set by a listener running
+    /// in THIS dispatch (via `stopPropagation()` or the
+    /// `cancelBubble` setter), as opposed to seeded by the inline
+    /// handler before the dispatch started (see
+    /// `run_event_dispatch`): the seeded flag must not skip
+    /// capture listeners, which conceptually already ran before
+    /// the inline handler's notional target phase, while a live
+    /// capture listener's own call still halts the remaining
+    /// capture phase. Reset at every dispatch start.
+    stop_propagation_live: bool,
     /// Set by `stopImmediatePropagation()`.
     stop_immediate: bool,
+    /// True when `stop_immediate` was set by a listener running
+    /// in THIS dispatch, as opposed to seeded by the inline
+    /// handler before the dispatch started: the mirror of
+    /// `stop_propagation_live` for the immediate flag. A seeded
+    /// immediate stop lets capture listeners run first (DOM
+    /// phase order — capture precedes the inline handler's
+    /// notional target phase) and halts target/bubble; a live
+    /// one halts the dispatch outright, including the remaining
+    /// capture phase. Reset at every dispatch start.
+    stop_immediate_live: bool,
+    /// DOM dispatch flag: true while `run_event_dispatch` is
+    /// delivering THIS event object. A reentrant dispatch of
+    /// the same object (a listener dispatching the event it is
+    /// currently handling) is a no-op — the inner call returns
+    /// the current prevented state without resetting or
+    /// clearing the outer dispatch's stop flags. Cleared in
+    /// the epilogue. Note `dispatchEvent` currently mints a
+    /// fresh handle per call, so the guard is defense-in-depth
+    /// for the host/stashed paths that reuse a handle, not a
+    /// live JS path today.
+    dispatching: bool,
     /// True while a `passive: true` listener is the innermost running
     /// listener: `preventDefault()` is a no-op then (DOM).
     in_passive_listener: bool,
@@ -1641,7 +1672,10 @@ impl EventDispatchState {
             phase: PHASE_NONE,
             path: Vec::new(),
             stop_propagation: false,
+            stop_propagation_live: false,
             stop_immediate: false,
+            stop_immediate_live: false,
+            dispatching: false,
             in_passive_listener: false,
         }
     }
@@ -2087,10 +2121,26 @@ struct HostEventFrame {
     /// `stopImmediatePropagation()` set by the inline handler: the
     /// core resets the stop flags at its start, so without this
     /// snapshot an inline `stopImmediatePropagation()` would be
-    /// silently dropped; the host skips the core entirely when it
-    /// is set (inline-first order: the inline handler is the first
-    /// listener, so halting means no listener runs).
+    /// silently dropped. The snapshot seeds the core's initial
+    /// stop-immediate flag (see [`run_event_dispatch`]): the
+    /// capture-exempt gate lets capture listeners run first —
+    /// DOM phase order puts capture before the inline handler's
+    /// notional target phase — and halts target/bubble entries.
+    /// (The old shape skipped the core entirely; that pinned
+    /// `""` for an inline immediate stop and contradicted the
+    /// phase order, fixed w86fix 5b.)
     stop_immediate: bool,
+    /// `stopPropagation()` set by the inline handler: same snapshot
+    /// shape as `stop_immediate` (the core resets the stop flags at
+    /// its start, so without it an inline `stopPropagation()` would
+    /// be silently dropped). Unlike `stop_immediate` the host does
+    /// NOT skip the core when it is set: the core runs with this as
+    /// its initial stop flag, so target-phase listeners still run
+    /// and only bubble ancestors are skipped — the inline handler
+    /// conceptually runs at target phase, after capture has
+    /// already run, so capture listeners still fire (see the
+    /// `stopPropagation()` gate in [`run_event_dispatch`]).
+    stop_propagation: bool,
     /// `defaultPrevented` on the wrapper right after the inline
     /// handler ran: the fallback prevention read when the core
     /// itself fails mid-flight (so an inline `preventDefault()`
@@ -2985,17 +3035,23 @@ fn resolve_shim_record(doc: &Document, rec: &ParseShimElementRecord) -> Option<N
 }
 
 fn adopt_shim_top_layer(ctx: ContextId, roots: &RefCell<ParseShimRoots>) {
-    let (show_order, dialog_modal, return_values, records, retained) = {
+    let (show_order, dialog_show_order, dialog_modal, return_values, records, retained, stored) = {
         let roots = roots.borrow();
         (
             roots.top_layer_show_ordered(),
+            roots.dialog_show_ordered(),
             roots.dialog_modal.clone(),
             roots.dialog_return.clone(),
             roots.element_wrappers.clone(),
             roots.exit_retained_live(),
+            roots.stored_exit_durations.clone(),
         )
     };
-    if show_order.is_empty() && return_values.is_empty() && retained.is_empty() {
+    if show_order.is_empty()
+        && dialog_show_order.is_empty()
+        && return_values.is_empty()
+        && retained.is_empty()
+    {
         return;
     }
     let Some(apis_rc) = web_apis(ctx) else { return };
@@ -3018,6 +3074,26 @@ fn adopt_shim_top_layer(ctx: ContextId, roots: &RefCell<ParseShimRoots>) {
     // snapshot, so only the top-layer promotion and the modal
     // flag need adopting here.
     for (arena, kind) in show_order {
+        // w86fix S5 note (NOT a fix — see below): a live member
+        // with no element-wrapper record skips the whole
+        // iteration, including the stored-duration adoption.
+        // No fix is possible here: the member's only identity
+        // is its parse arena, and adoption has no way to resolve
+        // an arena to a production node — the parse arena and the
+        // production Document arena are different numberings
+        // (elements-only vs all nodes), and no arena→node map
+        // survives to install (the layout hook's `node_arena`
+        // lives per rebuild and may never have run). The case
+        // is also unreachable through the shim show paths: both
+        // `parse_popover_apply` and `parse_dialog_show` run on
+        // wrappers, so a shown element always has a record by
+        // show time, and every removal path prunes the top layer
+        // alongside marking the record detached — so this skip
+        // is a defensive backstop for direct internal callers
+        // only, not a live divergence. Do not "fix" it by
+        // guessing a node from the arena index: a wrong node
+        // would promote and store a duration on an unrelated
+        // element.
         let Some(rec) = records
             .iter()
             .find(|rec| rec.el.arena_index() == arena && !rec.detached)
@@ -3057,6 +3133,38 @@ fn adopt_shim_top_layer(ctx: ContextId, roots: &RefCell<ParseShimRoots>) {
         {
             doc.promote_to_top_layer(node);
             doc.mark_dialog_modal(node);
+        }
+        // w86 G2: adopt the show-time stored exit duration, so a
+        // later window/testdriver dismissal (Escape, light-dismiss,
+        // submit) — which cannot measure the transition itself —
+        // defers the demotion through the same duration instead of
+        // demoting synchronously. Mirrors production
+        // `n_show_popover` / `n_show_dialog_modal`, which store at
+        // show time; a live member with no stored duration (no exit
+        // transition at show time) stores nothing, like production
+        // storing `0.0` (clear).
+        if let Some(d) = stored.get(&arena) {
+            doc.store_exit_duration(node, *d);
+        }
+    }
+    // w86fix B1: adopt the dialog show order (BOTH kinds) into
+    // production's `dialog_show_seq`, in show order. The live
+    // loop above only ever sees modal dialogs (non-modal shows
+    // never enter the top layer), so without this loop a
+    // parse-time `d2.show(); d1.show();` adopted with no
+    // sequences at all and Escape fell back to document order,
+    // contradicting Chrome probe A3b. A detached or
+    // attribute-stripped arena is skipped like the live loop;
+    // `adopt_dialog_show_seq` itself also requires `open`.
+    for arena in &dialog_show_order {
+        let Some(rec) = records
+            .iter()
+            .find(|rec| rec.el.arena_index() == *arena && !rec.detached)
+        else {
+            continue;
+        };
+        if let Some(node) = resolve_shim_record(&doc, rec) {
+            doc.adopt_dialog_show_seq(node);
         }
     }
     // w82: adopt exit retentions as retentions, not live
@@ -3320,9 +3428,9 @@ pub enum PointerMouseKind {
     Pointer,
 }
 
-/// Outcome of a host dialog/popover dispatch
+/// Outcome of a host dialog/popover/form dispatch
 /// ([`Vm::dispatch_cancel_event`], [`Vm::dispatch_close_event`],
-/// [`Vm::dispatch_toggle_event`]): `prevented` is true when the page
+/// [`Vm::dispatch_toggle_event`], [`Vm::dispatch_submit_event`]): `prevented` is true when the page
 /// canceled the event — the inline handler returning `false` on a
 /// cancelable event, the inline handler calling `preventDefault()`,
 /// or a non-passive listener calling `preventDefault()`. Both
@@ -3846,6 +3954,12 @@ impl Vm {
     /// attribute source, if any. See [`Self::dispatch_host_event`]
     /// for the single-wrapper inline mechanism and the fail-closed
     /// contract.
+    ///
+    /// This is the LIGHT-DISMISS / `requestClose()` shape:
+    /// `cancelable=true`, so `preventDefault()` genuinely keeps
+    /// the dialog open (Chrome 155 P2). The ESCAPE shape is
+    /// [`Self::dispatch_escape_cancel_event`], whose `cancel`
+    /// is `cancelable=false` — do not use this one for Escape.
     pub fn dispatch_cancel_event(
         &mut self,
         target: NodeId,
@@ -3854,6 +3968,29 @@ impl Vm {
         self.dispatch_host_event(
             target,
             dom::Event::new("cancel", false, true),
+            false,
+            inline,
+        )
+    }
+
+    /// Dispatch a trusted, non-bubbling, NON-cancelable dialog
+    /// `cancel` event at `target` — the ESCAPE shape (Chrome 155
+    /// P2: an Escape `cancel` has `cancelable=false`, so a
+    /// listener's `preventDefault()` is a no-op and the dialog
+    /// always closes; `prevented` is therefore always false,
+    /// exactly like [`Self::dispatch_close_event`]). The
+    /// light-dismiss shape, where `preventDefault()` genuinely
+    /// keeps the dialog open, is
+    /// [`Self::dispatch_cancel_event`]. `inline` is the target's
+    /// `oncancel` attribute source, if any.
+    pub fn dispatch_escape_cancel_event(
+        &mut self,
+        target: NodeId,
+        inline: Option<&str>,
+    ) -> HostEventOutcome {
+        self.dispatch_host_event(
+            target,
+            dom::Event::new("cancel", false, false),
             false,
             inline,
         )
@@ -3902,7 +4039,30 @@ impl Vm {
         )
     }
 
-    /// Shared host dialog/popover dispatch behind the three per-type
+    /// Dispatch a trusted, bubbling, cancelable form `submit`
+    /// event at `target` (HTML §4.10.21.2): the host-fired
+    /// counterpart of the old app path, which eval'd a plain
+    /// object through the public `dispatchEvent` and delivered
+    /// it untrusted (and page-overridable). `inline` is the
+    /// target's `onsubmit` attribute source, if any.
+    ///
+    /// The first BUBBLING trusted host event: [`run_event_dispatch`]
+    /// runs the bubble phase when `event.bubbles`, so capture
+    /// listeners on ancestors run first, then the target, then
+    /// bubble listeners up the ancestor chain (a bubble
+    /// `stopPropagation()` halts the remaining bubble phase).
+    /// An inline `stopPropagation()` carries into the listener
+    /// plan as the core's initial stop flag (see
+    /// [`HostEventFrame::stop_propagation`]); pinned by test.
+    pub fn dispatch_submit_event(
+        &mut self,
+        target: NodeId,
+        inline: Option<&str>,
+    ) -> HostEventOutcome {
+        self.dispatch_host_event(target, dom::Event::new("submit", true, true), false, inline)
+    }
+
+    /// Shared host dialog/popover/form dispatch behind the four per-type
     /// methods above: the event wrapper is built once in Rust with
     /// `trusted = true` (`wrap_event` / `wrap_toggle_event`) and
     /// delivered to the shared [`run_event_dispatch`] core — never
@@ -3921,14 +4081,23 @@ impl Vm {
     /// (`target`/`currentTarget`/`AT_TARGET`, plus the propagation
     /// path so `composedPath()` reads the dispatch-time path
     /// inside it, not `[]`); the core then re-seeds that state
-    /// for the listener plan, which also means an inline
-    /// `stopPropagation()` does not carry into the listener plan
-    /// — the same loss the old eval path had, preserved rather
-    /// than silently changed and pinned by test. An inline
-    /// `stopImmediatePropagation()` is NOT lost: it is snapshotted
-    /// after the inline run and the core is skipped entirely
-    /// (inline-first order — the inline handler is the first
-    /// listener, so halting means no listener runs).
+    /// for the listener plan, carrying the inline handler's
+    /// `stopPropagation()` with it as the core's initial stop
+    /// flag (snapshotted after the inline run, like
+    /// `stopImmediatePropagation()` — see
+    /// [`HostEventFrame::stop_propagation`]), so an inline stop
+    /// skips bubble ancestors while capture and target-phase
+    /// listeners still run (the inline handler conceptually runs
+    /// at target phase, after capture). An inline
+    /// `stopImmediatePropagation()` is likewise snapshotted
+    /// after the inline run and seeded into the core as its
+    /// initial stop-immediate flag — with the capture-exempt
+    /// gate, so the capture ancestor still fires first (DOM
+    /// phase order: capture precedes the inline handler's
+    /// notional target phase) and only target/bubble entries
+    /// halt (w86fix 5b). The old shape skipped the core
+    /// entirely on an inline immediate stop, which pinned `""`
+    /// and contradicted that phase order.
     ///
     /// Override-proofing (why there is no window stash): a host
     /// dispatch from idle Rust cannot invoke JS listeners directly
@@ -4061,14 +4230,14 @@ impl Vm {
                 inline_false: false,
                 inline_error: None,
                 stop_immediate: false,
+                stop_propagation: false,
                 inline_prevented: false,
             });
             if inline_func.is_some() {
                 g.host_event_inline_armed = true;
             }
         }
-        let (mut inline_false, mut stop_immediate, mut inline_prevented) =
-            (false, false, false);
+        let (mut inline_false, mut inline_prevented) = (false, false);
         let mut frame_present = true;
         if inline_func.is_some() {
             match self.eval("this[\"\\0bowser:hostEventInline\"]();") {
@@ -4092,7 +4261,6 @@ impl Vm {
                     {
                         inline_error = Some(crate::vm::VmError::Thrown(s.clone()));
                     }
-                    stop_immediate = frame.stop_immediate;
                     inline_prevented = frame.inline_prevented;
                 }
                 None => frame_present = false,
@@ -4110,6 +4278,13 @@ impl Vm {
                 s.phase = PHASE_NONE;
                 s.path.clear();
                 s.in_passive_listener = false;
+                // w86fix 5e: the core's epilogue never ran, so
+                // clear the stop flags here too — a stale
+                // `cancelBubble` must not survive the dispatch.
+                s.stop_propagation = false;
+                s.stop_propagation_live = false;
+                s.stop_immediate = false;
+                s.stop_immediate_live = false;
             }
             drop(g);
             let heap = self.heap_mut();
@@ -4120,28 +4295,6 @@ impl Vm {
                 dispatch_error: Some(crate::vm::VmError::Thrown(
                     "host dispatch frame lost before core dispatch".into(),
                 )),
-            };
-        }
-        // Inline `stopImmediatePropagation()` halts the dispatch
-        // outright (see the frame doc): pop the frame, clean the
-        // seeded dispatch state the way the core's epilogue would,
-        // and report only what the inline handler established.
-        if stop_immediate {
-            let mut g = apis.borrow_mut();
-            g.host_event_frames.pop();
-            if let Some(s) = g.event_states.get_mut(&handle) {
-                s.current_target = None;
-                s.phase = PHASE_NONE;
-                s.path.clear();
-                s.in_passive_listener = false;
-            }
-            drop(g);
-            let heap = self.heap_mut();
-            heap.release_temp(base);
-            return HostEventOutcome {
-                prevented: (inline_false && cancelable) || inline_prevented,
-                inline_error,
-                dispatch_error: None,
             };
         }
         // Core dispatch through the armed trampoline: it pops the
@@ -4180,6 +4333,13 @@ impl Vm {
                 s.phase = PHASE_NONE;
                 s.path.clear();
                 s.in_passive_listener = false;
+                // w86fix 5e: the core's epilogue never ran, so
+                // clear the stop flags here too — a stale
+                // `cancelBubble` must not survive the dispatch.
+                s.stop_propagation = false;
+                s.stop_propagation_live = false;
+                s.stop_immediate = false;
+                s.stop_immediate_live = false;
             }
             drop(g);
         }
@@ -5652,8 +5812,9 @@ fn install_web_apis_inner(
     // their target and prebuilt event on the global, then eval through
     // this key.
     def_native(heap, global, SNAP_DISPATCH_KEY, n_dispatch_snap_stashed)?;
-    // Host dialog/popover dispatches ([`Vm::dispatch_cancel_event`] /
-    // [`Vm::dispatch_close_event`] / [`Vm::dispatch_toggle_event`])
+    // Host dialog/popover/form dispatches ([`Vm::dispatch_cancel_event`] /
+    // [`Vm::dispatch_close_event`] / [`Vm::dispatch_toggle_event`] /
+    // [`Vm::dispatch_submit_event`])
     // eval through these trampolines (see
     // [`Vm::dispatch_host_event`]): locked, so a page assignment
     // or `delete` cannot divert them, and stateless, so a forged
@@ -8986,6 +9147,13 @@ fn n_contains(heap: &mut Heap, this: Value, args: &[Value]) -> Result<Value, Nat
 /// sequential focus navigation) are a later wave; this exists so page
 /// calls like `scroller.focus()` don't throw `TypeError: callee is not
 /// a function`. Returns `undefined` per WebIDL.
+///
+/// Design note (w86): real focus movement is NOT a bindings-only
+/// job — focusability predicates live in `bowser_app` and focus
+/// state is Rust-side, so a bridge needs design first (which side
+/// owns `activeElement`, how blur/focus events dispatch). Until
+/// then this stays a no-op for every element, focusable or not.
+/// Pinned by `element_focus_is_noop`.
 fn n_element_focus(heap: &mut Heap, this: Value, _args: &[Value]) -> Result<Value, NativeError> {
     let _ = apis_rc(heap, this)?;
     Ok(Value::Undefined)
@@ -11798,6 +11966,14 @@ fn n_event_composed_path(
 }
 
 /// `Event.prototype.cancelBubble` getter: the stop-propagation flag.
+/// A flag seeded by the inline handler reads `false` to capture
+/// listeners (w86fix 5a): the inline handler conceptually runs at
+/// target phase, after capture, so a capture listener reading
+/// `cancelBubble` before the inline handler has run must see
+/// `false` (Chrome). A live capture listener's own call still
+/// reads `true` (`stop_propagation_live`), as does any read at
+/// target/bubble phase. Outside dispatch the raw flag reads back
+/// (the epilogue clears it, so it is `false` after dispatch).
 fn n_event_cancel_bubble_get(
     heap: &mut Heap,
     this: Value,
@@ -11809,7 +11985,10 @@ fn n_event_cancel_bubble_get(
         .borrow()
         .event_states
         .get(&handle)
-        .map(|s| s.stop_propagation)
+        .map(|s| {
+            s.stop_propagation
+                && (s.phase != PHASE_CAPTURING || s.stop_propagation_live)
+        })
         .unwrap_or(false);
     Ok(Value::Bool(cancel))
 }
@@ -11828,6 +12007,10 @@ fn n_event_cancel_bubble_set(
         && let Some(s) = rc.borrow_mut().event_states.get_mut(&handle)
     {
         s.stop_propagation = true;
+        // A listener's own set counts as live (see
+        // `EventDispatchState::stop_propagation_live`): unlike the
+        // inline-seeded flag it halts the remaining capture phase.
+        s.stop_propagation_live = true;
     }
     Ok(Value::Undefined)
 }
@@ -11871,6 +12054,13 @@ fn n_stop_propagation(heap: &mut Heap, this: Value, _args: &[Value]) -> Result<V
     let handle = event_handle_of(heap, this)?;
     if let Some(s) = rc.borrow_mut().event_states.get_mut(&handle) {
         s.stop_propagation = true;
+        // A listener's own call counts as live (see
+        // `EventDispatchState::stop_propagation_live`): unlike the
+        // inline-seeded flag it halts the remaining capture phase.
+        // (An inline handler's call sets this too, but the core
+        // resets it at dispatch start — the inline call is the
+        // seed, not a live listener call.)
+        s.stop_propagation_live = true;
     }
     Ok(Value::Undefined)
 }
@@ -11884,6 +12074,13 @@ fn n_stop_immediate_propagation(
     let handle = event_handle_of(heap, this)?;
     if let Some(s) = rc.borrow_mut().event_states.get_mut(&handle) {
         s.stop_immediate = true;
+        // A listener's own call counts as live (see
+        // `EventDispatchState::stop_immediate_live`): unlike the
+        // inline-seeded flag it halts the remaining capture
+        // phase too. (An inline handler's call sets this too,
+        // but the core resets it at dispatch start — the inline
+        // call is the seed, not a live listener call.)
+        s.stop_immediate_live = true;
     }
     Ok(Value::Undefined)
 }
@@ -13120,7 +13317,7 @@ fn dispatch_popover_toggle(
         .map_err(|_| NativeError::OutOfMemory)?
     };
     let base = heap.protect(event_val);
-    let r = run_event_dispatch(heap, rc, node, event_val, handle);
+    let r = run_event_dispatch(heap, rc, node, event_val, handle, false, false);
     heap.release_temp(base);
     r?;
     Ok(())
@@ -13481,7 +13678,7 @@ fn n_close_dialog(heap: &mut Heap, this: Value, args: &[Value]) -> Result<Value,
     // as a temporary root across the dispatch (a listener's
     // allocation could otherwise collect it mid-dispatch).
     let base = heap.protect(event_val);
-    let r = run_event_dispatch(heap, &rc, node, event_val, handle);
+    let r = run_event_dispatch(heap, &rc, node, event_val, handle, false, false);
     heap.release_temp(base);
     r?;
     // w85fix: the dual's popover toggle, after the `close`
@@ -13578,7 +13775,7 @@ fn n_request_close_dialog(
             .map_err(|_| NativeError::OutOfMemory)?
     };
     let base = heap.protect(cancel_val);
-    let prevented = run_event_dispatch(heap, &rc, node, cancel_val, cancel_handle);
+    let prevented = run_event_dispatch(heap, &rc, node, cancel_val, cancel_handle, false, false);
     heap.release_temp(base);
     if prevented? {
         return Ok(Value::Undefined);
@@ -13631,7 +13828,7 @@ fn n_request_close_dialog(
             .map_err(|_| NativeError::OutOfMemory)?
     };
     let base = heap.protect(event_val);
-    let r = run_event_dispatch(heap, &rc, node, event_val, handle);
+    let r = run_event_dispatch(heap, &rc, node, event_val, handle, false, false);
     heap.release_temp(base);
     r?;
     if was_popover_live && !doc_rc.borrow().top_layer().contains(&node) {
@@ -14982,7 +15179,7 @@ fn dispatch_event_inner(
             }
             (event_val, event_handle)
         };
-        let prevented = run_event_dispatch(heap, &rc, target, event_val, event_handle)?;
+        let prevented = run_event_dispatch(heap, &rc, target, event_val, event_handle, false, false)?;
         Ok(Value::Bool(!prevented))
     })
 }
@@ -14994,26 +15191,88 @@ fn dispatch_event_inner(
 /// Returns true when a non-passive listener prevented the default
 /// (`preventDefault` inside a passive listener no-ops via
 /// [`n_prevent_default`]).
+///
+/// `initial_stop_propagation` seeds the per-dispatch stop flag: `false`
+/// for ordinary dispatches (a reused wrapper starts with fresh stop
+/// flags), and the inline handler's snapshot for host dispatches (see
+/// [`HostEventFrame::stop_propagation`]). The seeded flag applies
+/// only to bubble-phase (post-target) plan entries: the inline
+/// handler conceptually runs at target phase, after capture has
+/// already run, so capture listeners still fire and target-phase
+/// listeners still run, while bubble ancestors are skipped — NOT
+/// exactly as a target-phase listener's own call would behave if
+/// it ran before capture, because capture precedes it. A live
+/// listener's own `stopPropagation()` during capture still halts
+/// the remaining capture phase: the setters mark the flag live
+/// (see `EventDispatchState::stop_propagation_live`), and the
+/// gate below skips capture entries only for a live flag. The
+/// seeded flag stays visible to listeners through `cancelBubble`
+/// at target/bubble phase, like a target-phase listener's call —
+/// but NOT to capture listeners, which read `false` for a seeded
+/// flag (see `n_event_cancel_bubble_get`).
+/// `initial_stop_immediate` is the same seed shape for
+/// `stopImmediatePropagation()` (w86fix 5b): a seeded immediate
+/// stop lets capture entries run first (DOM phase order) and
+/// halts target/bubble entries, while a live listener's own call
+/// halts the dispatch outright. Both seeds are cleared, with the
+/// live flags, in the epilogue — a stale `cancelBubble` must not
+/// survive dispatch (w86fix 5e).
+/// A reentrant dispatch of the same event object is a no-op (DOM
+/// dispatch flag, w86fix 5d): when `dispatching` is already set
+/// for this handle the call returns the current prevented state
+/// without touching the outer dispatch's flags or plan.
 fn run_event_dispatch(
     heap: &mut Heap,
     rc: &Rc<RefCell<WebApis>>,
     target: NodeId,
     event_val: Value,
     event_handle: u32,
+    initial_stop_propagation: bool,
+    initial_stop_immediate: bool,
 ) -> Result<bool, NativeError> {
     // Build the full invocation plan under the apis borrow, then drop it
     // before invoking JS (reentrancy discipline).
     let (plan, event, root_base) = {
         let mut g = rc.borrow_mut();
         let event = event_of(heap, &g, event_val)?;
+        // DOM dispatch flag (w86fix 5d): a reentrant dispatch of
+        // the same event object is a no-op — return the current
+        // prevented state without resetting the outer dispatch's
+        // stop flags or rebuilding its plan.
+        if g.event_states
+            .get(&event_handle)
+            .map(|s| s.dispatching)
+            .unwrap_or(false)
+        {
+            let prevented = g
+                .events
+                .get(&event_handle)
+                .map(|e| e.default_prevented)
+                .unwrap_or(false);
+            return Ok(prevented);
+        }
         // (Re)set the per-dispatch state: a reused wrapper starts every
-        // dispatch with fresh stop flags and no passive listener running.
+        // dispatch with fresh stop flags and no passive listener running
+        // (except the seeded stop flags above, which carry the inline
+        // handler's `stopPropagation()` / `stopImmediatePropagation()`
+        // into the core).
         if let Some(s) = g.event_states.get_mut(&event_handle) {
             s.target = Some(target);
             s.current_target = None;
             s.phase = PHASE_NONE;
-            s.stop_propagation = false;
-            s.stop_immediate = false;
+            s.stop_propagation = initial_stop_propagation;
+            // The seed is not a live listener call: an inline
+            // handler's `stopPropagation()` (set before this
+            // dispatch started) must not skip capture listeners.
+            // A listener's own call during this dispatch sets the
+            // live flag again (see the setters).
+            s.stop_propagation_live = false;
+            s.stop_immediate = initial_stop_immediate;
+            // Same for the immediate seed (w86fix 5b): capture
+            // entries run first; only a live listener call halts
+            // them.
+            s.stop_immediate_live = false;
+            s.dispatching = true;
             s.in_passive_listener = false;
         }
         // The wrapper may sit in no traced root yet (a host-built event),
@@ -15053,6 +15312,13 @@ fn run_event_dispatch(
         let plan = match plan {
             Ok(plan) => plan,
             Err(e) => {
+                // The core never ran: clear the dispatch flag so a
+                // later dispatch of this object is not stuck as
+                // reentrant (the stop flags were never seeded past
+                // the reset above, so there is nothing else to clear).
+                if let Some(s) = g.event_states.get_mut(&event_handle) {
+                    s.dispatching = false;
+                }
                 heap.release_temp(root_base);
                 return Err(e);
             }
@@ -15061,18 +15327,39 @@ fn run_event_dispatch(
     };
     let invoker = rc.borrow().invoker.clone();
     for entry in plan {
-        let (stop_immediate, stop_propagation) = rc
+        let (stop_immediate, stop_immediate_live, stop_propagation, stop_live) = rc
             .borrow()
             .event_states
             .get(&event_handle)
-            .map(|s| (s.stop_immediate, s.stop_propagation))
-            .unwrap_or((false, false));
-        // `stopImmediatePropagation()`: halt the dispatch outright.
-        if stop_immediate {
+            .map(|s| {
+                (
+                    s.stop_immediate,
+                    s.stop_immediate_live,
+                    s.stop_propagation,
+                    s.stop_propagation_live,
+                )
+            })
+            .unwrap_or((false, false, false, false));
+        // `stopImmediatePropagation()`: halt the dispatch — except
+        // that a flag seeded by the inline handler (not set live
+        // by a listener in this dispatch) lets capture entries
+        // run first (w86fix 5b): DOM phase order puts capture
+        // before the inline handler's notional target phase, so
+        // the capture ancestor fires and only target/bubble
+        // entries halt. A live call halts outright, including
+        // the remaining capture phase.
+        if stop_immediate && (stop_immediate_live || entry.phase != PHASE_CAPTURING) {
             break;
         }
-        // `stopPropagation()`: skip every phase except the target phase.
-        if stop_propagation && entry.node != target {
+        // `stopPropagation()`: skip every phase except the target
+        // phase — except that a flag seeded by the inline handler
+        // (not set live by a listener in this dispatch) skips
+        // only bubble-phase entries: capture listeners precede
+        // the inline handler's notional target phase, so they
+        // still run. A live capture listener's own call still
+        // halts the remaining capture phase (`stop_live`).
+        if stop_propagation && entry.node != target && (stop_live || entry.phase != PHASE_CAPTURING)
+        {
             continue;
         }
         if entry.once {
@@ -15114,12 +15401,22 @@ fn run_event_dispatch(
     }
     // The dispatch is over: `currentTarget`/`eventPhase` go back to
     // null/`NONE`, and the `composedPath()` backing path is cleared
-    // (DOM).
+    // (DOM). The stop flags go too (w86fix 5e): a stale
+    // `cancelBubble` must not survive dispatch — a listener
+    // reading the event afterwards sees `false`, like a fresh
+    // wrapper. The dispatch flag clears last, so the no-op
+    // guard above stops applying exactly when the outer
+    // dispatch ends.
     if let Some(s) = rc.borrow_mut().event_states.get_mut(&event_handle) {
         s.current_target = None;
         s.phase = PHASE_NONE;
         s.path.clear();
         s.in_passive_listener = false;
+        s.stop_propagation = false;
+        s.stop_propagation_live = false;
+        s.stop_immediate = false;
+        s.stop_immediate_live = false;
+        s.dispatching = false;
     }
     let prevented = rc
         .borrow()
@@ -15193,7 +15490,7 @@ fn n_dispatch_wheel_stashed(
             target_node(heap, t, &g)?
         };
         let handle = event_handle_of(heap, e)?;
-        run_event_dispatch(heap, &rc, target, e, handle)
+        run_event_dispatch(heap, &rc, target, e, handle, false, false)
     })();
     heap.release_temp(base);
     Ok(Value::Bool(r?))
@@ -15246,7 +15543,7 @@ fn n_dispatch_touch_stashed(
             target_node(heap, t, &g)?
         };
         let handle = event_handle_of(heap, e)?;
-        run_event_dispatch(heap, &rc, target, e, handle)
+        run_event_dispatch(heap, &rc, target, e, handle, false, false)
     })();
     heap.release_temp(base);
     Ok(Value::Bool(r?))
@@ -15299,7 +15596,7 @@ fn n_dispatch_pointer_mouse_stashed(
             target_node(heap, t, &g)?
         };
         let handle = event_handle_of(heap, e)?;
-        run_event_dispatch(heap, &rc, target, e, handle)
+        run_event_dispatch(heap, &rc, target, e, handle, false, false)
     })();
     heap.release_temp(base);
     Ok(Value::Bool(r?))
@@ -15348,7 +15645,7 @@ fn n_dispatch_snap_stashed(
             target_node(heap, t, &g)?
         };
         let handle = event_handle_of(heap, e)?;
-        run_event_dispatch(heap, &rc, target, e, handle)
+        run_event_dispatch(heap, &rc, target, e, handle, false, false)
     })();
     heap.release_temp(base);
     Ok(Value::Bool(r?))
@@ -15424,6 +15721,10 @@ fn n_host_event_inline(
                     .get(&f.event_handle)
                     .map(|s| s.stop_immediate)
                     .unwrap_or(false),
+                g.event_states
+                    .get(&f.event_handle)
+                    .map(|s| s.stop_propagation)
+                    .unwrap_or(false),
                 g.events
                     .get(&f.event_handle)
                     .map(|e| e.default_prevented)
@@ -15435,7 +15736,7 @@ fn n_host_event_inline(
         Err(InvokeError(s)) => Some(s),
         _ => None,
     };
-    if let Some((handle, stop_immediate, inline_prevented)) = snapshot {
+    if let Some((handle, stop_immediate, stop_propagation, inline_prevented)) = snapshot {
         let mut g = rc.borrow_mut();
         if let Some(frame) = g.host_event_frames.last_mut()
             && frame.event_handle == handle
@@ -15443,6 +15744,7 @@ fn n_host_event_inline(
             frame.inline_false = inline_false;
             frame.inline_error = throw;
             frame.stop_immediate = stop_immediate;
+            frame.stop_propagation = stop_propagation;
             frame.inline_prevented = inline_prevented;
         }
     }
@@ -15494,7 +15796,7 @@ fn n_host_event_core(
     // the way the old stashed natives did, so a collection during
     // the plan build cannot sweep it).
     let base = heap.protect(frame.event_val);
-    let r = run_event_dispatch(heap, &rc, frame.target, frame.event_val, frame.event_handle);
+    let r = run_event_dispatch(heap, &rc, frame.target, frame.event_val, frame.event_handle, frame.stop_propagation, frame.stop_immediate);
     heap.release_temp(base);
     Ok(Value::Bool(r?))
 }
@@ -22185,6 +22487,19 @@ pub(crate) struct ParseShimRoots {
     /// / modal sets (never `dialog_return`, which survives
     /// removal in production too, keyed by the node).
     dialog_open: HashSet<usize>,
+    /// Dialog show order (w86fix B1): every arena in
+    /// [`Self::dialog_open`], in the order the shim's
+    /// `show()` / `showModal()` opened it — BOTH kinds, in
+    /// one list. The unified [`Self::top_layer_show_order`]
+    /// cannot carry it: only modal dialogs live in the top
+    /// layer, so a non-modal show never lands there, and
+    /// adoption would have no order to transfer. Maintained
+    /// by [`Self::dialog_open_insert`] /
+    /// [`Self::dialog_open_remove`]: append on first show,
+    /// drop on close, so a re-show re-appends at the end.
+    /// Adopted into production's `dialog_show_seq` by
+    /// [`adopt_shim_top_layer`]. Plain data: no tracing needed.
+    dialog_show_order: Vec<usize>,
     dialog_modal: HashSet<usize>,
     dialog_return: HashMap<usize, String>,
     /// Mid-parse exit-transition retentions (w82): arenas
@@ -22199,6 +22514,24 @@ pub(crate) struct ParseShimRoots {
     /// on read); a re-show clears the record. Plain data: no
     /// tracing needed.
     exit_retained: HashMap<usize, (Instant, TopLayerShowKind)>,
+    /// Mid-parse stored exit-transition durations (w86): per-arena
+    /// durations measured at show time for live shim-shown members
+    /// (a popover via `showPopover`, a modal dialog via
+    /// `showModal`), with the exit-retention grace
+    /// ([`EXIT_RETENTION_GRACE_S`]) already included — the shim
+    /// twin of production's `Document::exit_transition_durations`.
+    /// A live member's dismissal may come from a path that cannot
+    /// measure the transition itself (the window / testdriver
+    /// Escape, light-dismiss, and submit paths, which consume the
+    /// stored value through `deferred_hide_popover` /
+    /// `deferred_close_dialog`), so the duration is captured while
+    /// the member is open and adopted into the production document
+    /// by [`adopt_shim_top_layer`]. A dismissal consumes the value
+    /// exactly once (see [`Self::take_stored_exit_duration`]); a
+    /// re-show re-measures and overwrites it; a demotion that is
+    /// not a dismissal (attribute removal, subtree removal)
+    /// drops it. Plain data: no tracing needed.
+    stored_exit_durations: HashMap<usize, f64>,
 }
 
 /// One entry of [`ParseShimRoots::top_layer_show_order`]: which
@@ -22278,6 +22611,32 @@ impl ParseShimRoots {
         }
     }
 
+    /// Record a show-time exit duration for a live member (see
+    /// the [`Self::stored_exit_durations`] field docs). `None`
+    /// (no exit transition) clears any stored value, like
+    /// production `store_exit_duration(node, 0.0)` on re-show:
+    /// a stale positive value must not survive a re-show whose
+    /// style no longer transitions.
+    fn store_exit_duration(&mut self, arena: usize, duration: Option<f64>) {
+        match duration {
+            Some(d) if d.is_finite() && d > 0.0 => {
+                self.stored_exit_durations
+                    .insert(arena, d + EXIT_RETENTION_GRACE_S);
+            }
+            _ => {
+                self.stored_exit_durations.remove(&arena);
+            }
+        }
+    }
+
+    /// Consume (remove and return) the stored exit duration for
+    /// `arena`, mirroring production `take_stored_exit_duration`:
+    /// a dismissal consumes the value exactly once — a retention
+    /// built from it now holds it, and the next show re-measures.
+    fn take_stored_exit_duration(&mut self, arena: usize) -> Option<f64> {
+        self.stored_exit_durations.remove(&arena)
+    }
+
     /// The unified show sequence, filtered against the open sets,
     /// so any entry whose set membership was lost without going
     /// through the remove helpers (none should exist) cannot
@@ -22327,9 +22686,14 @@ impl ParseShimRoots {
 
     /// Record a dialog show: insert into the open set, and (for
     /// `showModal`) into the modal set with show-order tracking,
-    /// mirroring [`Self::top_layer_insert`].
+    /// mirroring [`Self::top_layer_insert`]. Both kinds append
+    /// to the dialog show order (w86fix B1) on first show only —
+    /// a show on an already-open dialog is rejected by the
+    /// caller, so no move-to-end is needed here.
     fn dialog_open_insert(&mut self, arena: usize, modal: bool) {
-        self.dialog_open.insert(arena);
+        if self.dialog_open.insert(arena) {
+            self.dialog_show_order.push(arena);
+        }
         if modal && self.dialog_modal.insert(arena) {
             self.top_layer_show_insert(arena, TopLayerShowKind::ModalDialog);
         }
@@ -22339,11 +22703,27 @@ impl ParseShimRoots {
     /// modal sets (and the modal order), so a later re-show
     /// re-appends at the end. The stored `returnValue` is NOT
     /// dropped here — it survives close in production too.
+    /// The dialog show order drops the arena too (w86fix B1):
+    /// a closed dialog has no show sequence to adopt, and a
+    /// re-show re-appends at the end with a fresh sequence.
     fn dialog_open_remove(&mut self, arena: usize) {
         self.dialog_open.remove(&arena);
+        self.dialog_show_order.retain(|a| *a != arena);
         if self.dialog_modal.remove(&arena) {
             self.top_layer_show_remove(arena, TopLayerShowKind::ModalDialog);
         }
+    }
+
+    /// The dialog show order, filtered against the open set, so
+    /// any order entry whose set membership was lost without
+    /// going through [`Self::dialog_open_remove`] (none should
+    /// exist) cannot adopt a stale sequence.
+    fn dialog_show_ordered(&self) -> Vec<usize> {
+        self.dialog_show_order
+            .iter()
+            .copied()
+            .filter(|a| self.dialog_open.contains(a))
+            .collect()
     }
 }
 
@@ -24601,6 +24981,10 @@ fn drop_shim_top_layer_arena(id: u64, arena: usize) {
     let mut g = roots.borrow_mut();
     g.top_layer_remove(arena);
     g.exit_retained.remove(&arena);
+    // w86 G2: a demotion drops the show-time stored exit
+    // duration too (production `remove_attribute` hides through
+    // the hide path, which consumes it).
+    g.take_stored_exit_duration(arena);
 }
 
 /// Drop every top-layer arena in the subtree rooted at `root`
@@ -24630,6 +25014,8 @@ fn prune_shim_top_layer_subtree(
     for arena in arenas {
         g.top_layer_remove(arena);
         g.exit_retained.remove(&arena);
+        // w86 G2: see `drop_shim_top_layer_arena`.
+        g.take_stored_exit_duration(arena);
     }
 }
 
@@ -24646,6 +25032,10 @@ fn drop_shim_dialog_arena(id: u64, arena: usize) {
     let mut g = roots.borrow_mut();
     g.dialog_open_remove(arena);
     g.exit_retained.remove(&arena);
+    // w86 G2: a demotion drops the show-time stored exit
+    // duration too (production `remove_attribute` closes through
+    // the close path, which consumes it).
+    g.take_stored_exit_duration(arena);
 }
 
 /// Drop every dialog open/modal arena in the subtree rooted at
@@ -24674,6 +25064,8 @@ fn prune_shim_dialog_subtree(
     for arena in arenas {
         g.dialog_open_remove(arena);
         g.exit_retained.remove(&arena);
+        // w86 G2: see `drop_shim_dialog_arena`.
+        g.take_stored_exit_duration(arena);
     }
 }
 
@@ -33466,34 +33858,30 @@ fn parse_popover_state<'a, 'x, 'h>(
     })
 }
 
-/// Popover state for an arena index with no recorded wrapper
-/// (w85fix): the fallback `parse_dialog_show`'s retained arm
-/// uses when the wrapper lookup misses. Walks the connected
-/// tree from the document element (the same walk
-/// `prune_shim_top_layer_subtree` uses), so an unwrapped
-/// retained `auto` reads as `auto` instead of surviving as
-/// non-auto. `None` when the element is not found in the
-/// connected tree (detached, template contents, or inside a
-/// shadow root — see the one-walk form's doc for why the
-/// shadow miss is unreachable for a genuine victim) or
-/// carries no `popover` attribute — fail-closed, like the old
-/// missing-wrapper read.
-fn shim_popover_state_for_arena<'a, 'x, 'h>(
+/// Find the parse-tree element for `arena` by a document walk
+/// (w86): the measurement twin of
+/// [`shim_popover_states_for_arenas`] — a live auto-close victim
+/// with no wrapper record still needs its [`ScriptElement`] to
+/// measure its exit transition before the show demotes it.
+/// `None` for a detached / template / shadow-tree arena, which
+/// then demotes synchronously (fail-closed, as before).
+fn shim_element_for_arena<'a, 'x, 'h>(
     host: &ScriptHost<'a, 'x, 'h>,
     arena: usize,
-) -> Option<&'static str> {
+) -> Option<ScriptElement> {
     let root = host.document_element()?;
     let mut stack = vec![root];
     while let Some(el) = stack.pop() {
         if el.arena_index() == arena {
-            return parse_popover_state(host, el);
+            return Some(el);
         }
         stack.extend(host.child_elements(el));
     }
     None
 }
 
-/// One-walk form of [`shim_popover_state_for_arena`] for a
+/// One-walk form (w86fix: the singular per-arena walk was
+/// deleted as dead code; this is now the only form) for a
 /// candidate set (w85fix S4): a single DFS from the document
 /// element records the `popover` state of just the candidates
 /// it meets, instead of one full walk per candidate. A
@@ -33534,6 +33922,73 @@ fn shim_popover_states_for_arenas<'a, 'x, 'h>(
         stack.extend(host.child_elements(el));
     }
     out
+}
+
+/// Identify `auto` popover victims among candidate arenas (w86fix S6):
+/// shared by the dialog and popover show paths (`parse_dialog_show`,
+/// `parse_popover_apply`). A candidate is a victim when it is not the
+/// shown element, not one of its ancestors, and not a modal dialog
+/// (`dialog_modal` membership excludes modal dialogs; retained-kind
+/// filtering is the caller's — the live set carries no kind, the
+/// retained set does, and the caller pre-filters it to `Popover`).
+/// Its `auto`-ness reads from its wrapper record when one exists,
+/// else from the tree via one DFS
+/// ([`shim_popover_states_for_arenas`]) for the wrapper-missing
+/// candidates — a wrapper miss must not read as non-auto and let a
+/// live/retained auto survive a show (w85fix S1). Returns the victim
+/// arenas with their elements for exit measurement (`None` when the
+/// element cannot be found — detached / template / shadow — which
+/// then demotes synchronously, fail-closed as before).
+fn shim_auto_victims<'a, 'x, 'h>(
+    host: &ScriptHost<'a, 'x, 'h>,
+    roots: &ParseShimRoots,
+    self_arena: usize,
+    ancestors: &HashSet<usize>,
+    candidates: Vec<usize>,
+) -> Vec<(usize, Option<ScriptElement>)> {
+    let victims: Vec<usize> = candidates
+        .into_iter()
+        .filter(|other| {
+            *other != self_arena
+                && !ancestors.contains(other)
+                && !roots.dialog_modal.contains(other)
+        })
+        .collect();
+    // One DFS for the wrapper-missing candidates (see
+    // `shim_popover_states_for_arenas`), not one walk per candidate.
+    let missing_states = if victims.iter().any(|arena| {
+        !roots
+            .element_wrappers
+            .iter()
+            .any(|rec| rec.el.arena_index() == *arena)
+    }) {
+        shim_popover_states_for_arenas(host, &victims)
+    } else {
+        HashMap::new()
+    };
+    victims
+        .into_iter()
+        .filter_map(|other| {
+            let (is_auto, el) = match roots
+                .element_wrappers
+                .iter()
+                .find(|rec| rec.el.arena_index() == other)
+            {
+                Some(rec) => (
+                    parse_popover_state(host, rec.el) == Some("auto"),
+                    Some(rec.el),
+                ),
+                None => (
+                    missing_states.get(&other) == Some(&"auto"),
+                    shim_element_for_arena(host, other),
+                ),
+            };
+            if !is_auto {
+                return None;
+            }
+            Some((other, el))
+        })
+        .collect()
 }
 
 /// Shared show/hide/toggle core for the shim popover natives: the
@@ -33731,15 +34186,61 @@ fn parse_popover_apply(
     // popover (the pre-hide values are the exit's start values).
     // A retained popover never reaches here (the no-op return
     // above), so it is never re-measured into a fresh
-    // retention. Auto-closed others (below)
-    // demote synchronously: their exits are not measured
-    // here (the production `show_popover` path retains a
-    // live victim with a stored exit duration instead, but
-    // the shim has no stored durations to consult).
+    // retention.
     let exit = if !show && is_open {
         shim_exit_transition_duration(id, host, el)
     } else {
         None
+    };
+    // w86 G1: measure live auto-close victims BEFORE the mutation
+    // too (their pre-show values are the exit's start values), so
+    // the show branch below can retain them instead of demoting
+    // synchronously — the shim twin of production `show_popover`,
+    // which retains a live victim with its stored exit duration.
+    // Measured outside the mutation closure: the measurer borrows
+    // the hosts table, which the closure already holds mutably.
+    // The victim identification is the show branch's own (live
+    // members only, self / ancestors / modal dialogs excepted,
+    // `auto` only, wrapper lookup with the tree fallback — see
+    // `shim_auto_victims`), hoisted so the measurement and the
+    // demotion agree on the set. A victim with no measurable
+    // transition reads `None` and demotes synchronously, as before.
+    // `ancestors` is hoisted with it: the mutation closure's
+    // retained arm (#3 below) needs the same set.
+    let mut ancestors = HashSet::new();
+    let mut cur = host_ref.parent_element(el);
+    while let Some(p) = cur {
+        ancestors.insert(p.arena_index());
+        cur = host_ref.parent_element(p);
+    }
+    let victim_exits: Vec<(usize, Option<f64>)> = if show && state == "auto" {
+        let victims: Vec<(usize, Option<ScriptElement>)> = PARSE_HOSTS.with(|hosts| {
+            let hosts = hosts.borrow();
+            let Some(entry) = hosts.get(&id) else {
+                return Vec::new();
+            };
+            let roots = entry.listeners.borrow();
+            shim_auto_victims(
+                host_ref,
+                &roots,
+                arena,
+                &ancestors,
+                roots.top_layer_ordered(),
+            )
+        });
+        victims
+            .into_iter()
+            .map(|(other, other_el)| {
+                (
+                    other,
+                    other_el.and_then(|other_el| {
+                        shim_exit_transition_duration(id, host, other_el)
+                    }),
+                )
+            })
+            .collect()
+    } else {
+        Vec::new()
     };
     PARSE_HOSTS.with(|hosts| {
         let mut hosts = hosts.borrow_mut();
@@ -33750,46 +34251,65 @@ fn parse_popover_apply(
         if show {
             // Re-showing during an exit transition cancels it.
             roots.exit_retained.remove(&arena);
+            // w86fix #3: end pre-existing retained autos BEFORE the
+            // live-victim loop (mirror of the dialog arm in
+            // `parse_dialog_show`, and of production `show_popover`,
+            // which ends already-retained autos on an `auto` show):
+            // a retained `auto` ends its retention silently (the
+            // shim fires no toggles at all), consuming nothing —
+            // its stored exit duration is already gone with the
+            // retention. Gated on `auto` like production and like
+            // the live loop below: showing a manual/hint popover
+            // ends no retentions. Excepted, like the dialog arm:
+            // the shown element itself, its ancestors, and
+            // modal-kind retentions. Runs before the live loop on
+            // purpose (see the dialog arm's ordering note): a live
+            // victim the loop just retained must not be ended by
+            // this arm.
+            if state == "auto" {
+                let retained_candidates: Vec<usize> = roots
+                    .exit_retained
+                    .iter()
+                    .filter(|(other, (_, kind))| {
+                        **other != arena
+                            && !ancestors.contains(*other)
+                            && *kind == TopLayerShowKind::Popover
+                    })
+                    .map(|(other, _)| *other)
+                    .collect();
+                for (other, _) in shim_auto_victims(
+                    host_ref,
+                    &roots,
+                    arena,
+                    &ancestors,
+                    retained_candidates,
+                ) {
+                    roots.exit_retained.remove(&other);
+                }
+            }
             // Auto-close (same rule as `Document::show_popover`):
             // showing an `auto` popover closes every other open
-            // `auto` popover except ancestors of this one. Ancestors
-            // come from the host's parent chain; other open popovers
-            // are resolved through the recorded wrappers (arena ->
-            // handle), and their states read from the live tree.
-            if state == "auto" {
-                let mut ancestors = HashSet::new();
-                let mut cur = host_ref.parent_element(el);
-                while let Some(p) = cur {
-                    ancestors.insert(p.arena_index());
-                    cur = host_ref.parent_element(p);
-                }
-                let open_arenas: Vec<usize> = roots.top_layer_ordered();
-                for other in open_arenas {
-                    if other == arena || ancestors.contains(&other) {
-                        continue;
-                    }
-                    // w84fix C10, shim twin of production
-                    // `Document::show_popover`: a modal dialog is
-                    // not in the spec's showing auto popover list
-                    // (never opened in popover mode), so it is
-                    // never an auto-close victim — demoting it
-                    // here would strand its modal flag and `open`
-                    // attribute exactly like the production bug.
-                    if roots.dialog_modal.contains(&other) {
-                        continue;
-                    }
-                    let other_is_auto = roots
-                        .element_wrappers
-                        .iter()
-                        .find(|rec| rec.el.arena_index() == other)
-                        .is_some_and(|rec| parse_popover_state(host_ref, rec.el) == Some("auto"));
-                    if other_is_auto {
-                        roots.top_layer_remove(other);
-                    }
+            // `auto` popover except ancestors of this one.
+            // Victims were measured before the mutation (see above);
+            // a victim with a positive exit transition is retained
+            // instead of demoted synchronously (w86 G1, production
+            // `show_popover` twin). The stored duration is consumed
+            // either way — the retention now holds it, or there is
+            // nothing to defer.
+            for (other, exit_d) in &victim_exits {
+                roots.take_stored_exit_duration(*other);
+                roots.top_layer_remove(*other);
+                if let Some(d) = exit_d {
+                    roots.exit_retain(*other, TopLayerShowKind::Popover, *d);
                 }
             }
             roots.top_layer_insert(arena);
         } else {
+            // w86 G2: the hide consumes any stored exit duration
+            // (the retention below now holds it, if one was
+            // created), like production `n_hide_popover`'s
+            // `take_stored_exit_duration`.
+            roots.take_stored_exit_duration(arena);
             roots.top_layer_remove(arena);
             if let Some(d) = exit {
                 roots.exit_retain(arena, TopLayerShowKind::Popover, d);
@@ -33802,6 +34322,24 @@ fn parse_popover_apply(
         entry.layout_hook.entries.clear();
         Ok::<(), NativeError>(())
     })?;
+    // w86 G2: measure-while-open for the window/testdriver paths:
+    // the newly shown member's exit duration is stored now (the
+    // post-show computed style is the exit's start state), so a
+    // later Escape / light-dismiss / submit dismissal defers
+    // through it instead of demoting synchronously. Mirrors
+    // production `n_show_popover` (which stores `0.0` — i.e.
+    // clears — when there is no transition).
+    if show {
+        let stored = shim_exit_transition_duration(id, host, el);
+        PARSE_HOSTS.with(|hosts| {
+            if let Some(entry) = hosts.borrow_mut().get_mut(&id) {
+                entry
+                    .listeners
+                    .borrow_mut()
+                    .store_exit_duration(arena, stored);
+            }
+        });
+    }
     Ok(show)
 }
 
@@ -33980,6 +34518,59 @@ fn parse_dialog_show(
             "{op}: InvalidStateError: dialog is already open"
         )));
     }
+    // w86 G1: measure live auto victims BEFORE the mutation, like
+    // `parse_popover_apply` — the shim twin of production
+    // `show_dialog` / `show_dialog_modal`, which retains a live
+    // victim with its stored exit duration instead of demoting it
+    // synchronously. "Before the mutation" includes the `open`
+    // attribute write below (w86fix nit): the measurement reads
+    // computed styles, and a `dialog[open]` style change could
+    // move a victim's exit transition, so the write waits until
+    // the measurement is done. The victim identification is the
+    // show branch's own (live members only, self / ancestors /
+    // modal dialogs excepted, `auto` only, wrapper lookup with the
+    // tree fallback), hoisted so the measurement and the demotion
+    // agree on the set. A victim with no element to measure
+    // (detached / shadow-tree, so the fallback finds nothing) or
+    // no measurable transition reads `None` and demotes
+    // synchronously, as before.
+    let mut ancestors = HashSet::new();
+    let mut cur = host_ref.parent_element(el);
+    while let Some(p) = cur {
+        ancestors.insert(p.arena_index());
+        cur = host_ref.parent_element(p);
+    }
+    let dialog_victims: Vec<(usize, Option<f64>)> = {
+        let victims: Vec<(usize, Option<ScriptElement>)> = PARSE_HOSTS.with(|hosts| {
+            let hosts = hosts.borrow();
+            let Some(entry) = hosts.get(&id) else {
+                return Vec::new();
+            };
+            let roots = entry.listeners.borrow();
+            // Shared victim identification (w86fix S6): live
+            // members only, self / ancestors / modal dialogs
+            // excepted, `auto` only, wrapper lookup with the
+            // tree fallback — a wrapper miss must not read as
+            // non-auto and let a live auto survive a dialog show.
+            shim_auto_victims(
+                host_ref,
+                &roots,
+                el.arena_index(),
+                &ancestors,
+                roots.top_layer_ordered(),
+            )
+        });
+        victims
+            .into_iter()
+            .map(|(other, other_el)| {
+                let measured =
+                    other_el.and_then(|other_el| shim_exit_transition_duration(id, host, other_el));
+                (other, measured)
+            })
+            .collect()
+    };
+    // The `open` attribute write (see the measurement note above):
+    // after victim measurement, before the state mutation below.
     host_ref.set_attribute(el, "open", "");
     PARSE_HOSTS.with(|hosts| {
         let mut hosts = hosts.borrow_mut();
@@ -33992,44 +34583,23 @@ fn parse_dialog_show(
         // (Chrome probe RESULTS.md §2a: a mid-parse
         // auto.showPopover(); dlg.showModal(); must not
         // adopt as a modal dialog above a still-open auto).
-        // Live victims demote in show order; retained autos
-        // end their retention silently (the shim fires no
-        // toggles at all, per `parse_popover_apply`'s docs).
+        // Live victims retain their exit transition (w86 G1) in
+        // show order; retained autos end their retention silently
+        // (the shim fires no toggles at all, per
+        // `parse_popover_apply`'s docs).
         // Excepted, like production: the dialog itself, its
         // ancestors (Chrome probe 2 Q3: a dialog nested
         // inside an open auto coexists with it), and modal
         // dialogs (C10).
         let mut roots = entry.listeners.borrow_mut();
-        let mut ancestors = HashSet::new();
-        let mut cur = host_ref.parent_element(el);
-        while let Some(p) = cur {
-            ancestors.insert(p.arena_index());
-            cur = host_ref.parent_element(p);
-        }
-        for other in roots.top_layer_ordered() {
-            if other == el.arena_index()
-                || ancestors.contains(&other)
-                || roots.dialog_modal.contains(&other)
-            {
-                continue;
-            }
-            // w85fix S1: a live victim with no wrapper record
-            // reads its state straight from the tree, like the
-            // retained arm's fallback — a wrapper miss must
-            // not read as non-auto and let a live auto
-            // survive a dialog show.
-            let other_is_auto = match roots
-                .element_wrappers
-                .iter()
-                .find(|rec| rec.el.arena_index() == other)
-            {
-                Some(rec) => parse_popover_state(host_ref, rec.el) == Some("auto"),
-                None => shim_popover_state_for_arena(host_ref, other) == Some("auto"),
-            };
-            if other_is_auto {
-                roots.top_layer_remove(other);
-            }
-        }
+        // w86 G1 ordering: the retained arm below must run BEFORE
+        // the live-victim loop — it ends only retentions that
+        // predate this show, like production
+        // `hide_open_auto_popovers_except`, which retains live
+        // victims while ending already-retained autos. Running it
+        // after would end the retention the live loop just created
+        // for the same victim (it is `auto`, so the filter matches
+        // it) and silently un-retain it.
         // w85fix re-review: the retained arm ends ONLY
         // retained `auto` popovers, like the live-victim
         // loop above and like production
@@ -34038,12 +34608,13 @@ fn parse_dialog_show(
         // with an exit duration, so a retained manual
         // (or hint) popover died on a shim dialog show
         // that must leave it retained. The wrapper-based
-        // auto check is the live loop's, applied to the
-        // retained candidate's own wrapper; when the
-        // wrapper lookup misses, the fallback reads the
-        // candidate's `popover` attribute straight from
-        // the tree, so a retained auto cannot survive a
-        // dialog show on a missing wrapper.
+        // auto check is the shared `shim_auto_victims`
+        // identification (w86fix S6), applied to the
+        // retained candidates; when the wrapper lookup
+        // misses, the fallback reads the candidate's
+        // `popover` attribute straight from the tree, so
+        // a retained auto cannot survive a dialog show
+        // on a missing wrapper.
         let retained_candidates: Vec<usize> = roots
             .exit_retained
             .iter()
@@ -34054,34 +34625,31 @@ fn parse_dialog_show(
             })
             .map(|(arena, _)| *arena)
             .collect();
-        // w85fix S4: one DFS for the wrapper-missing
-        // candidates (see `shim_popover_states_for_arenas`),
-        // not one walk per candidate.
-        let retained_states = if retained_candidates.iter().any(|arena| {
-            !roots
-                .element_wrappers
-                .iter()
-                .any(|rec| rec.el.arena_index() == *arena)
-        }) {
-            shim_popover_states_for_arenas(host_ref, &retained_candidates)
-        } else {
-            HashMap::new()
-        };
-        let retained_autos: Vec<usize> = retained_candidates
-            .into_iter()
-            .filter(|arena| {
-                if let Some(rec) = roots
-                    .element_wrappers
-                    .iter()
-                    .find(|rec| rec.el.arena_index() == *arena)
-                {
-                    return parse_popover_state(host_ref, rec.el) == Some("auto");
-                }
-                retained_states.get(arena) == Some(&"auto")
-            })
-            .collect();
+        let retained_autos: Vec<usize> = shim_auto_victims(
+            host_ref,
+            &roots,
+            el.arena_index(),
+            &ancestors,
+            retained_candidates,
+        )
+        .into_iter()
+        .map(|(arena, _)| arena)
+        .collect();
         for other in retained_autos {
             roots.exit_retained.remove(&other);
+        }
+        // w86 G1: victims measured above; a victim with a positive
+        // exit transition is retained instead of demoted
+        // synchronously. The stored duration is consumed either
+        // way — the retention now holds it, or there is nothing
+        // to defer. Runs after the retained arm on purpose (see
+        // the ordering note above).
+        for (other, exit_d) in &dialog_victims {
+            roots.take_stored_exit_duration(*other);
+            roots.top_layer_remove(*other);
+            if let Some(d) = exit_d {
+                roots.exit_retain(*other, TopLayerShowKind::Popover, *d);
+            }
         }
         // Re-showing during an exit transition cancels it.
         roots.exit_retained.remove(&el.arena_index());
@@ -34091,6 +34659,21 @@ fn parse_dialog_show(
         entry.layout_hook.entries.clear();
         Ok::<(), NativeError>(())
     })?;
+    // w86 G2: measure-while-open for the window/testdriver paths,
+    // like production `n_show_dialog_modal`. A non-modal `show()`
+    // promotes nothing to the top layer (and production stores
+    // nothing for it), so only the modal arm stores.
+    if modal {
+        let stored = shim_exit_transition_duration(id, host, el);
+        PARSE_HOSTS.with(|hosts| {
+            if let Some(entry) = hosts.borrow_mut().get_mut(&id) {
+                entry
+                    .listeners
+                    .borrow_mut()
+                    .store_exit_duration(el.arena_index(), stored);
+            }
+        });
+    }
     Ok(())
 }
 
@@ -34186,6 +34769,10 @@ fn parse_dialog_close(
             roots.dialog_return.insert(el.arena_index(), v);
         }
         roots.dialog_open_remove(el.arena_index());
+        // w86 G2: the close consumes any stored exit duration (the
+        // retention below now holds it, if one was created), like
+        // production `n_close_dialog`'s `take_stored_exit_duration`.
+        roots.take_stored_exit_duration(el.arena_index());
         if in_top_layer && let Some(d) = exit {
             let kind = if was_modal {
                 TopLayerShowKind::ModalDialog
@@ -46723,7 +47310,7 @@ mod tests {
     }
 
     /// Probe executor for the w85 retained-auto fallback
-    /// test: records `shim_popover_state_for_arena` for
+    /// test: records `shim_popover_states_for_arenas` for
     /// markup elements it looks up through the host API
     /// only — deliberately never wrapping them in JS, so
     /// no `element_wrappers` record exists — plus a
@@ -46742,11 +47329,23 @@ mod tests {
             _attrs: &[(String, String)],
             _script: &str,
         ) {
-            for id in ["a", "m", "n"] {
-                let state = host
-                    .get_element_by_id(id)
-                    .and_then(|el| shim_popover_state_for_arena(host, el.arena_index()))
-                    .unwrap_or("");
+            // w86fix: the singular `shim_popover_state_for_arena`
+            // was deleted as dead code; the probe drives the
+            // plural one-walk form with all four arenas at once.
+            let detached = host.create_element("div");
+            host.set_attribute(detached, "popover", "auto");
+            let arenas: Vec<usize> = ["a", "m", "n"]
+                .iter()
+                .filter_map(|id| host.get_element_by_id(id))
+                .map(|el| el.arena_index())
+                .chain(std::iter::once(detached.arena_index()))
+                .collect();
+            let states = shim_popover_states_for_arenas(host, &arenas);
+            for (id, arena) in ["a", "m", "n"]
+                .iter()
+                .zip(arenas.iter().take(3))
+            {
+                let state = states.get(arena).copied().unwrap_or("");
                 self.results.borrow_mut().push(format!("{id}:{state}"));
             }
             // w85fix S3: the detached element carries
@@ -46754,10 +47353,10 @@ mod tests {
             // the walk missing it — not the attribute being
             // absent, which the old probe could not
             // distinguish.
-            let detached = host.create_element("div");
-            host.set_attribute(detached, "popover", "auto");
-            let state =
-                shim_popover_state_for_arena(host, detached.arena_index()).unwrap_or("");
+            let state = states
+                .get(&detached.arena_index())
+                .copied()
+                .unwrap_or("");
             self.results.borrow_mut().push(format!("detached:{state}"));
         }
     }
@@ -48857,10 +49456,17 @@ mod tests {
 
     #[test]
     fn host_event_inline_stop_immediate_halts_listeners() {
-        // S1: an inline `stopImmediatePropagation()` halts the
-        // whole dispatch (inline-first order), while an inline
-        // `stopPropagation()` alone does not carry into the
-        // listener plan (documented loss, pinned here).
+        // S1, corrected w86fix 5b: an inline
+        // `stopImmediatePropagation()` is seeded into the core
+        // with a capture-exempt gate — the capture ancestor
+        // runs first (DOM phase order: capture precedes the
+        // inline handler's notional target phase), then target
+        // and bubble listeners halt. The old shape skipped the
+        // core entirely and pinned `""`; that contradicted the
+        // phase order. An inline `stopPropagation()` carries
+        // into the listener plan as the core's initial stop
+        // flag (w86fix): target-phase listeners still run, and
+        // the seeded flag skips only bubble ancestors.
         let (mut vm, doc, ctx) = production_vm();
         let inner = doc.borrow().get_element_by_id("inner").unwrap();
         vm.eval(
@@ -48876,7 +49482,12 @@ mod tests {
             Some("event.stopImmediatePropagation();"),
         );
         assert!(!halted.prevented, "stopImmediate alone does not prevent");
-        assert_eq!(eval_log(&mut vm, "seen.join(';');"), "");
+        assert_eq!(
+            eval_log(&mut vm, "seen.join(';');"),
+            "cap",
+            "inline stopImmediate lets the capture ancestor run, then halts target/bubble"
+        );
+        vm.eval("seen = [];").unwrap();
         let halted_prevented = vm.dispatch_cancel_event(
             inner,
             Some("event.stopImmediatePropagation(); event.preventDefault();"),
@@ -48885,7 +49496,12 @@ mod tests {
             halted_prevented.prevented,
             "inline prevention still counts when listeners are halted"
         );
-        assert_eq!(eval_log(&mut vm, "seen.join(';');"), "");
+        assert_eq!(
+            eval_log(&mut vm, "seen.join(';');"),
+            "cap",
+            "inline prevention counts and capture still runs"
+        );
+        vm.eval("seen = [];").unwrap();
         let propagated = vm.dispatch_cancel_event(
             inner,
             Some("event.stopPropagation();"),
@@ -48894,7 +49510,198 @@ mod tests {
         assert_eq!(
             eval_log(&mut vm, "seen.join(';');"),
             "cap;target",
-            "inline stopPropagation is documented as not carrying into the listener plan"
+            "inline stopPropagation lets the capture ancestor run but the target listener still runs"
+        );
+        remove_context(ctx);
+    }
+
+    #[test]
+    fn host_event_inline_stop_propagation_halts_bubble_phase() {
+        // S1b (w86fix): the bubbling case — an inline
+        // `stopPropagation()` on a `submit` skips the ancestor's
+        // bubble listener, while the capture ancestor (already
+        // past by the inline handler's notional target phase)
+        // and the target listener still run (div stands in for
+        // the form, as in the submit prevention tests).
+        let (mut vm, doc, ctx) = production_vm();
+        let inner = doc.borrow().get_element_by_id("inner").unwrap();
+        vm.eval(
+            "globalThis.seen = []; \
+             var innerEl = document.getElementById('inner'); \
+             var outerEl = document.getElementById('outer'); \
+             outerEl.addEventListener('submit', function() { seen.push('cap'); }, true); \
+             innerEl.addEventListener('submit', function() { seen.push('target'); }); \
+             outerEl.addEventListener('submit', function() { seen.push('bubble'); });",
+        )
+        .unwrap();
+        let outcome = vm.dispatch_submit_event(
+            inner,
+            Some("event.stopPropagation();"),
+        );
+        assert!(!outcome.prevented);
+        assert_eq!(
+            eval_log(&mut vm, "seen.join(';');"),
+            "cap;target",
+            "inline stopPropagation skips the bubble ancestor but the capture ancestor still runs"
+        );
+        // Control: without the inline stop, all three phases run in
+        // capture-target-bubble order.
+        vm.eval("seen = [];").unwrap();
+        let control = vm.dispatch_submit_event(inner, None);
+        assert!(!control.prevented);
+        assert_eq!(
+            eval_log(&mut vm, "seen.join(';');"),
+            "cap;target;bubble",
+            "no inline stop: capture, target, then bubble"
+        );
+        remove_context(ctx);
+    }
+
+    #[test]
+    fn host_event_inline_stop_propagation_lets_capture_run() {
+        // w86fix capture correction: an inline
+        // `stopPropagation()` on a bubbling `submit` must NOT
+        // suppress a capture listener on an ancestor — the inline
+        // handler conceptually runs at target phase, after
+        // capture has already run — while the bubble ancestor
+        // stays suppressed and target listeners still run. The
+        // seeded flag also stays visible through `cancelBubble`
+        // to the target listeners, like a target-phase listener's
+        // own call — but NOT to the capture listener (w86fix 5a):
+        // the inline handler has not run yet at capture time, so
+        // Chrome reads `cancelBubble` as `false` there. Style
+        // follows `host_event_submit_bubble_stop_propagation`.
+        let (mut vm, doc, ctx) = production_vm();
+        let inner = doc.borrow().get_element_by_id("inner").unwrap();
+        vm.eval(
+            "globalThis.seen = []; \
+             var innerEl = document.getElementById('inner'); \
+             var outerEl = document.getElementById('outer'); \
+             outerEl.addEventListener('submit', function(e) { seen.push('cap'); seen.push('cb:' + e.cancelBubble); }, true); \
+             innerEl.addEventListener('submit', function() { seen.push('target'); }); \
+             innerEl.addEventListener('submit', function(e) { seen.push('cb:' + e.cancelBubble); }); \
+             outerEl.addEventListener('submit', function() { seen.push('bubble'); });",
+        )
+        .unwrap();
+        let outcome = vm.dispatch_submit_event(inner, Some("event.stopPropagation();"));
+        assert!(!outcome.prevented);
+        assert_eq!(
+            eval_log(&mut vm, "seen.join(';');"),
+            "cap;cb:false;target;cb:true",
+            "inline stopPropagation: capture fires with cancelBubble false (seed not yet set), target runs with cancelBubble true, bubble is skipped"
+        );
+        // Control: without the inline stop, all three phases run
+        // in capture-target-bubble order and cancelBubble is false.
+        vm.eval("seen = [];").unwrap();
+        let control = vm.dispatch_submit_event(inner, None);
+        assert!(!control.prevented);
+        assert_eq!(
+            eval_log(&mut vm, "seen.join(';');"),
+            "cap;cb:false;target;cb:false;bubble",
+            "no inline stop: capture, target, then bubble"
+        );
+        remove_context(ctx);
+    }
+
+    #[test]
+    fn host_event_live_capture_stop_propagation_halts_capture() {
+        // w86fix 5c: a LIVE capture listener's `stopPropagation()`
+        // halts the remaining capture phase — two capture
+        // ancestors, the first (documentElement, outermost in
+        // capture order) stops: the second capture listener must
+        // not run, the target must still run, and the bubble
+        // ancestor must not run. (Contrast with the seeded flag,
+        // which never skips capture.)
+        let (mut vm, doc, ctx) = production_vm();
+        let inner = doc.borrow().get_element_by_id("inner").unwrap();
+        vm.eval(
+            "globalThis.seen = []; \
+             var innerEl = document.getElementById('inner'); \
+             var outerEl = document.getElementById('outer'); \
+             document.documentElement.addEventListener('submit', function(e) { seen.push('cap-html'); e.stopPropagation(); }, true); \
+             outerEl.addEventListener('submit', function() { seen.push('cap-outer'); }, true); \
+             innerEl.addEventListener('submit', function() { seen.push('target'); }); \
+             outerEl.addEventListener('submit', function() { seen.push('bubble'); });",
+        )
+        .unwrap();
+        let outcome = vm.dispatch_submit_event(inner, None);
+        assert!(!outcome.prevented);
+        assert_eq!(
+            eval_log(&mut vm, "seen.join(';');"),
+            "cap-html;target",
+            "live capture stop halts the second capture and the bubble, but the target still runs"
+        );
+        remove_context(ctx);
+    }
+
+    #[test]
+    fn redispatch_fresh_handle_keeps_outer_stop_flags() {
+        // w86fix 5d: re-dispatching from a listener mints a
+        // FRESH handle per `dispatchEvent` call, so the inner
+        // dispatch is a new dispatch, not same-object reentry
+        // — this test pins that observable behavior: the outer
+        // dispatch's stop flags survive the fresh-handle
+        // redispatch (the outer bubble listener stays skipped
+        // after the outer capture listener stopped
+        // propagation). NOTE: the DOM dispatch-flag guard in
+        // `run_event_dispatch` itself is currently
+        // unobservable via JS and UNTESTED here — no
+        // same-handle reentrant path exists from JS
+        // (`dispatchEvent` always mints a fresh handle); the
+        // guard is defense-in-depth for the host/stashed
+        // paths that reuse a handle.
+        let (mut vm, _doc, ctx) = production_vm();
+        vm.eval(
+            "globalThis.seen = []; globalThis.__re = false; \
+             var innerEl = document.getElementById('inner'); \
+             var outerEl = document.getElementById('outer'); \
+             outerEl.addEventListener('click', function(e) { seen.push('cap-stop'); e.stopPropagation(); }, true); \
+             innerEl.addEventListener('click', function(e) { seen.push('target'); if (!window.__re) { window.__re = true; innerEl.dispatchEvent(e); } }); \
+             outerEl.addEventListener('click', function() { seen.push('bubble'); });",
+        )
+        .unwrap();
+        vm.eval("innerEl.dispatchEvent({type: 'click', bubbles: true});")
+            .unwrap();
+        assert_eq!(
+            eval_log(&mut vm, "seen.join(';');"),
+            "cap-stop;target;cap-stop;target",
+            "outer stop survives the reentrant dispatch: no bubble runs in either dispatch"
+        );
+        remove_context(ctx);
+    }
+
+    #[test]
+    fn cancel_bubble_cleared_after_dispatch() {
+        // w86fix 5e: a listener's `stopPropagation()` must not
+        // leak past the dispatch — after dispatch the event's
+        // `cancelBubble` reads `false`, like a fresh wrapper.
+        // (The `cancelBubble=false` setter no-op is pre-existing
+        // and untouched: only the dispatch-end clear is new.)
+        let (mut vm, _doc, ctx) = production_vm();
+        vm.eval(
+            "globalThis.saved = null; globalThis.bubbled = false; \
+             var innerEl = document.getElementById('inner'); \
+             var outerEl = document.getElementById('outer'); \
+             innerEl.addEventListener('click', function(e) { globalThis.saved = e; e.stopPropagation(); }); \
+             outerEl.addEventListener('click', function() { globalThis.bubbled = true; });",
+        )
+        .unwrap();
+        vm.eval("innerEl.dispatchEvent({type: 'click', bubbles: true});")
+            .unwrap();
+        assert_eq!(
+            eval_log(&mut vm, "String(globalThis.bubbled);"),
+            "false",
+            "the bubble listener must not run (the stop worked during dispatch)"
+        );
+        assert_eq!(
+            eval_log(&mut vm, "String(saved.cancelBubble);"),
+            "false",
+            "cancelBubble is cleared when the dispatch ends"
+        );
+        assert_eq!(
+            eval_log(&mut vm, "String(saved.eventPhase);"),
+            "0",
+            "eventPhase is NONE after dispatch (existing epilogue behavior)"
         );
         remove_context(ctx);
     }
@@ -48930,6 +49737,40 @@ mod tests {
     }
 
     #[test]
+    fn host_event_escape_cancel_is_not_cancelable() {
+        // w86fix P2 (Chrome 155): an Escape `cancel` has
+        // `cancelable=false` — a listener's
+        // `preventDefault()` is a no-op and an inline
+        // `return false` prevents nothing, while the
+        // cancelable light-dismiss shape
+        // (`dispatch_cancel_event`) still prevents.
+        let (mut vm, doc, ctx) = production_vm();
+        let inner = doc.borrow().get_element_by_id("inner").unwrap();
+        vm.eval(
+            "globalThis.seen = []; \
+             var innerEl = document.getElementById('inner'); \
+             innerEl.addEventListener('cancel', function(e) { seen.push('cancel:' + e.cancelable + ',' + e.defaultPrevented); e.preventDefault(); seen.push('after:' + e.defaultPrevented); });",
+        )
+        .unwrap();
+        let escape = vm.dispatch_escape_cancel_event(inner, Some("return false;"));
+        assert!(
+            !escape.prevented,
+            "inline return false must not prevent a non-cancelable Escape cancel"
+        );
+        assert_eq!(
+            eval_log(&mut vm, "seen.join(';');"),
+            "cancel:false,false;after:false",
+            "Escape cancel reports cancelable=false and preventDefault() leaves defaultPrevented false"
+        );
+        let cancel = vm.dispatch_cancel_event(inner, Some("return false;"));
+        assert!(
+            cancel.prevented,
+            "the cancelable light-dismiss cancel still prevents"
+        );
+        remove_context(ctx);
+    }
+
+    #[test]
     fn host_event_capture_once_passive_and_non_bubbling() {
         // S5: capture, `once`, and passive listeners all behave on
         // the host path, and a non-bubbling `cancel` never reaches
@@ -48955,6 +49796,155 @@ mod tests {
             eval_log(&mut vm, "seen.join(';');"),
             "cap;once;pas;cap;pas",
             "capture runs every dispatch, once runs once, bubble never runs (non-bubbling)"
+        );
+        remove_context(ctx);
+    }
+
+    #[test]
+    fn host_event_submit_bubbles_and_survives_override() {
+        // w86: `submit` is the first BUBBLING trusted host event —
+        // capture on an ancestor runs first, then the target, then
+        // bubble listeners up the ancestor chain — and a page
+        // override of `dispatchEvent` (on the target and on
+        // `window`) cannot swallow or untrust it. The `#inner`
+        // div stands in for the form: `dispatch_submit_event`
+        // is target-agnostic, and the app-level form wiring is
+        // pinned by the testdriver test instead.
+        let (mut vm, doc, ctx) = production_vm();
+        let inner = doc.borrow().get_element_by_id("inner").unwrap();
+        vm.eval(
+            "globalThis.seen = []; globalThis.overrideCalled = false; \
+             var innerEl = document.getElementById('inner'); \
+             var outerEl = document.getElementById('outer'); \
+             innerEl.dispatchEvent = function() { overrideCalled = true; }; \
+             window.dispatchEvent = function() { overrideCalled = true; }; \
+             outerEl.addEventListener('submit', function(e) { \
+                 seen.push('cap:' + e.isTrusted + ',' + e.bubbles + ',' + e.cancelable \
+                     + ',' + e.eventPhase + ',' + (e.target === innerEl) \
+                     + ',' + (e.currentTarget === outerEl)); \
+             }, true); \
+             innerEl.addEventListener('submit', function(e) { \
+                 seen.push('target:' + e.isTrusted + ',' + e.eventPhase \
+                     + ',' + (e.target === innerEl)); \
+             }); \
+             outerEl.addEventListener('submit', function(e) { \
+                 seen.push('bub:' + e.isTrusted + ',' + e.eventPhase \
+                     + ',' + (e.target === innerEl) + ',' + (e.currentTarget === outerEl)); \
+             }); \
+             document.documentElement.addEventListener('submit', function(e) { \
+                 seen.push('html:' + e.eventPhase); \
+             });",
+        )
+        .unwrap();
+        let outcome = vm.dispatch_submit_event(
+            inner,
+            Some("seen.push('inline:' + event.isTrusted + ',' + event.bubbles + ',' + event.cancelable);"),
+        );
+        assert!(!outcome.prevented, "unprevented submit is not prevented");
+        assert!(
+            outcome.inline_error.is_none(),
+            "inline submit must not throw"
+        );
+        assert!(outcome.dispatch_error.is_none());
+        assert_eq!(
+            eval_log(&mut vm, "seen.join(';');"),
+            "inline:true,true,true;cap:true,true,true,1,true,true;target:true,2,true;bub:true,3,true,true;html:3"
+        );
+        assert_eq!(
+            vm.eval("overrideCalled;").unwrap(),
+            Value::Bool(false),
+            "host submit dispatch must not call the overridden dispatchEvent"
+        );
+        remove_context(ctx);
+    }
+
+    #[test]
+    fn host_event_submit_prevented_semantics() {
+        // w86: a cancelable `submit` is prevented by an inline
+        // `return false`, by an inline `preventDefault()`, and by
+        // a listener `preventDefault()` — but not by a passive
+        // listener's `preventDefault()`, which no-ops.
+        let (mut vm, doc, ctx) = production_vm();
+        let inner = doc.borrow().get_element_by_id("inner").unwrap();
+        vm.eval(
+            "globalThis.seen = []; \
+             var innerEl = document.getElementById('inner'); \
+             innerEl.addEventListener('submit', function(e) { \
+                 seen.push('listener:' + e.defaultPrevented); e.preventDefault(); \
+             }); \
+             innerEl.addEventListener('submit', function(e) { \
+                 seen.push('passive'); e.preventDefault(); \
+             }, {passive: true});",
+        )
+        .unwrap();
+        let by_return = vm.dispatch_submit_event(inner, Some("return false;"));
+        assert!(by_return.prevented, "inline return false prevents submit");
+        let by_inline_prevent = vm.dispatch_submit_event(inner, Some("event.preventDefault();"));
+        assert!(
+            by_inline_prevent.prevented,
+            "inline preventDefault prevents submit"
+        );
+        let by_listener = vm.dispatch_submit_event(inner, None);
+        assert!(
+            by_listener.prevented,
+            "listener preventDefault prevents submit"
+        );
+        assert_eq!(
+            eval_log(&mut vm, "seen.join(';');"),
+            "listener:false;passive;listener:true;passive;listener:false;passive",
+            "return false sets no defaultPrevented; inline preventDefault is visible to the listener; the listener's own preventDefault lands after its read"
+        );
+        remove_context(ctx);
+        // Passive-only: nothing prevents.
+        let (mut vm, doc, ctx) = production_vm();
+        let inner = doc.borrow().get_element_by_id("inner").unwrap();
+        vm.eval(
+            "var innerEl = document.getElementById('inner'); \
+             innerEl.addEventListener('submit', function(e) { e.preventDefault(); }, {passive: true});",
+        )
+        .unwrap();
+        let passive_only = vm.dispatch_submit_event(inner, None);
+        assert!(
+            !passive_only.prevented,
+            "passive preventDefault must not prevent submit"
+        );
+        remove_context(ctx);
+    }
+
+    #[test]
+    fn host_event_submit_bubble_stop_propagation() {
+        // w86: a bubble-phase `stopPropagation()` halts the
+        // remaining bubble phase (further ancestors never run),
+        // and an inline `stopPropagation()` (w86fix) carries
+        // into the listener plan as the core's initial stop flag:
+        // the second dispatch runs only the target listener.
+        let (mut vm, doc, ctx) = production_vm();
+        let inner = doc.borrow().get_element_by_id("inner").unwrap();
+        vm.eval(
+            "globalThis.seen = []; \
+             var innerEl = document.getElementById('inner'); \
+             var outerEl = document.getElementById('outer'); \
+             outerEl.addEventListener('submit', function(e) { \
+                 seen.push('bub-outer'); e.stopPropagation(); \
+             }); \
+             document.documentElement.addEventListener('submit', function() { \
+                 seen.push('bub-html'); \
+             }); \
+             innerEl.addEventListener('submit', function() { seen.push('target'); });",
+        )
+        .unwrap();
+        vm.dispatch_submit_event(inner, None);
+        assert_eq!(
+            eval_log(&mut vm, "seen.join(';');"),
+            "target;bub-outer",
+            "bubble stopPropagation must halt the remaining bubble phase"
+        );
+        let inline_stopped = vm.dispatch_submit_event(inner, Some("event.stopPropagation();"));
+        assert!(!inline_stopped.prevented);
+        assert_eq!(
+            eval_log(&mut vm, "seen.join(';');"),
+            "target;bub-outer;target",
+            "inline stopPropagation skips the bubble ancestors; only the target runs"
         );
         remove_context(ctx);
     }
@@ -49006,6 +49996,7 @@ mod tests {
                 inline_false: false,
                 inline_error: None,
                 stop_immediate: false,
+                stop_propagation: false,
                 inline_prevented: false,
             });
             g.host_event_core_armed = true;
@@ -51299,6 +52290,36 @@ mod tests {
     }
 
     #[test]
+    fn parse_shim_dialog_show_order_adopted_for_nonmodal() {
+        // w86fix B1 (Chrome probe A3b): parse-time script shows
+        // must adopt their show order — a non-modal `d2.show();
+        // d1.show();` in an inline script Escapes D1 first after
+        // install, not in document order. Before the fix the
+        // non-modal shows never entered any shim order list, so
+        // adoption recorded no sequences and `escape_targets`
+        // fell back to document order ([D2, D1] here, wrong).
+        let (_probe, doc, ctx) = captured_install(
+            b"<html><body><dialog id=\"d1\" closedby=\"any\">one</dialog><dialog id=\"d2\" closedby=\"any\">two</dialog><script>\
+              document.getElementById('d2').show();\
+              document.getElementById('d1').show();\
+              </script></body></html>",
+        );
+        let d1 = doc.borrow().get_element_by_id("d1").expect("dialog#d1");
+        let d2 = doc.borrow().get_element_by_id("d2").expect("dialog#d2");
+        assert!(doc.borrow().is_dialog_open(d1));
+        assert!(doc.borrow().is_dialog_open(d2));
+        assert_eq!(
+            doc.borrow().escape_targets(),
+            vec![
+                bowser_dom::EscapeTarget::NonModalDialog(d1),
+                bowser_dom::EscapeTarget::NonModalDialog(d2),
+            ],
+            "last-shown (d1) escapes first, not document-first (d2)"
+        );
+        remove_context(ContextId(ctx));
+    }
+
+    #[test]
     fn parse_shim_dialog_show_hides_open_auto_popover() {
         // w85fix issue 2: a mid-parse auto.showPopover();
         // dlg.showModal(); must adopt as a modal dialog with
@@ -51383,6 +52404,76 @@ mod tests {
         assert!(
             !doc.borrow().is_exit_retained(a_node),
             "retained auto popover must end on a shim dialog show"
+        );
+        remove_context(ContextId(ctx));
+    }
+
+    #[test]
+    fn parse_shim_popover_show_ends_retained_auto_not_retained_manual() {
+        // w86fix #3: the shim popover-show hide arm must end a
+        // retained `auto` popover's retention but leave a retained
+        // `manual` popover's retention intact — the mirror of the
+        // dialog arm above, and of production `show_popover`.
+        // Both popovers hide with an exit transition first, so
+        // both are retained when B shows. A manual show ends
+        // neither (production only auto-closes on an `auto` show).
+        let (mut probe, doc, ctx) = captured_install(
+            b"<html><body><div id=\"m\" popover=\"manual\">hi</div><div id=\"a\" popover=\"auto\">hi</div><div id=\"b\" popover=\"auto\">hi</div><script>\
+              globalThis.__m = document.getElementById('m');\
+              globalThis.__a = document.getElementById('a');\
+              globalThis.__b = document.getElementById('b');\
+              __m.style.transition = 'overlay 2s allow-discrete, display 2s allow-discrete';\
+              __a.style.transition = 'overlay 2s allow-discrete, display 2s allow-discrete';\
+              __m.showPopover();\
+              __m.hidePopover();\
+              __a.showPopover();\
+              __a.hidePopover();\
+              __b.showPopover();\
+              globalThis.__bOpen = String(__b.matches(':popover-open'));\
+              </script></body></html>",
+        );
+        assert_eq!(node_list_str(&mut probe.vm, "globalThis.__bOpen;"), "true");
+        let m_node = doc.borrow().get_element_by_id("m").expect("div#m");
+        let a_node = doc.borrow().get_element_by_id("a").expect("div#a");
+        let b_node = doc.borrow().get_element_by_id("b").expect("div#b");
+        assert!(doc.borrow().is_popover_open(b_node));
+        assert!(
+            doc.borrow().is_exit_retained(m_node),
+            "retained manual popover must survive a shim auto popover show"
+        );
+        assert!(
+            !doc.borrow().is_exit_retained(a_node),
+            "retained auto popover must end on a shim auto popover show"
+        );
+        remove_context(ContextId(ctx));
+
+        let (mut probe, doc, ctx) = captured_install(
+            b"<html><body><div id=\"m\" popover=\"manual\">hi</div><div id=\"a\" popover=\"auto\">hi</div><div id=\"c\" popover=\"manual\">hi</div><script>\
+              globalThis.__m = document.getElementById('m');\
+              globalThis.__a = document.getElementById('a');\
+              globalThis.__c = document.getElementById('c');\
+              __m.style.transition = 'overlay 2s allow-discrete, display 2s allow-discrete';\
+              __a.style.transition = 'overlay 2s allow-discrete, display 2s allow-discrete';\
+              __m.showPopover();\
+              __m.hidePopover();\
+              __a.showPopover();\
+              __a.hidePopover();\
+              __c.showPopover();\
+              globalThis.__cOpen = String(__c.matches(':popover-open'));\
+              </script></body></html>",
+        );
+        assert_eq!(node_list_str(&mut probe.vm, "globalThis.__cOpen;"), "true");
+        let m_node = doc.borrow().get_element_by_id("m").expect("div#m");
+        let a_node = doc.borrow().get_element_by_id("a").expect("div#a");
+        let c_node = doc.borrow().get_element_by_id("c").expect("div#c");
+        assert!(doc.borrow().is_popover_open(c_node));
+        assert!(
+            doc.borrow().is_exit_retained(m_node),
+            "retained manual popover must survive a shim manual popover show"
+        );
+        assert!(
+            doc.borrow().is_exit_retained(a_node),
+            "retained auto popover must survive a shim manual popover show"
         );
         remove_context(ContextId(ctx));
     }
@@ -51551,7 +52642,7 @@ mod tests {
     #[test]
     fn w85_shim_retained_auto_fallback_reads_popover_attribute_without_wrapper() {
         // w85fix: pins the retained-arm fallback read itself
-        // (`shim_popover_state_for_arena`), for elements
+        // (`shim_popover_states_for_arenas`), for elements
         // that were never wrapped in JS — no wrapper record
         // exists for them, so the wrapper lookup in
         // `parse_dialog_show` would miss. The retained-arm
@@ -52262,6 +53353,225 @@ mod tests {
         assert!(
             !doc.borrow().is_exit_retained(p_node),
             "forced-true re-open must cancel the retention, not leave it live"
+        );
+        remove_context(ContextId(ctx));
+    }
+
+    // w86 G1+G2: a mid-parse `showPopover` that auto-closes a live
+    // `auto` victim retains the victim's exit transition (production
+    // `show_popover` twin) instead of demoting it synchronously, and
+    // the survivor's show-time duration is adopted as its stored
+    // duration. The show/hide/show round trip below re-shows the
+    // victim, which cancels its retention, re-opens it live (with a
+    // fresh stored duration), and retains the new victim in turn —
+    // the remaining duration the next dismissal will defer through
+    // is the 2s transition + the 1.5s exit-retention grace.
+    #[test]
+    fn w86_parse_shim_popover_show_retains_auto_victim_and_stores_survivor() {
+        let (mut probe, doc, ctx) = captured_install(
+            b"<html><body><div id=\"a\" popover=\"auto\">hi</div><div id=\"b\" popover=\"auto\">hi</div><script>\
+              globalThis.__a = document.getElementById('a');\
+              globalThis.__b = document.getElementById('b');\
+              __a.style.transition = 'overlay 2s allow-discrete, display 2s allow-discrete';\
+              __b.style.transition = 'overlay 2s allow-discrete, display 2s allow-discrete';\
+              globalThis.__out = [];\
+              __a.showPopover();\
+              __out.push(String(__a.matches(':popover-open')));\
+              __b.showPopover();\
+              __out.push(String(__a.matches(':popover-open')));\
+              __out.push(String(__b.matches(':popover-open')));\
+              __a.showPopover();\
+              __out.push(String(__a.matches(':popover-open')));\
+              __out.push(String(__b.matches(':popover-open')));\
+              </script></body></html>",
+        );
+        // A retained popover still matches `:popover-open` (it keeps
+        // rendering until its exit transition finishes), so every
+        // read here is `true` — the adoption assertions below are
+        // what distinguish retained from live.
+        assert_eq!(
+            node_list_str(&mut probe.vm, "__out.join(';');"),
+            "true;true;true;true;true"
+        );
+        let a_node = doc.borrow().get_element_by_id("a").expect("div#a");
+        let b_node = doc.borrow().get_element_by_id("b").expect("div#b");
+        assert!(
+            !doc.borrow().is_exit_retained(a_node),
+            "re-showing the victim must cancel its retention"
+        );
+        assert!(doc.borrow().is_popover_open(a_node));
+        assert!(
+            doc.borrow().is_exit_retained(b_node),
+            "the re-show's auto-close victim must retain its exit transition"
+        );
+        let a_stored = doc.borrow().stored_exit_duration(a_node);
+        assert!(
+            a_stored.is_some_and(|d| (d - 3.5).abs() < 0.01),
+            "re-shown survivor must adopt its 2s transition + 1.5s grace as its stored duration, got {a_stored:?}"
+        );
+        assert_eq!(
+            doc.borrow().stored_exit_duration(b_node),
+            None,
+            "an auto-closed victim's stored duration is consumed into its retention"
+        );
+        remove_context(ContextId(ctx));
+    }
+
+    // w86 G1+G2, dialog arm: a mid-parse `showModal` retains a live
+    // `auto` victim's exit transition (production `show_dialog_modal`
+    // twin), and the modal dialog's own show-time duration is adopted
+    // as its stored duration.
+    #[test]
+    fn w86_parse_shim_dialog_show_retains_auto_victim_and_stores_modal() {
+        let (mut probe, doc, ctx) = captured_install(
+            b"<html><body><div id=\"p\" popover=\"auto\">hi</div><dialog id=\"d\">hi</dialog><script>\
+              globalThis.__p = document.getElementById('p');\
+              globalThis.__d = document.getElementById('d');\
+              __p.style.transition = 'overlay 2s allow-discrete, display 2s allow-discrete';\
+              __d.style.transition = 'overlay 2s allow-discrete, display 2s allow-discrete';\
+              globalThis.__out = [];\
+              __p.showPopover();\
+              __d.showModal();\
+              __out.push(String(__p.matches(':popover-open')));\
+              __out.push(String(__d.matches(':modal')));\
+              </script></body></html>",
+        );
+        assert_eq!(
+            node_list_str(&mut probe.vm, "__out.join(';');"),
+            "true;true"
+        );
+        let p_node = doc.borrow().get_element_by_id("p").expect("div#p");
+        let d_node = doc.borrow().get_element_by_id("d").expect("dialog#d");
+        assert!(
+            doc.borrow().is_exit_retained(p_node),
+            "a dialog show's auto-close victim must retain its exit transition"
+        );
+        assert!(doc.borrow().is_dialog_modal(d_node));
+        let d_stored = doc.borrow().stored_exit_duration(d_node);
+        assert!(
+            d_stored.is_some_and(|d| (d - 3.5).abs() < 0.01),
+            "modal dialog must adopt its 2s transition + 1.5s grace as its stored duration, got {d_stored:?}"
+        );
+        assert_eq!(
+            doc.borrow().stored_exit_duration(p_node),
+            None,
+            "an auto-closed victim's stored duration is consumed into its retention"
+        );
+        remove_context(ContextId(ctx));
+    }
+
+    // w86 G2, window/testdriver contract: a popover shown mid-parse
+    // with a 2s exit transition adopts its stored duration, and the
+    // dismissal path the window uses for Escape / light-dismiss /
+    // submit (`take_stored_exit_duration` + `hide_popover_deferred`,
+    // exactly `bowser_app::window::deferred_hide_popover`) retains
+    // it through that duration instead of demoting synchronously.
+    // The no-transition control adopts no duration and demotes at
+    // once, proving the retention comes from the adopted value.
+    #[test]
+    fn w86_adopted_shim_shown_popover_retains_on_deferred_dismissal() {
+        let (mut probe, doc, ctx) = captured_install(
+            b"<html><body><div id=\"p\" popover=\"auto\">hi</div><script>\
+              globalThis.__p = document.getElementById('p');\
+              __p.style.transition = 'overlay 2s allow-discrete, display 2s allow-discrete';\
+              __p.showPopover();\
+              </script></body></html>",
+        );
+        let p_node = doc.borrow().get_element_by_id("p").expect("div#p");
+        assert!(doc.borrow().is_popover_open(p_node));
+        assert_eq!(
+            node_list_str(&mut probe.vm, "getComputedStyle(__p).overlay;"),
+            "auto"
+        );
+        let stored = doc.borrow().stored_exit_duration(p_node);
+        assert!(
+            stored.is_some_and(|d| (d - 3.5).abs() < 0.01),
+            "adopted stored duration must be the 2s transition + 1.5s grace, got {stored:?}"
+        );
+        // The window/testdriver deferred dismissal, replayed verbatim.
+        let d = doc
+            .borrow_mut()
+            .take_stored_exit_duration(p_node)
+            .expect("stored duration adopted at show time");
+        doc.borrow_mut()
+            .hide_popover_deferred(p_node, d)
+            .expect("deferred hide");
+        assert!(
+            doc.borrow().is_exit_retained(p_node),
+            "an Escape-style dismissal must retain through the adopted stored duration"
+        );
+        assert_eq!(
+            doc.borrow().stored_exit_duration(p_node),
+            None,
+            "the dismissal consumes the stored duration exactly once"
+        );
+        remove_context(ContextId(ctx));
+
+        let (mut probe, doc, ctx) = captured_install(
+            b"<html><body><div id=\"p\" popover=\"auto\">hi</div><script>\
+              globalThis.__p = document.getElementById('p');\
+              __p.showPopover();\
+              </script></body></html>",
+        );
+        let p_node = doc.borrow().get_element_by_id("p").expect("div#p");
+        assert_eq!(
+            node_list_str(&mut probe.vm, "getComputedStyle(__p).overlay;"),
+            "auto"
+        );
+        assert_eq!(
+            doc.borrow().stored_exit_duration(p_node),
+            None,
+            "a popover with no exit transition adopts no stored duration"
+        );
+        doc.borrow_mut()
+            .hide_popover(p_node)
+            .expect("synchronous hide of the control");
+        assert!(
+            !doc.borrow().is_exit_retained(p_node),
+            "with no stored duration the dismissal demotes synchronously"
+        );
+        remove_context(ContextId(ctx));
+    }
+
+    // w86 G2, modal-dialog arm of the same contract: a dialog shown
+    // mid-parse via `showModal` with a 2s exit transition adopts its
+    // stored duration, and the Escape dismissal
+    // (`take_stored_exit_duration` + `close_dialog_deferred`,
+    // exactly `bowser_app::window::deferred_close_dialog`) retains
+    // it instead of demoting synchronously.
+    #[test]
+    fn w86_adopted_shim_shown_modal_retains_on_deferred_close() {
+        let (mut probe, doc, ctx) = captured_install(
+            b"<html><body><dialog id=\"d\">hi</dialog><script>\
+              globalThis.__d = document.getElementById('d');\
+              __d.style.transition = 'overlay 2s allow-discrete, display 2s allow-discrete';\
+              __d.showModal();\
+              </script></body></html>",
+        );
+        let d_node = doc.borrow().get_element_by_id("d").expect("dialog#d");
+        assert!(doc.borrow().is_dialog_modal(d_node));
+        assert_eq!(
+            node_list_str(&mut probe.vm, "String(__d.matches(':modal'));"),
+            "true"
+        );
+        let stored = doc.borrow().stored_exit_duration(d_node);
+        assert!(
+            stored.is_some_and(|d| (d - 3.5).abs() < 0.01),
+            "adopted stored duration must be the 2s transition + 1.5s grace, got {stored:?}"
+        );
+        let d = doc
+            .borrow_mut()
+            .take_stored_exit_duration(d_node)
+            .expect("stored duration adopted at show time");
+        assert!(
+            doc.borrow_mut()
+                .close_dialog_deferred(d_node, None, d)
+                .expect("deferred close"),
+            "the deferred close must report the dialog closed"
+        );
+        assert!(
+            doc.borrow().is_exit_retained(d_node),
+            "an Escape-style dialog close must retain through the adopted stored duration"
         );
         remove_context(ContextId(ctx));
     }
@@ -54169,9 +55479,80 @@ mod tests {
 
     #[test]
     fn element_focus_is_noop() {
-        let (mut vm, _, _doc) = snap_page_vm(SNAP_HTML);
+        // w86: `focus()` is an unconditional no-op (see
+        // `n_element_focus`): it returns `undefined`, never
+        // throws, and changes no state — for a non-focusable
+        // div, a disabled button, a hidden element, and a
+        // detached element alike. Real focus movement is a
+        // follow-up wave, not a bindings-only change.
+        // Strengthened (w86fix nit): `focus`/`blur` listeners
+        // on every target assert the no-op dispatches nothing —
+        // a silent focus move that fired events would be worse
+        // than one that merely returned `undefined`.
+        let (mut vm, _, _doc) = snap_page_vm(
+            "<html><head></head><body><div id=\"a\"></div>\
+             <button id=\"dis\" disabled>go</button>\
+             <div id=\"hid\" style=\"display:none\">x</div></body></html>",
+        );
+        snap_str(
+            &mut vm,
+            "globalThis.__seen = []; \
+             var __targets = [document, document.body, document.getElementById('a'), \
+             document.getElementById('dis'), document.getElementById('hid')]; \
+             __targets.forEach(function(t) { \
+             var __name = t.id || t.tagName || 'document'; \
+             t.addEventListener('focus', function() { __seen.push(__name + ':focus'); }); \
+             t.addEventListener('blur', function() { __seen.push(__name + ':blur'); }); });",
+        );
         assert_eq!(snap_str(&mut vm, "typeof document.body.focus;"), "function");
         assert_eq!(snap_str(&mut vm, "document.body.focus();"), "undefined");
+        assert_eq!(
+            snap_str(&mut vm, "document.getElementById('a').focus();"),
+            "undefined"
+        );
+        // Disabled button: still `undefined`, still disabled.
+        assert_eq!(
+            snap_str(&mut vm, "document.getElementById('dis').focus();"),
+            "undefined"
+        );
+        assert_eq!(
+            snap_str(&mut vm, "document.getElementById('dis').getAttribute('disabled');"),
+            ""
+        );
+        // Hidden element: still `undefined`, still hidden.
+        assert_eq!(
+            snap_str(&mut vm, "document.getElementById('hid').focus();"),
+            "undefined"
+        );
+        assert_eq!(
+            snap_str(
+                &mut vm,
+                "document.getElementById('hid').getAttribute('style');"
+            ),
+            "display:none"
+        );
+        // Detached element (never inserted): still `undefined`.
+        assert_eq!(
+            snap_str(&mut vm, "document.createElement('div').focus();"),
+            "undefined"
+        );
+        // Detached element with listeners: still dispatches nothing.
+        snap_str(
+            &mut vm,
+            "var __det = document.createElement('div'); \
+             __det.addEventListener('focus', function() { __seen.push('det:focus'); }); \
+             __det.addEventListener('blur', function() { __seen.push('det:blur'); }); \
+             __det.focus();",
+        );
+        // Options argument is accepted and ignored; repeated
+        // calls stay `undefined` (no focus state accumulates).
+        assert_eq!(
+            snap_str(
+                &mut vm,
+                "document.getElementById('a').focus({preventScroll: true});"
+            ),
+            "undefined"
+        );
         assert_eq!(
             snap_str(&mut vm, "document.getElementById('a').focus();"),
             "undefined"
@@ -54179,6 +55560,12 @@ mod tests {
         // The document wrapper shares `element_proto`, so it sees
         // `focus` through the same chain.
         assert_eq!(snap_str(&mut vm, "document.focus();"), "undefined");
+        // No `focus`/`blur` event fired on any target above.
+        assert_eq!(
+            snap_str(&mut vm, "globalThis.__seen.join(',');"),
+            "",
+            "focus() must not dispatch focus/blur on any target"
+        );
     }
 
     #[test]
