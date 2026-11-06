@@ -1418,6 +1418,18 @@ impl TestDriver {
         // `preventDefault()` is a no-op and every dialog
         // proceeds to close. A `cancel` listener may close
         // another target, so open-ness is re-checked.
+        // Phase-3 re-show guard (w87, twin of the windowed
+        // `handle_escape` snapshot): snapshot each auto's
+        // promotion sequence now, before any listener runs,
+        // so phase 3 can tell a member re-shown mid-gesture
+        // from the one the Escape snapshotted.
+        let auto_seqs: HashMap<NodeId, u64> = match tab.document_ref() {
+            Some(doc) => autos
+                .iter()
+                .filter_map(|&pop| doc.top_layer_seq(pop).map(|seq| (pop, seq)))
+                .collect(),
+            None => HashMap::new(),
+        };
         let mut to_close: Vec<NodeId> = Vec::new();
         for dialog in dialogs {
             let open = tab
@@ -1469,13 +1481,20 @@ impl TestDriver {
         }
         // Phase 3: hide every open `auto` popover, newest
         // first, firing its `toggle` after all dialog closes.
-        // Unprobed (w86fix): a dialog `close` listener that
-        // re-shows an auto also in this phase-3 snapshot gets
-        // it hidden again — there is no re-show check here,
-        // unlike light-dismiss — so the re-show does not
-        // survive Escape. Needs a Chrome probe before any fix;
-        // do not add a speculative re-show check.
+        // Re-show guard (w87, twin of the windowed path):
+        // an auto whose promotion sequence changed since
+        // the snapshot was hidden and re-shown by a dialog
+        // listener during this Escape, so it survives (no
+        // hide, no `toggle`); the probe question lives on
+        // the windowed snapshot — see `handle_escape`.
         for pop in autos {
+            let re_shown = match tab.document_ref() {
+                Some(doc) => doc.top_layer_seq(pop) != auto_seqs.get(&pop).copied(),
+                None => true,
+            };
+            if re_shown {
+                continue;
+            }
             let hidden = match tab.installed_mut() {
                 Some(installed) => {
                     let mut doc = installed.document().borrow_mut();
@@ -1568,13 +1587,15 @@ impl TestDriver {
     /// the dialog's `close`). A re-shown victim is live
     /// again and skips both; a retained victim clears, since
     /// no later clear runs at retention expiry.
-    /// Known edge (w86fix nit, same as the windowed path):
-    /// a victim re-shown AND hidden again between the hide
-    /// and this deferred toggle still toggles once here, on
-    /// top of the re-hide's own toggle — two `closed`
-    /// toggles for one net hide. Closing it needs task-level
-    /// toggle coalescing (see S1 in
-    /// `PageEventDispatch::dispatch_toggle`).
+    /// Closed edge (w87, same as the windowed path): a victim
+    /// re-shown AND hidden again between the hide and this
+    /// deferred toggle does NOT skip — the liveness check
+    /// passes at finish time (the victim is hidden again), so
+    /// this helper DOES enqueue its `closed` on top of the
+    /// re-hide's own `closed`, and exactly one `closed` fires
+    /// only because the deferred-toggle queue dedups them
+    /// last-wins per target (the re-show enqueued `open`, the
+    /// re-hide replaced it with `closed`).
     fn fire_ld_popover_toggles_and_clears(
         &mut self,
         tab: &mut Tab,
@@ -2621,6 +2642,16 @@ impl TestDriver {
             }
         }
         Self::grant_activation(tab);
+        // Operation-end toggle flush (w87fix M1/m4): a
+        // direct `execute_click` caller gets no `complete()`
+        // pump after this, so the invoker / submit-close
+        // toggles enqueued above fire here, at the click's
+        // end — not at the next pump. A no-op when nothing
+        // is queued, and the drain's `complete()` flush
+        // stays a harmless second drain.
+        if let Some(page_vm) = tab.page_vm_mut() {
+            page_vm.flush_pending_toggles();
+        }
         Ok(())
     }
 
@@ -2737,6 +2768,18 @@ pub fn drain_testdriver_requests(tab: &mut Tab) {
     // shows that ran during a completion pump. Idempotent
     // with the per-sequence sync above.
     driver.sync_modal_focus(tab);
+    // Operation-end toggle flush (w87fix r3): the other
+    // production `execute_*` paths never flush — they were
+    // saved only incidentally by `TestDriver::execute`'s
+    // `complete()`, whose eval flushes at outermost-script
+    // end. (`execute_click` flushes itself now, w87fix
+    // M1/m4, so its toggles already fired; this drain
+    // flush is a harmless second drain for it.) A toggle
+    // enqueued by any request in this drain fires here, at the
+    // drain's end, instead of waiting for the next pump turn.
+    if let Some(page_vm) = tab.page_vm_mut() {
+        page_vm.flush_pending_toggles();
+    }
     if let Some(ctx) = ctx {
         store_persisted_action_state(ctx, std::mem::take(&mut driver.actions));
     }
@@ -4504,6 +4547,11 @@ mod tests {
             !popover_open(&tab, pop),
             "Escape must dismiss the auto popover"
         );
+        // w87fix: `execute_send_keys` is called directly
+        // here, so no `complete()` pump runs after it —
+        // flush the Escape's deferred toggle before
+        // reading `toggleTrusted`.
+        tab.page_vm_mut().expect("page vm").flush_pending_toggles();
         assert!(
             js_true(&mut tab, "toggleTrusted === true"),
             "Escape toggle must be trusted"
@@ -6153,6 +6201,13 @@ mod tests {
              d.addEventListener('toggle', function() { __log.push('toggle'); }); \
              d.show(); d.showPopover(); window.__log = [];",
         );
+        // w87fix: the setup `showPopover`'s `toggle:open`
+        // is deferred to the end of the eval above — after
+        // `window.__log = []` ran — so flush it here and
+        // reset the log, or the gesture's log would start
+        // with the setup show's own toggle.
+        tab.page_vm_mut().expect("page vm").flush_pending_toggles();
+        eval(&mut tab, "window.__log = [];");
         let mut driver = TestDriver::new();
         driver.execute(
             &mut tab,
@@ -6212,6 +6267,115 @@ mod tests {
     }
 
     #[test]
+    fn w87_escape_phase3_reshow_guard_keeps_auto_open() {
+        // w87, testdriver twin of the windowed
+        // `w87_escape_phase3_reshow_guard_keeps_auto_open`:
+        // real JS (not the stub): a dialog `close`
+        // listener that hides and re-shows an auto popover
+        // also in the phase-3 snapshot must NOT see it
+        // hidden again by this Escape. w87fix S1
+        // coalescing (w87fix M2 net-transition rule): the hide
+        // and the re-show run in one close-listener task, so
+        // the queue keeps one net entry, `open` -> `open`
+        // (task-start `open`, final `open`) — the intermediate
+        // `closed` is dropped, but the net-zero entry still
+        // fires one toggle (Chrome S2 / S-P1-cancel-reshow
+        // both pin count 1 for a net-zero same-task
+        // transition; dropping it would fire none). The
+        // listener logs `newState` only, so the log still
+        // reads `toggle:open`; phase 3 adds nothing after it.
+        let mut tab = tab_from_html(
+            b"<html><body><div id=\"pop\" popover>hi</div>\
+              <dialog id=\"dlg\" closedby=\"closerequest\"><button id=\"a\">a</button></dialog></body></html>",
+        );
+        eval(
+            &mut tab,
+            "var d = document.getElementById('dlg'); var p = document.getElementById('pop'); window.__log = []; \
+             d.addEventListener('cancel', function() { __log.push('cancel'); }); \
+             d.addEventListener('close', function() { __log.push('close'); p.hidePopover(); p.showPopover(); }); \
+             p.addEventListener('toggle', function(e) { __log.push('toggle:' + e.newState); }); \
+             d.showModal(); p.showPopover(); window.__log = [];",
+        );
+        // w87fix: the setup `showPopover`'s `toggle:open`
+        // is deferred to the end of the eval above — after
+        // `window.__log = []` ran — so flush it here and
+        // reset the log, or the gesture's log would start
+        // with the setup show's own toggle.
+        tab.page_vm_mut().expect("page vm").flush_pending_toggles();
+        eval(&mut tab, "window.__log = [];");
+        let mut driver = TestDriver::new();
+        driver.execute(
+            &mut tab,
+            sequence_request(vec![key_source(vec![
+                key_item(ActionItemKind::KeyDown, "Escape"),
+                key_item(ActionItemKind::KeyUp, "Escape"),
+            ])]),
+        );
+        assert!(
+            !tab.document_ref()
+                .expect("document")
+                .is_dialog_open(el(&tab, "dlg")),
+            "Escape must still close the dialog whose listener re-showed the auto"
+        );
+        assert!(
+            popover_open(&tab, el(&tab, "pop")),
+            "a close-listener hide+re-show must leave the auto open after Escape"
+        );
+        assert!(
+            js_true(
+                &mut tab,
+                "window.__log.join(',') === 'cancel,close,toggle:open'"
+            ),
+            "phase 3 must add no toggle after the net (open>open) toggle open"
+        );
+
+        // Control: the same Escape with no re-show hides
+        // the auto and fires its toggle after the closes.
+        let mut tab = tab_from_html(
+            b"<html><body><div id=\"pop\" popover>hi</div>\
+              <dialog id=\"dlg\" closedby=\"closerequest\"><button id=\"a\">a</button></dialog></body></html>",
+        );
+        eval(
+            &mut tab,
+            "var d = document.getElementById('dlg'); var p = document.getElementById('pop'); window.__log = []; \
+             d.addEventListener('cancel', function() { __log.push('cancel'); }); \
+             d.addEventListener('close', function() { __log.push('close'); }); \
+             p.addEventListener('toggle', function(e) { __log.push('toggle:' + e.newState); }); \
+             d.showModal(); p.showPopover(); window.__log = [];",
+        );
+        // w87fix: same setup-toggle flush as the first
+        // half — the setup show's deferred `toggle:open`
+        // would otherwise lead the control log too.
+        tab.page_vm_mut().expect("page vm").flush_pending_toggles();
+        eval(&mut tab, "window.__log = [];");
+        let mut driver = TestDriver::new();
+        driver.execute(
+            &mut tab,
+            sequence_request(vec![key_source(vec![
+                key_item(ActionItemKind::KeyDown, "Escape"),
+                key_item(ActionItemKind::KeyUp, "Escape"),
+            ])]),
+        );
+        assert!(
+            !tab.document_ref()
+                .expect("document")
+                .is_dialog_open(el(&tab, "dlg")),
+            "control: Escape must close the dialog"
+        );
+        assert!(
+            !popover_open(&tab, el(&tab, "pop")),
+            "control: Escape must hide the auto when nothing re-shows it"
+        );
+        assert!(
+            js_true(
+                &mut tab,
+                "window.__log.join(',') === 'cancel,close,toggle:closed'"
+            ),
+            "control: cancel, close, then the auto toggle closed"
+        );
+    }
+
+    #[test]
     fn w85fix_dual_light_dismiss_fires_toggle_after_close() {
         // Manual dual, `closedby=any`, outside pointer
         // sequence: cancel, close, then the dual toggle.
@@ -6227,6 +6391,13 @@ mod tests {
              d.addEventListener('toggle', function() { __log.push('toggle'); }); \
              d.show(); d.showPopover(); window.__log = [];",
         );
+        // w87fix: the setup `showPopover`'s `toggle:open`
+        // is deferred to the end of the eval above — after
+        // `window.__log = []` ran — so flush it here and
+        // reset the log, or the gesture's log would start
+        // with the setup show's own toggle.
+        tab.page_vm_mut().expect("page vm").flush_pending_toggles();
+        eval(&mut tab, "window.__log = [];");
         let mut driver = TestDriver::new();
         driver.execute(
             &mut tab,
@@ -6271,6 +6442,10 @@ mod tests {
              d.addEventListener('toggle', function() { __log.push('toggle'); }); \
              d.show(); d.showPopover(); window.__log = [];",
         );
+        // w87fix: same setup-toggle flush as the manual
+        // half above.
+        tab.page_vm_mut().expect("page vm").flush_pending_toggles();
+        eval(&mut tab, "window.__log = [];");
         let mut driver = TestDriver::new();
         driver.execute(
             &mut tab,
@@ -6315,6 +6490,13 @@ mod tests {
              p.addEventListener('toggle', function() { __log.push('toggle:p'); }); \
              d1.show(); d2.show(); p.showPopover(); window.__log = [];",
         );
+        // w87fix: the setup `showPopover`'s `toggle:p`
+        // is deferred to the end of the eval above — after
+        // `window.__log = []` ran — so flush it here and
+        // reset the log, or the gesture's log would start
+        // with the setup show's own toggle.
+        tab.page_vm_mut().expect("page vm").flush_pending_toggles();
+        eval(&mut tab, "window.__log = [];");
         let mut driver = TestDriver::new();
         driver.execute(
             &mut tab,
@@ -6373,6 +6555,13 @@ mod tests {
              document.addEventListener('click', function() { __log.push('click'); }); \
              d1.show(); d2.show(); p.showPopover(); window.__log = [];",
         );
+        // w87fix: the setup `showPopover`'s `toggle:p`
+        // is deferred to the end of the eval above — after
+        // `window.__log = []` ran — so flush it here and
+        // reset the log, or the gesture's log would start
+        // with the setup show's own toggle.
+        tab.page_vm_mut().expect("page vm").flush_pending_toggles();
+        eval(&mut tab, "window.__log = [];");
         let mut driver = TestDriver::new();
         driver.execute(
             &mut tab,
@@ -6432,6 +6621,11 @@ mod tests {
              document.addEventListener('click', function() { __log.push('click'); }); \
              d2.show(); d1.show(); p.showPopover(); window.__log = [];",
         );
+        // w87fix: same setup-toggle flush as the first
+        // half — the setup show's deferred `toggle:p`
+        // would otherwise lead the reversed log too.
+        tab.page_vm_mut().expect("page vm").flush_pending_toggles();
+        eval(&mut tab, "window.__log = [];");
         let mut driver = TestDriver::new();
         driver.execute(
             &mut tab,
@@ -6469,9 +6663,13 @@ mod tests {
     fn w86fix_p1_dialog_close_listener_reshow_keeps_auto_open() {
         // w86fix P1 (Chrome 155): a dialog `close` listener
         // that re-shows the about-to-dismiss auto leaves it
-        // open with NO `toggle closed` — the pending closed
-        // toggle is coalesced away and only the re-show's
-        // `toggle open` fires. Same for a `cancel` listener
+        // open with NO `toggle closed` — the begin half hid
+        // the popover state-only and deferred its toggle, and
+        // the finish half skips the toggle for a re-shown
+        // victim, so the only queued toggle is the re-show's
+        // own `closed` -> `open`: a fresh single transition,
+        // not a net-zero coalescing case, so w87fix M2 does
+        // not change this test. Same for a `cancel` listener
         // re-show (second half).
         let html = "<html><body><button id=\"btn\" popovertarget=\"pop\">\
              <span id=\"span\">t</span></button>\
@@ -6560,24 +6758,24 @@ mod tests {
             popover_open(&tab, pop),
             "P1: a cancel-listener re-show leaves the auto open"
         );
-        // w86fix: state-only assertion, not order — Chrome
-        // S-P1-cancel-reshow raw data fires the re-show's open
-        // toggle AFTER close (`cancel, cancel-reshow-after,
-        // click, close, toggle:open`), while Bowser fires it
-        // synchronously at the re-show (`cancel,toggle:open,
-        // close`). The order divergence is a known gap (a
-        // toggle queue is deferred to a later wave — see the
-        // S1 note in `dispatch_toggle`); what is pinned here
-        // is the state: the auto stays open, the re-show's
-        // open toggle fires (order-free, so either order
-        // passes), and no closed toggle fires.
+        // w87: ORDERED now — the deferred-toggle queue closes
+        // the w86fix gap. Chrome S-P1-cancel-reshow raw data
+        // fires the re-show's open toggle AFTER close
+        // (`cancel, cancel-reshow-after, click, close,
+        // toggle:open`); the re-show enqueues during the
+        // `cancel` dispatch and fires only at the operation-end
+        // flush, after `close`. (`cancel-reshow-after` is the
+        // re-show call itself and `click` is the gesture's own
+        // click — neither is logged here, since no listener
+        // records them — so the pinned log is
+        // `cancel,close,toggle:open`, the same string as the
+        // close-listener half above.)
         assert!(
-            js_true(&mut tab, "!window.__log.includes('toggle:closed')"),
-            "P1: cancel-listener re-show fires no toggle closed"
-        );
-        assert!(
-            js_true(&mut tab, "window.__log.includes('toggle:open')"),
-            "P1: cancel-listener re-show fires the open toggle"
+            js_true(
+                &mut tab,
+                "window.__log.join(',') === 'cancel,close,toggle:open'"
+            ),
+            "P1: cancel-listener re-show fires its open toggle AFTER close (Chrome S-P1-cancel-reshow)"
         );
     }
 
@@ -6990,6 +7188,13 @@ mod tests {
              p.addEventListener('toggle', function() { __log.push('toggle:p'); }); \
              d1.showModal(); p.showPopover(); window.__log = [];",
         );
+        // w87fix: the setup `showPopover`'s `toggle:p`
+        // is deferred to the end of the eval above — after
+        // `window.__log = []` ran — so flush it here and
+        // reset the log, or the gesture's log would read
+        // the setup show's toggle twice.
+        tab.page_vm_mut().expect("page vm").flush_pending_toggles();
+        eval(&mut tab, "window.__log = [];");
         let mut driver = TestDriver::new();
         driver.execute(
             &mut tab,
@@ -7041,6 +7246,13 @@ mod tests {
              p.addEventListener('toggle', function() { __log.push('toggle:p'); }); \
              d1.show(); d2.show(); p.showPopover(); window.__log = [];",
         );
+        // w87fix: the setup `showPopover`'s `toggle:p`
+        // is deferred to the end of the eval above — after
+        // `window.__log = []` ran — so flush it here and
+        // reset the log, or the gesture's log would start
+        // with the setup show's own toggle.
+        tab.page_vm_mut().expect("page vm").flush_pending_toggles();
+        eval(&mut tab, "window.__log = [];");
         let mut driver = TestDriver::new();
         driver.execute(
             &mut tab,
@@ -7645,9 +7857,19 @@ mod tests {
              document.querySelector('form').addEventListener('submit', function() { __log.push('submit'); }); \
              d.show(); d.showPopover(); window.__log = [];",
         );
+        // w87fix: the setup `showPopover`'s toggle is
+        // deferred to the end of the eval above — after
+        // `window.__log = []` ran — so flush it here and
+        // reset the log, or the click's log would start
+        // with the setup show's own toggle.
+        tab.page_vm_mut().expect("page vm").flush_pending_toggles();
+        eval(&mut tab, "window.__log = [];");
         let mut driver = TestDriver::new();
         let click_node = el(&tab, "sub");
         driver.execute_click(&mut tab, click_node).expect("click");
+        // w87fix M1/m4: the submit-close's deferred dual
+        // toggle fires inside `execute_click` now, so no
+        // manual flush is needed before reading the log.
         assert!(
             !tab.document_ref()
                 .expect("document")
@@ -7686,9 +7908,15 @@ mod tests {
              document.querySelector('form').addEventListener('submit', function() { __log.push('submit'); }); \
              d.show(); d.showPopover(); window.__log = [];",
         );
+        // w87fix: same setup-toggle flush as the first
+        // half.
+        tab.page_vm_mut().expect("page vm").flush_pending_toggles();
+        eval(&mut tab, "window.__log = [];");
         let mut driver = TestDriver::new();
         let click_node = el(&tab, "sub");
         driver.execute_click(&mut tab, click_node).expect("click");
+        // w87fix M1/m4: same — the close-listener
+        // re-show's toggle fires inside `execute_click`.
         assert!(
             !tab.document_ref()
                 .expect("document")
@@ -7726,7 +7954,18 @@ mod tests {
              d.addEventListener('cancel', function() { __log.push('cancel'); }); \
              d.addEventListener('close', function() { __log.push('close'); }); \
              d.addEventListener('toggle', function() { __log.push('toggle'); }); \
-             d.show(); d.showPopover(); window.__log = []; d.removeAttribute('open');",
+             d.show(); d.showPopover(); window.__log = [];",
+        );
+        // w87fix: the setup `showPopover`'s toggle is
+        // deferred to the end of the eval above — after
+        // `window.__log = []` ran — so flush it here and
+        // reset the log, or the removal's log would start
+        // with the setup show's own toggle.
+        tab.page_vm_mut().expect("page vm").flush_pending_toggles();
+        eval(&mut tab, "window.__log = [];");
+        eval(
+            &mut tab,
+            "document.getElementById('dlg').removeAttribute('open');",
         );
         assert!(
             !tab.document_ref()

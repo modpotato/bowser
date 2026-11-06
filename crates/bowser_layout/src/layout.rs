@@ -1756,6 +1756,24 @@ fn run_tasks(
                     mc.as_ref(),
                     hspec,
                 );
+                // w87 D1: the inline path re-drives once when the shown
+                // `auto` scrollbar narrows the line width (see
+                // [`inline_scrollbar_redrive`]).
+                let out = inline_scrollbar_redrive(
+                    forest,
+                    scratch,
+                    frame.idx,
+                    frame.content_x,
+                    frame.content_top,
+                    frame.content_w,
+                    &floats.entries,
+                    fonts,
+                    mc.as_ref(),
+                    hspec,
+                    frame.cb_h,
+                    frame.height_is_min,
+                    out,
+                );
                 finish_content_height(
                     forest,
                     frame.idx,
@@ -4013,6 +4031,26 @@ fn layout_block(
     } else {
         hspec
     };
+    // w87 D2: a forced classic horizontal scrollbar (`overflow-x:
+    // scroll`) consumes its thickness from the content box, so the
+    // height base threaded to children is the definite height minus
+    // the strip — the horizontal mirror of the vertical reservation
+    // above, which narrows `kids_w`. Only the children's base
+    // shrinks: the box's own height (`hspec`, `height_definite`,
+    // `rect.h`) is unchanged, exactly as the vertical strip leaves
+    // the box's own width alone. Gated on a definite base (an auto
+    // height grows instead; see the completion's auto redrive) and
+    // skipped for the table-cell measurement pass, whose base is
+    // already indefinite above. Flex/grid/table engines resolve
+    // their children's heights from `input`, not this base, so their
+    // forced-horizontal `%` heights stay unmodeled (deferred, see
+    // the completion's note).
+    let child_hspec = match (child_hspec, forest.nodes[idx].style.as_ref()) {
+        (Some(h), Some(style)) => {
+            Some((h - crate::forced_horizontal_scrollbar_height(style)).max(0.0))
+        }
+        (other, _) => other,
+    };
     // Whether the used height is definite (explicitly specified, an
     // override, solved above, or transferred from the aspect ratio):
     // the `position: relative` post-pass needs it, because percentage
@@ -4201,6 +4239,24 @@ fn layout_block(
                 scratch,
                 multicol.as_ref(),
                 hspec,
+            );
+            // w87 D1: the inline path re-drives once when the shown
+            // `auto` scrollbar narrows the line width (see
+            // [`inline_scrollbar_redrive`]).
+            let out = inline_scrollbar_redrive(
+                forest,
+                scratch,
+                idx,
+                kids_x,
+                content_top,
+                kids_w,
+                &floats.entries,
+                fonts,
+                multicol.as_ref(),
+                hspec,
+                input.cb_h,
+                input.height_is_min,
+                out,
             );
             finish_content_height(
                 forest,
@@ -4869,12 +4925,54 @@ fn resume_block(
         n.mb_place = mb_place;
         n.baseline = n.rect.h;
         // Shared `overflow-y: auto` scrollbar re-drive (see
-        // [`auto_scrollbar_redrive`]): when the shown scrollbar went
-        // unreserved, re-drive this box's children once against the
-        // narrowed width. Stale out-of-flow static positions were
-        // already cleared by the helper, so the second pass re-records
-        // them fresh.
-        if let Some((kids_x2, kids_w2)) = auto_scrollbar_redrive(
+        // [`auto_scrollbar_redrive`]) plus the w87 D2 horizontal
+        // re-drive: when a shown scrollbar went unreserved, re-drive
+        // this box's children once against the narrowed geometry.
+        // Stale out-of-flow static positions were already cleared by
+        // the helper, so the second pass re-records them fresh.
+        //
+        // The horizontal strip shown on this pass: forced
+        // (`overflow-x: scroll`, already subtracted from the
+        // children's height base in the prologue), or `auto` with
+        // real horizontal overflow of the padding box (see
+        // [`block_horizontal_extent`]). The strip shrinks the
+        // visible height the vertical check measures against, and
+        // an `auto` strip re-drives the children once against the
+        // reduced height base (a `height: 100%` child is 88, not
+        // 100, when the bar shows). Both re-drives ride in one
+        // pushed frame under the same once-per-frame bound: the
+        // single `auto_redriven` flag prevents loops, so no
+        // fixpoint is needed or allowed. An auto height grows
+        // instead of scrolling, so the horizontal re-drive needs a
+        // definite `child_cb_h` (its Chrome behavior for the
+        // auto-height case is unprobed — see the deferred probe
+        // in the w87 report — and is left alone here).
+        let (pb, pl, pr) = {
+            let m = &forest.nodes[idx].metrics;
+            (m.pb, m.pl, m.pr)
+        };
+        let (forced_h, auto_h_style) = match forest.nodes[idx].style.as_ref() {
+            Some(style) => (
+                crate::forced_horizontal_scrollbar_height(style),
+                crate::auto_horizontal_scrollbar_height(style),
+            ),
+            None => (0.0, 0.0),
+        };
+        let h_auto = if auto_h_style > 0.0 {
+            let n = &forest.nodes[idx];
+            let pad_l = n.rect.x + n.metrics.bl + pl;
+            let pad_r = pad_l + n.metrics.content_w + pr;
+            let (min_x, max_x) = block_horizontal_extent(forest, idx);
+            if max_x > pad_r + 0.001 || min_x < pad_l - 0.001 {
+                auto_h_style
+            } else {
+                0.0
+            }
+        } else {
+            0.0
+        };
+        let h_strip = forced_h.max(h_auto);
+        let v_redrive = auto_scrollbar_redrive(
             forest,
             scratch,
             &AutoRedriveCheck {
@@ -4883,9 +4981,18 @@ fn resume_block(
                 content_h,
                 content_w: fr.content_w,
                 content_x: fr.content_x,
+                pad_overflow: pb - h_strip,
                 auto_redriven: fr.auto_redriven,
             },
-        ) {
+        );
+        let h_redrive =
+            h_auto > 0.0 && forced_h == 0.0 && fr.child_cb_h.is_some() && !fr.auto_redriven;
+        if v_redrive.is_some() || h_redrive {
+            if v_redrive.is_none() {
+                // Only the horizontal axis re-drives: the vertical
+                // helper did not run its abspos clearing.
+                clear_redrive_abspos(forest, idx);
+            }
             // Drop this pass's float placements from the shared
             // context: entries before `floats_start` belong to
             // ancestors and stay; the re-drive re-places this
@@ -4895,6 +5002,13 @@ fn resume_block(
             // bare truncate would leave stale index nodes whose ids
             // alias the re-pushed floats.
             fr.floats.borrow_mut().truncate(fr.floats_start);
+            let (kids_x2, kids_w2) = v_redrive.unwrap_or((fr.content_x, fr.content_w));
+            let child_cb_h2 = if h_redrive {
+                fr.child_cb_h
+                    .map(|h| (h - crate::SCROLLBAR_THICKNESS).max(0.0))
+            } else {
+                fr.child_cb_h
+            };
             tasks.push(Task::ResumeBlock(BlockFrame {
                 idx,
                 child_i: 0,
@@ -4906,7 +5020,7 @@ fn resume_block(
                 content_top: fr.content_top,
                 content_w: kids_w2,
                 cb_h: fr.cb_h,
-                child_cb_h: fr.child_cb_h,
+                child_cb_h: child_cb_h2,
                 own_hspec: fr.own_hspec,
                 height_is_min: fr.height_is_min,
                 floats: fr.floats,
@@ -4919,16 +5033,100 @@ fn resume_block(
     }
 }
 
+/// Horizontal scrollable-overflow extent of a block container's
+/// subtree, as `(min_left, max_right)` margin-box edges in document
+/// coordinates, for the `overflow-x: auto` scrollbar decision (w87
+/// D2). Mirrors [`crate::scrollable_extent`]'s rules over [`Forest`]
+/// nodes: nested scroll containers contribute only their own margin
+/// box (their content is clipped by their own scrollport), and
+/// out-of-flow descendants are skipped — at `resume_block` time they
+/// have no final rect yet (the `layout_position` post-pass lays them
+/// out later), so an abspos child alone overflowing sideways does
+/// not trigger this re-drive; its scrollable overflow is still
+/// reported by `scroll_containers`, so the app still paints the bar
+/// — only the 12px height consumption is missed for that shape.
+/// Text nodes carry real rects (the union of their placed line
+/// fragments, see `do_inline_layout`), so long unbroken lines count
+/// toward the extent exactly like wide block children.
+fn block_horizontal_extent(forest: &Forest, idx: usize) -> (f32, f32) {
+    let (mut min_x, mut max_x) = (f32::INFINITY, f32::NEG_INFINITY);
+    let mut stack: Vec<usize> = forest.nodes[idx].children.to_vec();
+    while let Some(n) = stack.pop() {
+        if layout_position::is_out_of_flow(forest, n) {
+            continue;
+        }
+        let node = &forest.nodes[n];
+        // A zero-area border box contributes nothing: table
+        // measurement-pass cells are detached with a zeroed rect at
+        // the document origin, which would otherwise read as
+        // overflow for any container not at the origin. The walk
+        // still descends (a zero-size wrapper can hold real
+        // children); only this node's own edges are skipped.
+        if node.rect.w != 0.0 || node.rect.h != 0.0 {
+            // CSS Overflow 3 §3: the scrollable overflow region is
+            // the union of descendants' margin boxes, not their
+            // border boxes — a positive horizontal margin extends
+            // the region just as the border box does. Take the
+            // union of the two boxes, not the margin box alone:
+            // the used margin of an over-constrained block is
+            // recomputed to satisfy the constraint equation (CSS
+            // 2.1 §10.3.3), so a 200px child in a 100px container
+            // has used `margin-right` -100 — using the margin box
+            // alone would end the extent at the container edge and
+            // hide the overflow the border box shows. (Horizontal
+            // margins never collapse, so the used `ml`/`mr`
+            // apply as-is wherever they extend the border box.)
+            min_x = min_x.min(node.rect.x - node.metrics.ml).min(node.rect.x);
+            max_x = max_x
+                .max(node.rect.x + node.rect.w + node.metrics.mr)
+                .max(node.rect.x + node.rect.w);
+        }
+        // A descendant that clips on the x axis is a boundary for
+        // this walk: its content is clipped by its own scrollport
+        // and never extends the outer container's range. Any
+        // non-`visible` effective `overflow-x` counts — `auto` /
+        // `scroll` / `hidden` alike, and `clip` too, which clips
+        // without forming a scroll container, so the
+        // `overflow_axes` container tuple (which excludes `clip`)
+        // cannot express the stop. The effective value applies the
+        // CSS Overflow 3 §2 visible→auto pairing: a `visible` x
+        // against a non-`visible` y computes to `auto`.
+        let is_scroller = node.style.as_ref().is_some_and(|s| {
+            let ox = s.get_str_by_index(props::OVERFLOW_X).unwrap_or("visible");
+            if ox.eq_ignore_ascii_case("visible") {
+                let oy = s.get_str_by_index(props::OVERFLOW_Y).unwrap_or("visible");
+                !oy.eq_ignore_ascii_case("visible")
+            } else {
+                true
+            }
+        });
+        if !is_scroller {
+            stack.extend(node.children.iter().copied());
+        }
+    }
+    (min_x, max_x)
+}
+
 /// Decision inputs for the shared `overflow-y: auto` scrollbar re-drive
 /// ([`auto_scrollbar_redrive`]): the box, its natural vs. used content
 /// heights, the content-box geometry the completed pass laid out
 /// against, and whether this frame already is a re-drive.
+///
+/// `pad_overflow` is the height beyond the used content height that
+/// still fits inside the scrollport (CSS Overflow 3 §2.2/§2.3: the
+/// scrollbar appears exactly when content overflows the *padding*
+/// box, not the content box): the bottom padding, minus any
+/// horizontal scrollbar strip already consuming the scrollport's
+/// bottom edge (a shown horizontal bar shrinks the visible height by
+/// its thickness). Callers with no horizontal strip pass the bottom
+/// padding alone; the block completion passes `pb - h_strip`.
 pub(crate) struct AutoRedriveCheck {
     pub(crate) idx: usize,
     pub(crate) natural_h: f32,
     pub(crate) content_h: f32,
     pub(crate) content_w: f32,
     pub(crate) content_x: f32,
+    pub(crate) pad_overflow: f32,
     pub(crate) auto_redriven: bool,
 }
 
@@ -4971,10 +5169,18 @@ fn clear_redrive_abspos(forest: &mut Forest, idx: usize) {
 /// (unforced, unreserved) overflow went unaccounted: the painted
 /// scrollbar overlays the last SCROLLBAR_THICKNESS px of content. Now
 /// that the used content height is known, detect the definite-height
-/// overflow (`natural_h > content_h`; an auto height grows to fit
-/// instead — floats are already folded into `natural_h` by the caller,
-/// and `height_is_min` floors rather than clamps) and report the
-/// narrowed `(kids_x, kids_w)` for one re-drive of this box's children.
+/// overflow (`natural_h > content_h + pad_overflow`; an auto height
+/// grows to fit instead — floats are already folded into `natural_h`
+/// by the caller, and `height_is_min` floors rather than clamps).
+/// The threshold is the padding-box edge, not the content-box edge:
+/// content spilling only into the bottom padding is no overflow
+/// (w87: the old `natural_h > content_h` test showed a scrollbar —
+/// and narrowed the children by a full thickness — for a 110px child
+/// in a 100px box with 20px bottom padding, where Chrome shows
+/// none), and a shown horizontal scrollbar shrinks the visible
+/// height further (see [`AutoRedriveCheck::pad_overflow`]). Report
+/// the narrowed `(kids_x, kids_w)` for one re-drive of this box's
+/// children.
 ///
 /// The strip takes the per-side max with the prologue's reservations
 /// (a shown scrollbar paints exactly the reserved strip, never
@@ -5006,7 +5212,7 @@ pub(crate) fn auto_scrollbar_redrive(
         scratch.viewport_scroller_doms.0 == Some(d) || scratch.viewport_scroller_doms.1 == Some(d)
     });
     if (al > 0.0 || ar > 0.0)
-        && c.natural_h > c.content_h + 0.001
+        && c.natural_h > c.content_h + c.pad_overflow + 0.001
         && !c.auto_redriven
         && !is_viewport_scroller
     {
@@ -5030,6 +5236,81 @@ pub(crate) fn auto_scrollbar_redrive(
         }
     }
     None
+}
+
+/// One `overflow-y: auto` scrollbar re-drive for an inline formatting
+/// context (w87 D1): after [`do_inline_layout`], when the text's
+/// natural height overflows the padding box, re-run the line layout
+/// once against the narrowed width (the vertical strip the shown
+/// scrollbar consumes) and return the new output; else return `out`
+/// unchanged. The caller re-stamps the content height from the
+/// returned output.
+///
+/// The block/flex/grid engines re-drive through their own resume
+/// machinery; the inline paths had no re-drive at all, so a pure-text
+/// container kept its first-pass wrap under the painted bar. Bounded
+/// to one pass (the helper never re-drives its own output), skipped
+/// for multicol containers (line distribution is not re-entrant),
+/// and skipped for the viewport scrollers by
+/// [`auto_scrollbar_redrive`] itself (their geometry belongs to the
+/// viewport pass). Inline-block children keep their first-pass
+/// widths: they were pre-laid out before line breaking and the
+/// second line pass does not re-lay them.
+#[allow(clippy::too_many_arguments)]
+fn inline_scrollbar_redrive(
+    forest: &mut Forest,
+    scratch: &mut LayoutScratch,
+    idx: usize,
+    content_x: f32,
+    content_top: f32,
+    content_w: f32,
+    floats: &[FloatEntry],
+    fonts: &dyn FontMetrics,
+    multicol: Option<&layout_multicol::MulticolParams>,
+    hspec: Option<f32>,
+    cb_h: Option<f32>,
+    height_is_min: bool,
+    out: InlineLayoutOutput,
+) -> InlineLayoutOutput {
+    if multicol.is_some() {
+        return out;
+    }
+    let content_h = clamp_height(
+        forest,
+        idx,
+        cb_h,
+        min_floor_hspec(height_is_min, hspec, out.height).unwrap_or(out.height),
+    );
+    let check = AutoRedriveCheck {
+        idx,
+        natural_h: out.height,
+        content_h,
+        content_w,
+        content_x,
+        // Padding-box overflow (w87 D1): content spilling only into
+        // the bottom padding is no overflow. No horizontal-strip
+        // deduction here: the inline engine does not yet model the
+        // horizontal bar's height consumption (see the block
+        // completion's `pad_overflow` for the modeled case).
+        pad_overflow: forest.nodes[idx].metrics.pb,
+        auto_redriven: false,
+    };
+    if let Some((kids_x2, kids_w2)) = auto_scrollbar_redrive(forest, scratch, &check) {
+        do_inline_layout(
+            forest,
+            idx,
+            kids_x2,
+            content_top,
+            kids_w2,
+            floats,
+            fonts,
+            scratch,
+            multicol,
+            hspec,
+        )
+    } else {
+        out
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -14322,6 +14603,12 @@ fn flex_auto_redrive(
         content_h: forest.nodes[idx].content_h,
         content_w: ctx.content_w,
         content_x: ctx.content_x,
+        // Padding-box overflow (w87 D1): content spilling only into
+        // the bottom padding is no overflow. No horizontal-strip
+        // deduction here: the flex engine does not yet model the
+        // horizontal bar's height consumption (see the block
+        // completion's `pad_overflow` for the modeled case).
+        pad_overflow: forest.nodes[idx].metrics.pb,
         auto_redriven: ctx.auto_redriven,
     };
     if let Some((kids_x2, kids_w2)) = auto_scrollbar_redrive(forest, scratch, &check) {

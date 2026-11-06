@@ -8697,6 +8697,319 @@ fn auto_scrollbar_no_strip_under_vertical_writing_mode() {
 }
 
 #[test]
+fn w87_auto_scrollbar_padding_bottom_spill_is_not_overflow() {
+    // D1 (w87): CSS Overflow 3 §2.2/§2.3 — the `auto` scrollbar
+    // appears exactly when content overflows the PADDING box, not
+    // the content box. A 110px child in a 100px-high container with
+    // 20px bottom padding ends 10px inside the padding box: Chrome
+    // shows no scrollbar and does not narrow the content width.
+    // Before the fix the re-drive compared against the content
+    // height alone and narrowed the child to 88.
+    let l = layout_html(
+        "<div id=\"outer\"><div id=\"inner\">x</div></div>",
+        "#outer { overflow-y: auto; width: 100px; height: 100px; padding-bottom: 20px; } \
+         #inner { width: 100%; height: 110px; }",
+    );
+    let inner = &body(&l).children[0].children[0];
+    assert!(
+        approx(inner.rect.w, 100.0),
+        "padding-bottom spill child width {} != 100 (no scrollbar)",
+        inner.rect.w
+    );
+}
+
+#[test]
+fn w87_auto_scrollbar_redrives_inline_container() {
+    // D1, inline formatting context: a pure-text container with a
+    // definite height that its text overflows shows the vertical
+    // scrollbar, so the text rewraps at the narrowed width (the
+    // 8-word paragraph wraps to 4 lines at 110px but 8 lines at
+    // 98px — the same wrap counts as the abspos re-drive test).
+    // Before the fix the inline paths never ran the re-drive at all,
+    // so the text stayed wrapped at the full width.
+    let l = layout_html(
+        "<div id=\"outer\">aaaaa bbbbb ccccc ddddd eeeee fffff ggggg hhhhh</div>",
+        "body { margin: 0; } \
+         #outer { overflow-y: auto; width: 110px; height: 40px; }",
+    );
+    let outer = &body(&l).children[0];
+    let text = &outer.children[0];
+    assert!(
+        approx(text.rect.h, 8.0 * 19.2),
+        "inline container text height {} != 153.6 (no rewrap)",
+        text.rect.h
+    );
+}
+
+#[test]
+fn w87_auto_scrollbar_padding_bottom_real_overflow_still_narrows() {
+    // D1 control: the same padded container with a 130px child
+    // overflows the 120px padding box, so the scrollbar shows and
+    // the child narrows to 88.
+    let l = layout_html(
+        "<div id=\"outer\"><div id=\"inner\">x</div></div>",
+        "#outer { overflow-y: auto; width: 100px; height: 100px; padding-bottom: 20px; } \
+         #inner { width: 100%; height: 130px; }",
+    );
+    let inner = &body(&l).children[0].children[0];
+    assert!(
+        approx(inner.rect.w, 100.0 - crate::SCROLLBAR_THICKNESS),
+        "real overflow child width {} != 88",
+        inner.rect.w
+    );
+}
+
+#[test]
+fn w87_auto_scrollbar_flex_padding_bottom_spill_is_not_overflow() {
+    // D1, flex engine: same padding-box rule through the flex
+    // re-drive — a 110px item in a 100px flex container with 20px
+    // bottom padding is no overflow, so the item keeps the full
+    // content width.
+    let l = layout_html(
+        "<div id=\"outer\"><div id=\"inner\">x</div></div>",
+        "body { margin: 0; } \
+         #outer { display: flex; overflow-y: auto; width: 100px; height: 100px; padding-bottom: 20px; } \
+         #inner { width: 100%; height: 110px; }",
+    );
+    let inner = &body(&l).children[0].children[0];
+    assert!(
+        approx(inner.rect.w, 100.0),
+        "flex padding-bottom spill child width {} != 100 (no scrollbar)",
+        inner.rect.w
+    );
+}
+
+#[test]
+fn w87_auto_scrollbar_grid_padding_bottom_spill_is_not_overflow() {
+    // D1, grid engine: same padding-box rule through the grid
+    // re-drive.
+    let l = layout_html(
+        "<div id=\"outer\"><div id=\"inner\">x</div></div>",
+        "body { margin: 0; } \
+         #outer { display: grid; overflow-y: auto; width: 100px; height: 100px; padding-bottom: 20px; } \
+         #inner { width: 100%; height: 110px; }",
+    );
+    let inner = &body(&l).children[0].children[0];
+    assert!(
+        approx(inner.rect.w, 100.0),
+        "grid padding-bottom spill child width {} != 100 (no scrollbar)",
+        inner.rect.w
+    );
+}
+
+#[test]
+fn w87_auto_horizontal_scrollbar_consumes_content_height() {
+    // D2 (w87): CSS Overflow 3 §2.2, horizontal mirror of the
+    // vertical rule — an `overflow-x: auto` container whose content
+    // overflows the padding box shows the classic horizontal
+    // scrollbar, which consumes its thickness from the content box:
+    // a `height: 100%` child is 88, not 100. Before the fix the
+    // horizontal strip was never modeled in layout and the child
+    // kept the full 100px height.
+    let l = layout_html(
+        "<div id=\"outer\"><div id=\"inner\">x</div></div>",
+        "#outer { overflow-x: auto; width: 100px; height: 100px; } \
+         #inner { width: 200px; height: 100%; }",
+    );
+    let inner = &body(&l).children[0].children[0];
+    assert!(
+        approx(inner.rect.h, 100.0 - crate::SCROLLBAR_THICKNESS),
+        "auto horizontal-bar child height {} != 88",
+        inner.rect.h
+    );
+}
+
+#[test]
+fn w87_collapsed_row_cell_does_not_fake_horizontal_overflow() {
+    // w87 D2 guard: `resume_table` detaches measured-only cells
+    // (collapsed rows) with a zeroed rect at the document origin.
+    // The horizontal-extent walk must not read that origin rect as
+    // leftward overflow: with the container offset 50px from the
+    // origin, the phantom edge at x=0 would otherwise trigger a
+    // spurious horizontal bar and shrink the direct `height: 100%`
+    // child to 88.
+    let l = layout_html(
+        "<div id=\"outer\"><table><tr id=\"gone\"><td>hidden</td></tr><tr><td>y</td></tr></table><div id=\"inner\">x</div></div>",
+        "body { margin: 0; } \
+         #outer { overflow-x: auto; width: 100px; height: 100px; margin-left: 50px; } \
+         #gone { visibility: collapse; } table { width: 100px; } \
+         #inner { width: 50px; height: 100%; }",
+    );
+    let outer = &body(&l).children[0];
+    // The inner div is the only 50px-wide box under the container;
+    // find it by width instead of a brittle child path.
+    fn find_w50(b: &LayoutBox) -> Option<&LayoutBox> {
+        if (b.rect.w - 50.0).abs() < 0.01 && b.node.is_some() {
+            return Some(b);
+        }
+        b.children.iter().find_map(find_w50)
+    }
+    let found = find_w50(outer).expect("inner div under container");
+    assert!(
+        approx(found.rect.h, 100.0),
+        "collapsed-row phantom overflow shrank child height {} != 100",
+        found.rect.h
+    );
+}
+
+#[test]
+fn w87fix_hidden_descendant_clipped_content_no_spurious_horizontal_bar() {
+    // m1: an `overflow-x: hidden` descendant clips its content at
+    // its own scrollport, so a 200px child inside a 100px hidden
+    // wrapper is not horizontal overflow of the `overflow-x: auto`
+    // outer container: no auto bar, and the `height: 100%` probe
+    // keeps the full 100px. Before the fix the extent walk
+    // descended into the clipped content, invented the bar, and
+    // shrank the probe to 88.
+    let l = layout_html(
+        "<div id=\"outer\"><div id=\"clip\"><div id=\"wide\">x</div></div><div id=\"inner\">x</div></div>",
+        "body { margin: 0; } \
+         #outer { overflow-x: auto; width: 100px; height: 100px; } \
+         #clip { overflow-x: hidden; width: 100px; height: 50px; } \
+         #wide { width: 200px; height: 10px; } \
+         #inner { width: 50px; height: 100%; }",
+    );
+    let outer = &body(&l).children[0];
+    fn find_w50(b: &LayoutBox) -> Option<&LayoutBox> {
+        if (b.rect.w - 50.0).abs() < 0.01 && b.node.is_some() {
+            return Some(b);
+        }
+        b.children.iter().find_map(find_w50)
+    }
+    let found = find_w50(outer).expect("inner div under container");
+    assert!(
+        approx(found.rect.h, 100.0),
+        "hidden descendant's clipped content shrank child height {} != 100",
+        found.rect.h
+    );
+}
+
+#[test]
+fn w87fix_horizontal_extent_counts_descendant_margins() {
+    // m1, margins: CSS Overflow 3 §3 counts descendant margins in
+    // the scrollable overflow region. A 90px inline-block with a
+    // 20px right margin has a margin box reaching 110px in a 100px
+    // `overflow-x: auto` container, so the auto bar shows and the
+    // `height: 100%` probe shrinks to 88 — the border box alone
+    // (90px) would show no bar. An inline-block carries the pin:
+    // a block-level child's over-constrained `margin-right` is
+    // recomputed to fit by CSS 2.1 §10.3.3, so only a
+    // non-block-level box keeps the specified margin as used.
+    let l = layout_html(
+        "<div id=\"outer\"><div id=\"m\">x</div><div id=\"inner\">x</div></div>",
+        "body { margin: 0; } \
+         #outer { overflow-x: auto; width: 100px; height: 100px; } \
+         #m { display: inline-block; width: 90px; height: 10px; margin-right: 20px; } \
+         #inner { width: 50px; height: 100%; }",
+    );
+    let outer = &body(&l).children[0];
+    fn find_w50(b: &LayoutBox) -> Option<&LayoutBox> {
+        if (b.rect.w - 50.0).abs() < 0.01 && b.node.is_some() {
+            return Some(b);
+        }
+        b.children.iter().find_map(find_w50)
+    }
+    let found = find_w50(outer).expect("inner div under container");
+    assert!(
+        approx(found.rect.h, 100.0 - crate::SCROLLBAR_THICKNESS),
+        "descendant margin overflow did not show the bar, child height {} != 88",
+        found.rect.h
+    );
+}
+
+#[test]
+fn w87_forced_horizontal_scrollbar_consumes_content_height() {
+    // D2, forced case: `overflow-x: scroll` always shows the
+    // horizontal bar, so the `height: 100%` child is 88 even with
+    // no horizontal overflow at all.
+    let l = layout_html(
+        "<div id=\"outer\"><div id=\"inner\">x</div></div>",
+        "#outer { overflow-x: scroll; width: 100px; height: 100px; } \
+         #inner { width: 50px; height: 100%; }",
+    );
+    let inner = &body(&l).children[0].children[0];
+    assert!(
+        approx(inner.rect.h, 100.0 - crate::SCROLLBAR_THICKNESS),
+        "forced horizontal-bar child height {} != 88",
+        inner.rect.h
+    );
+}
+
+#[test]
+fn w87_sticky_auto_vertical_scrollbar_shrinks_scrollport() {
+    // D2, sticky (w86 C4b shape with `overflow: auto`): the tall
+    // content shows the `auto` vertical scrollbar, so the
+    // `right: 0` sticky's scrollport width shrinks by the strip and
+    // it sticks at x=108, not 120. Before the fix the sticky pass
+    // subtracted only forced strips, so the box stuck 12px too far.
+    let html = r#"<div id="sc"><div id="container"><div id="filler"></div><div id="sticky"></div></div></div>"#;
+    let css = "body { margin: 0; } \
+         #sc { position: relative; width: 200px; height: 100px; overflow: auto; padding: 0 20px; } \
+         #container { width: 500px; height: 500px; } \
+         #filler { display: inline-block; width: 200px; height: 50px; } \
+         #sticky { display: inline-block; position: sticky; right: 0; width: 100px; height: 50px; }";
+    let (x, _, _, _) = w86_sticky_rect(html, css, &[("sc", (0.0, 0.0))], "sticky");
+    assert!(approx(x, 108.0), "auto vertical-bar sticky x={x} != 108");
+}
+
+#[test]
+fn w87_sticky_auto_horizontal_scrollbar_shrinks_scrollport() {
+    // D2, sticky, vertical mirror (w86 C4a shape with
+    // `overflow: auto`): the wide content shows the `auto`
+    // horizontal scrollbar, so the `bottom: 0` sticky's scrollport
+    // height shrinks by the strip and at scrollTop 100 it sticks
+    // at y=208, not 220.
+    let html = r#"<div id="sc"><div id="contents"><div id="pre"></div><div id="container"><div id="filler"></div><div id="sticky"></div></div></div></div>"#;
+    let css = "body { margin: 0; } \
+         #sc { position: relative; width: 100px; height: 200px; overflow: auto; padding: 20px 0; } \
+         #contents { width: 500px; height: 500px; } #pre { height: 100px; } \
+         #container { width: 500px; height: 300px; } #filler { height: 100px; } \
+         #sticky { position: sticky; bottom: 0; height: 100px; }";
+    let (_, y, _, _) = w86_sticky_rect(html, css, &[("sc", (0.0, 100.0))], "sticky");
+    assert!(approx(y, 208.0), "auto horizontal-bar sticky y={y} != 208");
+}
+
+#[test]
+fn w87fix_sticky_dual_axis_text_overhang_shows_vertical_bar() {
+    // w87fix dual-axis: both `overflow: auto` bars show in a 200px
+    // `nowrap` scroller, and the short inline-block's text run
+    // overhangs the 60px line box to 69.2 — real vertical overflow
+    // the natural height (60) misses. The sticky pass must agree
+    // with the block re-drive and the app's extent measure that the
+    // vertical bar shows, so the `right: 0` sticky's scrollport
+    // loses the 12px strip: it sticks at x=658 at scrollLeft 500
+    // (500 + 220 - 12 - 50), not 670, and rides to 608 at 450.
+    // Before the fix the sticky rule tested vertical overflow
+    // against `content_h + pb` with no strip deduction and no
+    // extent fallback, baked 670, and the app-side fold (far pin
+    // 658) classified the box floor-clamped and folded zero shifts.
+    // Auto height takes no strip deduction (the WPT
+    // RTL-overconstrained datum), so the bar here comes from the
+    // extent walk alone.
+    let html =
+        r#"<div id="outer"><div id="pad">x</div><div id="st">y</div><div id="tall">z</div></div>"#;
+    let css = "body { margin: 0; } \
+         #outer { overflow-x: auto; width: 200px; padding-left: 20px; white-space: nowrap; } \
+         #pad { display: inline-block; width: 1000px; height: 10px; } \
+         #st { position: sticky; right: 0; width: 50px; height: 50px; display: inline-block; } \
+         #tall { width: 2000px; height: 10px; }";
+    let (x, _, _, _) = w86_sticky_rect(html, css, &[("outer", (500.0, 0.0))], "st");
+    assert!(approx(x, 658.0), "dual-axis far-stuck x={x} != 658");
+    let (x, _, _, _) = w86_sticky_rect(html, css, &[("outer", (450.0, 0.0))], "st");
+    assert!(approx(x, 608.0), "dual-axis far-stuck x={x} != 608 at 450");
+    // Far-padding twin: padding-right 30 widens the padding box to
+    // 250, but the far pin is the content-box edge minus the strip,
+    // so it still sticks at 658.
+    let css_far = "body { margin: 0; } \
+         #outer { overflow-x: auto; width: 200px; padding-left: 20px; padding-right: 30px; white-space: nowrap; } \
+         #pad { display: inline-block; width: 1000px; height: 10px; } \
+         #st { position: sticky; right: 0; width: 50px; height: 50px; display: inline-block; } \
+         #tall { width: 2000px; height: 10px; }";
+    let (x, _, _, _) = w86_sticky_rect(html, css_far, &[("outer", (500.0, 0.0))], "st");
+    assert!(approx(x, 658.0), "dual-axis far-padding x={x} != 658");
+}
+
+#[test]
 fn viewport_auto_overflow_narrows_initial_containing_block() {
     // `overflow-y: auto` propagated to the viewport with real document
     // overflow: the shown scrollbar consumes its thickness from the

@@ -1138,6 +1138,152 @@ fn cb_scrollable_size(
     (w.max(0.0), h.max(0.0))
 }
 
+/// Scrollable-overflow extent of scroller `p`'s subtree, as
+/// `(min_x, min_y, max_x, max_y)` border-box edges relative to the
+/// scroller's content origin (w87 D2). Mirrors
+/// [`cb_scrollable_size`]'s skip rules — `position: fixed` subtrees
+/// never scroll with the scroller, absolutely positioned boxes whose
+/// containing block lies outside it scroll with that block instead,
+/// and nested scroll containers contribute only their own border box
+/// (their content is clipped by their own scrollport) — but returns
+/// minima as well as maxima, so leftward / RTL overflow is
+/// measurable too. A split-inline wrapper (see
+/// [`crate::scrollable_extent`]) contributes only its children: its
+/// own rect is the unshifted flow footprint, not a real border box
+/// (its border/padding spill ring is not modeled here; it can only
+/// understate the extent by that ring when the spill alone
+/// overflows).
+fn scroller_scrollable_extent(forest: &Forest, p: usize) -> (f32, f32, f32, f32) {
+    let n = &forest.nodes[p];
+    let (cb_x, cb_y) = (
+        n.rect.x + n.metrics.bl + n.metrics.pl,
+        n.rect.y + n.metrics.bt + n.metrics.pt,
+    );
+    let (mut min_x, mut min_y) = (0.0f32, 0.0f32);
+    let (mut max_x, mut max_y) = (n.metrics.content_w, n.content_h);
+    let scroller_positioned = n.data.position != Position::Static;
+    let mut stack: Vec<(usize, bool, bool)> = forest.nodes[p]
+        .children
+        .iter()
+        .map(|&c| (c, scroller_positioned, false))
+        .collect();
+    while let Some((b, cb_inside, fixed_cb_inside)) = stack.pop() {
+        let node = &forest.nodes[b];
+        let pos = node.data.position;
+        if pos == Position::Fixed && !fixed_cb_inside {
+            continue;
+        }
+        if pos == Position::Absolute && !cb_inside {
+            continue;
+        }
+        let split_inline_wrapper = node.box_type == BoxType::Block
+            && node.style.as_ref().is_some_and(|s| {
+                matches!(s.get("display"), Some(CssValue::Keyword(k)) if k.eq_ignore_ascii_case("inline"))
+            });
+        if !split_inline_wrapper && (node.rect.w != 0.0 || node.rect.h != 0.0) {
+            // Zero-area boxes contribute nothing (see
+            // `block_horizontal_extent`: table measurement-pass cells
+            // are detached with a zeroed rect at the origin).
+            min_x = min_x.min(node.rect.x - cb_x);
+            min_y = min_y.min(node.rect.y - cb_y);
+            max_x = max_x.max(node.rect.x + node.rect.w - cb_x);
+            max_y = max_y.max(node.rect.y + node.rect.h - cb_y);
+        }
+        let child_cb_inside = pos != Position::Static
+            || cb_inside
+            || node
+                .style
+                .as_ref()
+                .is_some_and(|s| crate::establishes_fixed_cb(s));
+        let child_fixed_cb_inside = fixed_cb_inside
+            || node
+                .style
+                .as_ref()
+                .is_some_and(|s| crate::establishes_fixed_cb(s));
+        let nested_scroller = node.style.as_ref().is_some_and(|s| {
+            let ((cx, cy), _) = crate::overflow_axes(s);
+            cx || cy
+        });
+        if !nested_scroller {
+            stack.extend(
+                node.children
+                    .iter()
+                    .map(|&c| (c, child_cb_inside, child_fixed_cb_inside)),
+            );
+        }
+    }
+    (min_x, min_y, max_x, max_y)
+}
+
+/// Whether scroller `p` shows an `overflow: auto` scrollbar on each
+/// axis, as `(horizontal_bar, vertical_bar)` (w87 D2), measured from
+/// the final layout and memoized in `cache` per scroller (the walk is
+/// O(subtree), and the axis fn runs twice per sticky box). The
+/// vertical bar shows exactly when the scroller's natural content
+/// height — or the scrollable-overflow bottom from the extent walk —
+/// exceeds its *visible* height: the padding-box height
+/// (`content_h + pb`, the w87 D1 rule) minus a shown horizontal
+/// strip when the height is definite (`pb - h_strip`, the same
+/// measure the block re-drive uses, so layout and sticky agree on
+/// whether the bar shows even in the band where both bars show),
+/// or content extends above the padding box. An
+/// auto-height box grows to fit the strip instead, so it takes no
+/// deduction: WPT `position-sticky-horizontal-rtl-overconstrained`
+/// pins a 100px auto-height scroller with a shown horizontal bar at
+/// offsetLeft 80, not 68. The extent walk is strip-independent
+/// either way and catches overhang the natural height misses (a text
+/// run overflowing its short inline-block still scrolls: w87fix
+/// dual-axis, a 19.2px run bottoming 9.2px past a 60px box with a
+/// shown horizontal bar). The horizontal bar shows when the
+/// scrollable-overflow width exceeds the padding box on either side,
+/// so RTL leftward overflow counts. A `NaN` natural height (a box
+/// whose engine never stamped one) falls back to the extent walk
+/// for the vertical axis too.
+fn scroller_auto_scrollbars(
+    forest: &Forest,
+    p: usize,
+    cache: &mut HashMap<usize, (bool, bool)>,
+) -> (bool, bool) {
+    if let Some(&bars) = cache.get(&p) {
+        return bars;
+    }
+    let n = &forest.nodes[p];
+    let m = &n.metrics;
+    let (min_x, min_y, max_x, max_y) = scroller_scrollable_extent(forest, p);
+    let h = max_x > m.content_w + m.pr + 0.001 || min_x < -m.pl - 0.001;
+    // A shown horizontal strip shrinks the visible height the
+    // vertical check measures against, mirroring the block
+    // re-drive's `pad_overflow = pb - h_strip` (see
+    // `AutoRedriveCheck` in `layout.rs`): forced
+    // (`overflow-x: scroll`) always shows, `auto` shows exactly
+    // when the extent overflows horizontally (`h` above). Only
+    // when the height is definite, though: an auto-height box grows
+    // to fit the strip instead of scrolling (see the fn docs — the
+    // WPT RTL-overconstrained datum), so deducting there would
+    // invent a vertical bar Chrome never shows.
+    let h_strip = match n.style.as_ref() {
+        Some(style) => crate::forced_horizontal_scrollbar_height(style).max(if h {
+            crate::auto_horizontal_scrollbar_height(style)
+        } else {
+            0.0
+        }),
+        None => 0.0,
+    };
+    let v_edge = if n.height_definite {
+        n.content_h + m.pb - h_strip
+    } else {
+        n.content_h + m.pb
+    };
+    let v = if n.natural_content_h.is_nan() {
+        max_y > v_edge + 0.001 || min_y < -m.pt - 0.001
+    } else {
+        n.natural_content_h > v_edge + 0.001 || max_y > v_edge + 0.001 || min_y < -m.pt - 0.001
+    };
+    let bars = (h, v);
+    cache.insert(p, bars);
+    bars
+}
+
 /// Scrollport `(origin, size, live scroll offset, near padding, far
 /// padding)` for one axis of the sticky box `i`: the scrollport of the
 /// nearest scroll container with a matching scrollable axis (see
@@ -1156,22 +1302,24 @@ fn cb_scrollable_size(
 /// minus borders (w79: the scrollport IS the padding box, CSS
 /// Overflow 3 §2.3 — the pre-w79 content-box size pinned a `bottom:
 /// 0` / `right: 0` box a full padding short of the far edge), minus
-/// the forced classic scrollbar strip on the perpendicular axis
-/// (w86: `overflow: scroll` always shows that scrollbar and its
-/// thickness comes out of the client size — Chrome 155 C4 reports
-/// client 85x225 under 15px bars where the border box is 100x240;
-/// Bowser's own thickness is [`crate::SCROLLBAR_THICKNESS`], so the
-/// strip here is 12px, not 15px). The strip sits on the far edge for
-/// the vertical axis (the horizontal scrollbar) and on the inline-end
+/// the classic scrollbar strip on the perpendicular axis (w86:
+/// `overflow: scroll` always shows that scrollbar and its thickness
+/// comes out of the client size — Chrome 155 C4 reports client
+/// 85x225 under 15px bars where the border box is 100x240; Bowser's
+/// own thickness is [`crate::SCROLLBAR_THICKNESS`], so the strip
+/// here is 12px, not 15px). The strip sits on the far edge for the
+/// vertical axis (the horizontal scrollbar) and on the inline-end
 /// edge for the horizontal axis (the vertical scrollbar: the right
 /// under LTR, the left under RTL — under RTL it also shifts the
 /// content origin past itself, matching the forced-scrollbar
 /// reservation in `crate::forced_scrollbar_reservation`, which lays
-/// children out past the left strip). `overflow: auto` scrollbars are
-/// NOT subtracted: whether one shows depends on the overflow extent,
-/// which this pass does not measure (the `scroll` case is the pinned
-/// one; an `auto` scroller with overflowing content sticks up to one
-/// strip too far — a known gap, see the w86 gutter test).
+/// children out past the left strip). `overflow: auto` scrollbars
+/// ARE subtracted since w87: this pass runs after layout, so the
+/// overflow extent is measurable here ([`scroller_auto_scrollbars`])
+/// — the pre-w87 gap, where an `auto` scroller with overflowing
+/// content stuck up to one strip too far, is closed. (The app-side
+/// fold measures the same strips from its own scroll state; see
+/// `StickyBand::gutter_*`.)
 ///
 /// The FAR EDGE the caller derives from this is the scrollport's
 /// CONTENT-box edge, not the padding-box edge: Chrome 155 (w86
@@ -1200,6 +1348,7 @@ fn sticky_scrollport_axis(
     horizontal: bool,
     doc_scroll: f32,
     vp_size: f32,
+    auto_strip_cache: &mut HashMap<usize, (bool, bool)>,
 ) -> (f32, f32, f32, f32, f32) {
     match sticky_scroller(forest, i, fixed_limit, horizontal) {
         Some(p) => {
@@ -1207,20 +1356,48 @@ fn sticky_scrollport_axis(
             let m = &n.metrics;
             let (sx, sy) = nested_scroll_offset(forest, p, nested_offsets);
             let s = if horizontal { sx } else { sy };
-            // Forced classic scrollbar strip on the perpendicular axis
-            // (see the fn docs): `overflow: scroll` always shows it.
-            let forced = |prop: u8| {
-                n.style.as_ref().is_some_and(|st| {
-                    st.get_str_by_index(prop)
-                        .is_some_and(|v| v.eq_ignore_ascii_case("scroll"))
-                })
-            };
-            if horizontal {
-                let strip = if forced(props::OVERFLOW_Y) {
+            // Classic scrollbar strip on the perpendicular axis (see
+            // the fn docs): `overflow: scroll` always shows it, and
+            // `overflow: auto` shows it exactly when the scroller
+            // overflows on that axis (measured from the final layout
+            // by [`scroller_auto_scrollbars`], memoized per scroller
+            // in `auto_strip_cache`).
+            let mut strip_for = |prop: u8| {
+                let Some(st) = n.style.as_ref() else {
+                    return 0.0;
+                };
+                if st
+                    .get_str_by_index(prop)
+                    .is_some_and(|v| v.eq_ignore_ascii_case("scroll"))
+                {
+                    return crate::SCROLLBAR_THICKNESS;
+                }
+                // `auto` (including the visible→auto pairing):
+                // user-scrollable on this axis and actually
+                // overflowing. `horizontal` here is the axis being
+                // sized, so the perpendicular strip is the other
+                // axis' bar: the vertical bar for the horizontal
+                // size, the horizontal bar for the vertical size.
+                let (_, (user_x, user_y)) = crate::overflow_axes(st);
+                let (is_auto, shows) = if prop == props::OVERFLOW_Y {
+                    (
+                        user_y,
+                        scroller_auto_scrollbars(forest, p, auto_strip_cache).1,
+                    )
+                } else {
+                    (
+                        user_x,
+                        scroller_auto_scrollbars(forest, p, auto_strip_cache).0,
+                    )
+                };
+                if is_auto && shows {
                     crate::SCROLLBAR_THICKNESS
                 } else {
                     0.0
-                };
+                }
+            };
+            if horizontal {
+                let strip = strip_for(props::OVERFLOW_Y);
                 // Under RTL the vertical strip sits on the left and the
                 // content origin moves past it (matching the layout
                 // reservation); under LTR it sits on the right and the
@@ -1234,11 +1411,7 @@ fn sticky_scrollport_axis(
                     m.pr,
                 )
             } else {
-                let strip = if forced(props::OVERFLOW_X) {
-                    crate::SCROLLBAR_THICKNESS
-                } else {
-                    0.0
-                };
+                let strip = strip_for(props::OVERFLOW_X);
                 (
                     n.rect.y + m.bt + m.pt,
                     (n.rect.h - m.bt - m.bb - strip).max(0.0),
@@ -1515,6 +1688,10 @@ pub(crate) fn apply_sticky_constraints(
     // Scrollable-overflow sizes of scroll-container containing blocks,
     // memoized per CB node (see `cb_scrollable_size`).
     let mut scrollable_cache: HashMap<usize, (f32, f32)> = HashMap::new();
+    // Whether each scroller shows an `overflow: auto` scrollbar per
+    // axis (see `scroller_auto_scrollbars`): memoized per scroller
+    // for the scrollport-axis fn, which runs twice per sticky box.
+    let mut auto_strip_cache: HashMap<usize, (bool, bool)> = HashMap::new();
     for i in 0..forest.nodes.len() {
         if !matches!(forest.nodes[i].data.position, Position::Sticky) {
             continue;
@@ -1606,8 +1783,16 @@ pub(crate) fn apply_sticky_constraints(
         //    `client - far padding`, not at the padding-box edge the w79
         //    model used (which sat a full near+far padding too far: 160
         //    where Chrome puts 120 for the padded geometry).
-        let (sp_x, sp_w, sp_sx, sp_pl, sp_pr) =
-            sticky_scrollport_axis(forest, i, fixed_limit, nested_offsets, true, scroll_x, vp_w);
+        let (sp_x, sp_w, sp_sx, sp_pl, sp_pr) = sticky_scrollport_axis(
+            forest,
+            i,
+            fixed_limit,
+            nested_offsets,
+            true,
+            scroll_x,
+            vp_w,
+            &mut auto_strip_cache,
+        );
         let (sp_y, sp_h, sp_sy, sp_pt, sp_pb) = sticky_scrollport_axis(
             forest,
             i,
@@ -1616,6 +1801,7 @@ pub(crate) fn apply_sticky_constraints(
             false,
             scroll_y,
             vp_h,
+            &mut auto_strip_cache,
         );
         let qx = if left.is_none() && right.is_none() {
             px

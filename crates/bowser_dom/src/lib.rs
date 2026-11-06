@@ -2315,6 +2315,19 @@ impl Document {
         &self.top_layer
     }
 
+    /// The promotion sequence of a live top-layer member, if
+    /// any (see the `top_layer_seq` field docs): a fresh
+    /// sequence on every real promotion, erased on explicit
+    /// demotion, preserved across an exit retention. A
+    /// re-show after a hide therefore reads a different
+    /// sequence than the show it replaced, so callers that
+    /// snapshot a member's sequence can tell a re-shown
+    /// member from the one they snapshotted (the Escape
+    /// phase-3 re-show guard, w87).
+    pub fn top_layer_seq(&self, node: NodeId) -> Option<u64> {
+        self.top_layer_seq.get(&node).copied()
+    }
+
     /// The top layer in promotion order, with unexpired
     /// exit-retained elements interleaved by their original
     /// promotion sequence (w82fix Whole-M7): a retained

@@ -16158,6 +16158,245 @@ pub struct Vm {
     /// embedder sets it (e.g. the page realm sets the document URL);
     /// `None` means relative specifiers cannot resolve.
     base_url: Option<String>,
+    /// Host-dispatch nesting depth (w87 deferred toggles): nonzero
+    /// while a host dispatch is mid-flight
+    /// ([`crate::bindings::Vm::begin_host_dispatch`]), suppressing
+    /// the deferred-toggle flush so a toggle enqueued by an early
+    /// step of one host operation cannot fire ahead of a later
+    /// step of the same operation.
+    pub(crate) host_dispatch_depth: u32,
+    /// Classic-script nesting depth: nonzero while a script runs
+    /// inside another script (a native that evals mid-script).
+    /// The deferred-toggle flush fires only at the outermost
+    /// script's end, never mid-script.
+    pub(crate) script_depth: u32,
+    /// Whether [`crate::bindings::Vm::flush_pending_toggles`] is
+    /// mid-drain: a toggle listener's show/hide re-enqueues into
+    /// the fresh queue for the next round instead of recursing
+    /// into delivery. Managed by [`FlushingTogglesGuard`], never
+    /// set/cleared by hand, so a panic mid-drain cannot leak it
+    /// set (w87fix round 4, M3).
+    pub(crate) flushing_toggles: bool,
+}
+
+/// RAII guard for one of `Vm`'s depth counters (w87fix round 3):
+/// increments on entry, decrements on drop — including during a panic
+/// unwind — so a mid-dispatch panic cannot leak the counter permanently
+/// and suppress every later toggle flush (host depth) or
+/// outermost-script flush (script depth) for the rest of the realm's
+/// life.
+///
+/// Holds a raw `*mut Vm` because the guarded code reborrows `&mut Vm`
+/// (dispatches, pumps, evals) while the guard lives, which a `&mut Vm`
+/// guard could not do.
+///
+/// What the code actually does (w87fix round 4, correcting the
+/// round-3 docs): the stored pointer IS derived from a `&mut Vm` —
+/// both call sites pass `self as *mut Vm`, where `self` is the
+/// method receiver — so the old claim that it is "derived without an
+/// intermediate `&mut Vm` reborrow" was false. The old claim that
+/// "the counter is incremented and decremented through the raw
+/// pointer" was half false too: the increment in `enter_host` /
+/// `enter_script` does write the counter through the raw pointer
+/// directly, with no `&mut` formed, but the decrement in
+/// [`Drop::drop`] forms a temporary `&mut Vm` from the stored
+/// pointer (`let vm = &mut *self.vm;`).
+///
+/// The invariant that makes that sound is strict sequencing, not
+/// the absence of a `&mut`. At each call site there is exactly one
+/// exclusive borrow chain for the `Vm` (the method receiver), and
+/// every access while a guard lives is either a reborrow of that
+/// chain — the guarded code's dispatches, pumps and evals, each
+/// short-lived and finished before the next begins — or the guard's
+/// own access. The `Drop`'s temporary `&mut` is created only after
+/// the last guarded-code use has returned, is used for exactly one
+/// counter write, and is discarded before the caller's borrow is
+/// used again, so at no instant are two live `&mut` paths used to
+/// touch the `Vm`, and the temporary is never used after the
+/// caller's borrow resumes. Do not introduce a second, independent
+/// `&mut Vm` to the same `Vm` while a guard lives (e.g. a second
+/// `vm_mut()` handle used interleaved with the guarded code), and
+/// do not use the caller's borrow inside the guard's `Drop`.
+/// Nested guards share the counter and drop LIFO, so the same
+/// sequencing holds per guard. `Vm` is single-threaded (`!Send`,
+/// holds `Rc`s), so no other thread touches the counter
+/// concurrently.
+///
+/// The guard must not outlive the stack frame that created it. That
+/// is a call-site convention: the `'a` lifetime (via the
+/// `PhantomData<&'a mut Vm>` field) only marks the guard as if it
+/// held a `&mut Vm`, for variance and auto-trait purposes — no
+/// borrow is actually passed in, so it does not statically tie the
+/// guard to the caller's borrow. The `Vm` must neither move nor
+/// drop while the guard lives. The type does not stop `mem::forget`
+/// from leaking a guard, so callers must still treat it as
+/// frame-scoped. Nested guards share the counter (an outer host
+/// guard with an inner host/script guard on the same `Vm` is
+/// routine), and
+/// [`flush_pending_toggles`](crate::bindings::Vm::flush_pending_toggles)
+/// reads it while guards live; the invariant is that every guard
+/// decrements exactly once on drop and nesting is LIFO-balanced,
+/// which restores the counter correctly. The only unsafe operations
+/// are the counter increment in `enter_host` / `enter_script` and
+/// the decrement in [`Drop::drop`], covered by that invariant.
+#[must_use]
+pub(crate) struct VmDepthGuard<'a> {
+    vm: *mut Vm,
+    /// `true` for `script_depth`, `false` for `host_dispatch_depth`.
+    script: bool,
+    _marker: std::marker::PhantomData<&'a mut Vm>,
+}
+
+impl VmDepthGuard<'_> {
+    /// Enter a host dispatch: `host_dispatch_depth` + 1 through the
+    /// raw pointer, undone on drop. `vm` must point at a live `Vm`
+    /// that outlives the guard; call sites pass `self as *mut Vm`
+    /// (see the struct docs for the sequencing invariant that
+    /// pointer relies on).
+    pub(crate) fn enter_host<'a>(vm: *mut Vm) -> VmDepthGuard<'a> {
+        // SAFETY: `vm` points at a live `Vm` for the guard's life
+        // (see the struct docs). The increment writes the counter
+        // through the raw pointer directly; no `&mut` is formed
+        // here (the `Drop` decrement does form one — see there).
+        unsafe {
+            (*vm).host_dispatch_depth = (*vm).host_dispatch_depth.saturating_add(1);
+        }
+        VmDepthGuard {
+            vm,
+            script: false,
+            _marker: std::marker::PhantomData,
+        }
+    }
+
+    /// Enter a script run: `script_depth` + 1 through the raw
+    /// pointer, undone on drop. Same pointer rules as
+    /// [`VmDepthGuard::enter_host`].
+    pub(crate) fn enter_script<'a>(vm: *mut Vm) -> VmDepthGuard<'a> {
+        // SAFETY: as in `enter_host`.
+        unsafe {
+            (*vm).script_depth = (*vm).script_depth.saturating_add(1);
+        }
+        VmDepthGuard {
+            vm,
+            script: true,
+            _marker: std::marker::PhantomData,
+        }
+    }
+}
+
+impl Drop for VmDepthGuard<'_> {
+    fn drop(&mut self) {
+        // SAFETY: the `Vm` outlives the guard (see the struct docs).
+        // Every guard decrements exactly once and nesting is
+        // LIFO-balanced, so this restores the counter even when
+        // nested guards share it. The decrement forms a temporary
+        // `&mut Vm` from the stored raw pointer: that is sound
+        // under the struct docs' sequencing invariant — the
+        // temporary is created only after the last guarded-code use
+        // has returned, is used for exactly this one write, and is
+        // discarded before the caller's borrow is used again. The
+        // decrement is saturating and assert-free on purpose: a
+        // panic here during unwind would abort, so the drop never
+        // calls the asserting `end_host_dispatch` (which manual
+        // callers keep using).
+        unsafe {
+            if self.script {
+                let vm = &mut *self.vm;
+                vm.script_depth = vm.script_depth.saturating_sub(1);
+            } else {
+                let vm = &mut *self.vm;
+                vm.host_dispatch_depth = vm.host_dispatch_depth.saturating_sub(1);
+            }
+        }
+    }
+}
+
+/// RAII guard for `Vm::flushing_toggles` (w87fix round 4, M3): sets
+/// the flag on entry, clears it on drop — including during a panic
+/// unwind — so a panic inside a toggle delivery cannot leave the
+/// flag set forever and make every later
+/// [`crate::bindings::Vm::flush_pending_toggles`] call no-op. The
+/// flag is a bool, not a counter, so the depth guard does not fit;
+/// this is the same shape with a set/clear pair instead of an
+/// increment/decrement pair.
+///
+/// The pointer is derived from a `&mut Vm` at the call site
+/// (`self as *mut Vm` in `flush_pending_toggles`), and the guarded
+/// body reborrows `self` while the guard lives. Both the set in
+/// [`FlushingTogglesGuard::enter`] and the clear in
+/// [`Drop::drop`] write the flag through the raw pointer directly —
+/// no `&mut Vm` is formed by this guard at all. The invariant is
+/// the same strict sequencing as [`VmDepthGuard`]: exactly one
+/// exclusive borrow chain for the `Vm` at the call site, the
+/// guard's raw-pointer writes sequenced after the last body use
+/// (the guard drops at the end of its block, before the caller
+/// reuses `self`), and no second, independent `&mut Vm` to the
+/// same `Vm` while the guard lives. `Vm` is single-threaded
+/// (`!Send`, holds `Rc`s), so no other thread touches the flag
+/// concurrently.
+///
+/// Only construct this guard when the flag is currently `false`:
+/// the call site checked that first (a flush already in progress
+/// returns early instead of re-entering), and [`Drop::drop`]
+/// clears unconditionally. The guard must not outlive the stack
+/// frame that created it, and the `Vm` must neither move nor drop
+/// while it lives; `mem::forget` would leak the flag set, so
+/// callers must treat the guard as frame-scoped, as with
+/// [`VmDepthGuard`].
+#[must_use]
+pub(crate) struct FlushingTogglesGuard<'a> {
+    vm: *mut Vm,
+    _marker: std::marker::PhantomData<&'a mut Vm>,
+}
+
+impl FlushingTogglesGuard<'_> {
+    /// Set `flushing_toggles`, to be cleared on drop. `vm` must
+    /// point at a live `Vm` that outlives the guard, and the flag
+    /// must currently be `false` (see the struct docs).
+    pub(crate) fn enter<'a>(vm: *mut Vm) -> FlushingTogglesGuard<'a> {
+        // SAFETY: `vm` points at a live `Vm` for the guard's life
+        // (see the struct docs). The flag is written through the
+        // raw pointer directly; no `&mut` is formed here.
+        unsafe {
+            (*vm).flushing_toggles = true;
+        }
+        FlushingTogglesGuard {
+            vm,
+            _marker: std::marker::PhantomData,
+        }
+    }
+}
+
+impl Drop for FlushingTogglesGuard<'_> {
+    fn drop(&mut self) {
+        // SAFETY: the `Vm` outlives the guard (see the struct
+        // docs). The flag is cleared through the raw pointer
+        // directly, with no `&mut` formed, so there is no
+        // temporary borrow to sequence against the caller's
+        // borrow — the write simply runs at the end of the
+        // guard's block, after the last guarded-code use. The
+        // clear is unconditional and cannot panic.
+        unsafe {
+            (*self.vm).flushing_toggles = false;
+        }
+    }
+}
+
+impl Vm {
+    /// Decrement `host_dispatch_depth`, saturating, without the debug
+    /// assert in [`crate::bindings::Vm::end_host_dispatch`]. For
+    /// guard `Drop` impls only — including the embedder's
+    /// `HostDispatchGuard`, which cannot reach the `pub(crate)` field
+    /// from another crate. A panic in `Drop` during unwind would
+    /// abort, so guards must never call the asserting
+    /// `end_host_dispatch`; manual callers keep using that one.
+    /// This must stay `pub`, not `pub(crate)`: `bowser_app`'s
+    /// `HostDispatchGuard::drop` calls it, and it is the only
+    /// other-crate caller (verified w87fix round 4). Do not call it
+    /// to adjust the counter outside a guard `Drop`.
+    pub fn end_host_dispatch_saturating(&mut self) {
+        self.host_dispatch_depth = self.host_dispatch_depth.saturating_sub(1);
+    }
 }
 
 impl Vm {
@@ -16208,6 +16447,9 @@ impl Vm {
             vm_nonce,
             module_loader: ModuleLoader::new(),
             base_url: None,
+            host_dispatch_depth: 0,
+            script_depth: 0,
+            flushing_toggles: false,
         }
     }
 
@@ -16586,6 +16828,34 @@ impl Vm {
     /// current length when running a precompiled handle (nothing new is
     /// interned, so the sweep is a no-op).
     fn run_script_func(&mut self, func: u32, tmpl_base: usize) -> Result<Value, VmError> {
+        // w87: the deferred-toggle flush fires at the outermost
+        // script's end only — a nested script (a native that evals
+        // mid-script) must not flush ahead of the outer script's
+        // remaining statements. `flush_pending_toggles` itself
+        // no-ops while a host dispatch is mid-flight.
+        // w87fix r3: the depth is a RAII guard now — a panic
+        // inside the run used to leak `script_depth` (the manual
+        // decrement below it never ran) and suppress every later
+        // outermost-script flush. The guard drops before the
+        // flush check below, so the depth is restored either way.
+        let result = {
+            let _guard = VmDepthGuard::enter_script(self as *mut Vm);
+            self.run_script_func_inner(func, tmpl_base)
+        };
+        if self.script_depth == 0 {
+            // A flushed toggle's inline throw has no host dispatch
+            // to report it to (unlike the old synchronous path,
+            // where the dispatcher recorded it): stash it with the
+            // other task errors, which the embedder drains into the
+            // script report at the next pump.
+            for (_, e) in self.flush_pending_toggles() {
+                self.uncaught_task_errors.push(e);
+            }
+        }
+        result
+    }
+
+    fn run_script_func_inner(&mut self, func: u32, tmpl_base: usize) -> Result<Value, VmError> {
         // Fresh script frame on the (empty) frame stack. Top-level `this`
         // gets the same coercion as an ordinary call: `globalThis` in
         // sloppy scripts, `undefined` in strict ones.
@@ -17000,7 +17270,18 @@ impl TaskRunner for Vm {
             Task::FireTimer { timer_id, callback } => {
                 let rec = match self.interp.timers.get(&callback).cloned() {
                     Some(r) => r,
-                    None => return,
+                    // w87fix r3: flush before the early return, or
+                    // the per-task guarantee below is skipped for a
+                    // missing timer record. Nothing is lost today
+                    // (`PageVm::pump`'s trailing flush covers it),
+                    // but a task must not depend on its caller for
+                    // its own boundary flush.
+                    None => {
+                        for (_, e) in self.flush_pending_toggles() {
+                            self.uncaught_task_errors.push(e);
+                        }
+                        return;
+                    }
                 };
                 if !rec.repeat {
                     self.interp.timers.remove(&callback);
@@ -17033,6 +17314,18 @@ impl TaskRunner for Vm {
                 let heap = &mut self.heap;
                 self.interp.run_job(heap, job);
             }
+        }
+        // w87: one task's toggles fire before the next task runs —
+        // a timer that shows and a later timer that hides are two
+        // tasks, so both toggles fire (unlike a same-task show+hide,
+        // which coalesces). The flush itself no-ops while a host
+        // dispatch is mid-flight, so a timer task a host pump runs
+        // mid-operation cannot fire a toggle ahead of that
+        // operation's own `close`. Script tasks already flushed at
+        // their eval's end, so this is a no-op for them. Errors go
+        // to the task-error stash, as with timer throws above.
+        for (_, e) in self.flush_pending_toggles() {
+            self.uncaught_task_errors.push(e);
         }
     }
 }

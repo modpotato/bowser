@@ -6327,16 +6327,18 @@ struct StickyBand {
     /// (see `scroller_padding_unsound`); a nonzero resolvable padding
     /// folds exactly.
     scroller_padding: Option<(f32, f32, f32, f32)>,
-    /// Forced classic scrollbar strips shrinking the client extent per
-    /// axis in px: the vertical scrollbar's thickness on the x axis
-    /// (`overflow-y: scroll`), the horizontal scrollbar's on the y
-    /// axis (`overflow-x: scroll`). Layout's sticky client size
-    /// subtracts the same strips (see `sticky_scrollport_axis`), so
-    /// the fold's far pin — `o1 + sp - gutter - far_pad - far -
-    /// size` — matches layout's content-box far edge. `overflow:
-    /// auto` strips are 0 here (the same known gap as layout:
-    /// whether an `auto` scrollbar shows depends on the overflow
-    /// extent, which neither pass measures).
+    /// Classic scrollbar strips shrinking the client extent per axis
+    /// in px: the vertical scrollbar's thickness on the x axis
+    /// (`overflow-y: scroll`, or `auto` with real vertical overflow),
+    /// the horizontal scrollbar's on the y axis (`overflow-x: scroll`,
+    /// or `auto` with real horizontal overflow). Layout's sticky
+    /// client size subtracts the same strips (see
+    /// `sticky_scrollport_axis`), so the fold's far pin —
+    /// `o1 + sp - gutter - far_pad - far - size` — matches layout's
+    /// content-box far edge. The `auto` case is measurable here from
+    /// the scroll tree itself (`scrollbar_axis_present`: user-scrollable
+    /// and `max > min`), mirroring layout's
+    /// `scroller_auto_scrollbars`, so it is no longer 0.
     gutter_x: f32,
     gutter_y: f32,
     /// Whether the constraining scroller's computed `direction` is
@@ -6707,14 +6709,17 @@ impl ScrollTree {
                         strict_px(s.get("padding-left"))?,
                     ))
                 }),
-            // Forced classic scrollbar strips (see the `gutter_*`
-            // fields): `overflow: scroll` on the perpendicular axis
-            // always shows that scrollbar, so its thickness comes out
-            // of the client extent the fold's far pin is measured
-            // against. The lookup can only fail when the scroller has
-            // no box in the tree or no computed style (impossible for
-            // a banded scroller); then 0.0 is the conservative
-            // no-strip assumption the fold already makes for `auto`.
+            // Classic scrollbar strips (see the `gutter_*` fields):
+            // `overflow: scroll` on the perpendicular axis always
+            // shows that scrollbar, so its thickness comes out of
+            // the client extent the fold's far pin is measured
+            // against; `overflow: auto` shows it exactly when the
+            // axis overflows (`scrollbar_axis_present`: user-scrollable
+            // and `max > min`), which the scroll tree measures
+            // directly. The lookup can only fail when the scroller
+            // has no box in the tree or no computed style (impossible
+            // for a banded scroller); then 0.0 is the conservative
+            // no-strip assumption.
             gutter_x: self.containers[scroller]
                 .node
                 .and_then(|n| find_box(root, n))
@@ -6722,6 +6727,7 @@ impl ScrollTree {
                 .map(|s| {
                     if s.get_str_by_index(props::OVERFLOW_Y)
                         .is_some_and(|v| v.eq_ignore_ascii_case("scroll"))
+                        || self.scrollbar_axis_present(scroller, ScrollbarAxis::Vertical)
                     {
                         SCROLLBAR_THICKNESS
                     } else {
@@ -6736,6 +6742,7 @@ impl ScrollTree {
                 .map(|s| {
                     if s.get_str_by_index(props::OVERFLOW_X)
                         .is_some_and(|v| v.eq_ignore_ascii_case("scroll"))
+                        || self.scrollbar_axis_present(scroller, ScrollbarAxis::Horizontal)
                     {
                         SCROLLBAR_THICKNESS
                     } else {
@@ -6757,9 +6764,10 @@ impl ScrollTree {
     /// bake-time offset; `size`/`sp` the box and scrollport extents;
     /// `near`/`far` the resolved near/far insets (`None` = no
     /// constraint on that side); `near_pad`/`far_pad` the scroller's
-    /// near/far padding on this axis; `gutter` the forced classic
-    /// scrollbar strip shrinking the client extent on this axis (0
-    /// unless that scrollbar is forced — see `StickyBand::gutter_*`);
+    /// near/far padding on this axis; `gutter` the classic scrollbar
+    /// strip shrinking the client extent on this axis (0 unless that
+    /// scrollbar is forced, or `auto` and showing — see
+    /// `StickyBand::gutter_*`);
     /// `rtl` whether the scroller is RTL: on the horizontal axis the
     /// vertical strip sits on the left, so layout's content origin is
     /// `near_pad + gutter` and the far pin loses the gutter (see
@@ -16818,9 +16826,11 @@ mod tests {
     /// the mirror of `sticky_fold_far_stuck_with_scroller_padding`.
     /// Geometry: content origin 20, padding-box width 220, `#st`
     /// natural at 1020 (`nowrap` keeps the 1000-wide inline-block
-    /// `#pad` on the same line), far pin at bake 500 is 670
-    /// (500 + 220 - 50 — the w79 pin was 690, counting the near
-    /// padding twice); ticking back rides the far edge.
+    /// `#pad` on the same line), far pin at bake 500 is 658
+    /// (500 + 220 - 50 - 12 — the w79 pin was 690, counting the near
+    /// padding twice, and the w87 dual-axis fix subtracts the 12px
+    /// vertical strip layout now detects); ticking back rides the
+    /// far edge.
     #[test]
     fn sticky_fold_far_stuck_with_scroller_padding_horizontal() {
         let css = "#outer { overflow-x: auto; width: 200px; padding-left: 20px; white-space: nowrap; } \
@@ -16838,7 +16848,7 @@ mod tests {
             .iter()
             .find(|b| b.scroller == io)
             .expect("band for #st");
-        assert!(approx_eq(band.pos_x, 670.0), "pos_x={}", band.pos_x);
+        assert!(approx_eq(band.pos_x, 658.0), "pos_x={}", band.pos_x);
         assert!(approx_eq(band.bake_x, 500.0), "bake_x={}", band.bake_x);
         assert_eq!(band.scroller_padding, Some((0.0, 0.0, 0.0, 20.0)));
         // Ticking back rides the far edge: shift is the scroll delta.
@@ -16854,8 +16864,71 @@ mod tests {
         let ref_st = ref_doc.get_element_by_id("st").expect("ref st");
         let ref_box = find_box(&ref_root, ref_st).expect("#st box");
         assert!(
-            approx_eq(ref_box.rect.x - sp_x, 620.0),
-            "layout agrees the box is far-stuck at 620, got {}",
+            approx_eq(ref_box.rect.x - sp_x, 608.0),
+            "layout agrees the box is far-stuck at 608, got {}",
+            ref_box.rect.x - sp_x
+        );
+        // Forward ticks from a far-stuck bake are the conservative
+        // re-bake path, not a zero shift.
+        assert!(tree.sticky_shifts_at(io, 530.0, 0.0).is_none());
+    }
+
+    /// Far-stuck folding for the dual-axis text-overhang geometry
+    /// (w87fix r3): the fold side of the layout pin
+    /// `w87fix_sticky_dual_axis_text_overhang_shows_vertical_bar`
+    /// — same HTML/CSS (a `nowrap` scroller, the short
+    /// inline-block's text run overhanging the 60px line box to
+    /// 69.2, real vertical overflow the natural height misses).
+    /// The layout pin proves the box sticks at x=658 at scrollLeft
+    /// 500; this pins the fold side: the band baked at 500 carries
+    /// pos_x 658 (500 + 220 - 50 - 12 — the -12 is the vertical
+    /// strip layout now detects from the overhang), ticking back
+    /// to 450 rides the far edge to 608, and an independent layout
+    /// at each offset agrees. The sibling tests above pin the
+    /// same 658 only for the padding geometry; this one pins it
+    /// for the overhang geometry, where the vertical bar comes
+    /// from the extent walk alone.
+    #[test]
+    fn sticky_fold_dual_axis_text_overhang_pins_658() {
+        let html = b"<html><body><div id=\"outer\"><div id=\"pad\">x</div><div id=\"st\">y</div><div id=\"tall\">z</div></div></body></html>";
+        let css = "#outer { overflow-x: auto; width: 200px; padding-left: 20px; white-space: nowrap; } \
+            #pad { display: inline-block; width: 1000px; height: 10px; } \
+            #st { position: sticky; right: 0; width: 50px; height: 50px; display: inline-block; } \
+            #tall { width: 2000px; height: 10px; }";
+        let (doc, root) = layout_html_nested_at(html, css, "outer", 500.0, 0.0);
+        let (_doc_state, _elements, tree) = build_tree_nested_at(&doc, &root, "outer", 500.0, 0.0);
+        let outer = doc.get_element_by_id("outer").expect("outer");
+        let st = doc.get_element_by_id("st").expect("st");
+        let io = tree.index_of(outer).expect("outer container");
+        let sp_x = tree.container(io).scrollport.x;
+        let band = tree
+            .sticky_bands
+            .iter()
+            .find(|b| b.scroller == io)
+            .expect("band for #st");
+        assert!(approx_eq(band.pos_x, 658.0), "pos_x={}", band.pos_x);
+        assert!(approx_eq(band.bake_x, 500.0), "bake_x={}", band.bake_x);
+        // Ticking back rides the far edge: shift is the scroll delta.
+        let shifts = tree.sticky_shifts_at(io, 450.0, 0.0).expect("foldable");
+        assert_eq!(shifts.len(), 1, "exactly the sticky box");
+        assert_eq!(shifts[0].node, st);
+        assert!(approx_eq(shifts[0].dx, -50.0));
+        // Behavior equivalence: independent layouts at 500 and 450
+        // agree the box is far-stuck at 658 and 608.
+        let (ref_doc, ref_root) = layout_html_nested_at(html, css, "outer", 500.0, 0.0);
+        let ref_st = ref_doc.get_element_by_id("st").expect("ref st");
+        let ref_box = find_box(&ref_root, ref_st).expect("#st box");
+        assert!(
+            approx_eq(ref_box.rect.x - sp_x, 658.0),
+            "layout agrees the box is far-stuck at 658, got {}",
+            ref_box.rect.x - sp_x
+        );
+        let (ref_doc, ref_root) = layout_html_nested_at(html, css, "outer", 450.0, 0.0);
+        let ref_st = ref_doc.get_element_by_id("st").expect("ref st");
+        let ref_box = find_box(&ref_root, ref_st).expect("#st box");
+        assert!(
+            approx_eq(ref_box.rect.x - sp_x, 608.0),
+            "layout agrees the box is far-stuck at 608, got {}",
             ref_box.rect.x - sp_x
         );
         // Forward ticks from a far-stuck bake are the conservative
@@ -16867,7 +16940,8 @@ mod tests {
     /// (w79fix round 2): layout's far pin is the content-box edge
     /// (w86): the padding-box width is 250 (200 + 20 + 30) but the
     /// content-box edge is 20 + 200 = 220, so the far pin at bake
-    /// 500 is 500 + 220 - 50 = 670. The old w79 padding-box pin was
+    /// 500 is 500 + 220 - 50 - 12 = 658 (the -12 is the vertical
+    /// strip the w87 dual-axis fix detects). The old w79 padding-box pin was
     /// 20 + 500 + 250 - 50 = 720; subtracting the far padding from
     /// the padding-box size while keeping the near-padding origin
     /// would pin at 690 (the near padding counted twice), and
@@ -16892,7 +16966,7 @@ mod tests {
             .iter()
             .find(|b| b.scroller == io)
             .expect("band for #st");
-        assert!(approx_eq(band.pos_x, 670.0), "pos_x={}", band.pos_x);
+        assert!(approx_eq(band.pos_x, 658.0), "pos_x={}", band.pos_x);
         assert!(approx_eq(band.bake_x, 500.0), "bake_x={}", band.bake_x);
         assert_eq!(band.scroller_padding, Some((0.0, 30.0, 0.0, 20.0)));
         let shifts = tree.sticky_shifts_at(io, 450.0, 0.0).expect("foldable");
@@ -16904,8 +16978,8 @@ mod tests {
         let ref_st = ref_doc.get_element_by_id("st").expect("ref st");
         let ref_box = find_box(&ref_root, ref_st).expect("#st box");
         assert!(
-            approx_eq(ref_box.rect.x - sp_x, 620.0),
-            "layout agrees the box is far-stuck at 620, got {}",
+            approx_eq(ref_box.rect.x - sp_x, 608.0),
+            "layout agrees the box is far-stuck at 608, got {}",
             ref_box.rect.x - sp_x
         );
         assert!(tree.sticky_shifts_at(io, 530.0, 0.0).is_none());
@@ -17017,6 +17091,111 @@ mod tests {
             approx_eq(ref_box.rect.y - sp_y, 123.0),
             "layout agrees the box tracks the far pin at 123, got {}",
             ref_box.rect.y - sp_y
+        );
+    }
+
+    /// Padding-only spill takes no auto gutter (w87fix, D1): a
+    /// 110px child in a 100px `overflow: auto` box with 20px bottom
+    /// padding spills only into the padding, so layout shows no
+    /// scrollbar (489b907) and the scroll tree must agree — its max
+    /// is border-box based (`scrollable_extent` seeds the range at
+    /// the scroller's border-box edge), so max stays 0 and the e5bd931
+    /// fold subtracts no 12px gutter. The control next door (130px
+    /// child, 10px past the padding-box edge) does overflow: max 10,
+    /// a shown scrollbar, and a 12px gutter. If the tree's max were
+    /// content-box based the D1 case would report max 10 and the fold
+    /// would wrongly subtract a strip layout never paints.
+    #[test]
+    fn sticky_fold_auto_no_gutter_for_padding_only_spill() {
+        let html = b"<html><body><div id=\"outer\">\
+            <div id=\"tall\"><div id=\"st\"></div></div></div></body></html>";
+        // D1: 110px of content in a 100px box + 20px bottom padding —
+        // the spill ends 10px short of the border-box edge.
+        let css_d1 = "#outer { overflow: auto; width: 200px; height: 100px; padding-bottom: 20px; } \
+            #tall { height: 110px; } \
+            #st { position: sticky; bottom: 0; width: 50px; height: 50px; }";
+        let (doc, root) = layout_html_nested_at(html, css_d1, "outer", 0.0, 0.0);
+        let (_doc_state, _elements, tree) = build_tree_nested_at(&doc, &root, "outer", 0.0, 0.0);
+        let outer = doc.get_element_by_id("outer").expect("outer");
+        let tall = doc.get_element_by_id("tall").expect("tall");
+        let io = tree.index_of(outer).expect("outer container");
+        assert_eq!(
+            tree.container(io).state.max_offset(),
+            (0.0, 0.0),
+            "padding-only spill has no scrollable overflow"
+        );
+        assert_eq!(tree.container(io).state.min_offset(), (0.0, 0.0));
+        let band = tree
+            .sticky_bands
+            .iter()
+            .find(|b| b.scroller == io)
+            .expect("band for #st");
+        assert_eq!(band.scroller_padding, Some((0.0, 0.0, 20.0, 0.0)));
+        // The vertical strip shrinks the x extent (`gutter_x`); the
+        // horizontal strip would shrink the y extent (`gutter_y`) —
+        // neither shows for a padding-only spill.
+        assert!(
+            approx_eq(band.gutter_x, 0.0),
+            "no vertical gutter for a padding-only spill, gutter_x={}",
+            band.gutter_x
+        );
+        assert!(
+            approx_eq(band.gutter_y, 0.0),
+            "no horizontal gutter either, gutter_y={}",
+            band.gutter_y
+        );
+        assert!(
+            tree.scrollbar_geom(io).vertical.is_none(),
+            "no vertical scrollbar painted for a padding-only spill"
+        );
+        // Layout agrees: no scrollbar means no 12px narrowing.
+        let tall_box = find_box(&root, tall).expect("#tall box");
+        assert!(
+            approx_eq(tall_box.rect.w, 200.0),
+            "child keeps the full content width, w={}",
+            tall_box.rect.w
+        );
+
+        // Control: 130px of content spills 10px past the
+        // padding-box edge, so the scrollbar shows and the fold
+        // takes the strip.
+        let css_spill = "#outer { overflow: auto; width: 200px; height: 100px; padding-bottom: 20px; } \
+            #tall { height: 130px; } \
+            #st { position: sticky; bottom: 0; width: 50px; height: 50px; }";
+        let (doc, root) = layout_html_nested_at(html, css_spill, "outer", 0.0, 0.0);
+        let (_doc_state, _elements, tree) = build_tree_nested_at(&doc, &root, "outer", 0.0, 0.0);
+        let outer = doc.get_element_by_id("outer").expect("outer");
+        let tall = doc.get_element_by_id("tall").expect("tall");
+        let io = tree.index_of(outer).expect("outer container");
+        assert_eq!(
+            tree.container(io).state.max_offset(),
+            (0.0, 10.0),
+            "spill past the padding-box edge scrolls 10px"
+        );
+        let band = tree
+            .sticky_bands
+            .iter()
+            .find(|b| b.scroller == io)
+            .expect("band for #st");
+        assert!(
+            approx_eq(band.gutter_x, 12.0),
+            "real vertical spill takes the gutter, gutter_x={}",
+            band.gutter_x
+        );
+        assert!(
+            approx_eq(band.gutter_y, 0.0),
+            "no horizontal overflow, so no horizontal gutter, gutter_y={}",
+            band.gutter_y
+        );
+        assert!(
+            tree.scrollbar_geom(io).vertical.is_some(),
+            "vertical scrollbar painted once content spills past padding"
+        );
+        let tall_box = find_box(&root, tall).expect("#tall box");
+        assert!(
+            approx_eq(tall_box.rect.w, 188.0),
+            "child narrows by the shown scrollbar, w={}",
+            tall_box.rect.w
         );
     }
 

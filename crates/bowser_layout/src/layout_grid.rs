@@ -2800,6 +2800,12 @@ pub(crate) fn resume_grid(
         content_h: forest.nodes[idx].content_h,
         content_w: fr.content_w,
         content_x: fr.content_x,
+        // Padding-box overflow (w87 D1): content spilling only into
+        // the bottom padding is no overflow. No horizontal-strip
+        // deduction here: the grid engine does not yet model the
+        // horizontal bar's height consumption (see the block
+        // completion's `pad_overflow` for the modeled case).
+        pad_overflow: forest.nodes[idx].metrics.pb,
         auto_redriven: fr.auto_redriven,
     };
     if let Some((kids_x2, kids_w2)) = auto_scrollbar_redrive(forest, scratch, &check) {

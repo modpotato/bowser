@@ -869,6 +869,14 @@ impl PageVm {
         for error in self.vm.take_uncaught_task_errors() {
             self.report.errors.push(ScriptError::task_error(error));
         }
+        // w87: the task-boundary toggle flush. Tasks above already
+        // flushed their own toggles per task; this drains what host
+        // dispatches enqueued (Escape / light-dismiss / invoker
+        // toggles), which no task boundary has passed since. A
+        // no-op while a host dispatch is mid-flight (the dispatcher
+        // guards its own pump — see `begin_host_dispatch`) and
+        // when nothing is queued.
+        self.flush_pending_toggles();
     }
 
     /// Drive the page's event loop like [`pump`](Self::pump), but run at
@@ -916,7 +924,26 @@ impl PageVm {
         for error in self.vm.take_uncaught_task_errors() {
             self.report.errors.push(ScriptError::task_error(error));
         }
+        // w87: same task-boundary toggle flush as [`pump`](Self::pump)
+        // — queued toggles from completed tasks and host dispatches
+        // fire here, never mid-pump.
+        self.flush_pending_toggles();
         drained
+    }
+
+    /// Fire every queued popover `toggle` (w87, Chrome 155 probe
+    /// S2): the task-boundary flush for [`Vm::flush_pending_toggles`].
+    /// A throwing inline handler or a mid-flight core failure lands
+    /// in the page's [`ScriptReport`] exactly like an immediate
+    /// dispatch's errors used to; listener throws are swallowed by
+    /// the dispatch core, as before. A no-op while a host dispatch
+    /// is mid-flight or when nothing is queued.
+    pub fn flush_pending_toggles(&mut self) {
+        for (target, e) in self.vm.flush_pending_toggles() {
+            self.report
+                .errors
+                .push(ScriptError::from_vm_error(target, None, &e));
+        }
     }
 
     /// Whether the WPT harness reporter armed this page: the
@@ -1254,6 +1281,8 @@ impl PageEventDispatch {
         // registry `Weak` — so no `Ref`/`RefMut` may be alive across
         // either eval.
         crate::tab::InstalledDocument::assert_no_live_borrow(doc);
+        // w87 host-dispatch guard (see `Vm::begin_host_dispatch`).
+        let _guard = HostDispatchGuard::enter(std::ptr::addr_of_mut!(page_vm.vm));
         // One eval: the inline handler runs with the dispatched event
         // object bound as `event`, then the same object goes to the
         // listeners via `dispatchEvent`.
@@ -1328,6 +1357,8 @@ impl PageEventDispatch {
         let (doc, page_vm) = installed.document_and_vm_mut();
         // Reentrancy gate: see `dispatch_key_phase`.
         crate::tab::InstalledDocument::assert_no_live_borrow(doc);
+        // w87 host-dispatch guard (see `Vm::begin_host_dispatch`).
+        let _guard = HostDispatchGuard::enter(std::ptr::addr_of_mut!(page_vm.vm));
         let bubbles = matches!(event_type, "focusin" | "focusout");
         let event_init = format!("{{type:'{event_type}',bubbles:{bubbles},cancelable:false}}");
         let prevented =
@@ -1515,6 +1546,8 @@ impl PageEventDispatch {
         // be alive across the dispatch.
         crate::tab::InstalledDocument::assert_no_live_borrow(installed.document());
         let page_vm = installed.page_vm_mut();
+        // w87 host-dispatch guard (see `Vm::begin_host_dispatch`).
+        let _guard = HostDispatchGuard::enter(std::ptr::addr_of_mut!(page_vm.vm));
         // Trusted, bubbling, cancelable touch event; returns true iff a
         // non-passive listener prevented the default (already fail-closed
         // when the realm is gone).
@@ -2065,6 +2098,8 @@ impl PageEventDispatch {
         // `Ref`/`RefMut` may be alive across the dispatch.
         crate::tab::InstalledDocument::assert_no_live_borrow(installed.document());
         let page_vm = installed.page_vm_mut();
+        // w87 host-dispatch guard (see `Vm::begin_host_dispatch`).
+        let _guard = HostDispatchGuard::enter(std::ptr::addr_of_mut!(page_vm.vm));
         let prevented = page_vm
             .vm_mut()
             .dispatch_pointer_mouse(target, event_type, kind, data);
@@ -2182,6 +2217,11 @@ impl PageEventDispatch {
                     if let Some(installed) = tab.installed_mut() {
                         crate::tab::InstalledDocument::assert_no_live_borrow(installed.document());
                         let page_vm = installed.page_vm_mut();
+                        // w87 host-dispatch guard (see
+                        // `Vm::begin_host_dispatch`): the scroll
+                        // dispatch is one step of the synthetic-scroll
+                        // default action, not its end.
+                        let _guard = HostDispatchGuard::enter(std::ptr::addr_of_mut!(page_vm.vm));
                         if let Err(e) = page_vm.eval("window.dispatchEvent({type:'scroll'})") {
                             page_vm.record_error(ScriptError::task_error(e));
                         }
@@ -2218,6 +2258,13 @@ fn dispatch_cancel_shaped(tab: &mut crate::tab::Tab, target: NodeId, escape: boo
     // registry `Weak` — so no `Ref`/`RefMut` may be alive across
     // either eval.
     crate::tab::InstalledDocument::assert_no_live_borrow(doc);
+    // w87 host-dispatch guard (see `Vm::begin_host_dispatch`):
+    // a `cancel` listener's re-show enqueues its `open` toggle
+    // here, and it must not flush until the host operation's
+    // `close` has fired — the guard spans the dispatch and the
+    // pump below. (`dispatch_host_event` guards its own evals
+    // too; this covers the pump's timer tasks.)
+    let _guard = HostDispatchGuard::enter(std::ptr::addr_of_mut!(page_vm.vm));
     let outcome = if escape {
         page_vm
             .vm_mut()
@@ -2242,6 +2289,111 @@ fn dispatch_cancel_shaped(tab: &mut crate::tab::Tab, target: NodeId, escape: boo
     prevented
 }
 
+/// RAII guard for `Vm::host_dispatch_depth` (w87fix round 3):
+/// increments on entry, decrements on drop — including during a panic
+/// unwind — so a mid-dispatch panic cannot leak the depth permanently
+/// and suppress every later toggle flush for the rest of the realm's
+/// life. Holds a raw `*mut Vm` because the guarded code reborrows the
+/// page VM (dispatches, pumps) while the guard lives, which a
+/// `&mut Vm` guard could not do.
+///
+/// What the code actually does (w87fix round 4, correcting the
+/// round-3 docs): the pointer itself IS derived without an
+/// intermediate `&mut Vm` at the call sites —
+/// `std::ptr::addr_of_mut!(page_vm.vm)` takes the address of the
+/// field, forming no `&mut Vm` — and that part of the old claim was
+/// true. But the old claim that "the counter is incremented and
+/// decremented through the raw pointer" was false: `enter` increments
+/// by calling `(*vm).begin_host_dispatch()`, which forms a temporary
+/// `&mut Vm` (the method receiver) from the raw pointer, and
+/// [`Drop::drop`] decrements the same way, by calling
+/// `(*self.vm).end_host_dispatch_saturating()`, which also forms a
+/// temporary `&mut Vm`.
+///
+/// The invariant that makes that sound is strict sequencing, not
+/// the absence of a `&mut`. At each call site there is exactly one
+/// exclusive borrow chain for the page VM (the `&mut` page/tab the
+/// field is reached through), and every access while a guard lives
+/// is either a reborrow of that chain — the guarded code's
+/// dispatches and pumps, each short-lived and finished before the
+/// next begins — or the guard's own access. The temporary `&mut`
+/// formed in `enter` is used for exactly the increment and
+/// discarded before `enter` returns, so before any guarded code
+/// runs; the temporary `&mut` formed in `Drop` is created only
+/// after the last guarded-code use has returned, is used for
+/// exactly the one decrement, and is discarded before the caller's
+/// borrow is used again. At no instant are two live `&mut` paths
+/// used to touch the `Vm`, and neither temporary is ever used after
+/// the caller's borrow resumes. Do not introduce a second,
+/// independent `&mut Vm` to the same `Vm` while a guard lives
+/// (e.g. a `vm_mut()` handle used interleaved with the guarded
+/// code), and do not use the caller's borrow inside the guard's
+/// `Drop`. Nested guards share the counter and drop LIFO, so the
+/// same sequencing holds per guard. `Vm` is single-threaded
+/// (`!Send`, holds `Rc`s), so no other thread touches the counter
+/// concurrently.
+///
+/// The guard must not outlive the stack frame that created it. That is
+/// a call-site convention: the `'a` lifetime (via the
+/// `PhantomData<&'a mut Vm>` field) only marks the guard as if it
+/// held a `&mut Vm`, for variance and auto-trait purposes — no
+/// borrow is actually passed in, so it does not statically tie the
+/// guard to the caller's borrow. The `Vm` must neither move nor drop
+/// while the guard lives. The type does not stop `mem::forget` from
+/// leaking a guard, so callers must still treat it as frame-scoped.
+/// Nested guards share the counter (an outer host guard with an
+/// inner host guard on the same `Vm` is routine), and
+/// `flush_pending_toggles` reads it while guards live; the invariant
+/// is that every guard decrements exactly once on drop and nesting
+/// is LIFO-balanced. The only unsafe operations are the counter
+/// increment in `enter` and the decrement in [`Drop::drop`],
+/// covered by that invariant. The `bowser_js` twin is `VmDepthGuard`
+/// (same shape, `pub(crate)` there, so this crate carries its own).
+#[must_use]
+struct HostDispatchGuard<'a> {
+    vm: *mut bowser_js::Vm,
+    _marker: std::marker::PhantomData<&'a mut bowser_js::Vm>,
+}
+
+impl HostDispatchGuard<'_> {
+    fn enter<'a>(vm: *mut bowser_js::Vm) -> HostDispatchGuard<'a> {
+        // SAFETY: `vm` points at a live `Vm` for the guard's life
+        // (see the struct docs). The increment calls
+        // `begin_host_dispatch` through the raw pointer, which
+        // forms a short-lived `&mut Vm` for exactly that call;
+        // it is discarded before `enter` returns, so before any
+        // guarded code runs (see the struct docs).
+        unsafe {
+            (*vm).begin_host_dispatch();
+        }
+        HostDispatchGuard {
+            vm,
+            _marker: std::marker::PhantomData,
+        }
+    }
+}
+
+impl Drop for HostDispatchGuard<'_> {
+    fn drop(&mut self) {
+        // SAFETY: the `Vm` outlives the guard (see the struct docs).
+        // Every guard decrements exactly once and nesting is
+        // LIFO-balanced, so this restores the counter even when
+        // nested guards share it. The decrement calls
+        // `end_host_dispatch_saturating` through the raw pointer,
+        // which forms a short-lived `&mut Vm` for exactly that
+        // call: it is created only after the last guarded-code use
+        // has returned and discarded before the caller's borrow is
+        // used again (see the struct docs). The decrement is
+        // saturating and assert-free on purpose: a panic here during
+        // unwind would abort, so this uses
+        // `end_host_dispatch_saturating` rather than the asserting
+        // `end_host_dispatch` (which manual callers keep using).
+        unsafe {
+            (*self.vm).end_host_dispatch_saturating();
+        }
+    }
+}
+
 impl crate::window::JsDispatch for PageEventDispatch {
     fn dispatch_click(&mut self, tab: &mut crate::tab::Tab, target: NodeId) -> bool {
         // Read the inline source before borrowing the VM: both live on
@@ -2261,6 +2413,11 @@ impl crate::window::JsDispatch for PageEventDispatch {
         // VM while `doc` is held, so no `Ref`/`RefMut` may be alive across
         // it.
         crate::tab::InstalledDocument::assert_no_live_borrow(doc);
+        // w87 host-dispatch guard (see `Vm::begin_host_dispatch`):
+        // a toggle a listener enqueues must not flush until this
+        // operation's later steps have run — the guard spans the
+        // dispatch and the pump below, and lifts before the sync.
+        let _guard = HostDispatchGuard::enter(std::ptr::addr_of_mut!(page_vm.vm));
         // One eval: the inline handler runs with the dispatched event
         // object bound as `event`, then the same object goes to the
         // listeners via `dispatchEvent`.
@@ -2295,6 +2452,8 @@ impl crate::window::JsDispatch for PageEventDispatch {
         crate::tab::InstalledDocument::assert_no_live_borrow(installed.document());
         let page_vm = installed.page_vm_mut();
         let mut prevented = false;
+        // w87 host-dispatch guard (see `Vm::begin_host_dispatch`).
+        let _guard = HostDispatchGuard::enter(std::ptr::addr_of_mut!(page_vm.vm));
         // One eval: the inline handler runs with the dispatched event
         // object bound as `event`, then the same object goes to the
         // document-level listeners via `dispatchEvent`.
@@ -2330,6 +2489,8 @@ impl crate::window::JsDispatch for PageEventDispatch {
         // be alive across the dispatch.
         crate::tab::InstalledDocument::assert_no_live_borrow(installed.document());
         let page_vm = installed.page_vm_mut();
+        // w87 host-dispatch guard (see `Vm::begin_host_dispatch`).
+        let _guard = HostDispatchGuard::enter(std::ptr::addr_of_mut!(page_vm.vm));
         // Trusted, bubbling, cancelable `wheel` event; returns true iff a
         // non-passive listener prevented the default (already fail-closed
         // when the realm is gone).
@@ -2350,6 +2511,8 @@ impl crate::window::JsDispatch for PageEventDispatch {
         // Disjoint field borrow: the DOM handle and the realm, with no
         // `Rc` clone — the tab keeps the sole strong owner.
         let (doc, page_vm) = installed.document_and_vm_mut();
+        // w87 host-dispatch guard (see `Vm::begin_host_dispatch`).
+        let _guard = HostDispatchGuard::enter(std::ptr::addr_of_mut!(page_vm.vm));
         self.dispatch_scroll_listeners(doc, page_vm, target, "scroll");
         page_vm.pump();
         tab.sync_dirty_flags();
@@ -2362,6 +2525,8 @@ impl crate::window::JsDispatch for PageEventDispatch {
         // Disjoint field borrow: the DOM handle and the realm, with no
         // `Rc` clone — the tab keeps the sole strong owner.
         let (doc, page_vm) = installed.document_and_vm_mut();
+        // w87 host-dispatch guard (see `Vm::begin_host_dispatch`).
+        let _guard = HostDispatchGuard::enter(std::ptr::addr_of_mut!(page_vm.vm));
         self.dispatch_scroll_listeners(doc, page_vm, target, "scrollend");
         page_vm.pump();
         tab.sync_dirty_flags();
@@ -2385,6 +2550,8 @@ impl crate::window::JsDispatch for PageEventDispatch {
         let root = installed.document().borrow().root();
         crate::tab::InstalledDocument::assert_no_live_borrow(installed.document());
         let page_vm = installed.page_vm_mut();
+        // w87 host-dispatch guard (see `Vm::begin_host_dispatch`).
+        let _guard = HostDispatchGuard::enter(std::ptr::addr_of_mut!(page_vm.vm));
         // A real `SnapEvent` wrapper built in Rust (the plain-object
         // eval the `scroll` dispatch uses cannot carry node payloads):
         // element containers dispatch at the element (no bubbling);
@@ -2463,6 +2630,14 @@ impl crate::window::JsDispatch for PageEventDispatch {
         };
         let (doc, page_vm) = installed.document_and_vm_mut();
         crate::tab::InstalledDocument::assert_no_live_borrow(doc);
+        // w87 host-dispatch guard (see `Vm::begin_host_dispatch`):
+        // a `close` listener's re-show enqueues its `open` toggle
+        // here, and it must fire after this `close`, at the
+        // host-operation-end flush — not at the pump below
+        // (that pump runs inside the guard, so its flush
+        // no-ops; the window flushes explicitly at the end
+        // of Escape / light-dismiss / invoker click).
+        let _guard = HostDispatchGuard::enter(std::ptr::addr_of_mut!(page_vm.vm));
         let outcome = page_vm
             .vm_mut()
             .dispatch_close_event(target, inline.as_deref());
@@ -2503,6 +2678,8 @@ impl crate::window::JsDispatch for PageEventDispatch {
         };
         let (doc, page_vm) = installed.document_and_vm_mut();
         crate::tab::InstalledDocument::assert_no_live_borrow(doc);
+        // w87 host-dispatch guard (see `Vm::begin_host_dispatch`).
+        let _guard = HostDispatchGuard::enter(std::ptr::addr_of_mut!(page_vm.vm));
         let outcome = page_vm
             .vm_mut()
             .dispatch_submit_event(form, inline.as_deref());
@@ -2531,29 +2708,48 @@ impl crate::window::JsDispatch for PageEventDispatch {
         // production call sites fire it only after a popover
         // visibility change).
         //
-        // Known divergence (w86fix S1, Chrome 155 probe S2): Chrome
+        // Deferred delivery (w87, Chrome 155 probe S2): Chrome
         // drops the `open` toggle for a popover opened then hidden
         // within one synchronous task (task-level coalescing — only
-        // the net `closed` fires). Bowser fires toggles synchronously
-        // at the state change, so it fires both. Coalescing would
-        // need a deferred-toggle queue flushed at task/pump boundaries
-        // across every emission site (show/hide, dialog close,
-        // Escape, light-dismiss, invoker, testdriver), and would
-        // invalidate the synchronous-order pins (`cancel,close,toggle`
-        // asserted in one log) — it does not fit the existing
-        // dispatch path, so it is documented here, not implemented.
-        // The STATES are correct throughout; only a same-task
-        // show+hide overstates the `open` count in the log.
-        // Order divergence, same cause (w86fix, Chrome
-        // S-P1-cancel-reshow raw data): a `cancel`-listener
-        // re-show's `toggle open` fires AFTER the dialog's
-        // `close` in Chrome (`cancel, cancel-reshow-after,
-        // click, close, toggle:open`), while Bowser fires it
-        // synchronously at the re-show, before `close`. The
-        // testdriver P1 cancel-reshow half therefore asserts
-        // state-only (auto stays open, no `toggle closed`),
-        // not order. A toggle queue would fix both halves of
-        // this note; it is deferred to a later wave.
+        // the net `closed` fires), so this hook ENQUEUES instead of
+        // delivering: `Vm::dispatch_toggle_event` appends to the
+        // realm's pending-toggle queue (net-transition coalescing
+        // per target, w87fix M2: `oldState` is the task-start
+        // state, `newState` the final state), and
+        // the event fires at the next task boundary — the end of
+        // an outermost script, the end of an event-loop task
+        // (`PageVm::pump`'s trailing flush), or an explicit
+        // host-operation-end flush
+        // (`WindowApp::flush_pending_toggles` at the end of
+        // Escape / light-dismiss / invoker click, or
+        // `JsDispatch::flush_pending_toggles`) — through
+        // `Vm::flush_pending_toggles` (see `PageVm::pump` and
+        // `JsDispatch::flush_pending_toggles`). There is no
+        // operation-end pump that flushes: every
+        // `PageEventDispatch` method pumps INSIDE its
+        // `begin`/`end_host_dispatch` guard, so that pump's
+        // flush no-ops at depth > 0 and no flush follows
+        // `end_host_dispatch`. Both emission
+        // paths share that queue: the JS-API natives
+        // (`showPopover` / `hidePopover` / `togglePopover`, dialog
+        // show/close) enqueue through `dispatch_popover_toggle`,
+        // and every host call site here enqueues through this
+        // method. The STATES are correct throughout; only the
+        // delivery time moved.
+        // Order, same mechanism (w87, Chrome S-P1-cancel-reshow
+        // raw data): a `cancel`-listener re-show's `toggle open`
+        // fires AFTER the dialog's `close` in Chrome (`cancel,
+        // cancel-reshow-after, click, close, toggle:open`). The
+        // re-show enqueues during the `cancel` dispatch (which
+        // suppresses the flush — see `begin_host_dispatch`), the
+        // `close` fires synchronously in the finish half, and the
+        // queued `open` fires at the host-operation-end flush,
+        // after `close`. The testdriver P1 cancel-reshow half now pins
+        // that order. Consequences callers must know: the toggle
+        // listener has NOT run when this method returns (assert
+        // after a flush, not after the call), and an inline
+        // `ontoggle` throw surfaces in the script report at flush
+        // time, not here.
         //
         // Direction without a trait argument: the `JsDispatch`
         // trait carries no old/new state, but every production call
@@ -2612,20 +2808,35 @@ impl crate::window::JsDispatch for PageEventDispatch {
         } else {
             ("open", "closed")
         };
-        let outcome =
-            page_vm
-                .vm_mut()
-                .dispatch_toggle_event(target, old_state, new_state, inline.as_deref());
-        if let Some(e) = outcome.inline_error {
-            page_vm.record_error(ScriptError::from_vm_error(target, None, &e));
-        }
-        // See `dispatch_cancel`: a mid-flight core failure is
-        // recorded exactly like an inline throw.
-        if let Some(e) = outcome.dispatch_error {
-            page_vm.record_error(ScriptError::from_vm_error(target, None, &e));
-        }
+        // Enqueue only: the outcome is the default (nothing ran
+        // yet, so nothing could have been prevented or thrown —
+        // the flush reports those). The host-dispatch guard spans
+        // the enqueue and the pump below, so a timer task this
+        // pump runs cannot flush a toggle enqueued earlier in the
+        // same host operation ahead of that operation's own
+        // `close` (see `Vm::begin_host_dispatch`).
+        let _guard = HostDispatchGuard::enter(std::ptr::addr_of_mut!(page_vm.vm));
+        page_vm
+            .vm_mut()
+            .dispatch_toggle_event(target, old_state, new_state, inline.as_deref());
         page_vm.pump();
         tab.sync_dirty_flags();
+    }
+
+    fn flush_pending_toggles(&mut self, tab: &mut crate::tab::Tab) {
+        // Explicit task-boundary flush (w87): the queue
+        // normally drains at a task boundary — outermost
+        // script end, `PageVm::pump`'s trailing flush, or
+        // the window's explicit host-operation-end flush —
+        // but a caller whose operation ends without one
+        // reaching it, and every test that asserts on a
+        // queued toggle, flushes here instead.
+        // Fail-closed with no installed document, like every
+        // other host dispatch.
+        let Some(installed) = tab.installed_mut() else {
+            return;
+        };
+        installed.page_vm_mut().flush_pending_toggles();
     }
 }
 
@@ -4044,6 +4255,9 @@ mod tests {
 
         let mut dispatch = PageEventDispatch::new();
         dispatch.dispatch_toggle(&mut tab, pop);
+        // w87: the toggle is queued, not delivered — flush at the
+        // task boundary before asserting on it.
+        dispatch.flush_pending_toggles(&mut tab);
 
         let vm = tab.page_vm_mut().expect("page vm");
         assert!(js_is_true(vm, "ran"), "toggle listener ran on show");
@@ -4108,6 +4322,9 @@ mod tests {
 
         let mut dispatch = PageEventDispatch::new();
         dispatch.dispatch_toggle(&mut tab, pop);
+        // w87: the toggle is queued, not delivered — flush at the
+        // task boundary before asserting on it.
+        dispatch.flush_pending_toggles(&mut tab);
 
         let vm = tab.page_vm_mut().expect("page vm");
         assert!(js_is_true(vm, "ran"), "toggle listener ran on hide");
@@ -4134,6 +4351,342 @@ mod tests {
         assert!(
             matches!(new, Value::Str(ref s) if s.as_wtf8().to_utf8_lossy() == "closed"),
             "hide: newState closed, got: {new:?}"
+        );
+    }
+
+    #[test]
+    fn page_event_dispatch_toggle_js_show_and_hide_run_inline_ontoggle() {
+        // w87fix r3: the JS-API path never carried an `ontoggle`
+        // snapshot, so `el.showPopover()` / `el.hidePopover()` never
+        // ran the inline handler — the flush reads the attribute at
+        // dispatch time, as Chrome does, so pure-JS transitions run
+        // it exactly like the host path.
+        let (mut tab, pop) = dispatch_tab(
+            "<html><body><div id=\"t\" popover=\"auto\" ontoggle=\"seenOld = event.oldState; seenNew = event.newState;\">hi</div></body></html>",
+        );
+        let _ = pop;
+        tab.page_vm_mut()
+            .expect("page vm")
+            .eval("ran = 0; document.getElementById('t').addEventListener('toggle', function(e) { ran++; gotOld = e.oldState; gotNew = e.newState; });")
+            .expect("register listener");
+
+        // Each eval is one task, so its end-of-script flush delivers
+        // the toggle before the eval returns.
+        tab.page_vm_mut()
+            .expect("page vm")
+            .eval("document.getElementById('t').showPopover();")
+            .expect("js show");
+        let vm = tab.page_vm_mut().expect("page vm");
+        assert_eq!(
+            vm.eval("ran").expect("read ran"),
+            Value::Int(1),
+            "toggle listener ran on js show"
+        );
+        let old = vm.eval("seenOld").expect("read seenOld");
+        let new = vm.eval("seenNew").expect("read seenNew");
+        assert!(
+            matches!(old, Value::Str(ref s) if s.as_wtf8().to_utf8_lossy() == "closed"),
+            "js show: inline oldState closed, got: {old:?}"
+        );
+        assert!(
+            matches!(new, Value::Str(ref s) if s.as_wtf8().to_utf8_lossy() == "open"),
+            "js show: inline newState open, got: {new:?}"
+        );
+
+        tab.page_vm_mut()
+            .expect("page vm")
+            .eval("document.getElementById('t').hidePopover();")
+            .expect("js hide");
+        let vm = tab.page_vm_mut().expect("page vm");
+        assert_eq!(
+            vm.eval("ran").expect("read ran"),
+            Value::Int(2),
+            "toggle listener ran on js hide"
+        );
+        let old = vm.eval("seenOld").expect("read seenOld");
+        let new = vm.eval("seenNew").expect("read seenNew");
+        assert!(
+            matches!(old, Value::Str(ref s) if s.as_wtf8().to_utf8_lossy() == "open"),
+            "js hide: inline oldState open, got: {old:?}"
+        );
+        assert!(
+            matches!(new, Value::Str(ref s) if s.as_wtf8().to_utf8_lossy() == "closed"),
+            "js hide: inline newState closed, got: {new:?}"
+        );
+    }
+
+    #[test]
+    fn page_event_dispatch_toggle_host_then_js_retransition_fires_once_with_current_ontoggle() {
+        // w87fix r3: a host-enqueued `ontoggle` snapshot was lost
+        // when a JS re-transition replaced the entry in the same
+        // task, and the flush used the stale snapshot even when the
+        // attribute had changed since. Host-enqueue a show toggle,
+        // then in one JS task change the attribute source AND hide:
+        // exactly one toggle fires (`closed` -> `closed`), running the
+        // CURRENT source, not the host snapshot. w87fix M2
+        // (net-transition coalescing): the host show enqueued
+        // `closed` -> `open` and the JS hide only advances the
+        // `newState` to `closed` — the `oldState` stays `closed`,
+        // the state at task start, so the one fired toggle reads
+        // `closed>closed`, not the pre-M2 `open>closed`.
+        use crate::window::JsDispatch;
+
+        let (mut tab, pop) = dispatch_tab(
+            "<html><body><div id=\"t\" popover=\"auto\" ontoggle=\"marker = 'old'; seenOld = event.oldState; seenNew = event.newState;\">hi</div></body></html>",
+        );
+        tab.installed_mut()
+            .expect("installed document")
+            .document()
+            .borrow_mut()
+            .show_popover(pop)
+            .expect("show popover");
+        tab.page_vm_mut()
+            .expect("page vm")
+            .eval("ran = 0; document.getElementById('t').addEventListener('toggle', function(e) { ran++; gotOld = e.oldState; gotNew = e.newState; });")
+            .expect("register listener");
+
+        // Host path enqueues the show toggle (with its snapshot) but
+        // does not deliver it — no flush follows the enqueue.
+        let mut dispatch = PageEventDispatch::new();
+        dispatch.dispatch_toggle(&mut tab, pop);
+
+        // One JS task: re-point the attribute, then hide. The hide
+        // replaces the queued entry's `newState` only (w87fix M2
+        // net-transition coalescing: `oldState` stays the
+        // task-start `closed`) and the task-end flush delivers it.
+        tab.page_vm_mut()
+            .expect("page vm")
+            .eval("document.getElementById('t').setAttribute('ontoggle', \"marker = 'new'; seenOld = event.oldState; seenNew = event.newState;\"); document.getElementById('t').hidePopover();")
+            .expect("js retransition");
+
+        let vm = tab.page_vm_mut().expect("page vm");
+        assert_eq!(
+            vm.eval("ran").expect("read ran"),
+            Value::Int(1),
+            "exactly one toggle fires for the host-then-js re-transition"
+        );
+        let marker = vm.eval("marker").expect("read marker");
+        assert!(
+            matches!(marker, Value::Str(ref s) if s.as_wtf8().to_utf8_lossy() == "new"),
+            "flush-time ontoggle read runs the current source, got: {marker:?}"
+        );
+        let old = vm.eval("seenOld").expect("read seenOld");
+        let new = vm.eval("seenNew").expect("read seenNew");
+        assert!(
+            matches!(old, Value::Str(ref s) if s.as_wtf8().to_utf8_lossy() == "closed"),
+            "re-hide: oldState closed (task-start state under net-transition coalescing), got: {old:?}"
+        );
+        assert!(
+            matches!(new, Value::Str(ref s) if s.as_wtf8().to_utf8_lossy() == "closed"),
+            "re-hide: newState closed, got: {new:?}"
+        );
+        let got_old = vm.eval("gotOld").expect("read gotOld");
+        let got_new = vm.eval("gotNew").expect("read gotNew");
+        assert!(
+            matches!(got_old, Value::Str(ref s) if s.as_wtf8().to_utf8_lossy() == "closed"),
+            "listener re-hide: oldState closed (task-start state under net-transition coalescing), got: {got_old:?}"
+        );
+        assert!(
+            matches!(got_new, Value::Str(ref s) if s.as_wtf8().to_utf8_lossy() == "closed"),
+            "listener re-hide: newState closed, got: {got_new:?}"
+        );
+    }
+
+    #[test]
+    fn w87_same_task_show_hide_fires_only_closed_toggle() {
+        // w87 (Chrome 155 probe S2): a popover opened then hidden
+        // within one synchronous task fires only the net `closed`
+        // toggle — the `open` is dropped, not merely delayed.
+        // w87fix M2 (net-transition coalescing): the show enqueues
+        // `closed` -> `open` and the hide only advances the
+        // `newState` to `closed`, so the one fired toggle reads
+        // `closed>closed` — `oldState` is the state at task start
+        // (closed), not the intermediate open. S2 pins the count
+        // (1) and the `newState` (`closed`) only; the `oldState`
+        // choice is Chrome-unprobed. A net-zero entry still fires
+        // (it is not dropped): S2's "only the net `closed` fires"
+        // is one event, and dropping it would fire none.
+        let (mut tab, pop) =
+            dispatch_tab("<html><body><div id=\"t\" popover=\"auto\">hi</div></body></html>");
+        tab.page_vm_mut()
+            .expect("page vm")
+            .eval("tLog = ''; document.getElementById('t').addEventListener('toggle', function(e) { tLog += e.oldState + '>' + e.newState + ';'; });")
+            .expect("register listener");
+        // One synchronous task: show, then hide, before any
+        // boundary.
+        tab.page_vm_mut()
+            .expect("page vm")
+            .eval("document.getElementById('t').showPopover(); document.getElementById('t').hidePopover();")
+            .expect("show then hide in one task");
+        let vm = tab.page_vm_mut().expect("page vm");
+        let log = vm.eval("tLog").expect("read tLog");
+        assert!(
+            matches!(log, Value::Str(ref s) if s.as_wtf8().to_utf8_lossy() == "closed>closed;"),
+            "same-task show+hide fires only the net closed toggle (oldState = task-start closed), got: {log:?}"
+        );
+        assert!(
+            !tab.document_ref().expect("document").is_popover_open(pop),
+            "the popover ends hidden"
+        );
+    }
+
+    #[test]
+    fn w87_reshow_toggle_fires_after_close() {
+        // w87 (Chrome S-P1-cancel-reshow raw data: `cancel,
+        // cancel-reshow-after, click, close, toggle:open`): a
+        // `cancel`-listener re-show's `toggle open` fires AFTER the
+        // dialog's `close`. The light-dismiss begin half hid the
+        // popover (state-only) before the `cancel` ran; the listener
+        // re-shows it, which only enqueues — the `open` must still
+        // be pending after `cancel` AND after `close`, and fire
+        // only at the flush.
+        use crate::window::JsDispatch;
+
+        let (mut tab, dialog) = dispatch_tab(
+            "<html><body><dialog id=\"t\">x</dialog><div id=\"p\" popover=\"auto\">hi</div></body></html>",
+        );
+        let pop = tab
+            .document_ref()
+            .expect("document")
+            .get_element_by_id("p")
+            .expect("popover");
+        // Dialog open; popover shown, then hidden state-only (the
+        // light-dismiss begin half's shape).
+        tab.installed_mut()
+            .expect("installed")
+            .document()
+            .borrow_mut()
+            .show_dialog(dialog)
+            .expect("show dialog");
+        tab.installed_mut()
+            .expect("installed")
+            .document()
+            .borrow_mut()
+            .show_popover(pop)
+            .expect("show popover");
+        tab.installed_mut()
+            .expect("installed")
+            .document()
+            .borrow_mut()
+            .hide_popover(pop)
+            .expect("hide popover");
+        tab.page_vm_mut()
+            .expect("page vm")
+            .eval("window.__log = []; \
+                 document.getElementById('p').addEventListener('toggle', function(e) { __log.push('toggle:' + e.newState); }); \
+                 document.getElementById('t').addEventListener('cancel', function() { __log.push('cancel'); document.getElementById('p').showPopover(); }); \
+                 document.getElementById('t').addEventListener('close', function() { __log.push('close'); });")
+            .expect("register listeners");
+
+        let mut dispatch = PageEventDispatch::new();
+        assert!(
+            !dispatch.dispatch_cancel(&mut tab, dialog),
+            "unprevented cancel"
+        );
+        // Queued, not fired: the re-show's open toggle is pending.
+        assert_eq!(
+            tab.page_vm_mut()
+                .expect("page vm")
+                .vm_mut()
+                .pending_toggle_count(),
+            1,
+            "re-show toggle is queued after cancel, not fired"
+        );
+        dispatch.dispatch_close(&mut tab, dialog);
+        // Still queued after close: the close did not flush it early.
+        assert_eq!(
+            tab.page_vm_mut()
+                .expect("page vm")
+                .vm_mut()
+                .pending_toggle_count(),
+            1,
+            "re-show toggle is still queued after close"
+        );
+        dispatch.flush_pending_toggles(&mut tab);
+        assert_eq!(
+            tab.page_vm_mut()
+                .expect("page vm")
+                .vm_mut()
+                .pending_toggle_count(),
+            0,
+            "flush drains the queue"
+        );
+        // The log read itself would flush, so read only now.
+        let vm = tab.page_vm_mut().expect("page vm");
+        let log = vm.eval("window.__log.join(',')").expect("read log");
+        assert!(
+            matches!(log, Value::Str(ref s) if s.as_wtf8().to_utf8_lossy() == "cancel,close,toggle:open"),
+            "re-show toggle fires after close, got: {log:?}"
+        );
+        assert!(
+            tab.document_ref().expect("document").is_popover_open(pop),
+            "the re-shown popover stays open"
+        );
+    }
+
+    #[test]
+    fn w87_toggle_flush_happens_at_task_boundary_not_earlier() {
+        // w87: a host-enqueued toggle has NOT fired when
+        // `dispatch_toggle` returns — it fires at the next task
+        // boundary. A script read of the log is itself such a
+        // boundary (the read runs first, the flush follows), so the
+        // first read still sees the empty log and only the second
+        // read sees the toggle. Separate tasks do NOT coalesce: a
+        // show in one task and a hide in the next fire both toggles.
+        use crate::window::JsDispatch;
+
+        let (mut tab, pop) =
+            dispatch_tab("<html><body><div id=\"t\" popover=\"auto\">hi</div></body></html>");
+        tab.installed_mut()
+            .expect("installed")
+            .document()
+            .borrow_mut()
+            .show_popover(pop)
+            .expect("show popover");
+        tab.page_vm_mut()
+            .expect("page vm")
+            .eval("tLog = ''; document.getElementById('t').addEventListener('toggle', function(e) { tLog += e.oldState + '>' + e.newState + ';'; });")
+            .expect("register listener");
+        let mut dispatch = PageEventDispatch::new();
+        dispatch.dispatch_toggle(&mut tab, pop);
+        // Not yet fired: one toggle is pending.
+        assert_eq!(
+            tab.page_vm_mut()
+                .expect("page vm")
+                .vm_mut()
+                .pending_toggle_count(),
+            1,
+            "toggle is queued after dispatch, not fired"
+        );
+        // The read runs BEFORE its own task-boundary flush, so it
+        // still sees the empty log...
+        let vm = tab.page_vm_mut().expect("page vm");
+        let first = vm.eval("tLog").expect("first read");
+        assert!(
+            matches!(first, Value::Str(ref s) if s.as_wtf8().is_empty()),
+            "no toggle fired before the boundary, got: {first:?}"
+        );
+        // ...and the second read sees the toggle the first read's
+        // boundary flushed.
+        let second = vm.eval("tLog").expect("second read");
+        assert!(
+            matches!(second, Value::Str(ref s) if s.as_wtf8().to_utf8_lossy() == "closed>open;"),
+            "toggle fired at the boundary, got: {second:?}"
+        );
+        // Separate tasks do not coalesce: hide in its own task fires
+        // its own toggle.
+        tab.page_vm_mut()
+            .expect("page vm")
+            .eval("document.getElementById('t').hidePopover();")
+            .expect("hide in its own task");
+        let third = tab
+            .page_vm_mut()
+            .expect("page vm")
+            .eval("tLog")
+            .expect("third read");
+        assert!(
+            matches!(third, Value::Str(ref s) if s.as_wtf8().to_utf8_lossy() == "closed>open;open>closed;"),
+            "separate-task hide fires its own toggle, got: {third:?}"
         );
     }
 
@@ -4243,6 +4796,9 @@ mod tests {
             .expect("register listener");
         let mut dispatch = PageEventDispatch::new();
         dispatch.dispatch_toggle(&mut tab, pop);
+        // w87: the toggle is queued, not delivered — flush at the
+        // task boundary before asserting on it.
+        dispatch.flush_pending_toggles(&mut tab);
         let vm = tab.page_vm_mut().expect("page vm");
         assert!(js_is_true(vm, "ran"), "toggle listener ran on retained");
         assert!(
@@ -4396,6 +4952,9 @@ mod tests {
         );
         dispatch.dispatch_close(&mut tab, dialog);
         dispatch.dispatch_toggle(&mut tab, pop);
+        // w87: the toggle is queued, not delivered — flush at the
+        // task boundary before asserting on it.
+        dispatch.flush_pending_toggles(&mut tab);
 
         let vm = tab.page_vm_mut().expect("page vm");
         for name in [
@@ -4574,6 +5133,9 @@ mod tests {
         dispatch.dispatch_cancel(&mut tab, dialog);
         dispatch.dispatch_close(&mut tab, dialog);
         dispatch.dispatch_toggle(&mut tab, pop);
+        // w87: the toggle is queued, not delivered — flush at the
+        // task boundary before asserting on it.
+        dispatch.flush_pending_toggles(&mut tab);
 
         let vm = tab.page_vm_mut().expect("page vm");
         assert!(

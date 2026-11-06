@@ -2148,6 +2148,37 @@ struct HostEventFrame {
     inline_prevented: bool,
 }
 
+/// Maximum drain rounds per [`Vm::flush_pending_toggles`] call:
+/// a page that ping-pongs show/hide from its own toggle listeners
+/// re-enqueues on every round, so the drain caps instead of
+/// spinning — leftovers stay queued for the next boundary.
+const MAX_TOGGLE_FLUSH_ROUNDS: usize = 64;
+
+/// One deferred popover `toggle` event (w87): the state change
+/// whose event fires at the next task boundary, not at the change
+/// itself. Chrome 155 probe S2 drops the `open` toggle for a
+/// popover opened then hidden within one synchronous task — only
+/// the net `closed` fires — so same-task transitions coalesce
+/// net-transition per target (w87fix M2: `old_state` is the
+/// task-start state, `new_state` the final state; see
+/// [`queue_popover_toggle`]).
+#[derive(Debug, Clone)]
+pub(crate) struct PendingToggle {
+    /// The popover whose visibility changed.
+    target: NodeId,
+    /// State before the change (`"open"` / `"closed"`).
+    old_state: &'static str,
+    /// State after the change (`"open"` / `"closed"`).
+    new_state: &'static str,
+    /// `ontoggle` source snapshot for host-path entries; `None`
+    /// for JS-API entries. The flush re-reads the attribute at
+    /// dispatch time (see [`Vm::flush_pending_toggles`]), so this
+    /// snapshot is only the fallback when the attribute is absent
+    /// — a direct caller-provided source, or the host path's
+    /// enqueue-time read.
+    inline: Option<String>,
+}
+
 pub struct WebApis {
     id: u32,
     /// In-flight host dialog/popover dispatch frames, innermost
@@ -2162,6 +2193,16 @@ pub struct WebApis {
     host_event_inline_armed: bool,
     /// Same gate for the core trampoline eval.
     host_event_core_armed: bool,
+    /// Deferred popover `toggle` events (w87): state changes whose
+    /// events have not fired yet, in enqueue order. Both emission
+    /// paths write here — the JS-API natives through
+    /// [`dispatch_popover_toggle`] and the host path through
+    /// [`Vm::dispatch_toggle_event`] — and
+    /// [`Vm::flush_pending_toggles`] drains it at task boundaries.
+    /// Unbounded only in the number of distinct popovers one task
+    /// touches; each entry is a few dozen bytes and the drain
+    /// empties it at every boundary.
+    pending_toggles: Vec<PendingToggle>,
     /// `document.readyState` lifecycle state. A `Cell` so the accessor
     /// getter reads it through a shared borrow (see
     /// [`n_ready_state_get`]).
@@ -2456,6 +2497,7 @@ impl WebApis {
             host_event_frames: Vec::new(),
             host_event_inline_armed: false,
             host_event_core_armed: false,
+            pending_toggles: Vec::new(),
         }
     }
 
@@ -3074,26 +3116,39 @@ fn adopt_shim_top_layer(ctx: ContextId, roots: &RefCell<ParseShimRoots>) {
     // snapshot, so only the top-layer promotion and the modal
     // flag need adopting here.
     for (arena, kind) in show_order {
-        // w86fix S5 note (NOT a fix — see below): a live member
-        // with no element-wrapper record skips the whole
-        // iteration, including the stored-duration adoption.
-        // No fix is possible here: the member's only identity
-        // is its parse arena, and adoption has no way to resolve
-        // an arena to a production node — the parse arena and the
-        // production Document arena are different numberings
-        // (elements-only vs all nodes), and no arena→node map
-        // survives to install (the layout hook's `node_arena`
-        // lives per rebuild and may never have run). The case
-        // is also unreachable through the shim show paths: both
-        // `parse_popover_apply` and `parse_dialog_show` run on
-        // wrappers, so a shown element always has a record by
-        // show time, and every removal path prunes the top layer
-        // alongside marking the record detached — so this skip
-        // is a defensive backstop for direct internal callers
-        // only, not a live divergence. Do not "fix" it by
-        // guessing a node from the arena index: a wrong node
-        // would promote and store a duration on an unrelated
-        // element.
+        // w86fix S5, VERIFIED unreachable (w87 close-out,
+        // no fix — the skip below stays a defensive
+        // backstop): a live member with no element-wrapper
+        // record cannot reach this loop. Proof by
+        // construction, checked against the code: the only
+        // inserters into the live sets are the two wrapper
+        // natives — `parse_popover_apply`
+        // (`top_layer_insert`) and `parse_dialog_show`
+        // (`dialog_open_insert`) — both reached only via
+        // `parse_el_host` on a wrapper minted by
+        // `wrap_parse_element`, which pushes a record for
+        // the element (or returns an already-recorded
+        // wrapper); and every removal path prunes the sets
+        // synchronously alongside marking the record
+        // detached — `removeChild` / `replaceChild` /
+        // `remove()` (`prune_shim_top_layer_subtree` +
+        // `prune_shim_dialog_subtree`), `textContent =` /
+        // `innerHTML =` (same prunes over the cleared
+        // children), `removeAttribute('popover')` /
+        // `removeAttribute('open')`
+        // (`drop_shim_top_layer_arena` /
+        // `drop_shim_dialog_arena`), and the show/close/hide
+        // natives themselves. A shown element therefore
+        // always has a non-detached record while it is live,
+        // and a removed one leaves the live sets before any
+        // adoption runs — so this skip never fires for a
+        // live member. Pinned by
+        // `w87_shim_modal_dialog_remove_then_reinsert_not_adopted_modal`
+        // (dialog leg; the popover leg is pinned by
+        // `parse_shim_popover_remove_then_reinsert_stays_closed`).
+        // Do not "fix" it by guessing a node from the arena
+        // index: a wrong node would promote and store a
+        // duration on an unrelated element.
         let Some(rec) = records
             .iter()
             .find(|rec| rec.el.arena_index() == arena && !rec.detached)
@@ -4019,12 +4074,64 @@ impl Vm {
     }
 
     /// Dispatch a trusted, non-bubbling, non-cancelable popover
-    /// `toggle` event at `target` carrying the `old_state` ->
+    /// Queue a `toggle` event at `target` carrying the `old_state` ->
     /// `new_state` pair through `ToggleEvent.prototype` (the same
     /// wrapper the JS-API `showPopover`/`hidePopover` path builds in
     /// [`dispatch_popover_toggle`]). `inline` is the target's
     /// `ontoggle` attribute source, if any.
+    ///
+    /// w87: this ENQUEUES; the event fires at the next task boundary
+    /// through [`Self::flush_pending_toggles`], never here. The
+    /// synchronous delivery used to fire a same-task show+hide's
+    /// `open` toggle, and a `cancel`-listener re-show's `open`
+    /// before the dialog's `close` — both contradicting the Chrome
+    /// 155 probe data (S2 / S-P1-cancel-reshow; see the S1 note on
+    /// the embedder's `PageEventDispatch::dispatch_toggle`).
+    /// The returned outcome is therefore the default (nothing has
+    /// run yet, so nothing could have been prevented or thrown);
+    /// the flush reports inline/dispatch errors through its own
+    /// return value for the embedder to record. A realm with no
+    /// installed web APIs fails closed exactly like
+    /// [`Self::dispatch_host_event`]'s gone-realm path: the toggle
+    /// is dropped and nothing runs.
     pub fn dispatch_toggle_event(
+        &mut self,
+        target: NodeId,
+        old_state: &str,
+        new_state: &str,
+        inline: Option<&str>,
+    ) -> HostEventOutcome {
+        let old_state: &'static str = if old_state == "open" {
+            "open"
+        } else {
+            "closed"
+        };
+        let new_state: &'static str = if new_state == "open" {
+            "open"
+        } else {
+            "closed"
+        };
+        if let Some(apis) = self.web_apis_rc() {
+            queue_popover_toggle(
+                &apis,
+                target,
+                old_state,
+                new_state,
+                inline.map(str::to_owned),
+            );
+        }
+        HostEventOutcome {
+            prevented: false,
+            inline_error: None,
+            dispatch_error: None,
+        }
+    }
+
+    /// Deliver one queued `toggle` immediately: the pre-w87 body of
+    /// [`Self::dispatch_toggle_event`], kept for the flush only.
+    /// Never call this from an emission site — it would reintroduce
+    /// the synchronous delivery the queue exists to defer.
+    fn dispatch_toggle_event_now(
         &mut self,
         target: NodeId,
         old_state: &str,
@@ -4037,6 +4144,177 @@ impl Vm {
             true,
             inline,
         )
+    }
+
+    /// The web-API context installed on this realm, if any: the
+    /// [`web_apis`](crate::bindings::web_apis) registry entry behind
+    /// the `CTX_KEY` global, shared with
+    /// [`Self::dispatch_host_event`].
+    fn web_apis_rc(&self) -> Option<Rc<RefCell<WebApis>>> {
+        match self.get_global(CTX_KEY) {
+            Some(Value::Int(id)) => web_apis(ContextId(id as u32)),
+            _ => None,
+        }
+    }
+
+    /// Mark the start of a host dispatch (a `PageEventDispatch`
+    /// method): while the depth is nonzero the deferred-toggle
+    /// flush is suppressed, so a toggle enqueued by an early step
+    /// of one host operation (a `cancel` listener's re-show) cannot
+    /// fire ahead of a later step of the same operation (the
+    /// dialog's `close`). Pair every call with
+    /// [`Self::end_host_dispatch`]; the counter (not a bool) keeps
+    /// nested dispatches — a listener re-entering the host path —
+    /// suppressed until the outermost one returns.
+    pub fn begin_host_dispatch(&mut self) {
+        self.host_dispatch_depth = self.host_dispatch_depth.saturating_add(1);
+    }
+
+    /// Mark the end of a host dispatch; see
+    /// [`Self::begin_host_dispatch`].
+    pub fn end_host_dispatch(&mut self) {
+        // w87fix r3: a double-`end` used to be silently masked by
+        // the saturating subtraction; fail loudly in debug builds
+        // instead. Manual callers only: the [`VmDepthGuard`](crate::vm::VmDepthGuard)
+        // decrements saturatingly on drop instead, so it can never
+        // trip this.
+        debug_assert!(
+            self.host_dispatch_depth > 0,
+            "end_host_dispatch without a matching begin_host_dispatch"
+        );
+        self.host_dispatch_depth = self.host_dispatch_depth.saturating_sub(1);
+    }
+
+    /// Current host-dispatch nesting depth (see
+    /// [`Self::begin_host_dispatch`]).
+    pub fn host_dispatch_depth(&self) -> u32 {
+        self.host_dispatch_depth
+    }
+
+    /// Number of popover `toggle` events currently queued for the
+    /// next task boundary (w87): one per distinct popover with a
+    /// pending transition, after net-transition coalescing. `0` when no
+    /// web APIs are installed. Test and embedder observability for
+    /// "queued, not yet fired" — a script read of the log would
+    /// itself flush the queue, so the count is the only way to
+    /// observe the pending state without delivering it.
+    pub fn pending_toggle_count(&self) -> usize {
+        self.web_apis_rc()
+            .map(|apis| apis.borrow().pending_toggles.len())
+            .unwrap_or(0)
+    }
+
+    /// The target's current `ontoggle` attribute source, read at
+    /// flush (dispatch) time (w87fix r3, as Chrome does): `None`
+    /// when there is no live document (the dispatch below then
+    /// fails closed); `Some(None)` when the element has no
+    /// `ontoggle` attribute right now.
+    fn ontoggle_source(&self, target: NodeId) -> Option<Option<String>> {
+        let apis = self.web_apis_rc()?;
+        let doc = apis.borrow().live_document().ok()?;
+        let borrowed = doc.borrow();
+        Some(
+            borrowed
+                .get_attribute(target, "ontoggle")
+                .map(str::to_owned),
+        )
+    }
+
+    /// Fire every queued popover `toggle` (w87), in enqueue order,
+    /// through [`Self::dispatch_toggle_event_now`].
+    ///
+    /// This is the task-boundary flush: the embedder calls it at
+    /// the end of a host operation (from its page pump and from its
+    /// explicit flush hook) and the engine calls it after each
+    /// event-loop task and each outermost script run. A no-op
+    /// while a host dispatch is mid-flight
+    /// ([`Self::begin_host_dispatch`]) — the operation's own later
+    /// steps still own the order — and while a flush is already
+    /// draining (a toggle listener's show/hide re-enqueues into
+    /// the fresh queue for the next round instead of recursing
+    /// into delivery).
+    ///
+    /// The `ontoggle` source is read at flush time, not carried
+    /// from enqueue time (w87fix r3): the attribute may have
+    /// changed since the transition was enqueued, and the JS-API
+    /// path never carried a snapshot at all — a path-dependent
+    /// snapshot never ran the inline handler for pure-JS
+    /// show/hide, and lost the host snapshot when a JS
+    /// re-transition replaced the entry in the same task. The
+    /// fresh read wins when the attribute is present; otherwise
+    /// the entry's stored snapshot runs (it is the
+    /// caller-provided source for [`Self::dispatch_toggle_event`]
+    /// — the host path's enqueue-time read — so a direct caller
+    /// without an attribute still delivers). Known deviation: an
+    /// attribute removed between enqueue and flush still runs its
+    /// stored snapshot instead of nothing.
+    ///
+    /// Delivery re-drains in rounds (a listener may enqueue more):
+    /// at most [`MAX_TOGGLE_FLUSH_ROUNDS`] rounds per call, so a
+    /// page that ping-pongs show/hide from its own toggle
+    /// listeners cannot spin the flush forever — the leftovers
+    /// stay queued for the next boundary instead of being dropped.
+    /// A leftover keeps its original `old_state` (w87fix M2):
+    /// replacements never rewrite it, so it is still the state
+    /// at the start of the task that enqueued it, not the state
+    /// the listener ping-ponged through.
+    /// The drain flag is held by a [`FlushingTogglesGuard`](crate::vm::FlushingTogglesGuard),
+    /// so a Rust panic inside a delivery still clears it on unwind
+    /// instead of leaving every later flush a no-op (w87fix M3).
+    /// Returns one `(target, error)` per inline throw or
+    /// mid-flight core failure, for the embedder to record exactly
+    /// like an immediate dispatch's errors; listener throws are
+    /// swallowed by the dispatch core, as before, and never appear
+    /// here.
+    pub fn flush_pending_toggles(&mut self) -> Vec<(NodeId, crate::vm::VmError)> {
+        if self.host_dispatch_depth() > 0 || self.flushing_toggles {
+            return Vec::new();
+        }
+        let Some(apis) = self.web_apis_rc() else {
+            return Vec::new();
+        };
+        // w87fix M3: the guard sets the flag and clears it on
+        // drop, including during a panic unwind. It drops at the
+        // end of this block, before the errors are returned and
+        // before the caller reuses `self`, so the clear is
+        // sequenced after the last delivery (see
+        // `FlushingTogglesGuard`). The early returns above run
+        // before the guard exists, so they never set the flag.
+        // The block is the tail expression (not bound to a `let`
+        // first) so clippy's `let_and_return` stays quiet.
+        {
+            let _guard = crate::vm::FlushingTogglesGuard::enter(self as *mut Vm);
+            let mut errors = Vec::new();
+            for _ in 0..MAX_TOGGLE_FLUSH_ROUNDS {
+                let batch: Vec<PendingToggle> =
+                    std::mem::take(&mut apis.borrow_mut().pending_toggles);
+                if batch.is_empty() {
+                    break;
+                }
+                for entry in batch {
+                    // w87fix r3: flush-time `ontoggle` read (see the
+                    // method docs above) — fresh attribute wins, stored
+                    // snapshot is the fallback.
+                    let inline = self
+                        .ontoggle_source(entry.target)
+                        .flatten()
+                        .or(entry.inline);
+                    let outcome = self.dispatch_toggle_event_now(
+                        entry.target,
+                        entry.old_state,
+                        entry.new_state,
+                        inline.as_deref(),
+                    );
+                    if let Some(e) = outcome.inline_error {
+                        errors.push((entry.target, e));
+                    }
+                    if let Some(e) = outcome.dispatch_error {
+                        errors.push((entry.target, e));
+                    }
+                }
+            }
+            errors
+        }
     }
 
     /// Dispatch a trusted, bubbling, cancelable form `submit`
@@ -4135,6 +4413,23 @@ impl Vm {
     /// inline handler already established, so it is never silently
     /// conflated with "not prevented".
     fn dispatch_host_event(
+        &mut self,
+        target: NodeId,
+        event: dom::Event,
+        use_toggle_proto: bool,
+        inline: Option<&str>,
+    ) -> HostEventOutcome {
+        // w87: the depth guard spans the whole dispatch, including
+        // its inline/core evals, so a toggle a listener enqueues
+        // cannot flush ahead of the host operation's later steps
+        // (see `begin_host_dispatch`). w87fix r3: RAII — a panic
+        // inside the dispatch used to leak the depth (the manual
+        // `end` below it never ran) and suppress every later flush.
+        let _guard = crate::vm::VmDepthGuard::enter_host(self as *mut Vm);
+        self.dispatch_host_event_inner(target, event, use_toggle_proto, inline)
+    }
+
+    fn dispatch_host_event_inner(
         &mut self,
         target: NodeId,
         event: dom::Event,
@@ -11985,10 +12280,7 @@ fn n_event_cancel_bubble_get(
         .borrow()
         .event_states
         .get(&handle)
-        .map(|s| {
-            s.stop_propagation
-                && (s.phase != PHASE_CAPTURING || s.stop_propagation_live)
-        })
+        .map(|s| s.stop_propagation && (s.phase != PHASE_CAPTURING || s.stop_propagation_live))
         .unwrap_or(false);
     Ok(Value::Bool(cancel))
 }
@@ -13297,6 +13589,64 @@ fn n_matches(heap: &mut Heap, this: Value, args: &[Value]) -> Result<Value, Nati
 /// Auto-closed victims fire first (`open` -> `closed`), then
 /// the newly shown target (`closed` -> `open`): the closes
 /// happened inside the show, before the promotion.
+/// Enqueue one deferred popover `toggle` (w87, Chrome 155 probe
+/// S2): the event fires at the next task boundary through
+/// [`Vm::flush_pending_toggles`], not here. Net-transition
+/// coalescing per target (w87fix M2): a later transition for the
+/// same popover keeps the FIRST entry's `old_state` — the state
+/// at task start — and takes only `new_state` from the latest
+/// transition, so the queued entry is the task's net transition:
+/// show-then-hide from closed leaves a single `closed` ->
+/// `closed`, and hide-then-show from open a single `open` ->
+/// `open`. The intermediate state was never observable to a
+/// toggle listener, since no listener runs between enqueue and
+/// flush. A net-zero entry (old == new) still fires one toggle:
+/// S2 pins exactly one `closed` toggle for show-then-hide from
+/// closed, and S-P1-cancel-reshow exactly one `open` toggle for
+/// hide-then-reshow from open — dropping net-zero entries would
+/// contradict both probed counts. The `oldState` of a net-zero
+/// entry is the task-start state; that choice is
+/// Chrome-unprobed (S2 pins count/newState only). Distinct
+/// targets keep FIFO order. `inline` is the host path's
+/// `ontoggle` snapshot; the JS-API path passes `None`. A `None`
+/// replacement preserves the existing snapshot (w87fix r3): a
+/// host-enqueued snapshot must not be lost when a JS
+/// re-transition replaces the entry in the same task — the flush
+/// re-reads the attribute anyway, but the snapshot is its fallback
+/// when the attribute is absent.
+fn queue_popover_toggle(
+    rc: &Rc<RefCell<WebApis>>,
+    target: NodeId,
+    old_state: &'static str,
+    new_state: &'static str,
+    inline: Option<String>,
+) {
+    let mut g = rc.borrow_mut();
+    if let Some(slot) = g
+        .pending_toggles
+        .iter_mut()
+        .find(|entry| entry.target == target)
+    {
+        // w87fix M2: keep the first entry's `old_state`
+        // (task-start state); only `new_state` advances.
+        // Taking `old_state` from the latest transition
+        // delivered `open>closed` for show-then-hide from
+        // closed and `closed>open` for hide-then-reshow
+        // from open — both mislabel the state at task start.
+        if let Some(inline) = inline {
+            slot.inline = Some(inline);
+        }
+        slot.new_state = new_state;
+    } else {
+        g.pending_toggles.push(PendingToggle {
+            target,
+            old_state,
+            new_state,
+            inline,
+        });
+    }
+}
+
 fn dispatch_popover_toggle(
     heap: &mut Heap,
     rc: &Rc<RefCell<WebApis>>,
@@ -13304,22 +13654,27 @@ fn dispatch_popover_toggle(
     old_state: &str,
     new_state: &str,
 ) -> Result<(), NativeError> {
-    let (event_val, handle) = {
-        let mut g = rc.borrow_mut();
-        let proto = g.gc_roots.borrow().toggle_event_proto;
-        wrap_toggle_event(
-            heap,
-            &mut g,
-            dom::Event::new("toggle", false, false).with_toggle_states(old_state, new_state),
-            true,
-            proto,
-        )
-        .map_err(|_| NativeError::OutOfMemory)?
+    // w87: enqueue, do not deliver. The JS-API show/hide/toggle
+    // natives call this mid-script (often from inside another
+    // event's listener); delivering here fired the `toggle`
+    // synchronously, so same-task show+hide logged both events
+    // and a `cancel`-listener re-show's `open` fired before the
+    // dialog's `close` — both contradicting the Chrome 155 probe
+    // data (S2 / S-P1-cancel-reshow). Every call site passes the
+    // `"open"` / `"closed"` literals, so the mapping below is
+    // exact, not a guess.
+    let _ = heap;
+    let old_state: &'static str = if old_state == "open" {
+        "open"
+    } else {
+        "closed"
     };
-    let base = heap.protect(event_val);
-    let r = run_event_dispatch(heap, rc, node, event_val, handle, false, false);
-    heap.release_temp(base);
-    r?;
+    let new_state: &'static str = if new_state == "open" {
+        "open"
+    } else {
+        "closed"
+    };
+    queue_popover_toggle(rc, node, old_state, new_state, None);
     Ok(())
 }
 
@@ -13607,6 +13962,51 @@ fn n_show_dialog_modal(
     Ok(Value::Undefined)
 }
 
+// JS-API dialog close-event audit (w87): every path that
+// closes a dialog, and whether it fires `close` —
+// * `close()` (below): fires `close` exactly when the
+//   dialog was open; a non-modal live popover member
+//   additionally fires its popover `toggle` after `close`
+//   (modal duals excluded, C10).
+// * `requestClose()`: `cancel` first (cancelable); an
+//   unprevented cancel closes exactly like `close()`,
+//   `close` event included; prevented: no close, no event.
+// * `method="dialog"` submit (window/testdriver
+//   `submit_activation_close`): closes directly, no
+//   `cancel`, exactly one `close`, `returnValue` = the
+//   submitter's value, plus the dual toggle when live.
+// * Escape (window `handle_escape` / testdriver
+//   `execute_escape`): `cancel` (NON-cancelable, Chrome
+//   155 P2) then `close`, newest-first per target, plus
+//   the dual toggle; a prevented `keydown` suppresses
+//   the whole gesture, so nothing fires.
+// * Light-dismiss (window/testdriver LD arms): `cancel`
+//   (cancelable) then `close`, plus the dual toggle;
+//   prevented `cancel` keeps the dialog open, no `close`.
+// * `hidePopover()` / `togglePopover(false)` on a
+//   non-modal dual: fires the popover `toggle` only —
+//   the dialog stays open, NO `close` (pinned by
+//   `w87_close_event_audit_hide_popover_on_dual_fires_toggle_not_close`);
+//   on a live modal dual both throw, no event.
+// * `open = false` / `removeAttribute('open')`: silent —
+//   no `close` (the spec warns toggling `open` directly
+//   skips the event; pinned by the `open = false` test).
+// * Element removal (`removeChild` / `remove()`): silent
+//   demote, `open` survives, NO `close` — PINNED
+//   CURRENT BEHAVIOR, Chrome-unprobed; see the probe
+//   question on
+//   `w87_close_event_audit_removal_fires_no_close`.
+// * `showPopover()` / `show()` / `showModal()` on another
+//   element auto-closing a non-modal dual victim: the
+//   victim's popover `toggle` fires, its dialog stays
+//   open, NO `close` (same shape as `hidePopover`).
+// * `command` / `commandfor` invoker closes: out of
+//   scope, deliberately unsupported (see window.rs).
+// * Parse-shim twins (`parse_dialog_close`,
+//   `requestClose`): same `close` rule as production;
+//   the shim fires no `toggle` events at all (pinned
+//   divergence), and its `open` setter is silent like
+//   production's.
 /// `HTMLDialogElement.close(returnValue)` (w81 phase 2): close
 /// the dialog, storing `returnValue` when an argument is given
 /// (an omitted argument — `undefined` — keeps the stored value),
@@ -15179,7 +15579,8 @@ fn dispatch_event_inner(
             }
             (event_val, event_handle)
         };
-        let prevented = run_event_dispatch(heap, &rc, target, event_val, event_handle, false, false)?;
+        let prevented =
+            run_event_dispatch(heap, &rc, target, event_val, event_handle, false, false)?;
         Ok(Value::Bool(!prevented))
     })
 }
@@ -15701,7 +16102,9 @@ fn n_host_event_inline(
     // reentrancy discipline in `run_event_dispatch`): the handler
     // may synchronously dispatch other events, which re-borrow.
     let invoker = rc.borrow().invoker.clone();
-    let result = invoker.borrow().call(heap, func, Value::Undefined, &[event_val]);
+    let result = invoker
+        .borrow()
+        .call(heap, func, Value::Undefined, &[event_val]);
     let inline_false = matches!(result, Ok(Value::Bool(false)));
     // Record the outcome back into the frame that is still on top
     // (a nested host dispatch pushed and popped its own frame
@@ -15770,11 +16173,7 @@ fn n_host_event_inline(
 /// set, and pops the frame on entry, so a second call — including
 /// one from inside a listener — finds nothing armed and runs
 /// nothing.
-fn n_host_event_core(
-    heap: &mut Heap,
-    this: Value,
-    _args: &[Value],
-) -> Result<Value, NativeError> {
+fn n_host_event_core(heap: &mut Heap, this: Value, _args: &[Value]) -> Result<Value, NativeError> {
     let rc = apis_rc(heap, this)?;
     let armed = {
         let mut g = rc.borrow_mut();
@@ -15796,7 +16195,15 @@ fn n_host_event_core(
     // the way the old stashed natives did, so a collection during
     // the plan build cannot sweep it).
     let base = heap.protect(frame.event_val);
-    let r = run_event_dispatch(heap, &rc, frame.target, frame.event_val, frame.event_handle, frame.stop_propagation, frame.stop_immediate);
+    let r = run_event_dispatch(
+        heap,
+        &rc,
+        frame.target,
+        frame.event_val,
+        frame.event_handle,
+        frame.stop_propagation,
+        frame.stop_immediate,
+    );
     heap.release_temp(base);
     Ok(Value::Bool(r?))
 }
@@ -34233,9 +34640,7 @@ fn parse_popover_apply(
             .map(|(other, other_el)| {
                 (
                     other,
-                    other_el.and_then(|other_el| {
-                        shim_exit_transition_duration(id, host, other_el)
-                    }),
+                    other_el.and_then(|other_el| shim_exit_transition_duration(id, host, other_el)),
                 )
             })
             .collect()
@@ -34277,13 +34682,9 @@ fn parse_popover_apply(
                     })
                     .map(|(other, _)| *other)
                     .collect();
-                for (other, _) in shim_auto_victims(
-                    host_ref,
-                    &roots,
-                    arena,
-                    &ancestors,
-                    retained_candidates,
-                ) {
+                for (other, _) in
+                    shim_auto_victims(host_ref, &roots, arena, &ancestors, retained_candidates)
+                {
                     roots.exit_retained.remove(&other);
                 }
             }
@@ -39883,6 +40284,72 @@ mod tests {
                 (c.func, target_id)
             })
             .collect()
+    }
+
+    // w87fix: deliver every queued popover `toggle` for a
+    // Fixture, the test-side task-boundary flush. The natives
+    // under test only ENQUEUE (w87 deferred delivery), and a
+    // Fixture has no `Vm` to call
+    // [`Vm::flush_pending_toggles`] on, so no task boundary
+    // ever drains the queue here: deliver each entry through
+    // the same heap-only core the pre-w87
+    // `dispatch_popover_toggle` used (`wrap_toggle_event` +
+    // `run_event_dispatch`), in rounds like the `Vm` flush (a
+    // listener may re-enqueue). JS-API entries never carry an
+    // inline `ontoggle` source (the native path passes `None`),
+    // so there is no inline handler to run.
+    fn flush_toggles(fx: &mut Fixture) {
+        for _ in 0..MAX_TOGGLE_FLUSH_ROUNDS {
+            let batch: Vec<PendingToggle> =
+                std::mem::take(&mut fx.apis.borrow_mut().pending_toggles);
+            if batch.is_empty() {
+                break;
+            }
+            // Wrap failures re-queue at the FRONT, in batch order,
+            // after the round: the batch was already taken, so the
+            // old `push` to the back jumped a failed entry behind
+            // entries listeners re-enqueued during this round and
+            // broke FIFO order for subsequent rounds. (w87fix r3:
+            // retain, do not drop — a persistently-unwrappable entry
+            // stays queued for the next flush; the round bound keeps
+            // it from spinning here.)
+            let mut failed: Vec<PendingToggle> = Vec::new();
+            for entry in batch {
+                let wrapped = {
+                    let mut g = fx.apis.borrow_mut();
+                    let proto = g.gc_roots.borrow().toggle_event_proto;
+                    wrap_toggle_event(
+                        &mut fx.heap,
+                        &mut g,
+                        dom::Event::new("toggle", false, false)
+                            .with_toggle_states(entry.old_state, entry.new_state),
+                        true,
+                        proto,
+                    )
+                };
+                let Ok((event_val, handle)) = wrapped else {
+                    failed.push(entry);
+                    continue;
+                };
+                let base = fx.heap.protect(event_val);
+                let _ = run_event_dispatch(
+                    &mut fx.heap,
+                    &fx.apis,
+                    entry.target,
+                    event_val,
+                    handle,
+                    false,
+                    false,
+                );
+                fx.heap.release_temp(base);
+            }
+            if !failed.is_empty() {
+                let mut g = fx.apis.borrow_mut();
+                let mut rest = std::mem::take(&mut g.pending_toggles);
+                g.pending_toggles = failed;
+                g.pending_toggles.append(&mut rest);
+            }
+        }
     }
 
     #[test]
@@ -47341,10 +47808,7 @@ mod tests {
                 .chain(std::iter::once(detached.arena_index()))
                 .collect();
             let states = shim_popover_states_for_arenas(host, &arenas);
-            for (id, arena) in ["a", "m", "n"]
-                .iter()
-                .zip(arenas.iter().take(3))
-            {
+            for (id, arena) in ["a", "m", "n"].iter().zip(arenas.iter().take(3)) {
                 let state = states.get(arena).copied().unwrap_or("");
                 self.results.borrow_mut().push(format!("{id}:{state}"));
             }
@@ -47353,10 +47817,7 @@ mod tests {
             // the walk missing it — not the attribute being
             // absent, which the old probe could not
             // distinguish.
-            let state = states
-                .get(&detached.arena_index())
-                .copied()
-                .unwrap_or("");
+            let state = states.get(&detached.arena_index()).copied().unwrap_or("");
             self.results.borrow_mut().push(format!("detached:{state}"));
         }
     }
@@ -47390,9 +47851,8 @@ mod tests {
             let pop = host.get_element_by_id("p").expect("p");
             let manual = host.get_element_by_id("m").expect("m");
             let dlg = host.get_element_by_id("d").expect("d");
-            let listeners = PARSE_HOSTS.with(|hosts| {
-                hosts.borrow().get(&id).map(|e| e.listeners.clone())
-            });
+            let listeners =
+                PARSE_HOSTS.with(|hosts| hosts.borrow().get(&id).map(|e| e.listeners.clone()));
             let listeners = listeners.expect("shim slot");
             {
                 let mut roots = listeners.borrow_mut();
@@ -49193,6 +49653,11 @@ mod tests {
             "open",
             Some("seen.push('inline-toggle:' + event.isTrusted + ',' + event.oldState + ',' + event.newState);"),
         );
+        // w87fix: the toggle above only enqueues (w87
+        // deferred delivery), so flush before reading —
+        // the eval's return value is computed before any
+        // end-of-script flush could deliver it.
+        vm.flush_pending_toggles();
         assert_eq!(
             eval_log(&mut vm, "seen.join(';');"),
             "inline-cancel:true,true;cancel:true,false,true;inline-close:true;close:true,false,false;inline-toggle:true,closed,open;toggle:true,closed,open,true"
@@ -49314,10 +49779,7 @@ mod tests {
             "listener preventDefault must still count after forged calls"
         );
         assert!(outcome.dispatch_error.is_none());
-        assert_eq!(
-            eval_log(&mut vm, "seen.join(';');"),
-            "inline;listener"
-        );
+        assert_eq!(eval_log(&mut vm, "seen.join(';');"), "inline;listener");
         assert_eq!(vm.eval("forged.length;").unwrap(), Value::Int(0));
         // A second, ordinary dispatch still works: no stale frame
         // or armed flag leaked from the forged calls.
@@ -49384,10 +49846,7 @@ mod tests {
             vm.dispatch_wheel(inner, 1.0, 2.0, 0),
             "wheel prevention must still count after CTX_KEY tampering"
         );
-        assert_eq!(
-            eval_log(&mut vm, "seen.join(';');"),
-            "cancel;wheel"
-        );
+        assert_eq!(eval_log(&mut vm, "seen.join(';');"), "cancel;wheel");
         remove_context(ctx);
     }
 
@@ -49477,10 +49936,7 @@ mod tests {
              innerEl.addEventListener('cancel', function() { seen.push('target'); });",
         )
         .unwrap();
-        let halted = vm.dispatch_cancel_event(
-            inner,
-            Some("event.stopImmediatePropagation();"),
-        );
+        let halted = vm.dispatch_cancel_event(inner, Some("event.stopImmediatePropagation();"));
         assert!(!halted.prevented, "stopImmediate alone does not prevent");
         assert_eq!(
             eval_log(&mut vm, "seen.join(';');"),
@@ -49502,10 +49958,7 @@ mod tests {
             "inline prevention counts and capture still runs"
         );
         vm.eval("seen = [];").unwrap();
-        let propagated = vm.dispatch_cancel_event(
-            inner,
-            Some("event.stopPropagation();"),
-        );
+        let propagated = vm.dispatch_cancel_event(inner, Some("event.stopPropagation();"));
         assert!(!propagated.prevented);
         assert_eq!(
             eval_log(&mut vm, "seen.join(';');"),
@@ -49534,10 +49987,7 @@ mod tests {
              outerEl.addEventListener('submit', function() { seen.push('bubble'); });",
         )
         .unwrap();
-        let outcome = vm.dispatch_submit_event(
-            inner,
-            Some("event.stopPropagation();"),
-        );
+        let outcome = vm.dispatch_submit_event(inner, Some("event.stopPropagation();"));
         assert!(!outcome.prevented);
         assert_eq!(
             eval_log(&mut vm, "seen.join(';');"),
@@ -49723,9 +50173,20 @@ mod tests {
         )
         .unwrap();
         let close = vm.dispatch_close_event(inner, Some("return false;"));
-        assert!(!close.prevented, "return false must not prevent non-cancelable close");
+        assert!(
+            !close.prevented,
+            "return false must not prevent non-cancelable close"
+        );
         let toggle = vm.dispatch_toggle_event(inner, "closed", "open", Some("return false;"));
-        assert!(!toggle.prevented, "return false must not prevent non-cancelable toggle");
+        assert!(
+            !toggle.prevented,
+            "return false must not prevent non-cancelable toggle"
+        );
+        // w87fix: the toggle above only enqueues — flush
+        // here, before the cancel, so the log keeps the
+        // dispatch order (close, toggle, cancel) instead
+        // of delivering the toggle after the cancel.
+        vm.flush_pending_toggles();
         let cancel = vm.dispatch_cancel_event(inner, Some("return false;"));
         assert!(cancel.prevented, "return false prevents cancelable cancel");
         assert_eq!(
@@ -49789,7 +50250,10 @@ mod tests {
         )
         .unwrap();
         let first = vm.dispatch_cancel_event(inner, None);
-        assert!(!first.prevented, "passive preventDefault must not prevent cancel");
+        assert!(
+            !first.prevented,
+            "passive preventDefault must not prevent cancel"
+        );
         let second = vm.dispatch_cancel_event(inner, None);
         assert!(!second.prevented);
         assert_eq!(
@@ -49967,10 +50431,8 @@ mod tests {
         )
         .unwrap();
         drop(doc);
-        let silent = vm.dispatch_cancel_event(
-            inner,
-            Some("seen.push('inline'); event.preventDefault();"),
-        );
+        let silent =
+            vm.dispatch_cancel_event(inner, Some("seen.push('inline'); event.preventDefault();"));
         assert!(!silent.prevented);
         assert!(silent.inline_error.is_none());
         assert!(
@@ -50002,7 +50464,10 @@ mod tests {
             g.host_event_core_armed = true;
         }
         let r = n_host_event_core(vm.heap_mut(), global, &[]);
-        assert!(r.is_err(), "core failure must propagate, not read as not-prevented");
+        assert!(
+            r.is_err(),
+            "core failure must propagate, not read as not-prevented"
+        );
         assert!(
             rc.borrow().host_event_frames.is_empty(),
             "the failed core consumed its frame"
@@ -52337,10 +52802,7 @@ mod tests {
               </script></body></html>",
         );
         assert_eq!(node_list_str(&mut probe.vm, "globalThis.__pOpen;"), "false");
-        assert_eq!(
-            node_list_str(&mut probe.vm, "globalThis.__dModal;"),
-            "true"
-        );
+        assert_eq!(node_list_str(&mut probe.vm, "globalThis.__dModal;"), "true");
         let p_node = doc.borrow().get_element_by_id("p").expect("div#p");
         let d_node = doc.borrow().get_element_by_id("d").expect("dialog#d");
         assert!(!doc.borrow().is_popover_open(p_node));
@@ -52495,10 +52957,7 @@ mod tests {
               </script></body></html>",
         );
         assert_eq!(node_list_str(&mut probe.vm, "globalThis.__xClosed;"), "");
-        assert_eq!(
-            node_list_str(&mut probe.vm, "globalThis.__dClosed;"),
-            "any"
-        );
+        assert_eq!(node_list_str(&mut probe.vm, "globalThis.__dClosed;"), "any");
         assert_eq!(
             node_list_str(&mut probe.vm, "globalThis.__plainClosed;"),
             ""
@@ -52538,18 +52997,14 @@ mod tests {
             "detached SVG dialog must not leak its closedby attribute"
         );
         assert!(
-            node_list_str(&mut probe.vm, "globalThis.__svgSet;")
-                .contains("NotSupportedError"),
+            node_list_str(&mut probe.vm, "globalThis.__svgSet;").contains("NotSupportedError"),
             "setter on a detached SVG dialog must throw NotSupportedError"
         );
         assert_eq!(
             node_list_str(&mut probe.vm, "globalThis.__htmlClosed;"),
             "any"
         );
-        assert_eq!(
-            node_list_str(&mut probe.vm, "globalThis.__divClosed;"),
-            ""
-        );
+        assert_eq!(node_list_str(&mut probe.vm, "globalThis.__divClosed;"), "");
         remove_context(ContextId(ctx));
     }
 
@@ -52596,10 +53051,7 @@ mod tests {
             "the victim must actually have been open before the dialog show, or the no-toggle pin is vacuous"
         );
         assert_eq!(node_list_str(&mut probe.vm, "globalThis.__pOpen;"), "false");
-        assert_eq!(
-            node_list_str(&mut probe.vm, "globalThis.__dModal;"),
-            "true"
-        );
+        assert_eq!(node_list_str(&mut probe.vm, "globalThis.__dModal;"), "true");
         let p_node = doc.borrow().get_element_by_id("p").expect("div#p");
         let d_node = doc.borrow().get_element_by_id("d").expect("dialog#d");
         assert!(!doc.borrow().is_popover_open(p_node));
@@ -52740,10 +53192,7 @@ mod tests {
             node_list_str(&mut probe.vm, "globalThis.__modalAfterBare;"),
             "true"
         );
-        assert_eq!(
-            node_list_str(&mut probe.vm, "globalThis.__forced;"),
-            "true"
-        );
+        assert_eq!(node_list_str(&mut probe.vm, "globalThis.__forced;"), "true");
         assert_eq!(
             node_list_str(&mut probe.vm, "globalThis.__modalAfterForced;"),
             "true"
@@ -53095,8 +53544,7 @@ mod tests {
         // shim bug where it silently inserted the dialog
         // into the popover set and returned true.
         assert!(
-            node_list_str(&mut probe.vm, "globalThis.__togErr;")
-                .contains("InvalidStateError"),
+            node_list_str(&mut probe.vm, "globalThis.__togErr;").contains("InvalidStateError"),
             "bare toggle on a modal dual must throw InvalidStateError, got: {}",
             node_list_str(&mut probe.vm, "globalThis.__togErr;")
         );
@@ -53212,6 +53660,47 @@ mod tests {
         assert!(doc.borrow().is_popover_open(a_node));
         assert!(!doc.borrow().is_popover_open(inner_node));
         assert!(!doc.borrow().is_popover_open(c_node));
+        remove_context(ContextId(ctx));
+    }
+
+    // w87 S5 close-out, dialog leg: showModal -> remove()
+    // -> reinsert must NOT resurrect the modal state at
+    // adoption — the removal prunes the dialog sets, so
+    // the adopted dialog arrives non-modal and outside
+    // the top layer. This is the leg that makes the S5
+    // live-member skip unreachable for dialogs: a removed
+    // dialog leaves the live sets before adoption runs, so
+    // no live member can ever lack its wrapper record at
+    // transfer time (see the verified note in
+    // `adopt_shim_top_layer`).
+    #[test]
+    fn w87_shim_modal_dialog_remove_then_reinsert_not_adopted_modal() {
+        let (mut probe, doc, ctx) = captured_install(
+            b"<html><body><dialog id=\"d\">hi</dialog><script>\
+              globalThis.__d = document.getElementById('d');\
+              globalThis.__out = [];\
+              __d.showModal();\
+              __out.push(String(__d.matches(':modal')));\
+              __d.remove();\
+              document.body.appendChild(__d);\
+              __out.push(String(__d.matches(':modal')));\
+              __out.push(String(__d.open));\
+              </script></body></html>",
+        );
+        assert_eq!(
+            node_list_str(&mut probe.vm, "__out.join(';');"),
+            "true;false;true",
+            "mid-parse: modal before removal, not modal after reinsert, open attribute survives"
+        );
+        let d_node = doc.borrow().get_element_by_id("d").expect("dialog#d");
+        assert!(
+            !doc.borrow().is_dialog_modal(d_node),
+            "a removed-then-reinserted modal dialog must not adopt as modal"
+        );
+        assert!(
+            !doc.borrow().is_in_top_layer(d_node),
+            "a removed-then-reinserted modal dialog must not adopt into the top layer"
+        );
         remove_context(ContextId(ctx));
     }
 
@@ -54045,10 +54534,14 @@ mod tests {
         };
         // Show p: one toggle, on p.
         n_show_popover(&mut fx.heap, p, &[]).unwrap();
+        // w87fix: the show only enqueues (deferred
+        // delivery), so flush before reading the log.
+        flush_toggles(&mut fx);
         assert_eq!(targets(&fx), vec![Some("p".to_string())]);
         fx.invoker.borrow().calls.borrow_mut().clear();
         // Show p2: auto-closes p first, then p2's own toggle.
         n_show_popover(&mut fx.heap, p2, &[]).unwrap();
+        flush_toggles(&mut fx);
         assert_eq!(
             targets(&fx),
             vec![Some("p".to_string()), Some("p2".to_string())]
@@ -54056,12 +54549,15 @@ mod tests {
         fx.invoker.borrow().calls.borrow_mut().clear();
         // Double-show throws and fires nothing.
         assert!(n_show_popover(&mut fx.heap, p2, &[]).is_err());
+        flush_toggles(&mut fx);
         assert!(targets(&fx).is_empty());
         // Hide p2, then hide again (no-op): one toggle total.
         n_hide_popover(&mut fx.heap, p2, &[]).unwrap();
+        flush_toggles(&mut fx);
         assert_eq!(targets(&fx), vec![Some("p2".to_string())]);
         fx.invoker.borrow().calls.borrow_mut().clear();
         n_hide_popover(&mut fx.heap, p2, &[]).unwrap();
+        flush_toggles(&mut fx);
         assert!(targets(&fx).is_empty());
         // Toggle on, forced-true no-op (no event), toggle off,
         // forced-false no-op (no event).
@@ -54069,23 +54565,27 @@ mod tests {
             n_toggle_popover(&mut fx.heap, p2, &[]).unwrap(),
             Value::Bool(true)
         );
+        flush_toggles(&mut fx);
         assert_eq!(targets(&fx), vec![Some("p2".to_string())]);
         fx.invoker.borrow().calls.borrow_mut().clear();
         assert_eq!(
             n_toggle_popover(&mut fx.heap, p2, &[Value::Bool(true)]).unwrap(),
             Value::Bool(true)
         );
+        flush_toggles(&mut fx);
         assert!(targets(&fx).is_empty());
         assert_eq!(
             n_toggle_popover(&mut fx.heap, p2, &[]).unwrap(),
             Value::Bool(false)
         );
+        flush_toggles(&mut fx);
         assert_eq!(targets(&fx), vec![Some("p2".to_string())]);
         fx.invoker.borrow().calls.borrow_mut().clear();
         assert_eq!(
             n_toggle_popover(&mut fx.heap, p2, &[Value::Bool(false)]).unwrap(),
             Value::Bool(false)
         );
+        flush_toggles(&mut fx);
         assert!(targets(&fx).is_empty());
     }
 
@@ -54204,6 +54704,12 @@ mod tests {
             fx.doc.borrow().is_exit_retained(p_node),
             "hide with a 2s exit transition must retain"
         );
+        // w87fix: the hide only enqueues (deferred
+        // delivery), so flush before reading the log —
+        // and the show's `open` was coalesced away by
+        // the hide's `closed` for the same target, so
+        // exactly one toggle fires.
+        flush_toggles(&mut fx);
         assert_eq!(
             dispatch_log(&fx).len(),
             1,
@@ -54211,6 +54717,7 @@ mod tests {
         );
         fx.invoker.borrow().calls.borrow_mut().clear();
         n_show_dialog_modal(&mut fx.heap, d, &[]).unwrap();
+        flush_toggles(&mut fx);
         assert!(
             dispatch_log(&fx).is_empty(),
             "showModal must fire no new toggle for the retained victim"
@@ -54248,6 +54755,9 @@ mod tests {
         n_show_dialog(&mut fx.heap, d, &[]).unwrap();
         n_show_popover(&mut fx.heap, d, &[]).unwrap();
         let d_node = node_of(&fx, d);
+        // w87fix: the show only enqueues (deferred
+        // delivery), so flush before reading the log.
+        flush_toggles(&mut fx);
         assert_eq!(
             dispatch_log(&fx).len(),
             1,
@@ -54263,6 +54773,9 @@ mod tests {
             !fx.doc.borrow().is_dialog_modal(d_node),
             "a non-modal dual retains as a popover, not as modal"
         );
+        // w87fix: same flush — the close-time toggle
+        // is enqueued after the synchronous `close`.
+        flush_toggles(&mut fx);
         assert_eq!(
             dispatch_log(&fx).len(),
             1,
@@ -54270,12 +54783,171 @@ mod tests {
         );
         fx.invoker.borrow().calls.borrow_mut().clear();
         n_show_dialog_modal(&mut fx.heap, e, &[]).unwrap();
+        flush_toggles(&mut fx);
         assert!(
             dispatch_log(&fx).is_empty(),
             "ending the retention at a later show fires no second toggle"
         );
         assert!(!fx.doc.borrow().is_exit_retained(d_node));
         remove_context(fx.ctx);
+    }
+
+    // w87 JS-API dialog close-event audit: `hidePopover()`
+    // on a non-modal dual fires the popover `toggle` and
+    // ends the popover membership, but the dialog stays
+    // open and NO `close` event fires — hiding the popover
+    // aspect is not closing the dialog (the modal dual
+    // instead throws; see
+    // `production_hide_popover_throws_for_live_modal_dialog_no_toggle`).
+    // A later `close()` then fires `close` exactly once.
+    #[test]
+    fn w87_close_event_audit_hide_popover_on_dual_fires_toggle_not_close() {
+        let mut fx =
+            setup("<html><body><dialog id=\"d\" popover=\"auto\">hi</dialog></body></html>");
+        let d = call_get_element_by_id(&mut fx, "d");
+        let close_listener = probe_listener(&mut fx.heap);
+        let toggle_listener = probe_listener(&mut fx.heap);
+        add_listener(&mut fx, d, "close", close_listener, false);
+        add_listener(&mut fx, d, "toggle", toggle_listener, false);
+        n_show_dialog(&mut fx.heap, d, &[]).unwrap();
+        n_show_popover(&mut fx.heap, d, &[]).unwrap();
+        fx.invoker.borrow().calls.borrow_mut().clear();
+        n_hide_popover(&mut fx.heap, d, &[]).unwrap();
+        assert_eq!(
+            n_dialog_open_get(&mut fx.heap, d, &[]).unwrap(),
+            Value::Bool(true),
+            "hidePopover on a non-modal dual must leave the dialog open"
+        );
+        let d_node = node_of(&fx, d);
+        assert!(!fx.doc.borrow().is_popover_open(d_node));
+        // w87fix: the setup show's `open` is still queued
+        // under the clear above, and the hide's `closed`
+        // replaces it last-wins for the same target — flush
+        // before reading, so exactly one toggle fires.
+        flush_toggles(&mut fx);
+        assert_eq!(
+            dispatch_log(&fx),
+            vec![(toggle_listener, Some("d".to_string()))],
+            "hidePopover on a dual fires exactly one toggle and no close"
+        );
+        fx.invoker.borrow().calls.borrow_mut().clear();
+        n_close_dialog(&mut fx.heap, d, &[]).unwrap();
+        flush_toggles(&mut fx);
+        assert_eq!(
+            dispatch_log(&fx),
+            vec![(close_listener, Some("d".to_string()))],
+            "the later close() fires exactly one close and no second toggle"
+        );
+        remove_context(fx.ctx);
+    }
+
+    // w87 JS-API dialog close-event audit: removing an
+    // open dialog from its document fires NO `close` event
+    // — the removal demotes the top layer and drops the
+    // modal flag, but the `open` attribute survives, so
+    // the dialog reads open (not modal, not top-layer)
+    // until `close()` runs. PINNED CURRENT BEHAVIOR, not
+    // Chrome-confirmed: no Chrome datum in the repo
+    // covers removal.
+    // DEFERRED PROBE (w87): headless Chrome 155, page
+    // with `<dialog id=d>`, `d.showModal()`, a `close`
+    // listener pushing to a log, then
+    // `document.body.removeChild(d)`. Observe: does the
+    // `close` listener fire? After removal, what are
+    // `d.open`, `d.matches(':modal')`, and
+    // `getComputedStyle(d).display`? After re-inserting
+    // `d`, is it open/modal again?
+    #[test]
+    fn w87_close_event_audit_removal_fires_no_close() {
+        let mut fx = setup("<html><body id=\"b\"><dialog id=\"d\">hi</dialog></body></html>");
+        let b = call_get_element_by_id(&mut fx, "b");
+        let d = call_get_element_by_id(&mut fx, "d");
+        let close_listener = probe_listener(&mut fx.heap);
+        add_listener(&mut fx, d, "close", close_listener, false);
+        n_show_dialog_modal(&mut fx.heap, d, &[]).unwrap();
+        fx.invoker.borrow().calls.borrow_mut().clear();
+        n_remove_child(&mut fx.heap, b, &[d]).unwrap();
+        assert!(
+            dispatch_log(&fx).is_empty(),
+            "removing an open dialog must fire no close event"
+        );
+        let d_node = node_of(&fx, d);
+        assert!(
+            !fx.doc.borrow().is_dialog_modal(d_node),
+            "removal must drop the modal flag"
+        );
+        assert!(
+            !fx.doc.borrow().is_in_top_layer(d_node),
+            "removal must drop the dialog from the top layer"
+        );
+        assert_eq!(
+            n_dialog_open_get(&mut fx.heap, d, &[]).unwrap(),
+            Value::Bool(true),
+            "removal must leave the open attribute in place"
+        );
+        remove_context(fx.ctx);
+    }
+
+    // w87 WAAPI overlay-auto decision, production
+    // end-to-end pin (CSS Cascade 5): animations sit
+    // below ALL `!important` origins, and the UA
+    // top-layer rules are `!important`
+    // (`[popover]:popover-open { overlay: auto
+    // !important }`, `dialog:modal { overlay: auto
+    // !important }`), so a WAAPI animation of `overlay`
+    // towards `none` on a shown top-layer element must
+    // NOT beat the UA rule — computed `overlay` stays
+    // `auto` at mid-progress. The engine-level
+    // `top_layer_ua_auto_overlay_stays_auto_under_animation`
+    // passes a hand-built blocked set; this test drives
+    // the real `getComputedStyle` blocked-set capture
+    // (`compute_important_properties`) through
+    // `showPopover` / `showModal` + `el.animate`.
+    // Control: the same animation on a plain div stays
+    // `none` (the UA `* { overlay: none !important }`
+    // winner blocks the `none -> auto` direction too).
+    #[test]
+    fn w87_top_layer_overlay_stays_auto_under_waapi_animation() {
+        let (mut vm, _doc) = computed_style_vm(
+            b"<html><body><div id=\"p\" popover>hi</div><dialog id=\"d\">hi</dialog><div id=\"q\">hi</div></body></html>",
+        );
+        // Show the modal FIRST: `showModal()` hides open
+        // `auto` popovers at show time (w85 show-time
+        // rule), so showing it after `showPopover()` would
+        // auto-close the popover and the test would read
+        // `none` for a reason unrelated to the animation.
+        vm.eval(
+            "var p = document.getElementById('p'); var d = document.getElementById('d'); var q = document.getElementById('q'); \
+             d.showModal(); p.showPopover(); \
+             var a1 = p.animate([{overlay: 'auto'}, {overlay: 'none'}], {duration: 100000, easing: 'linear'}); a1.pause(); a1.currentTime = 50000; \
+             var a2 = d.animate([{overlay: 'auto'}, {overlay: 'none'}], {duration: 100000, easing: 'linear'}); a2.pause(); a2.currentTime = 50000; \
+             var a3 = q.animate([{overlay: 'none'}, {overlay: 'auto'}], {duration: 100000, easing: 'linear'}); a3.pause(); a3.currentTime = 50000;",
+        )
+        .unwrap();
+        assert_eq!(
+            node_list_str(
+                &mut vm,
+                "getComputedStyle(document.getElementById('p')).overlay;"
+            ),
+            "auto",
+            "WAAPI overlay animation must not pull a shown popover out of auto"
+        );
+        assert_eq!(
+            node_list_str(
+                &mut vm,
+                "getComputedStyle(document.getElementById('d')).overlay;"
+            ),
+            "auto",
+            "WAAPI overlay animation must not pull a modal dialog out of auto"
+        );
+        assert_eq!(
+            node_list_str(
+                &mut vm,
+                "getComputedStyle(document.getElementById('q')).overlay;"
+            ),
+            "none",
+            "WAAPI overlay animation must not lift a plain div out of none"
+        );
     }
 
     // w81 phase 2: dialog production natives — show / showModal /
@@ -54449,9 +55121,8 @@ mod tests {
         // `closedBy` reflects the attribute verbatim; the
         // computed query (DOM level) normalizes. A non-dialog
         // getter reads `""`, a non-dialog setter throws.
-        let mut fx = setup(
-            "<html><body><dialog id=\"d\">hi</dialog><div id=\"x\">hi</div></body></html>",
-        );
+        let mut fx =
+            setup("<html><body><dialog id=\"d\">hi</dialog><div id=\"x\">hi</div></body></html>");
         let d = call_get_element_by_id(&mut fx, "d");
         let x = call_get_element_by_id(&mut fx, "x");
         let get = |fx: &mut Fixture, el: Value| {
@@ -54499,6 +55170,12 @@ mod tests {
         n_show_dialog_modal(&mut fx.heap, d, &[]).unwrap();
         assert!(!fx.doc.borrow().is_popover_open(node_of(&fx, pop)));
         assert!(fx.doc.borrow().is_dialog_open(node_of(&fx, d)));
+        // w87fix: the setup show's `open` is still queued
+        // under the clear above, and the dialog show's
+        // victim-hide `closed` replaces it last-wins —
+        // flush before reading, so the victim's one
+        // toggle fires.
+        flush_toggles(&mut fx);
         assert_eq!(
             targets(&fx),
             vec![Some("pop".to_string())],
@@ -54557,12 +55234,7 @@ mod tests {
         let svg_ns = str_val(&mut fx, "http://www.w3.org/2000/svg");
         let dialog_tag = str_val(&mut fx, "dialog");
         let div_tag = str_val(&mut fx, "div");
-        let svg_dlg = call_method(
-            &mut fx,
-            doc_val,
-            n_create_element_ns,
-            &[svg_ns, dialog_tag],
-        );
+        let svg_dlg = call_method(&mut fx, doc_val, n_create_element_ns, &[svg_ns, dialog_tag]);
         let html_dlg = call_method(
             &mut fx,
             doc_val,
@@ -54594,9 +55266,7 @@ mod tests {
                     "setter on a detached SVG dialog must throw NotSupportedError, got {m}"
                 );
             }
-            other => panic!(
-                "closedBy setter on a detached SVG dialog must throw, got {other:?}"
-            ),
+            other => panic!("closedBy setter on a detached SVG dialog must throw, got {other:?}"),
         }
         remove_context(fx.ctx);
     }
@@ -55516,7 +56186,10 @@ mod tests {
             "undefined"
         );
         assert_eq!(
-            snap_str(&mut vm, "document.getElementById('dis').getAttribute('disabled');"),
+            snap_str(
+                &mut vm,
+                "document.getElementById('dis').getAttribute('disabled');"
+            ),
             ""
         );
         // Hidden element: still `undefined`, still hidden.

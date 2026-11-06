@@ -295,6 +295,22 @@ pub trait JsDispatch {
     /// overrides this (see [`JsDispatch::dispatch_cancel`],
     /// including the trusted-delivery note there).
     fn dispatch_toggle(&mut self, _tab: &mut Tab, _target: NodeId) {}
+    /// Fire every queued popover `toggle` (w87 deferred toggles):
+    /// the explicit task-boundary flush for a host operation whose
+    /// end has no pump following it. The default does nothing, so
+    /// hosts without a JS bridge keep working; the production
+    /// dispatcher ([`crate::script::PageEventDispatch`]) flushes
+    /// the page realm's queue. w87fix: the windowed paths call
+    /// this explicitly at each host-operation end (Escape,
+    /// light-dismiss, invoker click) — they do NOT flush through
+    /// an operation-end pump. Every `PageEventDispatch` method
+    /// pumps INSIDE its `begin`/`end_host_dispatch` guard, so
+    /// that pump's flush no-ops at depth > 0, and no flush
+    /// follows `end_host_dispatch`; without this explicit call
+    /// a host toggle would sit queued until the next unguarded
+    /// pump or script end instead of firing at the end of its
+    /// own operation.
+    fn flush_pending_toggles(&mut self, _tab: &mut Tab) {}
     /// Dispatch a cancelable, bubbling `submit` event at `form`
     /// (submit-button activation, HTML §4.10.21.2). Returns true
     /// when the page prevented it, in which case no submission
@@ -3965,6 +3981,15 @@ fn fire_scroll_listeners_for_tab(
             None => fire_window_scroll_tab(tab),
         }
     }
+    // Host-operation end (w87fix r3): a `scroll` listener that called
+    // `showPopover()` enqueued a toggle; fire it now, at the end of
+    // this scroll dispatch — the dispatch methods' guarded pumps could
+    // not flush it, and the next pump turn is too late. A no-op with
+    // no JS bridge, nothing queued, or while a host dispatch is
+    // mid-flight.
+    if let Some(js) = js {
+        js.flush_pending_toggles(tab);
+    }
 }
 
 /// Touch-drag default pan for synthetic touch input (the testdriver
@@ -4062,6 +4087,10 @@ fn fire_snap_events_for_tab(
     for d in deliveries {
         js.dispatch_snap_event(tab, d.container, d.kind.as_str(), d.targets);
     }
+    // Host-operation end (w87fix r3): same as the `scroll` dispatch
+    // above — a snap listener that called `showPopover()` enqueued a
+    // toggle, and it fires now, not at the next pump turn.
+    js.flush_pending_toggles(tab);
 }
 
 /// Tab-level core of [`WindowApp::fire_scrollend_for`]: fire `scrollend`
@@ -4084,6 +4113,12 @@ fn fire_scrollend_for_tab(
             }
             None => fire_window_scrollend_tab(tab),
         }
+    }
+    // Host-operation end (w87fix r3): same as the `scroll` dispatch
+    // above — a `scrollend` listener that called `showPopover()`
+    // enqueued a toggle, and it fires now, not at the next pump turn.
+    if let Some(js) = js {
+        js.flush_pending_toggles(tab);
     }
 }
 
@@ -5516,6 +5551,12 @@ impl<'a> WindowApp<'a> {
         };
         self.needs_redraw = true;
         if prevented {
+            // Host-operation end (w87fix): the click
+            // operation ends here even though the default
+            // action does not run — a click listener may
+            // have enqueued toggles through the JS API, and
+            // they fire now rather than at the next pump.
+            self.flush_pending_toggles();
             return;
         }
         // Default action, part 1: popover-target activation (a
@@ -5551,6 +5592,11 @@ impl<'a> WindowApp<'a> {
                 js.dispatch_toggle(tab, target);
             }
         }
+        // No flush between the arms (w87fix r3): under the S1
+        // queued-toggle model a toggle has not fired mid-task in
+        // Chrome, so a submit listener observes the invoker
+        // toggle as still pending — the toggles above fire at
+        // the submit-arm-end flush (or the operation end) instead.
         // Default action, part 2: submit-button activation (w85,
         // HTML §4.10.21.2). Runs after popover activation: a
         // form-owned submitter is already barred from popover
@@ -5617,6 +5663,11 @@ impl<'a> WindowApp<'a> {
                 }
                 self.needs_redraw = true;
             }
+            // Host-operation end for the submit arm (w87fix):
+            // the dual toggle enqueued above (and any toggle
+            // a submit listener enqueued) fires before this
+            // click returns, not at the next pump.
+            self.flush_pending_toggles();
             return;
         }
         let href = self
@@ -5624,7 +5675,18 @@ impl<'a> WindowApp<'a> {
             .get(self.tab)
             .and_then(|tab| tab.document_ref())
             .and_then(|doc| link_href(&doc, node));
-        let Some(href) = href else { return };
+        let Some(href) = href else {
+            // Host-operation end (w87fix M1): a plain
+            // invoker click (no form, no link) ends here
+            // with the toggle still queued — flush it now
+            // instead of leaving it for the next pump.
+            self.flush_pending_toggles();
+            return;
+        };
+        // Host-operation end (w87fix M1): the click's
+        // toggles fire before navigation replaces the
+        // document, not at the next pump.
+        self.flush_pending_toggles();
         self.navigate_link(&href);
     }
 
@@ -5874,6 +5936,10 @@ impl<'a> WindowApp<'a> {
         if !scrolled.is_empty() {
             self.fire_scroll_listeners_for(self.tab, &scrolled);
         }
+        // Host-operation end (w87fix r3): a wheel listener that called
+        // `showPopover()` enqueued a toggle, and it must fire now, at
+        // the end of this wheel operation — not at the next pump turn.
+        self.flush_pending_toggles();
         self.needs_redraw = true;
     }
 
@@ -6341,6 +6407,22 @@ impl<'a> WindowApp<'a> {
         }
     }
 
+    /// Flush queued popover `toggle`s at a host-operation end
+    /// (w87fix, see [`JsDispatch::flush_pending_toggles`]): the
+    /// dispatch methods' own pumps run inside the host-dispatch
+    /// guard and cannot flush, so Escape, light-dismiss, and the
+    /// invoker click call this once their dispatches are done.
+    /// A no-op with no JS bridge or nothing queued, and safe to
+    /// call after any host operation — the depth is back to 0 by
+    /// then, since every dispatch method ends its own guard.
+    fn flush_pending_toggles(&mut self) {
+        if let Some(js) = self.js.as_mut()
+            && let Some(tab) = self.tabs.get_mut(self.tab)
+        {
+            js.flush_pending_toggles(tab);
+        }
+    }
+
     /// Multi-target Escape (w86, Chrome 155 verdict A,
     /// [`Document::escape_targets`]): one keyDown closes
     /// EVERY escapable watcher live — `cancel` on every
@@ -6378,6 +6460,45 @@ impl<'a> WindowApp<'a> {
                 EscapeTarget::AutoPopover(pop) => autos.push(pop),
             }
         }
+        // Phase-3 re-show guard (w87): snapshot each
+        // auto's promotion sequence before any listener
+        // runs. A hide + re-show during phase 1/2 assigns
+        // a fresh sequence (see
+        // [`Document::top_layer_seq`]: every real
+        // promotion mints one, explicit demotion erases
+        // it, retention preserves it until the re-show
+        // promotes again), so phase 3 can tell a member
+        // re-shown mid-gesture from the one the Escape
+        // snapshotted. Spec-plausible, pinned by test, but
+        // NOT Chrome-confirmed: a fresh show creates a
+        // fresh close watcher, and the in-flight Escape
+        // targeted the old one — the same re-show-survives
+        // rule light-dismiss already pins (see
+        // `fire_hidden_popover_toggles_and_clears`) — so
+        // the re-shown auto survives this Escape.
+        // DEFERRED PROBE (w87): headless Chrome 155, page
+        // with a modal dialog (`closedby=closerequest`)
+        // and an open auto popover; the dialog's `close`
+        // listener runs
+        // `pop.hidePopover(); pop.showPopover();`, then
+        // one Escape keypress. Observe: does the popover
+        // stay open (guard) or close again with a second
+        // `toggle closed` (no guard)? Also probe the
+        // dialog twin this guard does NOT cover: a dialog
+        // `cancel` listener that closes and re-shows the
+        // dialog itself — phase 2 still closes it on the
+        // open-ness re-check; does Chrome close it again
+        // or let the re-show survive?
+        let auto_seqs: HashMap<NodeId, u64> = match self.tabs.get(self.tab) {
+            Some(tab) => match tab.document_ref() {
+                Some(doc) => autos
+                    .iter()
+                    .filter_map(|&pop| doc.top_layer_seq(pop).map(|seq| (pop, seq)))
+                    .collect(),
+                None => HashMap::new(),
+            },
+            None => HashMap::new(),
+        };
         // Phase 1: `cancel` on every escapable dialog,
         // newest first. The Escape `cancel` is
         // non-cancelable (Chrome 155 P2), so `canceled`
@@ -6488,13 +6609,33 @@ impl<'a> WindowApp<'a> {
         // Chrome, 5/6 after, 1/6 between, so Bowser pins the
         // majority order and does not try to reproduce the
         // variance).
-        // Unprobed (w86fix): a dialog `close` listener that
-        // re-shows an auto also in this phase-3 snapshot gets
-        // it hidden again — there is no re-show check here,
-        // unlike light-dismiss — so the re-show does not
-        // survive Escape. Needs a Chrome probe before any fix;
-        // do not add a speculative re-show check.
+        // Re-show guard (w87, see the snapshot above): an
+        // auto whose promotion sequence changed since the
+        // snapshot was hidden and re-shown by a dialog
+        // `cancel`/`close` listener during this Escape, so
+        // it is a fresh show with a fresh close watcher —
+        // this gesture's target is gone, and the re-show
+        // survives (no hide, no `toggle`). An auto hidden
+        // and NOT re-shown is skipped the same way, not by
+        // the `was_open` check below: its demotion erased
+        // its sequence, so the comparison above reads it
+        // as re-shown and the `continue` skips it before
+        // `was_open` is ever reached. That check only ever
+        // sees autos whose sequence is unchanged — still
+        // live members — and guards the retained-hide case,
+        // where the sequence survives but the popover is
+        // already closed.
         for pop in autos {
+            let re_shown = match self.tabs.get(self.tab) {
+                Some(tab) => match tab.document_ref() {
+                    Some(doc) => doc.top_layer_seq(pop) != auto_seqs.get(&pop).copied(),
+                    None => true,
+                },
+                None => true,
+            };
+            if re_shown {
+                continue;
+            }
             // The boolean is whether the popover was actually
             // open and is now hidden — like the dialog arm's
             // `closed` — not `hide_popover().is_ok()`, which is
@@ -6529,6 +6670,12 @@ impl<'a> WindowApp<'a> {
             }
             self.needs_redraw = true;
         }
+        // Host-operation end (w87fix): the toggles enqueued
+        // above (and by any dialog listener during phases
+        // 1–2) fire now, at the end of this Escape — the
+        // dispatch methods' guarded pumps could not flush
+        // them, and nothing after this point would.
+        self.flush_pending_toggles();
         true
     }
 
@@ -6706,20 +6853,22 @@ impl<'a> WindowApp<'a> {
             }
         }
         // No pending dialog close (no candidate, prevented
-        // `cancel`, or already closed): the popover toggles
-        // and focus clears fire HERE, at pointerup, before
-        // the click — only a pending dialog close defers
-        // them past the click (w86fix P5: the dialog's
-        // `close` is what waits for the click; a popover-only
-        // dismissal completes at pointerup, so a click on a
-        // lower popover's invoker still toggles the victim
-        // before the activation toggle, as w85 pins).
+        // `cancel`, or already closed): the popover toggles are
+        // ENQUEUED here, at pointerup — but they fire only at
+        // the finish-half flush, after the click (w87fix r3:
+        // Chrome w86-probes2 P1 has cancel/click at t≈1589 and
+        // close/toggle at t≈1592, so the victim toggle fires
+        // after the click). Enqueueing here keeps the victim
+        // ahead of the click's activation toggle in FIFO queue
+        // order (the w85 victim-before-activation pin); only
+        // delivery time moves. The focus clears likewise run in
+        // the finish half.
         if pending_dialog.is_none() {
-            self.fire_hidden_popover_toggles_and_clears(&hidden_pops, deferred_focus_clears);
+            self.enqueue_hidden_popover_toggles(&hidden_pops);
             return PendingLightDismiss {
                 dialog: None,
-                hidden_pops: Vec::new(),
-                deferred_focus_clears: Vec::new(),
+                hidden_pops,
+                deferred_focus_clears,
             };
         }
         PendingLightDismiss {
@@ -6729,38 +6878,24 @@ impl<'a> WindowApp<'a> {
         }
     }
 
-    /// Fire the hidden popovers' `toggle`s and clear focus
-    /// inside them (w86fix P5 split helper): shared by the
-    /// begin half (no pending dialog — the toggles fire at
-    /// pointerup, before the click) and the finish half
-    /// (pending dialog — the toggles fire after the dialog's
-    /// `close`). A victim a dialog `cancel`/`close` listener
-    /// re-showed is live in the top layer again — skip its
-    /// stale `toggle` (the re-show fired its own `open`
-    /// toggle); every other victim toggles exactly once.
-    /// Focus clears run even when the dialog's `cancel` was
-    /// prevented (the popover still hid); the re-show check
-    /// is live top-layer membership, not `is_popover_open`:
-    /// an exit-retained victim still counts as open there,
-    /// but it is closed — no later clear runs at retention
-    /// expiry — so a retained victim with no re-show must
-    /// clear here, while a re-shown victim is live again
-    /// and must not. Same re-show check shape as
-    /// `fire_dual_popover_toggle_after_close`.
-    /// Known edge (w86fix nit): a victim re-shown AND hidden
-    /// again between the hide and this deferred toggle still
-    /// toggles once here (it is hidden at toggle time, so the
-    /// liveness check passes) — on top of the re-hide's own
-    /// toggle, so the log shows two `closed` toggles for one
-    /// net hide. Closing it needs task-level toggle coalescing
-    /// (see S1 in `PageEventDispatch::dispatch_toggle`); the
-    /// liveness check alone cannot tell this hide's toggle
-    /// from the re-hide's.
-    fn fire_hidden_popover_toggles_and_clears(
-        &mut self,
-        hidden_pops: &[NodeId],
-        deferred_focus_clears: Vec<NodeId>,
-    ) {
+    /// Enqueue the hidden popovers' `toggle`s (w87fix r3 enqueue
+    /// half of [`Self::fire_hidden_popover_toggles_and_clears`]):
+    /// the begin half (no pending dialog) enqueues at pointerup
+    /// without flushing — delivery waits for the finish-half
+    /// flush, after the click — and the finish half (pending
+    /// dialog) enqueues after the dialog's `close`. A victim a
+    /// dialog `cancel`/`close` listener re-showed is live in the
+    /// top layer again — skip its stale `toggle` (the re-show
+    /// fired its own `open` toggle); every other victim toggles
+    /// exactly once. The liveness check is live top-layer
+    /// membership, not `is_popover_open`, and it runs at enqueue
+    /// time: a victim re-shown AND hidden again before this
+    /// enqueue is NOT live, so this helper DOES enqueue for it —
+    /// and the JS re-hide enqueued its own `closed` too, so
+    /// exactly one `closed` fires only because last-wins dedups
+    /// the two entries (the w87 closed edge). Same re-show check
+    /// shape as `fire_dual_popover_toggle_after_close`.
+    fn enqueue_hidden_popover_toggles(&mut self, hidden_pops: &[NodeId]) {
         for pop in hidden_pops {
             let re_shown = match self.tabs.get(self.tab) {
                 Some(tab) => match tab.document_ref() {
@@ -6778,6 +6913,20 @@ impl<'a> WindowApp<'a> {
                 js.dispatch_toggle(tab, *pop);
             }
         }
+    }
+
+    /// Clear focus inside the hidden popovers (w87fix r3 clear
+    /// half of [`Self::fire_hidden_popover_toggles_and_clears`]):
+    /// runs in the finish half, after the click, with a
+    /// finish-time liveness check. Focus clears run even when the
+    /// dialog's `cancel` was prevented (the popover still hid);
+    /// the re-show check is live top-layer membership, not
+    /// `is_popover_open`: an exit-retained victim still counts
+    /// as open there, but it is closed — no later clear runs at
+    /// retention expiry — so a retained victim with no re-show
+    /// must clear here, while a re-shown victim is live again
+    /// and must not.
+    fn clear_hidden_popover_focus(&mut self, deferred_focus_clears: Vec<NodeId>) {
         for pop in deferred_focus_clears {
             let re_shown = match self.tabs.get(self.tab) {
                 Some(tab) => match tab.document_ref() {
@@ -6790,6 +6939,27 @@ impl<'a> WindowApp<'a> {
                 self.clear_focus_inside(pop);
             }
         }
+    }
+
+    /// Fire the hidden popovers' `toggle`s and clear focus
+    /// inside them (w86fix P5 split helper): the finish half
+    /// for a pending dialog — the toggles enqueue after the
+    /// dialog's `close` and fire at the flush below. The
+    /// popover-only path does NOT call this: its toggles were
+    /// already enqueued in the begin half, so its finish half
+    /// runs only the focus clears and the flush (see
+    /// [`Self::finish_light_dismiss_release`]).
+    /// Host-operation end (w87fix): the toggles enqueued above
+    /// fire here — the dispatch methods' guarded pumps could not
+    /// flush them.
+    fn fire_hidden_popover_toggles_and_clears(
+        &mut self,
+        hidden_pops: &[NodeId],
+        deferred_focus_clears: Vec<NodeId>,
+    ) {
+        self.enqueue_hidden_popover_toggles(hidden_pops);
+        self.clear_hidden_popover_focus(deferred_focus_clears);
+        self.flush_pending_toggles();
     }
 
     /// Finish half of a light-dismiss release (w86fix P5):
@@ -6808,20 +6978,28 @@ impl<'a> WindowApp<'a> {
     fn finish_light_dismiss_release(&mut self, pending: PendingLightDismiss) {
         if let Some(dialog) = pending.dialog {
             self.close_dialog_after_light_dismiss_cancel(dialog);
+            // Dialog arm done (cancel fired, close fired or
+            // prevented): now fire the hidden popovers' `toggle`s.
+            // A victim a dialog listener re-showed is live in the
+            // top layer again — skip its stale `toggle` (the
+            // re-show fired its own `open` toggle); every other
+            // victim toggles exactly once, after the dialog's
+            // `cancel`/`close`, as Chrome pins (verdict B).
+            self.fire_hidden_popover_toggles_and_clears(
+                &pending.hidden_pops,
+                pending.deferred_focus_clears,
+            );
+        } else {
+            // No pending dialog: the victim toggles were already
+            // enqueued in the begin half (pointerup) — enqueueing
+            // again here would double-deliver them. Only the focus
+            // clears and the delivery flush run here, after the
+            // click (w87fix r3: Chrome fires the victim toggle
+            // after the click, and FIFO queue order still puts it
+            // before the click's activation toggle).
+            self.clear_hidden_popover_focus(pending.deferred_focus_clears);
+            self.flush_pending_toggles();
         }
-        // Dialog arm done (cancel fired, close fired or
-        // prevented): now fire the hidden popovers' `toggle`s.
-        // A victim a dialog listener re-showed is live in the
-        // top layer again — skip its stale `toggle` (the
-        // re-show fired its own `open` toggle); every other
-        // victim toggles exactly once, after the dialog's
-        // `cancel`/`close`, as Chrome pins (verdict B).
-        // (When there was no pending dialog, the begin half
-        // already fired these and the pending vecs are empty.)
-        self.fire_hidden_popover_toggles_and_clears(
-            &pending.hidden_pops,
-            pending.deferred_focus_clears,
-        );
     }
 
     /// Fire the light-dismiss `cancel` for `dialog`
@@ -7051,6 +7229,12 @@ impl<'a> WindowApp<'a> {
             self.fire_scroll_listeners_for(self.tab, &scrolled);
             self.needs_redraw = true;
         }
+        // Host-operation end (w87fix r3): a keydown listener that
+        // called `showPopover()` enqueued a toggle, and it must fire
+        // now, at the end of this key operation — not at the next
+        // pump turn. (Escape is saved by `handle_escape`'s own
+        // flush; this covers every other key.)
+        self.flush_pending_toggles();
     }
 
     /// Fire `scroll` events for the containers a scroll gesture moved,
@@ -13317,6 +13501,14 @@ mod tests {
         /// popover, standing in for a dialog `close` listener
         /// (real JS) that re-shows a dismissed popover.
         reshow_on_close: Option<NodeId>,
+        /// Test-only: when set, `dispatch_close` hides this
+        /// popover and then re-shows it, standing in for a
+        /// dialog `close` listener (real JS) that runs
+        /// `pop.hidePopover(); pop.showPopover();` — the
+        /// hide + re-show assigns the popover a fresh
+        /// promotion sequence, which the Escape phase-3
+        /// re-show guard (w87) reads.
+        hide_reshow_on_close: Option<NodeId>,
     }
 
     impl JsDispatch for StubDispatch {
@@ -13395,6 +13587,13 @@ mod tests {
                 && let Some(installed) = tab.installed_mut()
             {
                 let _ = installed.document().borrow_mut().show_popover(pop);
+            }
+            if let Some(pop) = self.hide_reshow_on_close
+                && let Some(installed) = tab.installed_mut()
+            {
+                let mut doc = installed.document().borrow_mut();
+                let _ = doc.hide_popover(pop);
+                let _ = doc.show_popover(pop);
             }
         }
 
@@ -17583,6 +17782,193 @@ mod tests {
     }
 
     #[test]
+    fn w87fix_light_dismiss_victim_toggle_fires_after_click_before_activation() {
+        // w87fix r3 (Chrome w86-probes2 P1: cancel/click at t≈1589,
+        // close/toggle at t≈1592): a popover-only light-dismiss
+        // victim's `toggle` fires AFTER the release's `click`, but
+        // BEFORE the click's activation toggle — FIFO queue order
+        // (the victim is enqueued at pointerup, the activation
+        // during the click); only delivery time moved to after the
+        // click. Click on the lower auto's invoker: the upper auto
+        // is the victim, the lower auto is the activation target.
+        // Real JS listeners record the delivery order — the stub's
+        // synchronous record cannot pin delivery time.
+        use crate::script::PageVm;
+
+        let shared = Rc::new(RefCell::new(two_popover_doc()));
+        let (pop_a, pop_b, outside) = {
+            let doc = shared.borrow();
+            (
+                doc.get_element_by_id("popA").expect("popA"),
+                doc.get_element_by_id("popB").expect("popB"),
+                doc.get_element_by_id("outside").expect("outside"),
+            )
+        };
+        let btn_a = shared.borrow().get_element_by_id("btnA").expect("btnA");
+        let btn_b = shared.borrow().get_element_by_id("btnB").expect("btnB");
+        shared.borrow_mut().show_popover(pop_a).expect("show A");
+        shared.borrow_mut().show_popover(pop_b).expect("show B");
+        let base = bowser_url::parse("http://example.com/", None).expect("test url");
+        let page = PageVm::new_for_document(shared.clone(), &base, "TestBrowser/9.9", &[])
+            .expect("install");
+        let mut tab = test_tab();
+        tab.install_document(shared, page);
+        tab.layout_root = Some(Rc::new(layout_box(
+            rect(0.0, 0.0, 800.0, 600.0),
+            None,
+            vec![
+                layout_box(rect(0.0, 300.0, 800.0, 100.0), Some(outside), vec![]),
+                layout_box(rect(0.0, 0.0, 100.0, 30.0), Some(btn_a), vec![]),
+                layout_box(rect(0.0, 40.0, 100.0, 30.0), Some(btn_b), vec![]),
+                layout_box(rect(200.0, 200.0, 100.0, 100.0), Some(pop_a), vec![]),
+                layout_box(rect(350.0, 200.0, 100.0, 100.0), Some(pop_b), vec![]),
+            ],
+        )));
+        tab.page_vm_mut()
+            .expect("page vm")
+            .eval("order = ''; document.getElementById('btnA').addEventListener('click', function() { order += 'click;'; }); document.getElementById('popB').addEventListener('toggle', function() { order += 'toggleB;'; }); document.getElementById('popA').addEventListener('toggle', function() { order += 'toggleA;'; });")
+            .expect("register listeners");
+        let mut tabs = TabArena::default();
+        let tab_id = tabs.insert(tab);
+        let jar = Arc::new(Mutex::new(CookieJar::new()));
+        let mut app = test_app_with_js(
+            &mut tabs,
+            &jar,
+            tab_id,
+            Some(Box::new(PageEventDispatch::new())),
+        );
+        app.on_cursor_moved(50.0, 15.0);
+        app.on_mouse_button(true, MouseButton::Left);
+        app.on_mouse_button(false, MouseButton::Left);
+        assert!(
+            !check(&app, tab_id, |d| d.is_popover_open(pop_a)),
+            "lower auto must end closed after its own invoker was clicked"
+        );
+        assert!(
+            !check(&app, tab_id, |d| d.is_popover_open(pop_b)),
+            "upper auto must end closed"
+        );
+        let order = app
+            .tabs
+            .get_mut(tab_id)
+            .expect("tab")
+            .page_vm_mut()
+            .expect("page vm")
+            .eval("order")
+            .expect("read order");
+        assert!(
+            matches!(order, Value::Str(ref s) if s.as_wtf8().to_utf8_lossy() == "click;toggleB;toggleA;"),
+            "victim toggle fires after the click but before the activation toggle, got: {order:?}"
+        );
+    }
+
+    #[test]
+    fn w87fix_plain_invoker_click_fires_toggle_at_click_end() {
+        // M1: a plain `<button popovertarget>` click (no
+        // form, no link) fell through to `let Some(href) =
+        // href else { return };` with the invoker toggle
+        // still queued — it fired only at the next pump or
+        // script boundary. The click's host-operation end
+        // now flushes, so the toggle has fired by the time
+        // `on_click` returns. The queue is observed via
+        // `pending_toggle_count` (a script read of the log
+        // would itself flush the queue), and the log is
+        // read only after the count asserts. A second click
+        // closes again with exactly one toggle each way,
+        // pinning no double-fire.
+        use crate::script::PageVm;
+
+        let shared = Rc::new(RefCell::new(
+            Document::parse_html(
+                b"<html><body><button id=\"btn\" popovertarget=\"pop\">t</button>\
+                  <div id=\"pop\" popover>hi</div></body></html>",
+            )
+            .0,
+        ));
+        let (btn, pop) = {
+            let doc = shared.borrow();
+            (
+                doc.get_element_by_id("btn").expect("btn"),
+                doc.get_element_by_id("pop").expect("pop"),
+            )
+        };
+        let base = bowser_url::parse("http://example.com/", None).expect("test url");
+        let page = PageVm::new_for_document(shared.clone(), &base, "TestBrowser/9.9", &[])
+            .expect("install");
+        let mut tab = test_tab();
+        tab.install_document(shared, page);
+        tab.page_vm_mut()
+            .expect("page vm")
+            .eval("order = ''; document.getElementById('pop').addEventListener('toggle', function(e) { order += e.oldState + '>' + e.newState + ';'; });")
+            .expect("register listener");
+        let mut tabs = TabArena::default();
+        let tab_id = tabs.insert(tab);
+        let jar = Arc::new(Mutex::new(CookieJar::new()));
+        let mut app = test_app_with_js(
+            &mut tabs,
+            &jar,
+            tab_id,
+            Some(Box::new(PageEventDispatch::new())),
+        );
+        app.on_click(btn);
+        assert!(
+            check(&app, tab_id, |d| d.is_popover_open(pop)),
+            "plain invoker click must open the popover"
+        );
+        assert_eq!(
+            app.tabs
+                .get_mut(tab_id)
+                .expect("tab")
+                .page_vm_mut()
+                .expect("page vm")
+                .vm_mut()
+                .pending_toggle_count(),
+            0,
+            "invoker toggle must have fired at the click's end, not stayed queued for the next pump"
+        );
+        let order = app
+            .tabs
+            .get_mut(tab_id)
+            .expect("tab")
+            .page_vm_mut()
+            .expect("page vm")
+            .eval("order")
+            .expect("read order");
+        assert!(
+            matches!(order, Value::Str(ref s) if s.as_wtf8().to_utf8_lossy() == "closed>open;"),
+            "exactly one open toggle must have fired at the click, got: {order:?}"
+        );
+        app.on_click(btn);
+        assert!(
+            !check(&app, tab_id, |d| d.is_popover_open(pop)),
+            "second plain invoker click must close the popover"
+        );
+        assert_eq!(
+            app.tabs
+                .get_mut(tab_id)
+                .expect("tab")
+                .page_vm_mut()
+                .expect("page vm")
+                .vm_mut()
+                .pending_toggle_count(),
+            0,
+            "close toggle must have fired at the second click's end too"
+        );
+        let order = app
+            .tabs
+            .get_mut(tab_id)
+            .expect("tab")
+            .page_vm_mut()
+            .expect("page vm")
+            .eval("order")
+            .expect("read order");
+        assert!(
+            matches!(order, Value::Str(ref s) if s.as_wtf8().to_utf8_lossy() == "closed>open;open>closed;"),
+            "exactly one toggle per click, no double-fire, got: {order:?}"
+        );
+    }
+
+    #[test]
     fn w85fix_lower_invoker_press_release_outside_dismisses_nothing() {
         // Pinned corner: a press on the lower auto's invoker
         // records that auto, a release outside records
@@ -17699,6 +18085,7 @@ mod tests {
                 })),
                 prevent: false,
                 reshow_on_close: None,
+                hide_reshow_on_close: None,
             },
         );
         app.input.focused = Some(pop);
@@ -18334,6 +18721,7 @@ mod tests {
             })),
             prevent: false,
             reshow_on_close: None,
+            hide_reshow_on_close: None,
         };
         let (mut app, log) = dismiss_app(&mut tabs, &jar, tab_id, stub);
         app.on_key(&Key::Named(NamedKey::Escape), true);
@@ -18548,6 +18936,7 @@ mod tests {
                 })),
                 prevent: false,
                 reshow_on_close: None,
+                hide_reshow_on_close: None,
             },
         );
         app.on_key(&Key::Named(NamedKey::Escape), true);
@@ -18604,6 +18993,7 @@ mod tests {
                 })),
                 prevent: false,
                 reshow_on_close: None,
+                hide_reshow_on_close: None,
             },
         );
         app.on_key(&Key::Named(NamedKey::Escape), true);
@@ -18621,6 +19011,225 @@ mod tests {
             log.borrow().toggles,
             vec![dlg],
             "dual Escape close fires exactly one popover toggle, not two"
+        );
+    }
+
+    #[test]
+    fn w87_escape_phase3_reshow_guard_keeps_auto_open() {
+        // w87 Escape phase-3 re-show guard: a dialog `close`
+        // listener that hides and re-shows an auto popover
+        // also in the phase-3 snapshot must NOT see it hidden
+        // again by this Escape — the re-show is a fresh show
+        // with a fresh close watcher (fresh promotion
+        // sequence), so the gesture's target is gone. The
+        // dialog itself still closes; only the re-shown auto
+        // survives, with no phase-3 `toggle`. Spec-plausible,
+        // NOT Chrome-confirmed: see the probe question on
+        // `handle_escape`'s snapshot — if Chrome hides it
+        // again, this test flips to asserting the second
+        // hide instead.
+        let mut doc = dismiss_doc();
+        let pop = doc.get_element_by_id("pop").expect("pop");
+        let dlg = doc.get_element_by_id("dlg").expect("dlg");
+        doc.set_attribute(dlg, "closedby", "closerequest");
+        doc.show_dialog_modal(dlg).expect("showModal");
+        doc.show_popover(pop).expect("show");
+        let (tab, _, _, _, _, _) = dismiss_tab(doc);
+        let mut tabs = TabArena::default();
+        let tab_id = tabs.insert(tab);
+        let jar = Arc::new(Mutex::new(CookieJar::new()));
+        let (mut app, log) = dismiss_app(
+            &mut tabs,
+            &jar,
+            tab_id,
+            StubDispatch {
+                prevent: false,
+                hide_reshow_on_close: Some(pop),
+                ..Default::default()
+            },
+        );
+        app.on_key(&Key::Named(NamedKey::Escape), true);
+        assert!(
+            !check(&app, tab_id, |d| d.is_dialog_open(dlg)),
+            "Escape must still close the dialog whose listener re-showed the auto"
+        );
+        assert!(
+            check(&app, tab_id, |d| d.is_popover_open(pop)),
+            "a close-listener hide+re-show must leave the auto open after Escape"
+        );
+        assert_eq!(log.borrow().cancels, vec![dlg]);
+        assert_eq!(log.borrow().closes, vec![dlg]);
+        assert!(
+            log.borrow().toggles.is_empty(),
+            "the re-shown auto must fire no phase-3 toggle, got {:?}",
+            log.borrow().toggles
+        );
+
+        // Control: the same Escape with no re-show hides
+        // the auto and fires its toggle after the closes.
+        let mut doc = dismiss_doc();
+        let pop = doc.get_element_by_id("pop").expect("pop");
+        let dlg = doc.get_element_by_id("dlg").expect("dlg");
+        doc.set_attribute(dlg, "closedby", "closerequest");
+        doc.show_dialog_modal(dlg).expect("showModal");
+        doc.show_popover(pop).expect("show");
+        let (tab, _, _, _, _, _) = dismiss_tab(doc);
+        let mut tabs = TabArena::default();
+        let tab_id = tabs.insert(tab);
+        let jar = Arc::new(Mutex::new(CookieJar::new()));
+        let (mut app, log) = dismiss_app(
+            &mut tabs,
+            &jar,
+            tab_id,
+            StubDispatch {
+                prevent: false,
+                ..Default::default()
+            },
+        );
+        app.on_key(&Key::Named(NamedKey::Escape), true);
+        assert!(
+            !check(&app, tab_id, |d| d.is_dialog_open(dlg)),
+            "control: Escape must close the dialog"
+        );
+        assert!(
+            !check(&app, tab_id, |d| d.is_popover_open(pop)),
+            "control: Escape must hide the auto when nothing re-shows it"
+        );
+        assert_eq!(
+            log.borrow().dismiss_order,
+            vec![("cancel", dlg), ("close", dlg), ("toggle", pop)],
+            "control: cancel, close, then the auto toggle"
+        );
+    }
+
+    #[test]
+    fn w87_light_dismiss_auto_dual_prevented_cancel() {
+        // w87 LD auto-dual prevented-cancel: the dialog's
+        // light-dismiss `cancel` IS cancelable (unlike
+        // Escape's, Chrome 155 P2), so a prevented cancel
+        // keeps the dialog open — but the popover arm runs
+        // first and independently, so the popover aspect is
+        // already dismissed by the time `cancel` fires.
+        // Non-modal auto dual: the dialog stays open as a
+        // plain non-modal dialog (open, not modal, no
+        // popover membership) with exactly one `toggle`
+        // (the popover hide). Modal auto dual: no popover
+        // arm runs at all (modal dialogs are never
+        // until-set members), so it stays open AND modal
+        // with no toggle. The non-modal popover-hide half
+        // is CURRENT BEHAVIOR, consistent with the
+        // separate-dialog+popover pin (a prevented dialog
+        // cancel never un-hides a dismissed popover), but
+        // Chrome-unprobed for the dual — one element, two
+        // aspects — so it is pinned, not claimed.
+        // DEFERRED PROBE (w87): headless Chrome 155, page
+        // with `<dialog id=d popover=auto closedby=any>`,
+        // `d.show(); d.showPopover();`, a `cancel`
+        // listener calling `preventDefault()`, then an
+        // outside click. Observe: is `d` still `open`?
+        // is it still `:popover-open`? how many `toggle`
+        // events fire? Repeat with `d.showModal()`
+        // instead of `show()`: is `d` still `:modal`,
+        // and does any `toggle` fire?
+        // Non-modal auto dual, prevented cancel.
+        let mut doc = dismiss_doc();
+        let dlg = doc.get_element_by_id("dlg").expect("dlg");
+        doc.set_attribute(dlg, "popover", "auto");
+        doc.set_attribute(dlg, "closedby", "any");
+        doc.show_dialog(dlg).expect("show");
+        doc.show_popover(dlg).expect("showPopover");
+        let (tab, _, _, _, _, _) = dismiss_tab(doc);
+        let mut tabs = TabArena::default();
+        let tab_id = tabs.insert(tab);
+        let jar = Arc::new(Mutex::new(CookieJar::new()));
+        let (mut app, log) = dismiss_app(
+            &mut tabs,
+            &jar,
+            tab_id,
+            StubDispatch {
+                log: Rc::new(RefCell::new(CallLog {
+                    cancel_prevent: true,
+                    ..Default::default()
+                })),
+                prevent: false,
+                reshow_on_close: None,
+                hide_reshow_on_close: None,
+            },
+        );
+        app.on_cursor_moved(10.0, 500.0);
+        app.on_mouse_button(true, MouseButton::Left);
+        app.on_mouse_button(false, MouseButton::Left);
+        assert!(
+            check(&app, tab_id, |d| d.is_dialog_open(dlg)),
+            "prevented LD cancel must keep the non-modal dual open as a dialog"
+        );
+        assert!(
+            !check(&app, tab_id, |d| d.is_popover_open(dlg)),
+            "prevented LD cancel does not un-hide the dual's popover aspect"
+        );
+        assert!(
+            !check(&app, tab_id, |d| d.is_dialog_modal(dlg)),
+            "the dual was never modal"
+        );
+        assert_eq!(log.borrow().cancels, vec![dlg]);
+        assert!(
+            log.borrow().closes.is_empty(),
+            "prevented LD cancel must fire no close"
+        );
+        assert_eq!(
+            log.borrow().toggles,
+            vec![dlg],
+            "exactly one toggle: the popover hide, not a close toggle"
+        );
+
+        // Modal auto dual, prevented cancel.
+        let mut doc = dismiss_doc();
+        let dlg = doc.get_element_by_id("dlg").expect("dlg");
+        doc.set_attribute(dlg, "popover", "auto");
+        doc.set_attribute(dlg, "closedby", "any");
+        doc.show_dialog_modal(dlg).expect("showModal");
+        let (tab, _, _, _, _, _) = dismiss_tab(doc);
+        let mut tabs = TabArena::default();
+        let tab_id = tabs.insert(tab);
+        let jar = Arc::new(Mutex::new(CookieJar::new()));
+        let (mut app, log) = dismiss_app(
+            &mut tabs,
+            &jar,
+            tab_id,
+            StubDispatch {
+                log: Rc::new(RefCell::new(CallLog {
+                    cancel_prevent: true,
+                    ..Default::default()
+                })),
+                prevent: false,
+                reshow_on_close: None,
+                hide_reshow_on_close: None,
+            },
+        );
+        app.on_cursor_moved(10.0, 500.0);
+        app.on_mouse_button(true, MouseButton::Left);
+        app.on_mouse_button(false, MouseButton::Left);
+        assert!(
+            check(&app, tab_id, |d| d.is_dialog_open(dlg)),
+            "prevented LD cancel must keep the modal dual open"
+        );
+        assert!(
+            check(&app, tab_id, |d| d.is_dialog_modal(dlg)),
+            "prevented LD cancel must keep the modal dual modal"
+        );
+        assert!(
+            check(&app, tab_id, |d| d.is_in_top_layer(dlg)),
+            "prevented LD cancel must leave the modal dual in the top layer"
+        );
+        assert_eq!(log.borrow().cancels, vec![dlg]);
+        assert!(
+            log.borrow().closes.is_empty(),
+            "prevented LD cancel must fire no close"
+        );
+        assert!(
+            log.borrow().toggles.is_empty(),
+            "a modal dual's prevented LD cancel fires no toggle, got {:?}",
+            log.borrow().toggles
         );
     }
 
@@ -19019,6 +19628,7 @@ mod tests {
                 })),
                 prevent: false,
                 reshow_on_close: None,
+                hide_reshow_on_close: None,
             },
         );
         app.on_cursor_moved(10.0, 500.0);

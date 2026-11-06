@@ -912,9 +912,14 @@ pub fn scrollbar_gutter_reservation(style: &bowser_css::ComputedStyle) -> (f32, 
 /// (`bowser_app::scroll::vertical_track_rect`), so it never stacks
 /// with the `scrollbar-gutter` reservation: callers take the per-side
 /// max, since a shown scrollbar paints exactly the reserved strip.
-/// Only the vertical axis: a forced *horizontal* scrollbar's height
-/// consumption is not yet modeled (block layout resolves height
-/// bottom-up, so unlike width it is not a pure layout input).
+/// Only the vertical axis: the forced *horizontal* scrollbar's height
+/// consumption lives in [`forced_horizontal_scrollbar_height`] (and
+/// the `auto` height in [`auto_horizontal_scrollbar_height`]) —
+/// height resolves bottom-up, so unlike width it is not a pure
+/// layout input: the block prologue subtracts the forced strip from
+/// the children's height base and the block completion re-drives
+/// once for the `auto` strip, while flex/grid/table engines do not
+/// yet thread it (see the block prologue's note).
 pub fn forced_scrollbar_reservation(style: &bowser_css::ComputedStyle) -> (f32, f32) {
     let oy = style
         .get_str_by_index(props::OVERFLOW_Y)
@@ -989,6 +994,67 @@ pub fn auto_scrollbar_reservation(style: &bowser_css::ComputedStyle) -> (f32, f3
     } else {
         (0.0, SCROLLBAR_THICKNESS)
     }
+}
+
+/// Height consumed from a scroll container's content box by a
+/// *forced* classic horizontal scrollbar (CSS Overflow 3 §2.2):
+/// `overflow-x: scroll` displays the horizontal scrollbar whether
+/// or not any content overflows, and a displayed classic scrollbar
+/// takes its thickness out of the scroll container's content box —
+/// the vertical mirror of [`forced_scrollbar_reservation`], which
+/// models only the vertical strip (a forced *horizontal* scrollbar's
+/// height consumption was previously unmodeled anywhere in layout:
+/// children kept the full content height, so a `height: 100%` child
+/// and every sticky far-edge pin sat one thickness too far). The
+/// strip sits at the block-end (bottom) edge in horizontal writing
+/// modes; under a vertical writing mode the `overflow-x` scrollbar
+/// is a vertical strip at the block-end edge instead, which this
+/// height cannot express, so it returns 0 there — the same bail as
+/// the vertical reservations.
+pub fn forced_horizontal_scrollbar_height(style: &bowser_css::ComputedStyle) -> f32 {
+    let ox = style
+        .get_str_by_index(props::OVERFLOW_X)
+        .unwrap_or("visible");
+    if !ox.eq_ignore_ascii_case("scroll") {
+        return 0.0;
+    }
+    if !matches!(
+        style::writing_mode_of(style),
+        style::WritingMode::HorizontalTb
+    ) {
+        return 0.0;
+    }
+    SCROLLBAR_THICKNESS
+}
+
+/// Height consumed from a scroll container's content box by an
+/// `overflow-x: auto` horizontal scrollbar that actually appears
+/// (CSS Overflow 3 §2.2): the horizontal mirror of
+/// [`auto_scrollbar_reservation`]. Conditional like its vertical
+/// twin: the caller must have established that real horizontal
+/// overflow exists (layout knows that only after children are laid
+/// out). `scroll` is excluded — its strip is forced and already
+/// reserved by [`forced_horizontal_scrollbar_height`];
+/// `hidden`/`clip` never show a scrollbar. Horizontal writing modes
+/// only, for the same reason as the forced height.
+pub fn auto_horizontal_scrollbar_height(style: &bowser_css::ComputedStyle) -> f32 {
+    let ox = style
+        .get_str_by_index(props::OVERFLOW_X)
+        .unwrap_or("visible");
+    if ox.eq_ignore_ascii_case("scroll") {
+        return 0.0;
+    }
+    let (_, (user_x, _)) = overflow_axes(style);
+    if !user_x {
+        return 0.0;
+    }
+    if !matches!(
+        style::writing_mode_of(style),
+        style::WritingMode::HorizontalTb
+    ) {
+        return 0.0;
+    }
+    SCROLLBAR_THICKNESS
 }
 
 /// The `(left, right)` reservation widths for a style whose
